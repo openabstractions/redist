@@ -758,10 +758,10 @@ jobs:
               if [ "$STATE" = partial ]; then
                 printf -- '- **Signing was configured and did not run.** These repository secrets\n'
                 printf -- '  are empty or missing: `%s`. Nothing was signed and nothing was\n' "$MISSING"
-                printf -- '  attached. See `research/ci76/SIGNING-SETUP.md`.\n'
+                printf -- '  attached.\n'
               else
-                printf -- '- No signing material is configured in this repository. See\n'
-                printf -- '  `research/ci76/SIGNING-SETUP.md` for what it needs.\n'
+                printf -- '- No signing material is configured in this repository: none of the\n'
+                printf -- '  seven signing secrets is set.\n'
               fi
               printf '\nUntil then the route on macOS is `go install`, which needs none of it.\n'
             fi
@@ -789,41 +789,8 @@ jobs:
           security delete-keychain "$kc"
           printf 'ok    the keychain this run made is gone\n'
 
-  # Not a matrix leg that was skipped: a statement that these have no asset in
-  # this release. A green release page with silent gaps is the defect this job
-  # exists to prevent.
-  absent:
-    needs: [macos]
-    runs-on: ubuntu-latest
-    steps:
-      - name: what this release does not contain
-        env:
-          MACOS_STATE: ${{ needs.macos.outputs.state }}
-        run: |
-          {
-            printf '\n### Absent from this release\n\n'
-            if [ "$MACOS_STATE" != signed ]; then
-              printf -- '- **macOS**: no asset. A `.pkg` is built by the `macos` job and kept as a\n'
-              printf -- '  workflow artifact; unsigned and unnotarised, Gatekeeper refuses it.\n'
-            fi
-            printf -- '- **Abstraction Panel**: no published module, so it is in no package.\n'
-            printf -- '- **The C++ developer headers**: carried by no module.\n'
-            printf -- '- **The Python packages**: published on their own registry, so no package\n'
-            printf -- '  here carries a second copy of them.\n'
-            printf -- '- **arm64 Windows and arm64 Linux**: built, and no arm64 machine has run\n'
-            printf -- '  either.\n'
-            if [ "$MACOS_STATE" = signed ]; then
-              printf -- '- **A signature on Windows and Linux**: the macOS package is signed and\n'
-              printf -- '  notarised; the `.msi` and the tarballs are not. A checksum says the\n'
-              printf -- '  bytes did not change in transit and nothing about who made them.\n'
-            else
-              printf -- '- **Any signature at all**: every asset is unsigned. A checksum says the\n'
-              printf -- '  bytes did not change in transit and nothing about who made them.\n'
-            fi
-          } >> "$GITHUB_STEP_SUMMARY"
-
   draft:
-    needs: [windows, verify, linux, linux-verify, macos, absent]
+    needs: [windows, verify, linux, linux-verify, macos]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -858,42 +825,114 @@ jobs:
           fi
           cat dist/SHA256SUMS
 
+      # NOTES.md is what is true of every release; this step is what only the
+      # run knows. One script writes both the release body and the run summary,
+      # because two scripts asserting the same state drifted apart once
+      # already: v0.1.3 attached a signed, notarised, stapled `.pkg` under a
+      # page that said in three places that nothing here was signed and that
+      # macOS had no asset. The step below is what stops that recurring.
+      - name: what only this run knows
+        env:
+          MACOS_STATE: ${{ needs.macos.outputs.state }}
+          MACOS_MISSING: ${{ needs.macos.outputs.missing }}
+        run: |
+          [ -f NOTES.md ] || { printf 'FAIL  NOTES.md is not in this repository, and generated notes are not what this project ships\n'; exit 1; }
+          rc=0
+          for phrase in 'not signed' 'unsigned' 'no asset' '## Absent from' '## Signatures'; do
+            if grep -qiF -- "$phrase" NOTES.md; then
+              printf 'FAIL  NOTES.md says "%s". Only the run that built the assets may say that, and it says it here.\n' "$phrase"
+              rc=1
+            fi
+          done
+          [ "$rc" = 0 ] || exit 1
+          {
+            printf '\n## Signatures\n\n'
+            printf -- '- **Windows** — `abstraction-x64.msi` and `abstraction-arm64.msi` are\n'
+            printf -- '  **not signed**. SmartScreen will warn you and the publisher will show\n'
+            printf -- '  as unknown; that warning is correct. `jobd` installed from an unsigned\n'
+            printf -- '  package does not pass our own strict-mode check.\n'
+            printf -- '- **Linux** — the tarballs are **not signed**. There is no signature\n'
+            printf -- '  scheme for them here.\n'
+            if [ "$MACOS_STATE" = signed ]; then
+              printf -- '- **macOS** — the `.pkg` **is signed**: a Developer ID Installer\n'
+              printf -- '  certificate, notarised by Apple and stapled, and the three programs\n'
+              printf -- '  inside it signed with a Developer ID Application certificate with the\n'
+              printf -- '  hardened runtime enabled. It has still never been installed on a Mac.\n'
+              printf -- '  Gatekeeper opening a package is not the claim that the package works.\n'
+              printf '\nThe `.pkg` is the only signed file on this page. A checksum says the bytes\n'
+              printf 'did not change in transit and nothing about who made them.\n'
+            else
+              printf '\nNothing on this page is signed. A checksum says the bytes did not change\n'
+              printf 'in transit and nothing about who made them.\n'
+            fi
+            printf '\n## Absent from this release\n\n'
+            case "$MACOS_STATE" in
+              signed) ;;
+              partial)
+                printf -- '- **macOS**: no asset. Signing is configured in this repository and did\n'
+                printf -- '  not run — `%s` is empty or missing — so the\n' "$MACOS_MISSING"
+                printf -- '  `.pkg` was built, left unsigned and not attached. `go install` is the\n'
+                printf -- '  route on macOS.\n' ;;
+              *)
+                printf -- '- **macOS**: no asset. A universal `.pkg` was built and kept as a\n'
+                printf -- '  workflow artifact; unsigned and unnotarised, Gatekeeper refuses it,\n'
+                printf -- '  and a download that cannot be opened is worse than a platform that\n'
+                printf -- '  says it has no package. `go install` is the route on macOS.\n' ;;
+            esac
+            printf -- '- **Abstraction Panel**, the graphical front end: published from nowhere,\n'
+            printf -- '  so no package here contains it.\n'
+            printf -- '- **The C++ developer headers**: carried by no module.\n'
+            printf -- '- **The Python packages**: published on their own registry, so no package\n'
+            printf -- '  here carries a second copy of them.\n'
+            printf -- '- **A container**: `jobd` for a NAS is a separate image,\n'
+            printf -- '  [docker-jobd](https://github.com/openabstractions/docker-jobd).\n'
+          } > "$RUNNER_TEMP/state.md"
+          cat NOTES.md "$RUNNER_TEMP/state.md" > "$RUNNER_TEMP/NOTES.md"
+          cat "$RUNNER_TEMP/state.md" >> "$GITHUB_STEP_SUMMARY"
+          cat "$RUNNER_TEMP/state.md"
+
+      # The body above is written from $MACOS_STATE; these are the questions
+      # that ask whether $MACOS_STATE is what is on the disk about to be
+      # uploaded. Prose is not matched, because prose gets reworded and a check
+      # that silently stops matching is how the last one failed — except for
+      # the two words the rule requires and a reworder must not lose.
+      - name: the body against the files, before either is published
+        env:
+          MACOS_STATE: ${{ needs.macos.outputs.state }}
+        run: |
+          rc=0
+          pkgs=0
+          for f in dist/*.pkg; do
+            if [ -e "$f" ]; then pkgs=$((pkgs + 1)); fi
+          done
+          if [ "$MACOS_STATE" = signed ] && [ "$pkgs" -ne 1 ]; then
+            printf 'FAIL  the body says a signed .pkg is attached and %s are here\n' "$pkgs"
+            rc=1
+          fi
+          if [ "$MACOS_STATE" != signed ] && [ "$pkgs" -ne 0 ]; then
+            printf 'FAIL  the body says macOS has no asset and %s .pkg files are here\n' "$pkgs"
+            rc=1
+          fi
+          n=$(grep -c 'not signed' "$RUNNER_TEMP/state.md" || true)
+          n=${n:-0}
+          if [ "$n" -lt 2 ]; then
+            printf 'FAIL  Windows and Linux are unsigned and the body says "not signed" %s times\n' "$n"
+            rc=1
+          fi
+          [ "$rc" = 0 ] || exit 1
+          printf 'ok    the body names %s .pkg, and says "not signed" %s times for the packages that are not\n' "$pkgs" "$n"
+
       # A draft, always. A release is permanent and public the moment it is not
       # a draft, and that is the owner's decision to make, not this workflow's.
-      # The macOS paragraph is appended rather than kept in NOTES.md because
-      # which state a run was in is a property of the run, and a person reading
-      # the release page is the one who needs to know it.
       - name: draft the release
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
           MACOS_STATE: ${{ needs.macos.outputs.state }}
-          MACOS_MISSING: ${{ needs.macos.outputs.missing }}
         run: |
           tag=$GITHUB_REF_NAME
-          [ -f NOTES.md ] || { printf 'FAIL  NOTES.md is not in this repository, and generated notes are not what this project ships\n'; exit 1; }
-          notes="$RUNNER_TEMP/NOTES.md"
-          cp NOTES.md "$notes"
-          {
-            printf '\n## macOS\n\n'
-            case "$MACOS_STATE" in
-              signed)
-                printf 'The `.pkg` here is signed with a Developer ID Installer certificate,\n'
-                printf 'notarised by Apple and stapled; the three programs inside it are signed\n'
-                printf 'with a Developer ID Application certificate with the hardened runtime\n'
-                printf 'enabled. It has still never been installed on a Mac.\n' ;;
-              partial)
-                printf 'There is **no macOS asset**. Signing is configured in this repository and\n'
-                printf 'did not run: `%s` is empty or missing, so the package was\n' "$MACOS_MISSING"
-                printf 'left unsigned and unattached. Use `go install` on macOS.\n' ;;
-              *)
-                printf 'There is **no macOS asset**. A universal `.pkg` was built and kept as a\n'
-                printf 'workflow artifact; it is unsigned and unnotarised, so Gatekeeper refuses\n'
-                printf 'it. Use `go install` on macOS.\n' ;;
-            esac
-          } >> "$notes"
           set -- dist/abstraction-x64.msi dist/abstraction-arm64.msi \
             dist/*-linux-amd64.tar.gz dist/*-linux-arm64.tar.gz dist/SHA256SUMS
           if [ "$MACOS_STATE" = signed ]; then set -- "$@" dist/*.pkg; fi
-          gh release create "$tag" --draft --title "$tag" --notes-file "$notes" "$@"
+          gh release create "$tag" --draft --title "$tag" --notes-file "$RUNNER_TEMP/NOTES.md" "$@"
           printf 'ok    drafted %s with %s assets. It is not published until a person publishes it.\n' "$tag" "$#"

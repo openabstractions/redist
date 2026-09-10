@@ -1,18 +1,18 @@
-The first release of the Open Abstractions redistributable: three command-line
-programs in one Windows installer, built from our own published module versions
-rather than from a source tree.
+The Open Abstractions redistributable: three command-line programs in one
+package per platform, built from our own published module versions rather than
+from a source tree.
 
-This is release one. It ships Windows and nothing else, the packages are **not
-signed**, and the list of what is missing is longer than the list of what is
-here. All three are stated below rather than left to be discovered.
+Which packages this release carries, and which of them is signed, are stated at
+the end of this page by the run that built it. Nothing above that point is a
+claim about this particular run.
 
 ## What is in it
 
 | program | what it does | built from |
 |---|---|---|
-| `jobd.exe` | keeps downloads running when no application is open | `service-jobd@v0.2.0` |
-| `dl.exe` | fetches a URL, resumably, verifying a digest if you give one | `abstraction-download/go@v0.3.0` |
-| `jobctl.exe` | drives the job store directly, for scripts and debugging | `abstraction-job/go@v0.3.0` |
+| `jobd` | keeps downloads running when no application is open | `service-jobd@v0.2.0` |
+| `dl` | fetches a URL, resumably, verifying a digest if you give one | `abstraction-download/go@v0.4.1` |
+| `jobctl` | drives the job store directly, for scripts and debugging | `abstraction-job/go@v0.4.1` |
 
 Every version in that last column exists on `proxy.golang.org`. The release
 workflow refuses to build if one of them does not, so this package is made of
@@ -33,25 +33,24 @@ matters: the release workflow has `dl` fetch a file, then requires `jobd` to
 see that download and `jobctl show` to return the record `dl` wrote. It fails
 if any of them disagrees.
 
-## Assets
-
-- `abstraction-x64.msi` — Windows on Intel or AMD
-- `abstraction-arm64.msi` — Windows on ARM. **Built, and never run**: no arm64
-  machine has installed this. Treat it as untested.
-- `SHA256SUMS`
-
 ## Installing
 
-Download `abstraction-x64.msi`, check it against `SHA256SUMS` below, then run
-it. It installs to `%LOCALAPPDATA%\Programs\Abstraction`, adds that folder to
-your `PATH`, and asks for no administrator rights. Open a new terminal
-afterwards, or `PATH` will still be the old one.
+**Windows.** Download `abstraction-x64.msi` — or `abstraction-arm64.msi` on
+Windows on ARM — check it against `SHA256SUMS`, then run it. It installs to
+`%LOCALAPPDATA%\Programs\Abstraction`, adds that folder to your `PATH`, and asks
+for no administrator rights. Open a new terminal afterwards, or `PATH` will
+still be the old one.
 
     dl https://example.com/some/file.bin -o D:\downloads
 
 Uninstall from Apps & features, or `msiexec /x abstraction-x64.msi`. The
 release workflow installs and uninstalls the x64 package on a clean machine on
 every run and fails if anything is left behind.
+
+**Linux.** Unpack the tarball for your architecture and run the `install.sh`
+inside it. It puts the three programs in `~/.local/bin`, and an `uninstall.sh`
+with the `MANIFEST` it removes in `~/.local/share/abstraction`. The release
+workflow unpacks, installs and uninstalls the amd64 tarball on every run.
 
 ## Checking what you downloaded
 
@@ -72,37 +71,11 @@ The two strings match, or you did not get the file we built.
 between this page and your disk. It does not prove they came from us: the
 checksum file sits on the same page as the downloads, so anyone who could
 replace one could replace the other. A signature is what proves origin, and
-this release has none — see below. Both MSIs are built twice in one job and
-compared byte for byte, so the hash below is a property of the inputs and not
-of the minute the build ran.
-
-## These packages are not signed
-
-There is no code-signing certificate for Windows yet. Consequences, plainly:
-
-- **SmartScreen will warn you**, and the publisher will show as unknown. That
-  warning is correct. It is telling you exactly the thing this section is.
-- **Our own strict mode refuses an unsigned service.** `jobd` installed from
-  this package will not pass a strict-mode check.
-- Nothing about these files can be traced to us cryptographically. If that is
-  not a risk you want to take, build from source: every version is public, and
-  `go install` reaches the same modules this package was built from.
-
-Signing is a separate, manually approved step that is not wired to this
-workflow. When a certificate exists, the four programs inside each MSI and the
-MSIs themselves become signing targets.
-
-## Absent from this release, deliberately
-
-- **macOS.** No asset. The Developer ID exists but is not connected to CI, and
-  an unsigned, unnotarised `.pkg` is worse than no `.pkg`.
-- **Linux.** No asset. `go install` is the route there today; no `.deb` is
-  built.
-- **Abstraction Panel**, the graphical front end. It is published from nowhere,
-  so no package can contain it.
-- **The C++ developer headers.** No module carries them yet.
-- **A container.** `jobd` for a NAS is a separate image; see
-  [docker-jobd](https://github.com/openabstractions/docker-jobd).
+**Signatures** below says which of these files carries one. Both MSIs are built
+twice in one job and compared byte for byte, and so are the Go binaries that go
+into every package: a difference in the binaries fails the release, a
+difference in an MSI is reported and does not, and the inputs are identical
+either way.
 
 ## What may break
 
@@ -113,7 +86,8 @@ MSIs themselves become signing targets.
   proof.
 - **`JOB_STORE` overrides `ABSTRACTION_STORE` for `jobctl` alone**, as above.
   Set it and `jobctl` will be looking at a store `jobd` and `dl` are not.
-- **Windows on ARM is unrun**, as above.
+- **The arm64 packages are unrun**: built on every release, installed by no
+  arm64 machine, on either Windows or Linux.
 - A partly fetched download does not resume across a reinstall.
 - Nothing here has been measured on a machine that is not a CI runner.
 
