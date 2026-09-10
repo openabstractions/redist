@@ -11,18 +11,32 @@ HERE = Path(__file__).resolve().parent
 GOARCH = {"x64": "amd64", "arm64": "arm64"}
 GATE = {"Abstraction Panel.exe": "Panel",
         "Abstraction Panel.exe.manifest": "Panel",
+        "dev/python/job/abstraction_job.py": "Dev",
+        "dev/python/job/pyproject.toml": "Dev",
+        "dev/python/download/abstraction_download.py": "Dev",
+        "dev/python/download/pyproject.toml": "Dev",
         "dev/include/abstraction/download/over_curl.hpp": "Cpp"}
 
 
-def stage(src, out, arch):
+def prebuilt(binaries, kind, path):
+    if binaries is None or kind != "gobuild":
+        return None
+    p = binaries / Path(path).name
+    return p if p.is_file() else None
+
+
+def stage(src, out, arch, binaries=None):
     dropped = []
     for _, path, kind, source, frm, _ in rows("payload.tsv"):
-        if source not in src:
+        ready = prebuilt(binaries, kind, path)
+        if ready is None and source not in src:
             dropped.append(path)
             continue
         dst = out / "payload" / path
         dst.parent.mkdir(parents=True, exist_ok=True)
-        if kind == "gobuild":
+        if ready is not None:
+            shutil.copyfile(ready, dst)
+        elif kind == "gobuild":
             subprocess.run(
                 ["go", "build", "-ldflags", "-s -w -buildid=", "-o", str(dst), "."],
                 cwd=src[source] / frm, check=True,
@@ -44,7 +58,15 @@ def main():
     ap.add_argument("--src", action="append", default=[], metavar="ID=DIR",
                     help="where the sources.tsv source ID is checked out; "
                          "a source not given here is left out of the package")
+    ap.add_argument("--bin", type=Path, metavar="DIR",
+                    help="take the programs from DIR instead of building them, "
+                         "for a package assembled out of published module "
+                         "versions rather than out of checkouts")
     a = ap.parse_args()
+
+    # wix runs with cwd=out, so a relative --out would be applied twice and the
+    # package would land under itself.
+    a.out = a.out.resolve()
 
     src = {"installer": HERE}
     for pair in a.src:
@@ -52,10 +74,11 @@ def main():
         src[sid] = Path(d).resolve()
 
     a.out.mkdir(parents=True, exist_ok=True)
-    dropped = stage(src, a.out, a.arch)
+    dropped = stage(src, a.out, a.arch, a.bin)
     for path in dropped:
         if path not in GATE:
-            print(f"FAIL  {path} has no --src for its source and no gate to leave it out")
+            print(f"FAIL  {path} has no --src for its source, no --bin holding it, "
+                  f"and no gate to leave it out")
             return 1
 
     subprocess.run([sys.executable, str(HERE / "mklicense.py"),

@@ -21,5 +21,5 @@
 
 path		module							package		feature
 jobd.exe	github.com/openabstractions/service-jobd@v0.2.0		.		service
-dl.exe		github.com/openabstractions/abstraction-download/go@v0.3.0	cmd/dl		tools
-jobctl.exe	github.com/openabstractions/abstraction-job/go@v0.3.0	cmd/jobctl	tools
+dl.exe		github.com/openabstractions/abstraction-download/go@v0.4.1	cmd/dl		tools
+jobctl.exe	github.com/openabstractions/abstraction-job/go@v0.4.1	cmd/jobctl	tools

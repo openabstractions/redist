@@ -125,34 +125,29 @@ jobs:
           dotnet tool install --global wix --version "$WIX_VERSION"
           echo "$HOME/.dotnet/tools" >> "$GITHUB_PATH"
 
+      # windows/build.py is the packager on a workstation and it is the packager
+      # here, because two assemblers cannot be kept agreeing about what the
+      # package contains and abstraction.wxs installs more than tools.tsv names.
+      # --bin is what lets one packager serve both routes: the programs come
+      # from the published module versions installed above rather than from
+      # checkouts, and a row with no source here is named and gated out, the way
+      # posix/build.py does it.
       - name: package
         run: |
-          rows() { grep -v '^>' "$1" | sed '/^[[:space:]]*$/d' | tail -n +2 | tr -s '\t'; }
-          root=$PWD
           ref=${GITHUB_REF_NAME#v}
           case "$ref" in [0-9]*.[0-9]*.[0-9]*) version=$ref ;; *) version=0.0.0 ;; esac
-          printf 'version %s   panel no   c++ headers no\n' "$version"
 
           wix extension add -g "WixToolset.UI.wixext/$WIX_VERSION"
-          python3 windows/mklicense.py LICENSE license.rtf
 
           mkdir -p dist
           for arch in x64 arm64; do
             case $arch in x64) goarch=amd64 ;; *) goarch=arm64 ;; esac
-            rm -rf payload
-            mkdir -p payload
-            while IFS=$'\t' read -r path module package feature; do
-              cp "a/$goarch/$path" "payload/$path"
-            done < <(rows tools.tsv)
-
             for pass in a b; do
-              wix build -arch "$arch" -bindpath "$root" \
-                -d Version="$version" -d Panel=no -d Cpp=no \
-                -ext WixToolset.UI.wixext \
-                -o "$pass/abstraction-$arch.msi" windows/abstraction.wxs
+              python3 windows/build.py --arch "$arch" --version "$version" \
+                --out "pkg-$pass/$arch" --bin "a/$goarch" --license LICENSE
             done
-            cp "a/abstraction-$arch.msi" "dist/abstraction-$arch.msi"
-            if cmp -s "a/abstraction-$arch.msi" "b/abstraction-$arch.msi"; then
+            cp "pkg-a/$arch/abstraction-$arch.msi" "dist/abstraction-$arch.msi"
+            if cmp -s "pkg-a/$arch/abstraction-$arch.msi" "pkg-b/$arch/abstraction-$arch.msi"; then
               printf 'ok    abstraction-%s.msi is byte-identical across two builds\n' "$arch"
             else
               printf 'note  abstraction-%s.msi differs between two builds; its inputs do not\n' "$arch"
@@ -478,7 +473,16 @@ jobs:
           [ -n "$id" ] || { printf 'FAIL  dl did not name the job it created\n'; exit 1; }
           "$HOME/.local/bin/jobd" status | tee "$work/jobd.out"
           grep -q 'thing.bin' "$work/jobd.out" || { printf 'FAIL  jobd could not see the download dl completed in the store they share\n'; exit 1; }
-          "$HOME/.local/bin/jobctl" show "$id" | tee "$work/jobctl.out"
+          if ! "$HOME/.local/bin/jobctl" show "$id" | tee "$work/jobctl.out"; then
+            printf 'FAIL  jobctl would not resolve the store dl wrote to and jobd read.\n'
+            printf 'FAIL  ABSTRACTION_STORE=%s was set for all three; two took it and\n' "$ABSTRACTION_STORE"
+            printf 'FAIL  jobctl asked for a name of its own. Three programs in one package, and\n'
+            printf 'FAIL  they do not agree on how a store is found. Setting the name jobctl wants\n'
+            printf 'FAIL  would make this step green and change nothing a person installs, so it is\n'
+            printf 'FAIL  not done here. Check first that tools.tsv names the newest published\n'
+            printf 'FAIL  versions: a fix can be tagged and unused.\n'
+            exit 1
+          fi
           grep -q "$id" "$work/jobctl.out" || { printf 'FAIL  jobctl read the store and did not find the record dl wrote there\n'; exit 1; }
           printf 'ok    dl wrote it, jobd saw it, jobctl read the record back\n'
 
@@ -504,6 +508,16 @@ jobs:
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+
+      # This image carries no Go, and `go version` belongs in the state line, so
+      # Go is installed before the first number rather than the state line
+      # moving after the first build: state printed afterwards is the state of
+      # something else. The version is the one the Linux and Windows images
+      # carry; those two are still whatever their image ships, so this is a pin
+      # on one leg of three.
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: '1.24.13'
 
       - name: state
         run: |

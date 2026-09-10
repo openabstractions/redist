@@ -95,6 +95,7 @@
       <Component Directory="DevFolder">
         <File Id="using.txt" Source="payload/dev/USING.txt" KeyPath="yes" />
       </Component>
+      <?if $(var.Dev) = yes ?>
       <Component Directory="DevPythonJob">
         <File Id="abstraction_job.py" Source="payload/dev/python/job/abstraction_job.py" KeyPath="yes" />
       </Component>
@@ -107,6 +108,7 @@
       <Component Directory="DevPythonDownload">
         <File Id="download.pyproject.toml" Name="pyproject.toml" Source="payload/dev/python/download/pyproject.toml" KeyPath="yes" />
       </Component>
+      <?endif?>
       <?if $(var.Cpp) = yes ?>
       <Component Directory="DevIncludeDownload">
         <File Id="over_curl.hpp" Source="payload/dev/include/abstraction/download/over_curl.hpp" KeyPath="yes" />

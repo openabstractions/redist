@@ -72,7 +72,7 @@ def built(msi, wix, root, gated):
         if fid in inside:
             continue
         if path in gated:
-            print(f"note  {msi.name} leaves out {path}, which has no publishable source")
+            print(f"note  {msi.name} leaves out {path}, which this build was not given")
         else:
             bad.append(f"{msi.name}: {path} is in abstraction.wxs and not in the package")
     if not bad:

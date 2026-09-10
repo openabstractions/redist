@@ -45,6 +45,11 @@ with `--src` is left out, and it refuses to build a package missing a file
 `abstraction.wxs` cannot gate away — which is how the UNRESOLVED rows leave the
 package without anyone editing anything.
 
+`--bin DIR` takes the programs from `DIR` instead of building them. That is the
+release route: a package assembled out of published module versions, with no
+repository checked out, which is what `openabstractions/redist` does and what a
+stranger can reproduce.
+
 **What comes out is unsigned**, and Windows will name the publisher unknown.
 Signing is a separate, manually approved step, outside this build and outside
 the release workflow, and it signs the programs inside each MSI as well as each
@@ -71,6 +76,14 @@ cannot gate away.
   `payload.tsv` name `UNRESOLVED`, the workflow leaves them out and says so, and
   `abstraction.wxs` gates them on `$(var.Panel)` and `$(var.Cpp)`. Somebody has
   to decide which repository publishes them.
+- **The Python packages are in the release build and not in the release
+  package.** `$(var.Dev)` is the third gate. Those rows have a source, and a
+  build assembled out of published module versions has no checkout to copy them
+  from; they publish on their own registry instead. A build given `--src job`
+  and `--src download` carries them, the release does not, and `dev/USING.txt`
+  still tells the reader to install them from directories that are then not
+  there. That sentence wants rewriting once it is settled where a person is
+  told to get them.
 - **A hosted runner is an administrator and a person is not.** The one CI run
   that installed this package — run 34364113642, 2026-09-09 — registered a
   logon task that an unelevated account cannot register at all. Measured
