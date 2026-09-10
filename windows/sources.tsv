@@ -27,5 +27,5 @@ self		-						-
 installer	-						-
 download	openabstractions/abstraction-download		b344af364b44468c590e1f2cb1e61812e6a4223b
 job		openabstractions/abstraction-job		5c396e8b5ed0c3aa91bc5872fa0785d11624b35c
-panel		openabstractions/abstractions			-
+panel		openabstractions/abstractions			fc273d2f6bffc54623081a0b28e5c2701ccc4651
 UNRESOLVED	-						-
