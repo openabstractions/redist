@@ -503,14 +503,18 @@ jobs:
           [ "$left" = 0 ] || exit 1
           printf 'ok    uninstall reversed it: no program, no unit, no share directory\n'
 
-  # macOS is built and never attached. Gatekeeper refuses an unsigned,
-  # unnotarised .pkg, so shipping one is a download that cannot be opened; and a
-  # platform that is quietly missing from a release page is the defect this
-  # whole file exists to prevent. So the package is built here to prove it can
-  # be, kept as a workflow artifact a person can fetch, and named UNPROVEN in
-  # the summary and in the release notes with exactly what it needs.
+  # The package is built the same way whether or not this repository holds
+  # signing material; only what happens to it afterwards differs. Gatekeeper
+  # refuses an unsigned, unnotarised .pkg, so attaching one is a download that
+  # cannot be opened, and a platform quietly missing from a release page is the
+  # defect this whole file exists to prevent. So an unsigned run keeps the
+  # package as a workflow artifact and says UNPROVEN in the summary and in the
+  # release notes; a signed run attaches it and says which it was.
   macos:
     runs-on: macos-latest
+    outputs:
+      state: ${{ steps.material.outputs.state }}
+      missing: ${{ steps.material.outputs.missing }}
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
 
@@ -530,6 +534,68 @@ jobs:
             "$(getconf _NPROCESSORS_ONLN)" "$RUNNER_OS" "$RUNNER_ARCH"
           go version
           sw_vers
+
+      # Decided before anything is built, so every later step branches on one
+      # answer rather than each re-deciding. Names are printed and values never
+      # are. Some-but-not-all is its own state: it is a typo in a secret name,
+      # not a deliberate unsigned release, and it must not read like one.
+      - name: signing material, by name and never by value
+        id: material
+        env:
+          MACOS_CERTIFICATE: ${{ secrets.MACOS_CERTIFICATE }}
+          MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+          MACOS_INSTALLER_CERTIFICATE: ${{ secrets.MACOS_INSTALLER_CERTIFICATE }}
+          MACOS_INSTALLER_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_INSTALLER_CERTIFICATE_PASSWORD }}
+          APPLE_API_KEY_P8: ${{ secrets.APPLE_API_KEY_P8 }}
+          APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+          APPLE_API_ISSUER_ID: ${{ secrets.APPLE_API_ISSUER_ID }}
+        run: |
+          present=; missing=
+          for name in MACOS_CERTIFICATE MACOS_CERTIFICATE_PASSWORD \
+                      MACOS_INSTALLER_CERTIFICATE MACOS_INSTALLER_CERTIFICATE_PASSWORD \
+                      APPLE_API_KEY_P8 APPLE_API_KEY_ID APPLE_API_ISSUER_ID; do
+            if [ -n "${!name}" ]; then present="$present $name"; else missing="$missing $name"; fi
+          done
+          present=${present# }; missing=${missing# }
+          if [ -z "$missing" ]; then state=signed
+          elif [ -z "$present" ]; then state=absent
+          else state=partial
+          fi
+          printf 'state=%s\n' "$state" >> "$GITHUB_OUTPUT"
+          printf 'missing=%s\n' "$missing" >> "$GITHUB_OUTPUT"
+          printf 'signing material: %s\n' "$state"
+          [ -z "$missing" ] || printf 'not set: %s\n' "$missing"
+
+      # Imported into a keychain made for this run and deleted at the end of it,
+      # so nothing is added to any keychain that outlives the job. The keychain
+      # password is generated here, used here and never leaves this step: after
+      # unlock, securityd keeps it open for the rest of the job.
+      - name: a keychain for this run only
+        if: steps.material.outputs.state == 'signed'
+        env:
+          MACOS_CERTIFICATE: ${{ secrets.MACOS_CERTIFICATE }}
+          MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+          MACOS_INSTALLER_CERTIFICATE: ${{ secrets.MACOS_INSTALLER_CERTIFICATE }}
+          MACOS_INSTALLER_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_INSTALLER_CERTIFICATE_PASSWORD }}
+        run: |
+          kc="$RUNNER_TEMP/release.keychain-db"
+          pw=$(openssl rand -base64 24)
+          security create-keychain -p "$pw" "$kc"
+          security set-keychain-settings -lut 21600 "$kc"
+          security unlock-keychain -p "$pw" "$kc"
+          security list-keychains -d user | tr -d ' "' > "$RUNNER_TEMP/keychains.before"
+          security list-keychains -d user -s "$kc" $(cat "$RUNNER_TEMP/keychains.before")
+          for pair in MACOS_CERTIFICATE:MACOS_CERTIFICATE_PASSWORD \
+                      MACOS_INSTALLER_CERTIFICATE:MACOS_INSTALLER_CERTIFICATE_PASSWORD; do
+            b64=${pair%%:*}; pass=${pair#*:}
+            printf '%s' "${!b64}" | base64 --decode > "$RUNNER_TEMP/import.p12"
+            security import "$RUNNER_TEMP/import.p12" -k "$kc" -P "${!pass}" -f pkcs12 \
+              -T /usr/bin/codesign -T /usr/bin/productsign
+            rm -f "$RUNNER_TEMP/import.p12"
+          done
+          security set-key-partition-list -S apple-tool:,apple: -k "$pw" "$kc" > /dev/null
+          printf 'SIGNING_KEYCHAIN=%s\n' "$kc" >> "$GITHUB_ENV"
+          printf 'ok    two identities imported into a keychain this job will delete\n'
 
       - name: build from the published modules, universal
         env:
@@ -561,6 +627,32 @@ jobs:
             lipo -info "universal/${path%.exe}"
           done < <(rows tools.tsv)
 
+      # Before the package, because build.py copies these bytes into the payload
+      # and a signature travels in the Mach-O file. The identity is looked up in
+      # the keychain rather than written here: this file is public and the
+      # certificate's common name is a person and a team identifier.
+      - name: sign the programs
+        if: steps.material.outputs.state == 'signed'
+        run: |
+          app=$(security find-identity -v -p codesigning "$SIGNING_KEYCHAIN" |
+                awk '/Developer ID Application:/ {print $2}' || true)
+          set -- $app
+          if [ $# -ne 1 ]; then
+            printf 'FAIL  %s Developer ID Application identities in the keychain, wanted 1\n' "$#"
+            exit 1
+          fi
+          for f in universal/*; do
+            codesign --force --timestamp --options runtime \
+              --keychain "$SIGNING_KEYCHAIN" --sign "$1" "$f"
+            codesign --verify --strict --verbose=2 "$f"
+            codesign -dv --verbose=4 "$f" > "$RUNNER_TEMP/dv" 2>&1
+            grep -q '^Timestamp=' "$RUNNER_TEMP/dv" ||
+              { printf 'FAIL  %s carries no secure timestamp\n' "$f"; cat "$RUNNER_TEMP/dv"; exit 1; }
+            grep -q '^CodeDirectory .*flags=0x[0-9a-f]*([^)]*runtime' "$RUNNER_TEMP/dv" ||
+              { printf 'FAIL  %s has no hardened runtime\n' "$f"; cat "$RUNNER_TEMP/dv"; exit 1; }
+            printf 'ok    %s signed, hardened, timestamped\n' "$f"
+          done
+
       - name: package
         run: |
           ref=${GITHUB_REF_NAME#v}
@@ -570,49 +662,164 @@ jobs:
             --out dist --bin universal --license LICENSE
           (cd dist && shasum -a 256 ./*.pkg | sed 's#\./##' | tee SHA256SUMS.macos)
 
-      - name: UNPROVEN, and what it needs
+      # A .pkg takes the Installer certificate, which is a different certificate
+      # from the one the programs took; a .pkg signed with the Application one is
+      # rejected. Apple's notary service accepts a flat installer package as it
+      # stands, so nothing is zipped. The checksums are recomputed because
+      # productsign and stapler both rewrite the file.
+      - name: sign the package, notarise it, staple the ticket
+        if: steps.material.outputs.state == 'signed'
+        env:
+          APPLE_API_KEY_P8: ${{ secrets.APPLE_API_KEY_P8 }}
+          APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+          APPLE_API_ISSUER_ID: ${{ secrets.APPLE_API_ISSUER_ID }}
+        run: |
+          key="$RUNNER_TEMP/notary.p8"
+          trap 'rm -f "$key"' EXIT
+          inst=$(security find-identity -v "$SIGNING_KEYCHAIN" |
+                 awk '/Developer ID Installer:/ {print $2}' || true)
+          set -- $inst
+          if [ $# -ne 1 ]; then
+            printf 'FAIL  %s Developer ID Installer identities in the keychain, wanted 1\n' "$#"
+            exit 1
+          fi
+          pkg=$(ls dist/*.pkg)
+          productsign --keychain "$SIGNING_KEYCHAIN" --sign "$1" "$pkg" "$pkg.signed"
+          mv "$pkg.signed" "$pkg"
+          pkgutil --check-signature "$pkg"
+
+          printf '%s\n' "$APPLE_API_KEY_P8" > "$key"
+          chmod 600 "$key"
+          xcrun notarytool submit "$pkg" --key "$key" --key-id "$APPLE_API_KEY_ID" \
+            --issuer "$APPLE_API_ISSUER_ID" --wait --output-format json \
+            > "$RUNNER_TEMP/notary.json" || true
+          id=$(jq -r '.id // empty' "$RUNNER_TEMP/notary.json")
+          status=$(jq -r '.status // empty' "$RUNNER_TEMP/notary.json")
+          printf 'notary status %s for submission %s\n' "${status:-none}" "${id:-none}"
+          if [ "$status" != Accepted ]; then
+            [ -z "$id" ] || xcrun notarytool log "$id" --key "$key" \
+              --key-id "$APPLE_API_KEY_ID" --issuer "$APPLE_API_ISSUER_ID" || true
+            printf 'FAIL  the notary service did not accept the package\n'
+            exit 1
+          fi
+
+          xcrun stapler staple "$pkg"
+          xcrun stapler validate "$pkg"
+          spctl -a -vv -t install "$pkg" > "$RUNNER_TEMP/spctl" 2>&1 || true
+          cat "$RUNNER_TEMP/spctl"
+          grep -q ': accepted' "$RUNNER_TEMP/spctl" ||
+            { printf 'FAIL  Gatekeeper does not accept the package\n'; exit 1; }
+          grep -q 'source=Notarized Developer ID' "$RUNNER_TEMP/spctl" ||
+            { printf 'FAIL  Gatekeeper does not see a stapled notarisation ticket\n'; exit 1; }
+          (cd dist && shasum -a 256 ./*.pkg | sed 's#\./##' | tee SHA256SUMS.macos)
+
+      # The programs were signed before the package was built, so this asks the
+      # shipped bytes rather than the bytes we signed: a packager that rewrote
+      # them would strip the signature and nothing else here would notice.
+      - name: the programs inside the package are the signed ones
+        if: steps.material.outputs.state == 'signed'
+        run: |
+          pkg=$(ls dist/*.pkg)
+          pkgutil --expand-full "$pkg" "$RUNNER_TEMP/expanded"
+          for name in jobd dl jobctl; do
+            f=$(find "$RUNNER_TEMP/expanded" -type f -name "$name" | head -1)
+            [ -n "$f" ] || { printf 'FAIL  %s is not in the package\n' "$name"; exit 1; }
+            codesign --verify --strict --verbose=2 "$f"
+            codesign -dv --verbose=4 "$f" 2>&1 | grep -q '^Timestamp=' ||
+              { printf 'FAIL  %s in the package carries no secure timestamp\n' "$name"; exit 1; }
+            printf 'ok    %s in the package is signed and timestamped\n' "$name"
+          done
+
+      - name: which state this run was in
+        env:
+          STATE: ${{ steps.material.outputs.state }}
+          MISSING: ${{ steps.material.outputs.missing }}
         run: |
           {
-            printf '\n### macOS — UNPROVEN\n\n'
-            printf 'A universal `.pkg` was built here and is **not attached to the release**.\n\n'
-            printf -- '- It is unsigned and unnotarised, so Gatekeeper refuses it: a person who\n'
-            printf -- '  downloads it cannot open it, and a download that cannot be opened is\n'
-            printf -- '  worse than a platform that says it has no package.\n'
-            printf -- '- It has never been installed. `installer/posix/macos/postinstall`, the\n'
-            printf -- '  LaunchAgent and `uninstall.sh` have run on no machine.\n'
-            printf -- '- To attach it: a Developer ID Installer certificate in this repository as\n'
-            printf -- '  a secret, `productsign` before upload, `notarytool submit --wait` and\n'
-            printf -- '  `stapler staple`, and one run of this job that installs the result and\n'
-            printf -- '  removes it again.\n\n'
-            printf 'Until then the route on macOS is `go install`, which needs none of it.\n'
+            if [ "$STATE" = signed ]; then
+              printf '\n### macOS — signed and notarised\n\n'
+              printf 'The universal `.pkg` is **attached to the release**. Its three programs\n'
+              printf 'are signed with a Developer ID Application certificate with the hardened\n'
+              printf 'runtime enabled; the package is signed with a Developer ID Installer\n'
+              printf 'certificate, notarised by Apple and stapled. `spctl -a -vv -t install`\n'
+              printf 'accepted it on this runner.\n\n'
+              printf -- '- Still UNPROVEN: it has never been **installed**.\n'
+              printf -- '  `installer/posix/macos/postinstall`, the LaunchAgent and `uninstall.sh`\n'
+              printf -- '  have run on no machine. Gatekeeper opening a package is not the same\n'
+              printf -- '  claim as the package working.\n'
+            else
+              printf '\n### macOS — UNPROVEN\n\n'
+              printf 'A universal `.pkg` was built here and is **not attached to the release**.\n\n'
+              printf -- '- It is unsigned and unnotarised, so Gatekeeper refuses it: a person who\n'
+              printf -- '  downloads it cannot open it, and a download that cannot be opened is\n'
+              printf -- '  worse than a platform that says it has no package.\n'
+              printf -- '- It has never been installed. `installer/posix/macos/postinstall`, the\n'
+              printf -- '  LaunchAgent and `uninstall.sh` have run on no machine.\n'
+              if [ "$STATE" = partial ]; then
+                printf -- '- **Signing was configured and did not run.** These repository secrets\n'
+                printf -- '  are empty or missing: `%s`. Nothing was signed and nothing was\n' "$MISSING"
+                printf -- '  attached. See `research/ci76/SIGNING-SETUP.md`.\n'
+              else
+                printf -- '- No signing material is configured in this repository. See\n'
+                printf -- '  `research/ci76/SIGNING-SETUP.md` for what it needs.\n'
+              fi
+              printf '\nUntil then the route on macOS is `go install`, which needs none of it.\n'
+            fi
           } >> "$GITHUB_STEP_SUMMARY"
 
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: abstraction-macos-unsigned-unnotarised
-          path: dist/
+          name: abstraction-macos-${{ steps.material.outputs.state == 'signed' && 'signed' || 'unsigned-unnotarised' }}
+          path: |
+            dist/*.pkg
+            dist/SHA256SUMS.macos
           if-no-files-found: error
+
+      # By the fixed path rather than by $SIGNING_KEYCHAIN, because the step that
+      # exports that variable can fail after creating the keychain. `-s` with an
+      # empty argument list empties the search list, so the restore only happens
+      # when the file recording it was written.
+      - name: delete the keychain this run made
+        if: always()
+        run: |
+          kc="$RUNNER_TEMP/release.keychain-db"
+          [ -e "$kc" ] || exit 0
+          before="$RUNNER_TEMP/keychains.before"
+          if [ -s "$before" ]; then security list-keychains -d user -s $(cat "$before"); fi
+          security delete-keychain "$kc"
+          printf 'ok    the keychain this run made is gone\n'
 
   # Not a matrix leg that was skipped: a statement that these have no asset in
   # this release. A green release page with silent gaps is the defect this job
   # exists to prevent.
   absent:
+    needs: [macos]
     runs-on: ubuntu-latest
     steps:
       - name: what this release does not contain
+        env:
+          MACOS_STATE: ${{ needs.macos.outputs.state }}
         run: |
           {
             printf '\n### Absent from this release\n\n'
-            printf -- '- **macOS**: no asset. A `.pkg` is built by the `macos` job and kept as a\n'
-            printf -- '  workflow artifact; unsigned and unnotarised, Gatekeeper refuses it.\n'
+            if [ "$MACOS_STATE" != signed ]; then
+              printf -- '- **macOS**: no asset. A `.pkg` is built by the `macos` job and kept as a\n'
+              printf -- '  workflow artifact; unsigned and unnotarised, Gatekeeper refuses it.\n'
+            fi
             printf -- '- **Abstraction Panel**: no published module, so it is in no package.\n'
             printf -- '- **The C++ developer headers**: carried by no module.\n'
             printf -- '- **The Python packages**: published on their own registry, so no package\n'
             printf -- '  here carries a second copy of them.\n'
             printf -- '- **arm64 Windows and arm64 Linux**: built, and no arm64 machine has run\n'
             printf -- '  either.\n'
-            printf -- '- **Any signature at all**: every asset is unsigned. A checksum says the\n'
-            printf -- '  bytes did not change in transit and nothing about who made them.\n'
+            if [ "$MACOS_STATE" = signed ]; then
+              printf -- '- **A signature on Windows and Linux**: the macOS package is signed and\n'
+              printf -- '  notarised; the `.msi` and the tarballs are not. A checksum says the\n'
+              printf -- '  bytes did not change in transit and nothing about who made them.\n'
+            else
+              printf -- '- **Any signature at all**: every asset is unsigned. A checksum says the\n'
+              printf -- '  bytes did not change in transit and nothing about who made them.\n'
+            fi
           } >> "$GITHUB_STEP_SUMMARY"
 
   draft:
@@ -628,16 +835,20 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
+          MACOS_STATE: ${{ needs.macos.outputs.state }}
         run: |
           gh run download "$GITHUB_RUN_ID" -n abstraction-windows-unsigned -D dist
           gh run download "$GITHUB_RUN_ID" -n abstraction-linux-unsigned -D dist
+          if [ "$MACOS_STATE" = signed ]; then
+            gh run download "$GITHUB_RUN_ID" -n abstraction-macos-signed -D dist
+          fi
 
       # Each line was computed by the job that made the bytes. Joining them is
       # not recomputing them, so the file is checked once more here against what
       # is actually about to be attached.
       - name: one checksum file, checked
         run: |
-          (cd dist && cat SHA256SUMS.windows SHA256SUMS.linux > SHA256SUMS && rm SHA256SUMS.windows SHA256SUMS.linux)
+          (cd dist && cat SHA256SUMS.* > SHA256SUMS && rm SHA256SUMS.[a-z]*)
           (cd dist && sha256sum -c SHA256SUMS)
           n=$(grep -c . dist/SHA256SUMS)
           attached=$(ls dist | grep -cv '^SHA256SUMS$')
@@ -649,15 +860,40 @@ jobs:
 
       # A draft, always. A release is permanent and public the moment it is not
       # a draft, and that is the owner's decision to make, not this workflow's.
+      # The macOS paragraph is appended rather than kept in NOTES.md because
+      # which state a run was in is a property of the run, and a person reading
+      # the release page is the one who needs to know it.
       - name: draft the release
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
+          MACOS_STATE: ${{ needs.macos.outputs.state }}
+          MACOS_MISSING: ${{ needs.macos.outputs.missing }}
         run: |
           tag=$GITHUB_REF_NAME
           [ -f NOTES.md ] || { printf 'FAIL  NOTES.md is not in this repository, and generated notes are not what this project ships\n'; exit 1; }
-          gh release create "$tag" --draft --title "$tag" --notes-file NOTES.md \
-            dist/abstraction-x64.msi dist/abstraction-arm64.msi \
-            dist/*-linux-amd64.tar.gz dist/*-linux-arm64.tar.gz \
-            dist/SHA256SUMS
-          printf 'ok    drafted %s with 5 assets. It is not published until a person publishes it.\n' "$tag"
+          notes="$RUNNER_TEMP/NOTES.md"
+          cp NOTES.md "$notes"
+          {
+            printf '\n## macOS\n\n'
+            case "$MACOS_STATE" in
+              signed)
+                printf 'The `.pkg` here is signed with a Developer ID Installer certificate,\n'
+                printf 'notarised by Apple and stapled; the three programs inside it are signed\n'
+                printf 'with a Developer ID Application certificate with the hardened runtime\n'
+                printf 'enabled. It has still never been installed on a Mac.\n' ;;
+              partial)
+                printf 'There is **no macOS asset**. Signing is configured in this repository and\n'
+                printf 'did not run: `%s` is empty or missing, so the package was\n' "$MACOS_MISSING"
+                printf 'left unsigned and unattached. Use `go install` on macOS.\n' ;;
+              *)
+                printf 'There is **no macOS asset**. A universal `.pkg` was built and kept as a\n'
+                printf 'workflow artifact; it is unsigned and unnotarised, so Gatekeeper refuses\n'
+                printf 'it. Use `go install` on macOS.\n' ;;
+            esac
+          } >> "$notes"
+          set -- dist/abstraction-x64.msi dist/abstraction-arm64.msi \
+            dist/*-linux-amd64.tar.gz dist/*-linux-arm64.tar.gz dist/SHA256SUMS
+          if [ "$MACOS_STATE" = signed ]; then set -- "$@" dist/*.pkg; fi
+          gh release create "$tag" --draft --title "$tag" --notes-file "$notes" "$@"
+          printf 'ok    drafted %s with %s assets. It is not published until a person publishes it.\n' "$tag" "$#"

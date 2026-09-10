@@ -144,7 +144,11 @@ def pkg(root, files, out, version, work):
     (scripts / "postinstall").chmod(0o755)
 
     manifest = root / ".local/share/abstraction/FILES"
-    manifest.write_text("".join(f"{p}\n" for p, _ in sorted(files)), encoding="utf-8", newline="\n")
+    # io.open and not Path.write_text: newline= landed on write_text in 3.10, and
+    # macOS ships /usr/bin/python3 at 3.9, where this raised TypeError after every
+    # expensive step. LF is forced because the bom and the payload are compared.
+    with io.open(manifest, "w", encoding="utf-8", newline="\n") as fh:
+        fh.write("".join(f"{p}\n" for p, _ in sorted(files)))
 
     for path, mode in files:
         (root / path).chmod(mode)
@@ -162,8 +166,9 @@ def pkg(root, files, out, version, work):
     shutil.copyfile(root / ".local/share/abstraction/LICENSE", res / "LICENSE")
 
     dist = work / "distribution.xml"
-    dist.write_text((HERE / "macos" / "distribution.xml").read_text(encoding="utf-8")
-                    .replace("@VERSION@", version), encoding="utf-8", newline="\n")
+    with io.open(dist, "w", encoding="utf-8", newline="\n") as fh:
+        fh.write((HERE / "macos" / "distribution.xml").read_text(encoding="utf-8")
+                 .replace("@VERSION@", version))
 
     subprocess.run(["productbuild", "--distribution", str(dist),
                     "--package-path", str(work), "--resources", str(res), str(out)],
