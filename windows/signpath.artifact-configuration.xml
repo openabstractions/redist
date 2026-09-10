@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="utf-8"?>
+<artifact-configuration xmlns="http://signpath.io/artifact-configuration/v1">
+  <zip-file>
+    <msi-file path="abstraction-x64.msi">
+      <pe-file path="jobd.exe"><authenticode-sign /></pe-file>
+      <pe-file path="dl.exe"><authenticode-sign /></pe-file>
+      <pe-file path="jobctl.exe"><authenticode-sign /></pe-file>
+      <pe-file path="Abstraction Panel.exe"><authenticode-sign /></pe-file>
+      <authenticode-sign />
+    </msi-file>
+    <msi-file path="abstraction-arm64.msi">
+      <pe-file path="jobd.exe"><authenticode-sign /></pe-file>
+      <pe-file path="dl.exe"><authenticode-sign /></pe-file>
+      <pe-file path="jobctl.exe"><authenticode-sign /></pe-file>
+      <pe-file path="Abstraction Panel.exe"><authenticode-sign /></pe-file>
+      <authenticode-sign />
+    </msi-file>
+  </zip-file>
+</artifact-configuration>

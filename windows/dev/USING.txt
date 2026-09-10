@@ -1,0 +1,19 @@
+Building against these layers.
+
+Go — nothing here to install; the modules resolve on their own.
+
+    go get github.com/openabstractions/abstraction-download/go
+    go get github.com/openabstractions/abstraction-job/go
+    go get github.com/openabstractions/abstraction-facade/go
+
+Python — two packages, installed from the directories beside this file.
+
+    pip install .\python\job
+    pip install .\python\download
+
+C++ — one header, no library and no dependency beyond curl on PATH.
+
+    cl /std:c++17 /I .\include yourprogram.cpp
+
+The tools in the folder above are built from these same layers. dl is what the
+download layer looks like from a shell; anything dl does, your program can do.

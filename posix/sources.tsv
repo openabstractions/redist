@@ -1,0 +1,22 @@
+> Where every program in the Linux and macOS packages comes from.
+> installer/posix/build.py and the redist release workflow read this and nothing
+> else.
+>
+> id      the name payload.tsv uses
+> repo    owner/name on github.com
+> tag     the published tag, or "-" when the source has never been tagged
+> commit  the 40-hex commit that tag resolves to, because a tag can be moved
+>
+> Both columns, not one. The tag says which release this is; the commit is what
+> the build checks it got. A build that fetches the tag and lands on a different
+> commit fails rather than shipping.
+>
+> A source whose tag is "-" has no release. It is shipped from a commit on a
+> branch, and the release notes say so in those words. jobd is that source:
+> openabstractions/service-jobd has never carried a tag, checked 2026-09-09 with
+> git ls-remote --tags. Nothing here can invent one.
+
+id		repo					tag		commit
+jobd		openabstractions/service-jobd		-		415161ab6aed348050071f10fc1cafc5811e6c81
+download	openabstractions/abstraction-download	go/v0.3.0	9093166ef9d87c65993d254f711b0904fe9035da
+job		openabstractions/abstraction-job		go/v0.3.0	28fc45e7592877e70b9a99b5989ac584bd55c38e

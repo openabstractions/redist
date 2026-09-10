@@ -1,0 +1,644 @@
+name: release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  WIX_VERSION: '5.0.2'
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+
+      - name: state
+        run: |
+          printf 'a hosted runner, %s logical CPUs, %s %s, on mains\n' \
+            "$(getconf _NPROCESSORS_ONLN)" "$RUNNER_OS" "$RUNNER_ARCH"
+          go version
+          dotnet --version
+          git rev-parse HEAD
+
+      # Every version named here must exist on proxy.golang.org before anything
+      # is built. This is the whole point of the repository: the package is made
+      # of our published artifacts, so a tag we deleted or never pushed stops the
+      # release here, by name, instead of shipping.
+      - name: the modules resolve for a stranger
+        run: |
+          rows() { grep -v '^>' "$1" | sed '/^[[:space:]]*$/d' | tail -n +2 | tr -s '\t'; }
+          n=0
+          rc=0
+          while IFS=$'\t' read -r path module package feature; do
+            n=$((n + 1))
+            mod=${module%@*}
+            version=${module##*@}
+            case "$version" in
+              v[0-9]*) ;;
+              *) printf 'FAIL  %s names %s, which is not a published version\n' "$path" "$version"; rc=1; continue ;;
+            esac
+            if curl -fsS "https://proxy.golang.org/$mod/@v/$version.info" -o "info-$n.json"; then
+              printf 'ok    %-12s %s  %s\n' "$path" "$module" "$(cat "info-$n.json")"
+            else
+              printf 'FAIL  %s is not on proxy.golang.org, so nothing outside this org can build %s\n' \
+                "$module" "$path"
+              rc=1
+            fi
+          done < <(rows tools.tsv)
+          if [ "$n" -lt 1 ]; then
+            printf 'FAIL  tools.tsv named no program, and an empty package is not a release\n'
+            exit 1
+          fi
+          exit $rc
+
+      # Two passes into two trees, compared below. A package whose bytes depend
+      # on which minute it was built cannot be checked against its own checksum
+      # file by anyone but the machine that made it.
+      - name: build from the published modules
+        env:
+          CGO_ENABLED: '0'
+          GOOS: windows
+          GOFLAGS: -trimpath
+        run: |
+          rows() { grep -v '^>' "$1" | sed '/^[[:space:]]*$/d' | tail -n +2 | tr -s '\t'; }
+          root=$PWD
+          for arch in amd64 arm64; do
+            while IFS=$'\t' read -r path module package feature; do
+              mod=${module%@*}
+              version=${module##*@}
+              case "$package" in
+                .) target="$mod@$version" ;;
+                *) target="$mod/$package@$version" ;;
+              esac
+              # GOBIN refuses a cross-compiled install, so these land in
+              # GOPATH/bin under a name go chooses — at the root for the
+              # runner's own arch, in windows_arm64/ for the other. Emptying it
+              # first is what makes "the one file in there" a safe way to find
+              # what this install just produced.
+              gobin="$(go env GOPATH)/bin"
+              for pass in a b; do
+                mkdir -p "$root/$pass/$arch"
+                rm -rf "$gobin"
+                GOARCH="$arch" go install -ldflags '-s -w -buildid=' "$target"
+                built=$(find "$gobin" -type f -name '*.exe')
+                n=$(printf '%s\n' "$built" | sed '/^$/d' | wc -l)
+                if [ "$n" -ne 1 ]; then
+                  printf 'FAIL  %s produced %s binaries, expected 1\n' "$target" "$n"
+                  exit 1
+                fi
+                mv "$built" "$root/$pass/$arch/$path"
+              done
+              printf 'built %s %s from %s\n' "$arch" "$path" "$target"
+            done < <(rows tools.tsv)
+          done
+
+      - name: reproducible
+        run: |
+          rc=0
+          n=0
+          for f in a/*/*; do
+            n=$((n + 1))
+            if cmp -s "$f" "b/${f#a/}"; then
+              printf 'ok    %s is byte-identical across two builds of one module version\n' "${f#a/}"
+            else
+              printf 'FAIL  %s differs between two builds of one module version\n' "${f#a/}"
+              rc=1
+            fi
+          done
+          if [ "$n" -lt 2 ]; then
+            printf 'FAIL  binaries — %s inputs, and this rule cannot fail on fewer than 2\n' "$n"
+            exit 1
+          fi
+          exit $rc
+
+      - name: wix
+        run: |
+          dotnet tool install --global wix --version "$WIX_VERSION"
+          echo "$HOME/.dotnet/tools" >> "$GITHUB_PATH"
+
+      - name: package
+        run: |
+          rows() { grep -v '^>' "$1" | sed '/^[[:space:]]*$/d' | tail -n +2 | tr -s '\t'; }
+          root=$PWD
+          ref=${GITHUB_REF_NAME#v}
+          case "$ref" in [0-9]*.[0-9]*.[0-9]*) version=$ref ;; *) version=0.0.0 ;; esac
+          printf 'version %s   panel no   c++ headers no\n' "$version"
+
+          wix extension add -g "WixToolset.UI.wixext/$WIX_VERSION"
+          python3 windows/mklicense.py LICENSE license.rtf
+
+          mkdir -p dist
+          for arch in x64 arm64; do
+            case $arch in x64) goarch=amd64 ;; *) goarch=arm64 ;; esac
+            rm -rf payload
+            mkdir -p payload
+            while IFS=$'\t' read -r path module package feature; do
+              cp "a/$goarch/$path" "payload/$path"
+            done < <(rows tools.tsv)
+
+            for pass in a b; do
+              wix build -arch "$arch" -bindpath "$root" \
+                -d Version="$version" -d Panel=no -d Cpp=no \
+                -ext WixToolset.UI.wixext \
+                -o "$pass/abstraction-$arch.msi" windows/abstraction.wxs
+            done
+            cp "a/abstraction-$arch.msi" "dist/abstraction-$arch.msi"
+            if cmp -s "a/abstraction-$arch.msi" "b/abstraction-$arch.msi"; then
+              printf 'ok    abstraction-%s.msi is byte-identical across two builds\n' "$arch"
+            else
+              printf 'note  abstraction-%s.msi differs between two builds; its inputs do not\n' "$arch"
+            fi
+          done
+
+      # sha256sum's own format, so `sha256sum -c SHA256SUMS` is the verification
+      # command and we are not asking anyone to learn ours. One file per build
+      # job, joined by `draft`: a digest is computed by the job that made the
+      # bytes, or it describes a different build.
+      - name: digests
+        run: |
+          n=$(ls dist/*.msi | wc -l)
+          if [ "$n" -lt 2 ]; then
+            printf 'FAIL  packages — %s inputs, and this rule cannot fail on fewer than 2\n' "$n"
+            exit 1
+          fi
+          (cd dist && sha256sum ./*.msi | sed 's#\./##' | tee SHA256SUMS.windows)
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: abstraction-windows-unsigned
+          path: dist/
+          if-no-files-found: error
+
+  verify:
+    needs: windows
+    runs-on: windows-latest
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - name: fetch the package
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: gh run download "$GITHUB_RUN_ID" -n abstraction-windows-unsigned -D pkg
+
+      # The checksum file ships to strangers as the way to check a download, so
+      # it is checked here first. A SHA256SUMS nobody validated is decoration.
+      - name: the checksum file is true
+        run: (cd pkg && sha256sum -c SHA256SUMS.windows)
+
+      - name: install
+        shell: pwsh
+        run: |
+          $msi = (Resolve-Path pkg\abstraction-x64.msi).Path
+          $p = Start-Process msiexec -Wait -PassThru -ArgumentList @('/i', $msi, '/qn', '/norestart', '/l*v', 'install.log')
+          if ($p.ExitCode -ne 0) { Get-Content install.log -Tail 60; throw "msiexec /i exited $($p.ExitCode)" }
+
+      - name: what it changed
+        shell: pwsh
+        run: |
+          $dir = Join-Path $env:LOCALAPPDATA 'Programs\Abstraction'
+          foreach ($f in 'jobd.exe','dl.exe','jobctl.exe') {
+            if (-not (Test-Path (Join-Path $dir $f))) { throw "$f was not installed" }
+          }
+          $path = (Get-ItemProperty 'HKCU:\Environment' -Name Path -ErrorAction Stop).Path
+          if ($path -notlike "*$dir*") { throw "PATH does not carry $dir" }
+          if (-not (Get-ScheduledTask -TaskName 'jobd' -ErrorAction SilentlyContinue)) {
+            throw 'the five-minute sweep task was not registered, so nothing finishes a transfer after the shell closes'
+          }
+          # This runner is an administrator and the buyer is not. The package
+          # registers one task for that reason; a logon task needs either
+          # elevation or a password, and an install that asked for neither
+          # cannot have made one. If this ever finds one, the package acquired
+          # a step that will fail 1603 for every normal user and pass here.
+          if (Get-ScheduledTask -TaskName 'jobd-logon' -ErrorAction SilentlyContinue) {
+            throw 'a jobd-logon task exists. This job runs elevated; a person does not, and for them that task cannot be created at all.'
+          }
+          'ok    three programs, a PATH entry, one sweep task and no logon task'
+
+      # These three binaries come from three separately tagged modules, so the
+      # package contains three builds of one store format. Only writing with one
+      # and reading with the others says they agree.
+      #
+      # jobd and dl take the store from ABSTRACTION_STORE; the published jobctl
+      # reads JOB_STORE and nothing else. That divergence is asserted here, not
+      # worked around: the day jobctl learns ABSTRACTION_STORE this step goes
+      # red and somebody updates the release notes that describe it.
+      - name: the three programs agree about the store
+        shell: pwsh
+        run: |
+          $dir = Join-Path $env:LOCALAPPDATA 'Programs\Abstraction'
+          $work = Join-Path $env:RUNNER_TEMP 'agree'
+          New-Item -ItemType Directory -Force -Path "$work\serve","$work\out","$work\store" | Out-Null
+          $env:ABSTRACTION_STORE = "$work\store"
+          Set-Content "$work\serve\thing.bin" 'three modules, one store format'
+          $srv = Start-Process python -PassThru -WorkingDirectory "$work\serve" -ArgumentList '-m','http.server','8099','--bind','127.0.0.1'
+          try {
+            # 200 ms of backoff, at most ten seconds of it: http.server has no
+            # readiness signal, so the first successful request is the only one
+            # there is to wait for.
+            for ($i = 0; $i -lt 50; $i++) {
+              try { Invoke-WebRequest 'http://127.0.0.1:8099/thing.bin' -UseBasicParsing | Out-Null; break }
+              catch { Start-Sleep -Milliseconds 200 }
+            }
+            $fetched = & "$dir\dl.exe" 'http://127.0.0.1:8099/thing.bin' -o "$work\out" 2>&1
+            $fetched
+            if ($LASTEXITCODE -ne 0) { throw "dl exited $LASTEXITCODE" }
+            if (-not (Test-Path "$work\out\thing.bin")) { throw 'dl reported success and delivered nothing' }
+            $named = $fetched | Select-String -Pattern '^\s*job\s+(\S+)'
+            if (-not $named) { throw 'dl did not name the job it created' }
+            $id = $named.Matches[0].Groups[1].Value
+
+            $seen = & "$dir\jobd.exe" status
+            $seen
+            if (-not ($seen | Select-String -SimpleMatch 'thing.bin')) {
+              throw 'jobd could not see the download dl completed in the store they share'
+            }
+
+            $env:JOB_STORE = "$work\store"
+            $shown = & "$dir\jobctl.exe" show $id
+            if ($LASTEXITCODE -ne 0) { throw "jobctl show exited $LASTEXITCODE on the job dl wrote" }
+            if (-not ($shown | Select-String -SimpleMatch $id)) {
+              throw 'jobctl read the store and did not find the record dl wrote there'
+            }
+
+            Remove-Item Env:JOB_STORE
+            & "$dir\jobctl.exe" show $id 2>&1 | Out-Null
+            if ($LASTEXITCODE -eq 0) {
+              throw 'jobctl now works without JOB_STORE. That is an improvement, and the release notes say it does not: update them.'
+            }
+          } finally {
+            Stop-Process -Id $srv.Id -Force
+          }
+          'ok    dl wrote it, jobd saw it, jobctl read the record back — one store format, two environment variables'
+
+      - name: uninstall
+        shell: pwsh
+        run: |
+          $msi = (Resolve-Path pkg\abstraction-x64.msi).Path
+          $p = Start-Process msiexec -Wait -PassThru -ArgumentList @('/x', $msi, '/qn', '/norestart', '/l*v', 'uninstall.log')
+          if ($p.ExitCode -ne 0) { Get-Content uninstall.log -Tail 60; throw "msiexec /x exited $($p.ExitCode)" }
+          $dir = Join-Path $env:LOCALAPPDATA 'Programs\Abstraction'
+          if (Test-Path $dir) { throw 'the install folder survived uninstall' }
+          if (Test-Path 'HKCU:\Software\OpenAbstractions') { throw 'the registry key survived uninstall' }
+          if (Get-ScheduledTask -TaskName 'jobd' -ErrorAction SilentlyContinue) { throw 'the sweep task survived uninstall' }
+          $path = (Get-ItemProperty 'HKCU:\Environment' -Name Path -ErrorAction Stop).Path
+          if ($path -like '*Programs\Abstraction*') { throw 'the PATH entry survived uninstall' }
+          'ok    uninstall reversed it: no folder, no registry key, no task, no PATH entry'
+
+  linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+
+      - name: state
+        run: |
+          printf 'a hosted runner, %s logical CPUs, %s %s, on mains\n' \
+            "$(getconf _NPROCESSORS_ONLN)" "$RUNNER_OS" "$RUNNER_ARCH"
+          go version
+          git rev-parse HEAD
+
+      - name: the modules resolve for a stranger
+        run: |
+          rows() { grep -v '^>' "$1" | sed '/^[[:space:]]*$/d' | tail -n +2 | tr -s '\t'; }
+          n=0
+          rc=0
+          while IFS=$'\t' read -r path module package feature; do
+            n=$((n + 1))
+            mod=${module%@*}
+            version=${module##*@}
+            case "$version" in
+              v[0-9]*) ;;
+              *) printf 'FAIL  %s names %s, which is not a published version\n' "$path" "$version"; rc=1; continue ;;
+            esac
+            if curl -fsS "https://proxy.golang.org/$mod/@v/$version.info" -o "info-$n.json"; then
+              printf 'ok    %-12s %s  %s\n' "$path" "$module" "$(cat "info-$n.json")"
+            else
+              printf 'FAIL  %s is not on proxy.golang.org, so nothing outside this org can build %s\n' \
+                "$module" "$path"
+              rc=1
+            fi
+          done < <(rows tools.tsv)
+          if [ "$n" -lt 1 ]; then
+            printf 'FAIL  tools.tsv named no program, and an empty package is not a release\n'
+            exit 1
+          fi
+          exit $rc
+
+      # tools.tsv names Windows file names, because that is where it started.
+      # The tarball installs the same programs without .exe, and posix/build.py
+      # finds each one in --bin by the base name of its own payload row, so the
+      # suffix is stripped here and nowhere else.
+      - name: build from the published modules
+        env:
+          CGO_ENABLED: '0'
+          GOOS: linux
+          GOFLAGS: -trimpath
+        run: |
+          rows() { grep -v '^>' "$1" | sed '/^[[:space:]]*$/d' | tail -n +2 | tr -s '\t'; }
+          root=$PWD
+          for arch in amd64 arm64; do
+            while IFS=$'\t' read -r path module package feature; do
+              mod=${module%@*}
+              version=${module##*@}
+              case "$package" in
+                .) target="$mod@$version" ;;
+                *) target="$mod/$package@$version" ;;
+              esac
+              gobin="$(go env GOPATH)/bin"
+              for pass in a b; do
+                mkdir -p "$root/$pass/$arch"
+                rm -rf "$gobin"
+                GOARCH="$arch" go install -ldflags '-s -w -buildid=' "$target"
+                built=$(find "$gobin" -type f)
+                n=$(printf '%s\n' "$built" | sed '/^$/d' | wc -l)
+                if [ "$n" -ne 1 ]; then
+                  printf 'FAIL  %s produced %s binaries, expected 1\n' "$target" "$n"
+                  exit 1
+                fi
+                mv "$built" "$root/$pass/$arch/${path%.exe}"
+              done
+              printf 'built %s %s from %s\n' "$arch" "${path%.exe}" "$target"
+            done < <(rows tools.tsv)
+          done
+
+      - name: reproducible
+        run: |
+          rc=0
+          n=0
+          for f in a/*/*; do
+            n=$((n + 1))
+            if cmp -s "$f" "b/${f#a/}"; then
+              printf 'ok    %s is byte-identical across two builds of one module version\n' "${f#a/}"
+            else
+              printf 'FAIL  %s differs between two builds of one module version\n' "${f#a/}"
+              rc=1
+            fi
+          done
+          if [ "$n" -lt 2 ]; then
+            printf 'FAIL  binaries — %s inputs, and this rule cannot fail on fewer than 2\n' "$n"
+            exit 1
+          fi
+          exit $rc
+
+      # No --src. The Python packages posix/payload.tsv can also carry are
+      # published on their own registry; a redistributable holding a second copy
+      # of them would be one file with two homes. build.py names every row it
+      # leaves out for that reason, and stops if a program is ever one of them.
+      - name: package
+        run: |
+          ref=${GITHUB_REF_NAME#v}
+          case "$ref" in [0-9]*.[0-9]*.[0-9]*) version=$ref ;; *) version=0.0.0 ;; esac
+          mkdir -p dist
+          for arch in amd64 arm64; do
+            python3 posix/build.py --platform linux --arch "$arch" --version "$version" \
+              --out dist --bin "a/$arch" --license LICENSE
+          done
+          ls -l dist
+
+      - name: digests
+        run: |
+          n=$(ls dist/*.tar.gz | wc -l)
+          if [ "$n" -lt 2 ]; then
+            printf 'FAIL  packages — %s inputs, and this rule cannot fail on fewer than 2\n' "$n"
+            exit 1
+          fi
+          (cd dist && sha256sum ./*.tar.gz | sed 's#\./##' | tee SHA256SUMS.linux)
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: abstraction-linux-unsigned
+          path: dist/
+          if-no-files-found: error
+
+  linux-verify:
+    needs: linux
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - name: fetch the package
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: gh run download "$GITHUB_RUN_ID" -n abstraction-linux-unsigned -D pkg
+
+      - name: the checksum file is true
+        run: (cd pkg && sha256sum -c SHA256SUMS.linux)
+
+      # A hosted runner has no systemd user manager, so install.sh takes its
+      # documented other path and says so. That is the half a person without
+      # systemd gets, and it is the half this job can prove.
+      - name: install
+        run: |
+          tar xzf pkg/*-linux-amd64.tar.gz -C /tmp
+          d=$(find /tmp -maxdepth 1 -type d -name 'abstraction-*-linux-amd64')
+          "$d/install.sh"
+
+      - name: what it installed
+        run: |
+          for f in jobd dl jobctl; do
+            [ -x "$HOME/.local/bin/$f" ] || { printf 'FAIL  %s was not installed\n' "$f"; exit 1; }
+          done
+          [ -f "$HOME/.local/share/abstraction/MANIFEST" ] || { printf 'FAIL  no MANIFEST, so uninstall.sh cannot know what to remove\n'; exit 1; }
+          [ -x "$HOME/.local/share/abstraction/uninstall.sh" ] || { printf 'FAIL  no uninstall.sh\n'; exit 1; }
+          [ -f "$HOME/.local/share/abstraction/LICENSE" ] || { printf 'FAIL  no LICENSE in the package\n'; exit 1; }
+          printf 'ok    three programs, a MANIFEST, an uninstaller and a licence\n'
+          cat "$HOME/.local/share/abstraction/MANIFEST"
+
+      - name: the three programs agree about the store
+        run: |
+          work=$(mktemp -d)
+          mkdir -p "$work/serve" "$work/out" "$work/store"
+          export ABSTRACTION_STORE="$work/store"
+          printf 'three modules, one store format' > "$work/serve/thing.bin"
+          python3 -m http.server 8099 --bind 127.0.0.1 --directory "$work/serve" &
+          srv=$!
+          trap 'kill "$srv"' EXIT
+          # 200 ms of backoff, at most ten seconds of it: http.server has no
+          # readiness signal, so the first successful request is the only one
+          # there is to wait for.
+          for _ in $(seq 50); do
+            curl -fsS -o /dev/null http://127.0.0.1:8099/thing.bin && break
+            sleep 0.2
+          done
+          "$HOME/.local/bin/dl" http://127.0.0.1:8099/thing.bin -o "$work/out" | tee "$work/dl.out"
+          [ -f "$work/out/thing.bin" ] || { printf 'FAIL  dl reported success and delivered nothing\n'; exit 1; }
+          id=$(sed -n 's/^[[:space:]]*job[[:space:]]\{1,\}\([^[:space:]]*\).*/\1/p' "$work/dl.out" | head -1)
+          [ -n "$id" ] || { printf 'FAIL  dl did not name the job it created\n'; exit 1; }
+          "$HOME/.local/bin/jobd" status | tee "$work/jobd.out"
+          grep -q 'thing.bin' "$work/jobd.out" || { printf 'FAIL  jobd could not see the download dl completed in the store they share\n'; exit 1; }
+          "$HOME/.local/bin/jobctl" show "$id" | tee "$work/jobctl.out"
+          grep -q "$id" "$work/jobctl.out" || { printf 'FAIL  jobctl read the store and did not find the record dl wrote there\n'; exit 1; }
+          printf 'ok    dl wrote it, jobd saw it, jobctl read the record back\n'
+
+      - name: uninstall
+        run: |
+          "$HOME/.local/share/abstraction/uninstall.sh"
+          left=0
+          for f in jobd dl jobctl; do
+            [ -e "$HOME/.local/bin/$f" ] && { printf 'FAIL  %s survived uninstall\n' "$f"; left=1; }
+          done
+          [ -e "$HOME/.local/share/abstraction" ] && { printf 'FAIL  the share directory survived uninstall\n'; ls -la "$HOME/.local/share/abstraction"; left=1; }
+          [ -e "$HOME/.config/systemd/user/abstraction-jobd.timer" ] && { printf 'FAIL  the timer unit survived uninstall\n'; left=1; }
+          [ "$left" = 0 ] || exit 1
+          printf 'ok    uninstall reversed it: no program, no unit, no share directory\n'
+
+  # macOS is built and never attached. Gatekeeper refuses an unsigned,
+  # unnotarised .pkg, so shipping one is a download that cannot be opened; and a
+  # platform that is quietly missing from a release page is the defect this
+  # whole file exists to prevent. So the package is built here to prove it can
+  # be, kept as a workflow artifact a person can fetch, and named UNPROVEN in
+  # the summary and in the release notes with exactly what it needs.
+  macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+
+      - name: state
+        run: |
+          printf 'a hosted runner, %s logical CPUs, %s %s, on mains\n' \
+            "$(getconf _NPROCESSORS_ONLN)" "$RUNNER_OS" "$RUNNER_ARCH"
+          go version
+          sw_vers
+
+      - name: build from the published modules, universal
+        env:
+          CGO_ENABLED: '0'
+          GOOS: darwin
+          GOFLAGS: -trimpath
+        run: |
+          rows() { grep -v '^>' "$1" | sed '/^[[:space:]]*$/d' | tail -n +2 | tr -s '\t'; }
+          root=$PWD
+          mkdir -p universal
+          while IFS=$'\t' read -r path module package feature; do
+            mod=${module%@*}
+            version=${module##*@}
+            case "$package" in
+              .) target="$mod@$version" ;;
+              *) target="$mod/$package@$version" ;;
+            esac
+            gobin="$(go env GOPATH)/bin"
+            thin=""
+            for arch in amd64 arm64; do
+              rm -rf "$gobin"
+              GOARCH="$arch" go install -ldflags '-s -w -buildid=' "$target"
+              built=$(find "$gobin" -type f)
+              mkdir -p "$root/thin/$arch"
+              mv "$built" "$root/thin/$arch/${path%.exe}"
+              thin="$thin $root/thin/$arch/${path%.exe}"
+            done
+            lipo -create -output "universal/${path%.exe}" $thin
+            lipo -info "universal/${path%.exe}"
+          done < <(rows tools.tsv)
+
+      - name: package
+        run: |
+          ref=${GITHUB_REF_NAME#v}
+          case "$ref" in [0-9]*.[0-9]*.[0-9]*) version=$ref ;; *) version=0.0.0 ;; esac
+          mkdir -p dist
+          python3 posix/build.py --platform macos --version "$version" \
+            --out dist --bin universal --license LICENSE
+          (cd dist && shasum -a 256 ./*.pkg | sed 's#\./##' | tee SHA256SUMS.macos)
+
+      - name: UNPROVEN, and what it needs
+        run: |
+          {
+            printf '\n### macOS — UNPROVEN\n\n'
+            printf 'A universal `.pkg` was built here and is **not attached to the release**.\n\n'
+            printf -- '- It is unsigned and unnotarised, so Gatekeeper refuses it: a person who\n'
+            printf -- '  downloads it cannot open it, and a download that cannot be opened is\n'
+            printf -- '  worse than a platform that says it has no package.\n'
+            printf -- '- It has never been installed. `installer/posix/macos/postinstall`, the\n'
+            printf -- '  LaunchAgent and `uninstall.sh` have run on no machine.\n'
+            printf -- '- To attach it: a Developer ID Installer certificate in this repository as\n'
+            printf -- '  a secret, `productsign` before upload, `notarytool submit --wait` and\n'
+            printf -- '  `stapler staple`, and one run of this job that installs the result and\n'
+            printf -- '  removes it again.\n\n'
+            printf 'Until then the route on macOS is `go install`, which needs none of it.\n'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: abstraction-macos-unsigned-unnotarised
+          path: dist/
+          if-no-files-found: error
+
+  # Not a matrix leg that was skipped: a statement that these have no asset in
+  # this release. A green release page with silent gaps is the defect this job
+  # exists to prevent.
+  absent:
+    runs-on: ubuntu-latest
+    steps:
+      - name: what this release does not contain
+        run: |
+          {
+            printf '\n### Absent from this release\n\n'
+            printf -- '- **macOS**: no asset. A `.pkg` is built by the `macos` job and kept as a\n'
+            printf -- '  workflow artifact; unsigned and unnotarised, Gatekeeper refuses it.\n'
+            printf -- '- **Abstraction Panel**: no published module, so it is in no package.\n'
+            printf -- '- **The C++ developer headers**: carried by no module.\n'
+            printf -- '- **The Python packages**: published on their own registry, so no package\n'
+            printf -- '  here carries a second copy of them.\n'
+            printf -- '- **arm64 Windows and arm64 Linux**: built, and no arm64 machine has run\n'
+            printf -- '  either.\n'
+            printf -- '- **Any signature at all**: every asset is unsigned. A checksum says the\n'
+            printf -- '  bytes did not change in transit and nothing about who made them.\n'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  draft:
+    needs: [windows, verify, linux, linux-verify, macos, absent]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      actions: read
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+
+      - name: fetch the packages
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          gh run download "$GITHUB_RUN_ID" -n abstraction-windows-unsigned -D dist
+          gh run download "$GITHUB_RUN_ID" -n abstraction-linux-unsigned -D dist
+
+      # Each line was computed by the job that made the bytes. Joining them is
+      # not recomputing them, so the file is checked once more here against what
+      # is actually about to be attached.
+      - name: one checksum file, checked
+        run: |
+          (cd dist && cat SHA256SUMS.windows SHA256SUMS.linux > SHA256SUMS && rm SHA256SUMS.windows SHA256SUMS.linux)
+          (cd dist && sha256sum -c SHA256SUMS)
+          n=$(grep -c . dist/SHA256SUMS)
+          attached=$(ls dist | grep -cv '^SHA256SUMS$')
+          if [ "$n" != "$attached" ]; then
+            printf 'FAIL  SHA256SUMS has %s lines and %s files are attached\n' "$n" "$attached"
+            exit 1
+          fi
+          cat dist/SHA256SUMS
+
+      # A draft, always. A release is permanent and public the moment it is not
+      # a draft, and that is the owner's decision to make, not this workflow's.
+      - name: draft the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          tag=$GITHUB_REF_NAME
+          [ -f NOTES.md ] || { printf 'FAIL  NOTES.md is not in this repository, and generated notes are not what this project ships\n'; exit 1; }
+          gh release create "$tag" --draft --title "$tag" --notes-file NOTES.md \
+            dist/abstraction-x64.msi dist/abstraction-arm64.msi \
+            dist/*-linux-amd64.tar.gz dist/*-linux-arm64.tar.gz \
+            dist/SHA256SUMS
+          printf 'ok    drafted %s with 5 assets. It is not published until a person publishes it.\n' "$tag"

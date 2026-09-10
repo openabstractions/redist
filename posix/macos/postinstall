@@ -1,0 +1,43 @@
+#!/bin/sh
+# Runs as root after the payload lands. The payload is rooted at the installing
+# person's home directory, so everything here is about turning home-relative
+# facts into absolute ones and handing the LaunchAgent to that person's own
+# session — never to root's, and never to a LaunchDaemon.
+set -eu
+
+home=${HOME:-}
+case "$home" in
+/*) ;;
+*) home=$2 ;;
+esac
+share=$home/.local/share/abstraction
+bin=$home/.local/bin
+plist=$home/Library/LaunchAgents/com.openabstractions.jobd.plist
+
+uid=$(stat -f %u "$home")
+gid=$(stat -f %g "$home")
+
+tmp=$plist.new
+sed "s|@BIN@|$bin|g" "$plist" > "$tmp"
+mv -- "$tmp" "$plist"
+
+: > "$share/MANIFEST"
+while read -r rel; do
+	[ -n "$rel" ] || continue
+	echo "$home/$rel" >> "$share/MANIFEST"
+done < "$share/FILES"
+
+chown -R "$uid:$gid" "$share" "$bin" "$plist"
+
+launchctl bootout "gui/$uid/com.openabstractions.jobd" 2>/dev/null || true
+if launchctl bootstrap "gui/$uid" "$plist" 2>/dev/null; then
+	launchctl enable "gui/$uid/com.openabstractions.jobd" 2>/dev/null || true
+	echo "ok    com.openabstractions.jobd loaded: at login, then every 300 seconds"
+else
+	echo "note  the LaunchAgent could not be loaded into gui/$uid — no graphical"
+	echo "note  session for that user right now. It is installed and will load at"
+	echo "note  the next login. To load it now, as that person, run:"
+	echo "note      launchctl bootstrap gui/\$(id -u) $plist"
+fi
+
+exit 0

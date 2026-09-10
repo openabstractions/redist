@@ -1,0 +1,53 @@
+> Every file the Linux and macOS packages install, and where it lands.
+>
+> platform	both | linux | macos
+> path		where it lands, relative to the person's home directory. On macOS
+>		that is the payload tree pkgbuild is handed; on Linux it is the
+>		tree install.sh copies out of the tarball.
+> kind		gobuild    go build the package at <from> in <source>, unless --bin
+>		           names a directory that already holds the built programs
+>		copy       take the file at <from> out of <source>
+>		authored   written here, in installer/posix/, and shipped as it stands
+>		generated  written by build.py; <from> is "-"
+>		license    the file --license names; <source> is posix and <from> is "-".
+>		           The one LICENSE at a repository root is the whole obligation,
+>		           and which root that is depends on which repository is being
+>		           built, so it is an argument rather than a source id
+> source	an id from sources.tsv, or "posix" for a file that lives here
+> from		the path inside that source
+> mode		the permission bits, because a tar and a pkg both carry them and
+>		the machine this is built on may not be able to say what they are
+>
+> The Panel is not here: it has no publishable source on any platform, and it is
+> a Windows program. The C++ header is not here either — bindings/download-over-curl
+> publishes from nowhere. The Windows package gates both away and says so; these
+> two do not carry the rows at all, and the release notes name both.
+>
+> @BIN@ in an authored file is the absolute directory the three programs land in.
+> install.sh on Linux and scripts/postinstall on macOS substitute it. Nothing
+> else is substituted at install time anywhere.
+>
+> A source with no --src has its rows left out of the package and each one named,
+> the way the Windows build gates the UNRESOLVED rows. A program is never left
+> out that way: a gobuild row with neither --src nor --bin stops the build. That
+> is what lets a package built only from published module versions ship the three
+> programs without checking out the repositories the Python files come from -
+> those are published on their own registry, and a redistributable carrying a
+> second copy of them would be one file with two homes.
+
+platform	path								kind		source		from						mode
+both		.local/bin/jobd							gobuild		jobd		.						755
+both		.local/bin/dl							gobuild		download	go/cmd/dl					755
+both		.local/bin/jobctl						gobuild		job		go/cmd/jobctl					755
+both		.local/share/abstraction/LICENSE				license		posix		-						644
+both		.local/share/abstraction/dev/USING.txt				authored	posix		dev/USING.txt					644
+both		.local/share/abstraction/dev/python/job/abstraction_job.py	copy		job		python/abstraction_job.py			644
+both		.local/share/abstraction/dev/python/job/pyproject.toml		copy		job		python/pyproject.toml				644
+both		.local/share/abstraction/dev/python/download/abstraction_download.py	copy	download	python/abstraction_download.py			644
+both		.local/share/abstraction/dev/python/download/pyproject.toml	copy		download	python/pyproject.toml				644
+linux		.config/systemd/user/abstraction-jobd.service			authored	posix		linux/abstraction-jobd.service			644
+linux		.config/systemd/user/abstraction-jobd.timer			authored	posix		linux/abstraction-jobd.timer			644
+linux		.local/share/abstraction/uninstall.sh				authored	posix		linux/uninstall.sh				755
+macos		Library/LaunchAgents/com.openabstractions.jobd.plist		authored	posix		macos/com.openabstractions.jobd.plist		644
+macos		.local/share/abstraction/FILES					generated	posix		-						644
+macos		.local/share/abstraction/uninstall.sh				authored	posix		macos/uninstall.sh				755

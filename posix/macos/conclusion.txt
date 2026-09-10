@@ -1,0 +1,23 @@
+Installed.
+
+The three programs are in ~/.local/bin, which macOS does not put on PATH. Add
+it once, in your shell profile:
+
+    export PATH="$HOME/.local/bin:$PATH"
+
+Deliberately not written for you: an installer that edits a shell profile is an
+installer nobody can fully remove.
+
+The background sweep runs at login and then every five minutes. Check it:
+
+    launchctl print gui/$(id -u)/com.openabstractions.jobd
+
+To remove everything this put on the machine, run exactly:
+
+    ~/.local/share/abstraction/uninstall.sh
+
+That leaves your job store (~/.abstraction) and your settings
+(~/Library/Application Support/abstraction) alone; it prints the command that
+removes those too.
+
+This package was not signed and not notarised.

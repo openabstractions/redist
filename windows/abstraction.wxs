@@ -1,0 +1,170 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs"
+     xmlns:ui="http://wixtoolset.org/schemas/v4/wxs/ui">
+
+  <Package Name="Abstraction"
+           Manufacturer="Open Abstractions"
+           Version="$(var.Version)"
+           UpgradeCode="CEEF6550-5E44-4E83-8E18-A855C9D941CA"
+           Scope="perUser"
+           InstallerVersion="500"
+           Compressed="yes">
+
+    <SummaryInformation Description="Downloads that survive the program that started them" />
+
+    <MajorUpgrade DowngradeErrorMessage="A newer Abstraction is already installed. Remove it first." />
+    <MediaTemplate EmbedCab="yes" />
+
+    <Property Id="ARPURLINFOABOUT" Value="https://github.com/openabstractions" />
+    <Property Id="ARPNOREPAIR" Value="1" />
+
+    <StandardDirectory Id="LocalAppDataFolder">
+      <Directory Id="ProgramsFolder" Name="Programs">
+        <Directory Id="INSTALLFOLDER" Name="Abstraction">
+          <Directory Id="DevFolder" Name="dev">
+            <Directory Id="DevPython" Name="python">
+              <Directory Id="DevPythonJob" Name="job" />
+              <Directory Id="DevPythonDownload" Name="download" />
+            </Directory>
+            <Directory Id="DevInclude" Name="include">
+              <Directory Id="DevIncludeAbstraction" Name="abstraction">
+                <Directory Id="DevIncludeDownload" Name="download" />
+              </Directory>
+            </Directory>
+          </Directory>
+        </Directory>
+      </Directory>
+    </StandardDirectory>
+
+    <StandardDirectory Id="ProgramMenuFolder">
+      <Directory Id="AbstractionMenuFolder" Name="Abstraction" />
+    </StandardDirectory>
+
+    <ComponentGroup Id="ServiceFiles" Directory="INSTALLFOLDER">
+      <Component>
+        <File Id="jobd.exe" Source="payload/jobd.exe" KeyPath="yes" />
+      </Component>
+      <Component Id="RegistryRoot" Guid="8821E881-5E73-465E-904E-EF7FC1223A5C">
+        <RegistryValue Root="HKCU" Key="Software\OpenAbstractions\Abstraction"
+                       Name="version" Type="string" Value="$(var.Version)" KeyPath="yes" />
+        <RemoveRegistryKey Root="HKCU" Key="Software\OpenAbstractions" Action="removeOnUninstall" />
+      </Component>
+    </ComponentGroup>
+
+    <ComponentGroup Id="ToolFiles" Directory="INSTALLFOLDER">
+      <Component>
+        <File Id="dl.exe" Source="payload/dl.exe" KeyPath="yes" />
+      </Component>
+      <Component>
+        <File Id="jobctl.exe" Source="payload/jobctl.exe" KeyPath="yes" />
+      </Component>
+      <Component Id="ToolsOnPath" Guid="C605C537-BAEE-4DF4-BB83-163B66D759D7">
+        <RegistryValue Root="HKCU" Key="Software\OpenAbstractions\Abstraction\Tools"
+                       Name="installed" Type="integer" Value="1" KeyPath="yes" />
+        <RemoveRegistryKey Root="HKCU" Key="Software\OpenAbstractions\Abstraction\Tools"
+                           Action="removeOnUninstall" />
+        <Environment Id="AbstractionPath" Name="PATH" Value="[INSTALLFOLDER]"
+                     Action="set" Part="last" System="no" Permanent="no" />
+      </Component>
+    </ComponentGroup>
+
+    <?if $(var.Panel) = yes ?>
+    <ComponentGroup Id="PanelFiles" Directory="INSTALLFOLDER">
+      <Component>
+        <File Id="panel.exe" Name="Abstraction Panel.exe" Source="payload/Abstraction Panel.exe" KeyPath="yes" />
+      </Component>
+      <Component>
+        <File Id="panel.exe.manifest" Name="Abstraction Panel.exe.manifest" Source="payload/Abstraction Panel.exe.manifest" KeyPath="yes" />
+      </Component>
+    </ComponentGroup>
+    <ComponentGroup Id="PanelShortcut" Directory="AbstractionMenuFolder">
+      <Component Id="PanelStartMenu" Guid="E5D9EA35-65C8-4930-9FC0-06120E9F39BE">
+        <Shortcut Id="PanelShortcutFile" Name="Abstraction Panel"
+                  Description="What this machine is doing with downloads, and what is holding the card"
+                  Target="[#panel.exe]" WorkingDirectory="INSTALLFOLDER" />
+        <RemoveFolder Id="RemoveStartMenuFolder" On="uninstall" />
+        <RegistryValue Root="HKCU" Key="Software\OpenAbstractions\Abstraction\Panel"
+                       Name="installed" Type="integer" Value="1" KeyPath="yes" />
+        <RemoveRegistryKey Root="HKCU" Key="Software\OpenAbstractions\Abstraction\Panel"
+                           Action="removeOnUninstall" />
+      </Component>
+    </ComponentGroup>
+    <?endif?>
+
+    <ComponentGroup Id="DeveloperFiles">
+      <Component Directory="DevFolder">
+        <File Id="using.txt" Source="payload/dev/USING.txt" KeyPath="yes" />
+      </Component>
+      <Component Directory="DevPythonJob">
+        <File Id="abstraction_job.py" Source="payload/dev/python/job/abstraction_job.py" KeyPath="yes" />
+      </Component>
+      <Component Directory="DevPythonJob">
+        <File Id="job.pyproject.toml" Name="pyproject.toml" Source="payload/dev/python/job/pyproject.toml" KeyPath="yes" />
+      </Component>
+      <Component Directory="DevPythonDownload">
+        <File Id="abstraction_download.py" Source="payload/dev/python/download/abstraction_download.py" KeyPath="yes" />
+      </Component>
+      <Component Directory="DevPythonDownload">
+        <File Id="download.pyproject.toml" Name="pyproject.toml" Source="payload/dev/python/download/pyproject.toml" KeyPath="yes" />
+      </Component>
+      <?if $(var.Cpp) = yes ?>
+      <Component Directory="DevIncludeDownload">
+        <File Id="over_curl.hpp" Source="payload/dev/include/abstraction/download/over_curl.hpp" KeyPath="yes" />
+      </Component>
+      <?endif?>
+    </ComponentGroup>
+
+    <Feature Id="Service" Level="1" AllowAbsent="no" AllowAdvertise="no"
+             Title="Background service"
+             Description="Finishes transfers after the program that started them has closed. Registers one scheduled task for you, every five minutes, and needs no administrator.">
+      <ComponentGroupRef Id="ServiceFiles" />
+    </Feature>
+
+    <Feature Id="Tools" Level="1" AllowAdvertise="no"
+             Title="Command-line tools and panel"
+             Description="dl resumes a download from what it proved and refuses corruption that curl -C - accepts. jobctl drives the job store from a shell. The panel says what is holding the graphics card. Adds this folder to your PATH.">
+      <ComponentGroupRef Id="ToolFiles" />
+      <?if $(var.Panel) = yes ?>
+      <ComponentGroupRef Id="PanelFiles" />
+      <ComponentGroupRef Id="PanelShortcut" />
+      <?endif?>
+    </Feature>
+
+    <Feature Id="Developer" Level="1000" AllowAdvertise="no"
+             Title="Developer files"
+             Description="Headers, the Python packages and the Go module paths, for building an application against these layers. Not needed to use the tools.">
+      <ComponentGroupRef Id="DeveloperFiles" />
+    </Feature>
+
+    <!-- schtasks and not a service: BITS keeps transferring across an application
+         exit and a reboot under a normal user account, so nothing here needs
+         elevation, and the scope is perUser for the same reason.
+
+         One sweep task and no logon task, because a logon task cannot be
+         registered by an install that does not ask for a password or for
+         administrator rights. `schtasks /create /sc onlogon` with no /ru
+         registers a trigger that fires for every account on the machine, which
+         is an administrator's change: unelevated it exits 1 and the package
+         fails 1722, then 1603. Naming the account with /ru makes schtasks ask
+         for that account's password, and a silent install has no console to
+         answer with, so it blocks for ever - with /rp "" and with /it alike.
+         The sweep picks up unfinished work within five minutes of logon and
+         needs none of that. -->
+    <CustomAction Id="TaskCreateSweep" Directory="INSTALLFOLDER" Execute="deferred" Impersonate="yes" Return="check"
+                  ExeCommand="&quot;[SystemFolder]schtasks.exe&quot; /create /tn jobd /sc minute /mo 5 /tr &quot;\&quot;[#jobd.exe]\&quot; once --quiet&quot; /f" />
+    <CustomAction Id="TaskRollbackSweep" Directory="INSTALLFOLDER" Execute="rollback" Impersonate="yes" Return="ignore"
+                  ExeCommand="&quot;[SystemFolder]schtasks.exe&quot; /delete /tn jobd /f" />
+    <CustomAction Id="TaskDeleteSweep" Directory="INSTALLFOLDER" Execute="deferred" Impersonate="yes" Return="ignore"
+                  ExeCommand="&quot;[SystemFolder]schtasks.exe&quot; /delete /tn jobd /f" />
+
+    <InstallExecuteSequence>
+      <Custom Action="TaskDeleteSweep" Before="RemoveFiles" Condition="REMOVE=&quot;ALL&quot;" />
+      <Custom Action="TaskRollbackSweep" After="InstallFiles" Condition="&amp;Service=3" />
+      <Custom Action="TaskCreateSweep" After="TaskRollbackSweep" Condition="&amp;Service=3" />
+    </InstallExecuteSequence>
+
+    <ui:WixUI Id="WixUI_FeatureTree" />
+    <WixVariable Id="WixUILicenseRtf" Value="license.rtf" />
+
+  </Package>
+</Wix>

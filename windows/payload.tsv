@@ -1,0 +1,33 @@
+> Every file the package installs, and which feature puts it there.
+>
+> feature	service | tools | developer
+> path		where it lands under the install folder, and the staging path the
+>		workflow builds: payload/<path>, which is what File@Source says
+> kind		gobuild  go build the package at <from> in <source>
+>		copy     take the file at <from> out of <source>
+>		authored written here, in installer/, and shipped as it stands
+> source	an id from sources.tsv
+> from		the path inside that source
+> sign		Authenticode target. Only a PE file can be one; every other row is
+>		"no" and the two MSIs are signing targets in their own right
+>
+> The Panel has no publishable source. It is not published under any module path
+> the publishing rules allow, and openabstractions/polite-monitor is a different
+> program with the same name. Its rows stay here because the package's file list is the
+> question this file answers, and leaving them out would answer it wrongly.
+>
+> over_curl.hpp is the C++ package and bindings/download-over-curl is in no
+> repository rule, so it publishes nowhere either.
+
+feature		path						kind		source		from						sign
+service		jobd.exe					gobuild		self		.						yes
+tools		dl.exe						gobuild		download	go/cmd/dl					yes
+tools		jobctl.exe					gobuild		job		go/cmd/jobctl					yes
+tools		Abstraction Panel.exe				gobuild		UNRESOLVED	.						yes
+tools		Abstraction Panel.exe.manifest			copy		UNRESOLVED	panel.manifest					no
+developer	dev/USING.txt					authored	installer	dev/USING.txt					no
+developer	dev/python/job/abstraction_job.py		copy		job		python/abstraction_job.py			no
+developer	dev/python/job/pyproject.toml			copy		job		python/pyproject.toml				no
+developer	dev/python/download/abstraction_download.py	copy		download	python/abstraction_download.py			no
+developer	dev/python/download/pyproject.toml		copy		download	python/pyproject.toml				no
+developer	dev/include/abstraction/download/over_curl.hpp	copy		UNRESOLVED	include/abstraction/download/over_curl.hpp	no

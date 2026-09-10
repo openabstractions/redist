@@ -1,0 +1,18 @@
+Building against these layers.
+
+Go — nothing here to install; the modules resolve on their own.
+
+    go get github.com/openabstractions/abstraction-download/go
+    go get github.com/openabstractions/abstraction-job/go
+    go get github.com/openabstractions/abstraction-facade/go
+
+Python — two packages, installed from the directories beside this file.
+
+    pip install ./python/job
+    pip install ./python/download
+
+C++ — the over_curl header is not in this package. It publishes from no
+repository yet, so there is nothing here to point at and nothing to include.
+
+The tools in ~/.local/bin are built from these same layers. dl is what the
+download layer looks like from a shell; anything dl does, your program can do.

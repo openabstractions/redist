@@ -1,0 +1,19 @@
+> Where every file in the package comes from. installer/validate.py and the
+> release workflow read this and nothing else.
+>
+> id      the name payload.tsv uses
+> repo    owner/name on github.com, or "-" for the repository being built
+> ref     a full 40-hex commit, because a branch is not a pin
+>
+> UNRESOLVED is a source that has no published home yet. A payload row naming it
+> must be gated by a preprocessor variable in abstraction.wxs, and the workflow
+> leaves it out of the package and says so in the job summary. It is not a
+> placeholder to be filled in silently: somebody has to decide where that file
+> is published from.
+
+id		repo						ref
+self		-						-
+installer	-						-
+download	openabstractions/abstraction-download		b344af364b44468c590e1f2cb1e61812e6a4223b
+job		openabstractions/abstraction-job		5c396e8b5ed0c3aa91bc5872fa0785d11624b35c
+UNRESOLVED	-						-

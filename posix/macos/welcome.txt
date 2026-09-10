@@ -1,0 +1,18 @@
+Abstraction — downloads that survive the program that started them.
+
+This package installs for you alone. It asks for no administrator password, it
+writes nothing outside your home directory, and the background sweep it
+registers is a LaunchAgent in your own session — not a LaunchDaemon, and not
+anything that runs when you are logged out.
+
+It installs:
+
+    ~/.local/bin/jobd, dl, jobctl
+    ~/Library/LaunchAgents/com.openabstractions.jobd.plist
+    ~/.local/share/abstraction/  — the Python packages, and an uninstaller
+
+THIS PACKAGE IS NOT SIGNED AND NOT NOTARISED. macOS will say the developer
+cannot be identified, and it is right: nothing here proves who built it. Check
+the SHA-256 published beside the download against the file you have before you
+open it. If you did not get it from github.com/openabstractions, do not install
+it.

@@ -1,0 +1,9 @@
+[Unit]
+Description=Abstraction — finish transfers nobody is watching
+Documentation=https://github.com/openabstractions/service-jobd
+
+[Service]
+Type=oneshot
+ExecStart=@BIN@/jobd once --quiet
+Nice=10
+IOSchedulingClass=idle

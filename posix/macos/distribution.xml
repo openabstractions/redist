@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="utf-8"?>
+<installer-gui-script minSpecVersion="2">
+	<title>Abstraction</title>
+	<organization>com.openabstractions</organization>
+	<domains enable_anywhere="false" enable_currentUserHome="true" enable_localSystem="false"/>
+	<options customize="never" rootVolumeOnly="false" hostArchitectures="x86_64,arm64"/>
+	<welcome file="welcome.txt" mime-type="text/plain"/>
+	<license file="LICENSE" mime-type="text/plain"/>
+	<conclusion file="conclusion.txt" mime-type="text/plain"/>
+	<choices-outline>
+		<line choice="default">
+			<line choice="com.openabstractions.abstraction"/>
+		</line>
+	</choices-outline>
+	<choice id="default"/>
+	<choice id="com.openabstractions.abstraction" visible="false">
+		<pkg-ref id="com.openabstractions.abstraction"/>
+	</choice>
+	<pkg-ref id="com.openabstractions.abstraction" version="@VERSION@" onConclusion="none">component.pkg</pkg-ref>
+</installer-gui-script>

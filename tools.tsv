@@ -1,0 +1,25 @@
+> Every program this redistributable installs, and the published module version
+> it is built from. .github/workflows/release.yml reads this and nothing else.
+>
+> path		where it lands under the install folder
+> module	a Go module path and a version that exists on proxy.golang.org.
+>		A commit is not allowed here and neither is a branch: this package
+>		consumes our published tags exactly as a stranger does, so a module
+>		we broke turns this workflow red on the day it is released rather
+>		than on the day somebody outside tries to install it
+> package	the package to build, relative to the module. "." is the module
+>		root. It is a separate column because the proxy indexes modules and
+>		not packages: asking it for .../go/cmd/dl answers 404 whatever the
+>		version, and a check that cannot tell that from a deleted tag is
+>		not a check
+> feature	service | tools — the WiX feature that installs it
+>
+> A program with no published module has no row. It is named as absent in the
+> release notes instead; there is no placeholder here to be filled in silently.
+> Absent today: Abstraction Panel.exe, which is published from nowhere, and the
+> C++ developer headers, which no module carries.
+
+path		module							package		feature
+jobd.exe	github.com/openabstractions/service-jobd@v0.2.0		.		service
+dl.exe		github.com/openabstractions/abstraction-download/go@v0.3.0	cmd/dl		tools
+jobctl.exe	github.com/openabstractions/abstraction-job/go@v0.3.0	cmd/jobctl	tools
