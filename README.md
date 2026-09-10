@@ -14,8 +14,9 @@ below.
 ## Installing
 
 Download `abstraction-x64.msi` from the latest release, check it against
-`SHA256SUMS`, and run it. It installs to `%LOCALAPPDATA%\Programs\Abstraction`,
-puts that folder on your `PATH`, and needs no administrator rights.
+`SHA256SUMS`, and run it. It installs to
+`%LOCALAPPDATA%\Programs\OpenAbstractions`, puts the `tools\` folder inside it
+on your `PATH`, and needs no administrator rights.
 
     sha256sum -c SHA256SUMS
 
@@ -26,11 +27,14 @@ it.
 ## Without an installer
 
 Every program here is a published Go module, so the installer is a convenience
-and never the only route:
+and never the only route. The `module` column of [`tools.tsv`](tools.tsv) is
+the module path and version of each, and is what the release workflow builds
+from:
 
-    go install github.com/openabstractions/service-jobd@v0.2.0
-    go install github.com/openabstractions/abstraction-download/go/cmd/dl@v0.3.0
-    go install github.com/openabstractions/abstraction-job/go/cmd/jobctl@v0.3.0
+    go install <module>
+
+Nothing else in this repository types a version: two lists of the same three
+versions are two lists that disagree.
 
 ## What this repository is
 
@@ -39,11 +43,15 @@ into three versions with three release cadences. `tools.tsv` names each program
 and the published module version it is built from; the platform-specific
 packaging lives in a directory of its own — `windows/` holds the WiX sources.
 
-`tools.tsv` may name only versions that exist on `proxy.golang.org`. The
-release workflow checks every one before it builds anything, so a module we
-broke or a tag we deleted stops the release by name instead of shipping. That
-is the point of the repository: the package consumes our published artifacts
-exactly as a stranger does.
+`tools.tsv` may name only versions that are tags on their repositories. The
+release workflow resolves every one before it builds anything, so a module we
+broke stops the release by name instead of shipping. That is the point of the
+repository: the package consumes our published artifacts exactly as a stranger
+does.
+
+It resolves them through `proxy.golang.org`, and the proxy serves a version it
+has cached for good — including one whose tag was deleted. So that check cannot
+see a deleted tag; `git ls-remote --tags` on the repository is what does.
 
 The workflow drafts a release; it never publishes one. Publishing is a person's
 decision.

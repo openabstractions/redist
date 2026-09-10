@@ -8,16 +8,22 @@ claim about this particular run.
 
 ## What is in it
 
-| program | what it does | built from |
-|---|---|---|
-| `jobd` | keeps downloads running when no application is open | `service-jobd@v0.2.0` |
-| `dl` | fetches a URL, resumably, verifying a digest if you give one | `abstraction-download/go@v0.4.1` |
-| `jobctl` | drives the job store directly, for scripts and debugging | `abstraction-job/go@v0.4.1` |
+| program | what it does |
+|---|---|
+| `jobd` | keeps downloads running when no application is open |
+| `dl` | fetches a URL, resumably, verifying a digest if you give one |
+| `jobctl` | drives the job store directly, for scripts and debugging |
 
-Every version in that last column exists on `proxy.golang.org`. The release
-workflow refuses to build if one of them does not, so this package is made of
-the same artifacts a stranger gets from `go install` and cannot quietly drift
-into being built from something else.
+Each is built from a published module version, and `tools.tsv` in this
+repository at this tag is the list of them. It is the file the release workflow
+reads, so it is the only place those versions are written down.
+
+The workflow refuses to build if one of them does not resolve, so this package
+is made of the same artifacts a stranger gets from `go install` and cannot
+quietly drift into being built from something else. It resolves them through
+`proxy.golang.org`, which goes on serving a version whose tag was later
+deleted — so that check proves the artifact is fetchable, not that the tag is
+still there.
 
 **`jobctl` is not the friendly one.** All three find the store from
 `ABSTRACTION_STORE`. `jobctl` also accepts `JOB_STORE`, which wins where it is
@@ -37,9 +43,10 @@ if any of them disagrees.
 
 **Windows.** Download `abstraction-x64.msi` — or `abstraction-arm64.msi` on
 Windows on ARM — check it against `SHA256SUMS`, then run it. It installs to
-`%LOCALAPPDATA%\Programs\Abstraction`, adds that folder to your `PATH`, and asks
-for no administrator rights. Open a new terminal afterwards, or `PATH` will
-still be the old one.
+`%LOCALAPPDATA%\Programs\OpenAbstractions` — the programs in `tools\`, runnable
+examples in `examples\` — adds `tools\` to your `PATH`, and asks for no
+administrator rights. Open a new terminal afterwards, or `PATH` will still be
+the old one.
 
     dl https://example.com/some/file.bin -o D:\downloads
 

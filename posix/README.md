@@ -46,7 +46,8 @@ review. Reinstalling over an existing install is how you upgrade, and
 |---|---|
 | `jobd`, `dl`, `jobctl` | `~/.local/bin/` |
 | the sweep unit and its timer | `~/.config/systemd/user/abstraction-jobd.{service,timer}` |
-| the Python packages, `USING.txt`, `LICENSE` | `~/.local/share/abstraction/dev/` |
+| the Python packages and `USING.txt` | `~/.local/share/abstraction/dev/` |
+| `LICENSE` | `~/.local/share/abstraction/` |
 | the uninstaller and the list it works from | `~/.local/share/abstraction/{uninstall.sh,MANIFEST}` |
 
 `install.sh` then runs `systemctl --user enable --now abstraction-jobd.timer`.
@@ -84,7 +85,8 @@ destination the installer offers is the current user's home.
 |---|---|
 | `jobd`, `dl`, `jobctl`, universal | `~/.local/bin/` |
 | the LaunchAgent | `~/Library/LaunchAgents/com.openabstractions.jobd.plist` |
-| the Python packages, `USING.txt`, `LICENSE` | `~/.local/share/abstraction/dev/` |
+| the Python packages and `USING.txt` | `~/.local/share/abstraction/dev/` |
+| `LICENSE` | `~/.local/share/abstraction/` |
 | the uninstaller and its two lists | `~/.local/share/abstraction/{uninstall.sh,FILES,MANIFEST}` |
 
 **LaunchAgent identifier: `com.openabstractions.jobd`**, at
@@ -157,5 +159,10 @@ team identifier. It is kept in the private tree.
   and a `pkg` with `customize="never"` install everything they contain,
   developer files included. That is a deliberate divergence from
   `abstraction.wxs`, which makes Developer opt-in.
+- **The Windows package ships runnable examples and these ship none.** Both
+  packages agree on the tools — all three programs in one directory on `PATH`,
+  `~/.local/bin` here and `OpenAbstractions\tools\` there — and `installer/examples/`
+  has no counterpart on either platform. Its three `.cmd` files are Windows
+  shells; a person on Linux or macOS is given `USING.txt` and nothing to run.
 - **Upgrading is reinstalling.** Neither format removes a file that a previous
   version installed and this one does not.

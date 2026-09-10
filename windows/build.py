@@ -9,8 +9,7 @@ from validate import rows
 
 HERE = Path(__file__).resolve().parent
 GOARCH = {"x64": "amd64", "arm64": "arm64"}
-GATE = {"Abstraction Panel.exe": "Panel",
-        "Abstraction Panel.exe.manifest": "Panel",
+GATE = {"tools/Abstraction Panel.exe": "Panel",
         "dev/python/job/abstraction_job.py": "Dev",
         "dev/python/job/pyproject.toml": "Dev",
         "dev/python/download/abstraction_download.py": "Dev",
@@ -25,9 +24,13 @@ def prebuilt(binaries, kind, path):
     return p if p.is_file() else None
 
 
+def ldflags(subsystem):
+    return "-s -w -buildid=" + (" -H=windowsgui" if subsystem == "windows" else "")
+
+
 def stage(src, out, arch, binaries=None):
     dropped = []
-    for _, path, kind, source, frm, _ in rows("payload.tsv"):
+    for _, path, kind, source, frm, _, subsystem in rows("payload.tsv"):
         ready = prebuilt(binaries, kind, path)
         if ready is None and source not in src:
             dropped.append(path)
@@ -38,7 +41,7 @@ def stage(src, out, arch, binaries=None):
             shutil.copyfile(ready, dst)
         elif kind == "gobuild":
             subprocess.run(
-                ["go", "build", "-ldflags", "-s -w -buildid=", "-o", str(dst), "."],
+                ["go", "build", "-ldflags", ldflags(subsystem), "-o", str(dst), "."],
                 cwd=src[source] / frm, check=True,
                 env={**os.environ, "CGO_ENABLED": "0", "GOOS": "windows",
                      "GOARCH": GOARCH[arch], "GOFLAGS": "-trimpath"})
@@ -73,6 +76,9 @@ def main():
         sid, _, d = pair.partition("=")
         src[sid] = Path(d).resolve()
 
+    if subprocess.run([sys.executable, str(HERE / "validate.py")]).returncode:
+        return 1
+
     a.out.mkdir(parents=True, exist_ok=True)
     dropped = stage(src, a.out, a.arch, a.bin)
     for path in dropped:
@@ -83,8 +89,6 @@ def main():
 
     subprocess.run([sys.executable, str(HERE / "mklicense.py"),
                     str(a.license), str(a.out / "license.rtf")], check=True)
-    if subprocess.run([sys.executable, str(HERE / "validate.py")]).returncode:
-        return 1
 
     msi = a.out / f"abstraction-{a.arch}.msi"
     off = {GATE[p] for p in dropped}

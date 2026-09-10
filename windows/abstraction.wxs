@@ -6,21 +6,69 @@
            Manufacturer="Open Abstractions"
            Version="$(var.Version)"
            UpgradeCode="CEEF6550-5E44-4E83-8E18-A855C9D941CA"
-           Scope="perUser"
+           Scope="perUserOrMachine"
            InstallerVersion="500"
            Compressed="yes">
 
     <SummaryInformation Description="Downloads that survive the program that started them" />
 
-    <MajorUpgrade DowngradeErrorMessage="A newer Abstraction is already installed. Remove it first." />
+    <MajorUpgrade AllowSameVersionUpgrades="yes"
+                  DowngradeErrorMessage="A newer Abstraction is already installed. Remove it from Apps and features before installing this one." />
     <MediaTemplate EmbedCab="yes" />
 
     <Property Id="ARPURLINFOABOUT" Value="https://github.com/openabstractions" />
     <Property Id="ARPNOREPAIR" Value="1" />
 
+    <!-- A build that was not handed a source drops the files it would have
+         carried, and every one of those drops is silent: build.py prints a
+         note, the package says nothing, and a person reads feature text
+         written for a package that has more in it. That is the per-user
+         fallback one layer down — an artefact quietly doing less than it
+         promised — so each gate turns the same variable into a sentence a
+         person reads in Apps and features. An incomplete package may ship;
+         one that does not say it is incomplete may not. -->
+    <?if $(var.Panel) = yes ?><?define NoPanel = "" ?>
+    <?else?><?define NoPanel = " The Abstraction Panel, the graphical front end, is not in it." ?><?endif?>
+    <?if $(var.Dev) = yes ?><?define NoDev = "" ?>
+    <?else?><?define NoDev = " The Python packages are not in it; they are on their own registry." ?><?endif?>
+    <?if $(var.Cpp) = yes ?><?define NoCpp = "" ?>
+    <?else?><?define NoCpp = " The C++ header is not in it; no module carries it." ?><?endif?>
+    <?define Absent = "$(var.NoPanel)$(var.NoDev)$(var.NoCpp)" ?>
+    <?if $(var.Absent) = "" ?>
+    <Property Id="ARPCOMMENTS" Value="Downloads that survive the program that started them." />
+    <?else?>
+    <Property Id="ARPCOMMENTS" Value="This build is incomplete and says so.$(var.Absent)" />
+    <?endif?>
+    <Property Id="ApplicationFolderName" Value="OpenAbstractions" />
+    <Property Id="WixAppFolder" Value="WixPerUserFolder" />
+    <SetProperty Id="ARPINSTALLLOCATION" Value="[APPLICATIONFOLDER]" After="CostFinalize" />
+
+    <!-- WixUI_Advanced defaults these to LocalAppData\Apps and to the 32-bit
+         Program Files. Programs\ is where a per-user application goes on a
+         modern Windows, and an x64 package under Program Files (x86) is a lie
+         about what is inside it.
+
+         ProgramFiles64Folder and not ProgramFiles6432Folder: the 6432 spelling
+         is resolved by the compiler where a Directory is declared and means
+         nothing inside a property value, where it expands to the empty string
+         and leaves a bare relative folder name. Both architectures this
+         package is built for are 64-bit. -->
+    <SetProperty Action="AbstractionPerUserFolder" Id="WixPerUserFolder"
+                 Value="[LocalAppDataFolder]Programs\[ApplicationFolderName]"
+                 After="WixSetDefaultPerUserFolder" Sequence="both" />
+    <SetProperty Action="AbstractionPerMachineFolder" Id="WixPerMachineFolder"
+                 Value="[ProgramFiles64Folder][ApplicationFolderName]"
+                 After="WixSetDefaultPerMachineFolder" Sequence="both" />
+
     <StandardDirectory Id="LocalAppDataFolder">
       <Directory Id="ProgramsFolder" Name="Programs">
-        <Directory Id="INSTALLFOLDER" Name="Abstraction">
+        <Directory Id="APPLICATIONFOLDER" Name="OpenAbstractions">
+          <Directory Id="ToolsFolder" Name="tools" />
+          <Directory Id="ExamplesFolder" Name="examples">
+            <Directory Id="ExampleMachine" Name="what-this-machine-does" />
+            <Directory Id="ExampleLifecycle" Name="job-lifecycle" />
+            <Directory Id="ExampleDownload" Name="download-a-file" />
+          </Directory>
           <Directory Id="DevFolder" Name="dev">
             <Directory Id="DevPython" Name="python">
               <Directory Id="DevPythonJob" Name="job" />
@@ -40,52 +88,208 @@
       <Directory Id="AbstractionMenuFolder" Name="Abstraction" />
     </StandardDirectory>
 
-    <ComponentGroup Id="ServiceFiles" Directory="INSTALLFOLDER">
-      <Component>
-        <File Id="jobd.exe" Source="payload/jobd.exe" KeyPath="yes" />
+    <StandardDirectory Id="CommonAppDataFolder">
+      <Directory Id="MachineConfigFolder" Name="abstraction" />
+    </StandardDirectory>
+
+    <StandardDirectory Id="StartupFolder" />
+
+    <!-- jobd.exe is in tools\ with dl and jobctl, and on PATH with them, because
+         its own package comment calls it "the console program a person types
+         at": `jobd status` is what the what-this-machine-does example runs and
+         `jobd start` is what a person runs. The posix package has put all three
+         in ~/.local/bin since it existed, and two packages disagreeing about
+         where a tool lives is the same defect as one of them being wrong.
+
+         Nothing about the registration depends on the folder: the custom
+         actions below reach the file through the File table by Id, and the
+         service's ImagePath is written by jobd from its own os.Executable(). -->
+    <ComponentGroup Id="ServiceFiles">
+      <Component Directory="ToolsFolder">
+        <File Id="jobd.exe" Source="payload/tools/jobd.exe" KeyPath="yes" />
       </Component>
-      <Component Id="RegistryRoot" Guid="8821E881-5E73-465E-904E-EF7FC1223A5C">
-        <RegistryValue Root="HKCU" Key="Software\OpenAbstractions\Abstraction"
+      <Component Directory="ToolsFolder">
+        <File Id="jobdw.exe" Source="payload/tools/jobdw.exe" KeyPath="yes" />
+      </Component>
+      <Component Id="RegistryRoot" Directory="APPLICATIONFOLDER"
+                 Guid="8821E881-5E73-465E-904E-EF7FC1223A5C">
+        <RegistryValue Root="HKMU" Key="Software\OpenAbstractions\Abstraction"
                        Name="version" Type="string" Value="$(var.Version)" KeyPath="yes" />
-        <RemoveRegistryKey Root="HKCU" Key="Software\OpenAbstractions" Action="removeOnUninstall" />
+        <RemoveRegistryKey Root="HKMU" Key="Software\OpenAbstractions" Action="removeOnUninstall" />
       </Component>
     </ComponentGroup>
 
-    <ComponentGroup Id="ToolFiles" Directory="INSTALLFOLDER">
-      <Component>
-        <File Id="dl.exe" Source="payload/dl.exe" KeyPath="yes" />
-      </Component>
-      <Component>
-        <File Id="jobctl.exe" Source="payload/jobctl.exe" KeyPath="yes" />
-      </Component>
-      <Component Id="ToolsOnPath" Guid="C605C537-BAEE-4DF4-BB83-163B66D759D7">
-        <RegistryValue Root="HKCU" Key="Software\OpenAbstractions\Abstraction\Tools"
-                       Name="installed" Type="integer" Value="1" KeyPath="yes" />
-        <RemoveRegistryKey Root="HKCU" Key="Software\OpenAbstractions\Abstraction\Tools"
+    <!-- Registering the supervisor is a machine-scope act, because the only
+         thing that supervises a process on Windows is the SCM and reaching it
+         needs an administrator token. `sc create ... type= userown` gives a
+         template the operating system clones into every interactive session as
+         `<name>_<luid>`, running as that person with no password stored, and
+         restarts when it dies — measured on Windows 11, and
+         settled by the owner's own run of it, VISION.md 2026-09-10 "Host S is
+         unnecessary".
+
+         WiX cannot say it. ServiceInstall/@Type takes 'ownProcess,shareProcess'
+         and nothing else, so the registration is a deferred custom action
+         running the installed jobd.exe, which knows its own path, its own
+         recovery policy and — the part sc.exe cannot express — how to find and
+         delete the per-session instances that outlive the template.
+
+         Every one of these is conditioned on ALLUSERS. A per-user install has
+         no administrator token, and an action that needs one there is the 1603
+         the logon schtasks returned. -->
+    <CustomAction Id="RegisterSupervisor" FileRef="jobd.exe" ExeCommand="service install"
+                  Execute="deferred" Impersonate="no" Return="check" />
+    <CustomAction Id="RollbackSupervisor" FileRef="jobd.exe" ExeCommand="service uninstall"
+                  Execute="rollback" Impersonate="no" Return="ignore" />
+    <!-- Return="ignore" on the way out, and it is a choice: a supervisor that
+         cannot be deregistered must not be a product that cannot be removed.
+         What it leaves behind is named by `jobd service uninstall` in jobd.log
+         and removable by hand. -->
+    <CustomAction Id="UnregisterSupervisor" FileRef="jobd.exe" ExeCommand="service uninstall"
+                  Execute="deferred" Impersonate="no" Return="ignore" />
+
+    <InstallExecuteSequence>
+      <Custom Action="UnregisterSupervisor" Before="RemoveFiles"
+              Condition="ALLUSERS AND (REMOVE=&quot;ALL&quot; OR UPGRADINGPRODUCTCODE)" />
+      <Custom Action="RollbackSupervisor" After="InstallFiles"
+              Condition="ALLUSERS AND NOT (REMOVE=&quot;ALL&quot;)" />
+      <Custom Action="RegisterSupervisor" After="RollbackSupervisor"
+              Condition="ALLUSERS AND NOT (REMOVE=&quot;ALL&quot;)" />
+    </InstallExecuteSequence>
+
+    <ComponentGroup Id="SupervisorService" Directory="APPLICATIONFOLDER">
+      <Component Id="SupervisorServiceMarker" Guid="1C6E1D3F-6B0A-4D2E-9F3B-0A7E9C4D5B21"
+                 Condition="ALLUSERS">
+        <RegistryValue Root="HKLM" Key="Software\OpenAbstractions\Abstraction\Supervisor"
+                       Name="service" Type="string" Value="OpenAbstractionsSupervisor" KeyPath="yes" />
+        <RemoveRegistryKey Root="HKLM" Key="Software\OpenAbstractions\Abstraction\Supervisor"
                            Action="removeOnUninstall" />
-        <Environment Id="AbstractionPath" Name="PATH" Value="[INSTALLFOLDER]"
+      </Component>
+    </ComponentGroup>
+
+    <!-- What a per-user install gets instead, and it is less: the shortcut runs
+         at sign-in and nothing watches the supervisor afterwards. A logon task
+         does not restart it either: a killed
+         one four restart intervals over and it stayed dead. `jobd start` is
+         idempotent by the pipe name rather than by timing, which is what lets a
+         person, a tool and this shortcut all call it without producing two.
+
+         Show="minimized" because jobd.exe is a console image: the window is
+         created by the loader whatever we pass, and minimized is the only thing
+         the shell lets us say about it. -->
+    <ComponentGroup Id="LogonStart" Directory="StartupFolder">
+      <Component Id="LogonStartShortcut" Guid="C84BB684-4B58-4B42-9B05-8F12DAFAABDE"
+                 Condition="NOT ALLUSERS">
+        <Shortcut Id="LogonStartFile" Name="Abstraction supervisor"
+                  Description="Makes sure the supervisor that finishes downloads is running"
+                  Target="[#jobdw.exe]" Arguments="start"
+                  WorkingDirectory="ToolsFolder" />
+        <RegistryValue Root="HKCU" Key="Software\OpenAbstractions\Abstraction\Supervisor"
+                       Name="atLogon" Type="integer" Value="1" KeyPath="yes" />
+        <RemoveRegistryKey Root="HKCU" Key="Software\OpenAbstractions\Abstraction\Supervisor"
+                           Action="removeOnUninstall" />
+      </Component>
+    </ComponentGroup>
+
+    <!-- %ProgramData%\abstraction is where config.MachinePath() reads the file
+         that answers for every account on the box, and C:\ProgramData grants
+         BUILTIN\Users (CI)(WD,AD,WEA,WA): whoever creates that subdirectory
+         first owns it and keeps full control of it. config refuses a machine
+         file no administrator owns, so a squatted directory does not redirect
+         anything — it makes the machine rung unreadable for everyone, including
+         the administrator who installs afterwards. Creating it here, under the
+         only scope that has an administrator, is what leaves that administrator
+         somewhere to write.
+
+         LockPermissions replaces the inherited ACL rather than adding to it,
+         which is the whole point: the Users create-file ACE inherited from
+         ProgramData must not survive into this directory. Users keep read and
+         traverse, because every account has to be able to read the answer.
+
+         ALLUSERS only. A per-user install has no administrator and must not
+         leave a directory in a machine-wide location that it cannot protect. -->
+    <ComponentGroup Id="MachineConfigFolderGroup" Directory="MachineConfigFolder">
+      <Component Id="MachineConfigFolderAcl" Guid="C98ADFAD-1DEC-45F0-9FE5-C00345B3CFD3"
+                 Condition="ALLUSERS">
+        <CreateFolder>
+          <Permission User="Administrators" GenericAll="yes" />
+          <Permission User="SYSTEM" GenericAll="yes" />
+          <Permission User="Users" GenericRead="yes" GenericExecute="yes" />
+        </CreateFolder>
+        <RegistryValue Root="HKLM" Key="Software\OpenAbstractions\Abstraction\MachineConfig"
+                       Name="folder" Type="string" Value="[MachineConfigFolder]" KeyPath="yes" />
+        <RemoveRegistryKey Root="HKLM" Key="Software\OpenAbstractions\Abstraction\MachineConfig"
+                           Action="removeOnUninstall" />
+      </Component>
+    </ComponentGroup>
+
+    <ComponentGroup Id="ToolFiles" Directory="ToolsFolder">
+      <Component>
+        <File Id="dl.exe" Source="payload/tools/dl.exe" KeyPath="yes" />
+      </Component>
+      <Component>
+        <File Id="jobctl.exe" Source="payload/tools/jobctl.exe" KeyPath="yes" />
+      </Component>
+    </ComponentGroup>
+
+    <!-- tools\, examples\ and dev\ are siblings under the install root, and only
+         tools\ is on PATH: what a person runs and the source it runs are one
+         file, and the programs they call are next door. -->
+    <ComponentGroup Id="ExampleFiles">
+      <Component Directory="ExamplesFolder">
+        <File Id="examples.README.txt" Source="payload/examples/README.txt" KeyPath="yes" />
+      </Component>
+      <Component Directory="ExampleMachine">
+        <File Id="example.machine.cmd" Source="payload/examples/what-this-machine-does/run.cmd" KeyPath="yes" />
+      </Component>
+      <Component Directory="ExampleLifecycle">
+        <File Id="example.lifecycle.cmd" Source="payload/examples/job-lifecycle/run.cmd" KeyPath="yes" />
+      </Component>
+      <Component Directory="ExampleDownload">
+        <File Id="example.download.cmd" Source="payload/examples/download-a-file/run.cmd" KeyPath="yes" />
+      </Component>
+    </ComponentGroup>
+
+    <!-- Two components and not one because Environment@System is fixed when
+         the package is built and the scope is chosen when it is installed.
+
+         [ToolsFolder] and not [APPLICATIONFOLDER]tools\: the value is the
+         resolved Directory row the executables are actually installed into, so
+         moving them moves what goes on PATH and there is no second spelling of
+         the path to keep in step. validate.py fails a PATH entry naming a
+         directory the tools are not in. -->
+    <ComponentGroup Id="PathEntry" Directory="APPLICATIONFOLDER">
+      <Component Id="PathForMe" Guid="095FC050-F9AE-458B-9614-03B94D5FD51E"
+                 Condition="NOT ALLUSERS">
+        <RegistryValue Root="HKCU" Key="Software\OpenAbstractions\Abstraction\Path"
+                       Name="scope" Type="string" Value="user" KeyPath="yes" />
+        <Environment Id="PathUser" Name="PATH" Value="[ToolsFolder]"
                      Action="set" Part="last" System="no" Permanent="no" />
+      </Component>
+      <Component Id="PathForEveryone" Guid="447B9BFA-5714-4477-A5F8-2391D65E23B3"
+                 Condition="ALLUSERS">
+        <RegistryValue Root="HKLM" Key="Software\OpenAbstractions\Abstraction\Path"
+                       Name="scope" Type="string" Value="machine" KeyPath="yes" />
+        <Environment Id="PathMachine" Name="PATH" Value="[ToolsFolder]"
+                     Action="set" Part="last" System="yes" Permanent="no" />
       </Component>
     </ComponentGroup>
 
     <?if $(var.Panel) = yes ?>
-    <ComponentGroup Id="PanelFiles" Directory="INSTALLFOLDER">
+    <ComponentGroup Id="PanelFiles" Directory="ToolsFolder">
       <Component>
-        <File Id="panel.exe" Name="Abstraction Panel.exe" Source="payload/Abstraction Panel.exe" KeyPath="yes" />
-      </Component>
-      <Component>
-        <File Id="panel.exe.manifest" Name="Abstraction Panel.exe.manifest" Source="payload/Abstraction Panel.exe.manifest" KeyPath="yes" />
+        <File Id="panel.exe" Name="Abstraction Panel.exe" Source="payload/tools/Abstraction Panel.exe" KeyPath="yes" />
       </Component>
     </ComponentGroup>
     <ComponentGroup Id="PanelShortcut" Directory="AbstractionMenuFolder">
       <Component Id="PanelStartMenu" Guid="E5D9EA35-65C8-4930-9FC0-06120E9F39BE">
         <Shortcut Id="PanelShortcutFile" Name="Abstraction Panel"
                   Description="What this machine is doing with downloads, and what is holding the card"
-                  Target="[#panel.exe]" WorkingDirectory="INSTALLFOLDER" />
+                  Target="[#panel.exe]" WorkingDirectory="ToolsFolder" />
         <RemoveFolder Id="RemoveStartMenuFolder" On="uninstall" />
-        <RegistryValue Root="HKCU" Key="Software\OpenAbstractions\Abstraction\Panel"
+        <RegistryValue Root="HKMU" Key="Software\OpenAbstractions\Abstraction\Panel"
                        Name="installed" Type="integer" Value="1" KeyPath="yes" />
-        <RemoveRegistryKey Root="HKCU" Key="Software\OpenAbstractions\Abstraction\Panel"
+        <RemoveRegistryKey Root="HKMU" Key="Software\OpenAbstractions\Abstraction\Panel"
                            Action="removeOnUninstall" />
       </Component>
     </ComponentGroup>
@@ -117,55 +321,44 @@
     </ComponentGroup>
 
     <Feature Id="Service" Level="1" AllowAbsent="no" AllowAdvertise="no"
-             Title="Background service"
-             Description="Finishes transfers after the program that started them has closed. Registers one scheduled task for you, every five minutes, and needs no administrator.">
+             Title="Background supervisor"
+             Description="Finishes transfers after the program that started them has closed. For everyone, this is a service: Windows starts it in your own session at every sign-in, stores no password, and restarts it if it dies — and the install fails and rolls back if that registration does not happen, rather than leaving you the lesser one. Just for you, it is a Startup shortcut instead: it runs at sign-in and nothing replaces it if it dies before the next one. That is all a person without an administrator gets, and this package will not pretend otherwise.">
       <ComponentGroupRef Id="ServiceFiles" />
+      <ComponentGroupRef Id="SupervisorService" />
+      <ComponentGroupRef Id="LogonStart" />
+      <ComponentGroupRef Id="MachineConfigFolderGroup" />
     </Feature>
 
     <Feature Id="Tools" Level="1" AllowAdvertise="no"
-             Title="Command-line tools and panel"
-             Description="dl resumes a download from what it proved and refuses corruption that curl -C - accepts. jobctl drives the job store from a shell. The panel says what is holding the graphics card. Adds this folder to your PATH.">
+             Title="Command-line tools and examples"
+             Description="dl resumes a download from what it proved and refuses corruption that curl -C - accepts. jobctl drives the job store from a shell. examples\ holds three that run against this install and need no checkout.">
       <ComponentGroupRef Id="ToolFiles" />
+      <ComponentGroupRef Id="ExampleFiles" />
       <?if $(var.Panel) = yes ?>
       <ComponentGroupRef Id="PanelFiles" />
       <ComponentGroupRef Id="PanelShortcut" />
       <?endif?>
+
+      <Feature Id="Path" Level="1" AllowAdvertise="no"
+               Title="Add to PATH"
+               Description="Puts the tools folder inside the install folder on PATH, so dl, jobctl and jobd run in any shell. For everyone that is the machine PATH; just for you, your own. Untick this and they are still installed; you type the whole path.">
+        <ComponentGroupRef Id="PathEntry" />
+      </Feature>
     </Feature>
 
+    <!-- Two descriptions because the files behind the first one are gated and
+         the feature is not: a release build assembled out of published module
+         versions carries USING.txt alone, under text promising headers and
+         Python packages. -->
+    <?if "$(var.NoDev)$(var.NoCpp)" = "" ?><?define DeveloperText = "Headers, the Python packages and the Go module paths, for building an application against these layers. Not needed to use the tools." ?>
+    <?else?><?define DeveloperText = "USING.txt, which names the Go module paths and the package names to install, for building an application against these layers.$(var.NoDev)$(var.NoCpp) Not needed to use the tools." ?><?endif?>
     <Feature Id="Developer" Level="1000" AllowAdvertise="no"
              Title="Developer files"
-             Description="Headers, the Python packages and the Go module paths, for building an application against these layers. Not needed to use the tools.">
+             Description="$(var.DeveloperText)">
       <ComponentGroupRef Id="DeveloperFiles" />
     </Feature>
 
-    <!-- schtasks and not a service: BITS keeps transferring across an application
-         exit and a reboot under a normal user account, so nothing here needs
-         elevation, and the scope is perUser for the same reason.
-
-         One sweep task and no logon task, because a logon task cannot be
-         registered by an install that does not ask for a password or for
-         administrator rights. `schtasks /create /sc onlogon` with no /ru
-         registers a trigger that fires for every account on the machine, which
-         is an administrator's change: unelevated it exits 1 and the package
-         fails 1722, then 1603. Naming the account with /ru makes schtasks ask
-         for that account's password, and a silent install has no console to
-         answer with, so it blocks for ever - with /rp "" and with /it alike.
-         The sweep picks up unfinished work within five minutes of logon and
-         needs none of that. -->
-    <CustomAction Id="TaskCreateSweep" Directory="INSTALLFOLDER" Execute="deferred" Impersonate="yes" Return="check"
-                  ExeCommand="&quot;[SystemFolder]schtasks.exe&quot; /create /tn jobd /sc minute /mo 5 /tr &quot;\&quot;[#jobd.exe]\&quot; once --quiet&quot; /f" />
-    <CustomAction Id="TaskRollbackSweep" Directory="INSTALLFOLDER" Execute="rollback" Impersonate="yes" Return="ignore"
-                  ExeCommand="&quot;[SystemFolder]schtasks.exe&quot; /delete /tn jobd /f" />
-    <CustomAction Id="TaskDeleteSweep" Directory="INSTALLFOLDER" Execute="deferred" Impersonate="yes" Return="ignore"
-                  ExeCommand="&quot;[SystemFolder]schtasks.exe&quot; /delete /tn jobd /f" />
-
-    <InstallExecuteSequence>
-      <Custom Action="TaskDeleteSweep" Before="RemoveFiles" Condition="REMOVE=&quot;ALL&quot;" />
-      <Custom Action="TaskRollbackSweep" After="InstallFiles" Condition="&amp;Service=3" />
-      <Custom Action="TaskCreateSweep" After="TaskRollbackSweep" Condition="&amp;Service=3" />
-    </InstallExecuteSequence>
-
-    <ui:WixUI Id="WixUI_FeatureTree" />
+    <ui:WixUI Id="WixUI_Advanced" />
     <WixVariable Id="WixUILicenseRtf" Value="license.rtf" />
 
   </Package>

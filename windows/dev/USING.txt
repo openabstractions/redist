@@ -6,14 +6,19 @@ Go — nothing here to install; the modules resolve on their own.
     go get github.com/openabstractions/abstraction-job/go
     go get github.com/openabstractions/abstraction-facade/go
 
-Python — two packages, installed from the directories beside this file.
+Python — two packages. If python\job and python\download are beside this file,
+install from them; a release package carries neither, and they come from the
+same registry every other Python package does.
 
     pip install .\python\job
     pip install .\python\download
 
-C++ — one header, no library and no dependency beyond curl on PATH.
+C++ — one header, no library and no dependency beyond curl on PATH. If
+include\abstraction\ is beside this file, include from it; a release package
+carries it in no form, because over_curl.hpp publishes from no repository yet.
 
     cl /std:c++17 /I .\include yourprogram.cpp
 
-The tools in the folder above are built from these same layers. dl is what the
-download layer looks like from a shell; anything dl does, your program can do.
+The tools in ..\tools\ are built from these same layers. dl is what the download
+layer looks like from a shell; anything dl does, your program can do.
+..\examples\ runs three of them against this install, and needs no checkout.

@@ -1,25 +1,41 @@
 > Every program this redistributable installs, and the published module version
 > it is built from. .github/workflows/release.yml reads this and nothing else.
 >
-> path		where it lands under the install folder
-> module	a Go module path and a version that exists on proxy.golang.org.
+> path		the file name the workflow gives the built program, and the name
+>		windows/build.py then looks for in --bin. A base name, never a
+>		directory: the packager matches a --bin file to its own payload row
+>		by base name, and installer/payload.tsv is the only file that says
+>		where anything lands under the install folder
+> module	a Go module path and a version that is a tag on its repository.
 >		A commit is not allowed here and neither is a branch: this package
 >		consumes our published tags exactly as a stranger does, so a module
 >		we broke turns this workflow red on the day it is released rather
->		than on the day somebody outside tries to install it
+>		than on the day somebody outside tries to install it.
+>		The workflow asks proxy.golang.org, which serves a version for good
+>		once it has cached it and so cannot tell a live tag from a deleted
+>		one. `git ls-remote --tags` on the repository can, and is what
+>		decides whether a version may be written here
 > package	the package to build, relative to the module. "." is the module
 >		root. It is a separate column because the proxy indexes modules and
 >		not packages: asking it for .../go/cmd/dl answers 404 whatever the
 >		version, and a check that cannot tell that from a deleted tag is
 >		not a check
 > feature	service | tools — the WiX feature that installs it
+> subsystem	console | windows. "windows" appends -H=windowsgui to the link,
+>		which is the only way to build an image the loader gives no
+>		console, and it is also what says the row is a Windows image and
+>		nothing else: the Linux and macOS jobs skip such a row by name
+>		rather than building an ELF or a Mach-O nobody asked for
 >
 > A program with no published module has no row. It is named as absent in the
 > release notes instead; there is no placeholder here to be filled in silently.
-> Absent today: Abstraction Panel.exe, which is published from nowhere, and the
-> C++ developer headers, which no module carries.
+> Absent today: Abstraction Panel.exe, whose module github.com/openabstractions/
+> abstractions/monitor exists in the tree and is not yet published or tagged;
+> jobdw.exe, the windows-subsystem link of the same source as jobd.exe, which
+> needs a service-jobd tag that does not exist; and the C++ developer headers,
+> which no module carries.
 
-path		module							package		feature
-jobd.exe	github.com/openabstractions/service-jobd@v0.2.0		.		service
-dl.exe		github.com/openabstractions/abstraction-download/go@v0.4.1	cmd/dl		tools
-jobctl.exe	github.com/openabstractions/abstraction-job/go@v0.4.1	cmd/jobctl	tools
+path		module							package		feature		subsystem
+jobd.exe	github.com/openabstractions/service-jobd@v0.2.0		.		service		console
+dl.exe		github.com/openabstractions/abstraction-download/go@v0.4.1	cmd/dl		tools		console
+jobctl.exe	github.com/openabstractions/abstraction-job/go@v0.4.1	cmd/jobctl	tools		console

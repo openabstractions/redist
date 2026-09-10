@@ -6,7 +6,9 @@ Go — nothing here to install; the modules resolve on their own.
     go get github.com/openabstractions/abstraction-job/go
     go get github.com/openabstractions/abstraction-facade/go
 
-Python — two packages, installed from the directories beside this file.
+Python — two packages. If python/job and python/download are beside this file,
+install from them; a release package carries neither, and they come from the
+same registry every other Python package does.
 
     pip install ./python/job
     pip install ./python/download

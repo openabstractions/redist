@@ -4,6 +4,14 @@ on:
   push:
     tags: ['v*']
   workflow_dispatch:
+    inputs:
+      preview:
+        description: >-
+          Draft the release even though the machine scope was not proven on this
+          run. A tag push cannot set this, so an incomplete release is something
+          a person asked for by name and never something a run decided.
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -29,16 +37,23 @@ jobs:
           dotnet --version
           git rev-parse HEAD
 
-      # Every version named here must exist on proxy.golang.org before anything
-      # is built. This is the whole point of the repository: the package is made
-      # of our published artifacts, so a tag we deleted or never pushed stops the
-      # release here, by name, instead of shipping.
-      - name: the modules resolve for a stranger
+      # Every version named here must exist before anything is built. This is
+      # the whole point of the repository: the package is made of our published
+      # artifacts, so a tag we deleted or never pushed stops the release here,
+      # by name, instead of shipping.
+      #
+      # The repository is asked first and it is the authority: proxy.golang.org
+      # serves a deleted tag forever, and it served service-jobd v0.2.0 for a
+      # repository that has never had a tag — a release built on that answer is
+      # built out of a cache. The proxy is asked second, and answers a different
+      # question: whether `go install` can reach the version a stranger is told
+      # to install.
+      - name: the tags exist, and the modules resolve for a stranger
         run: |
           rows() { grep -v '^>' "$1" | sed '/^[[:space:]]*$/d' | tail -n +2 | tr -s '\t'; }
           n=0
           rc=0
-          while IFS=$'\t' read -r path module package feature; do
+          while IFS=$'\t' read -r path module package feature subsystem; do
             n=$((n + 1))
             mod=${module%@*}
             version=${module##*@}
@@ -46,11 +61,22 @@ jobs:
               v[0-9]*) ;;
               *) printf 'FAIL  %s names %s, which is not a published version\n' "$path" "$version"; rc=1; continue ;;
             esac
+            rest=${mod#github.com/openabstractions/}
+            repo=${rest%%/*}
+            dir=${rest#"$repo"}; dir=${dir#/}
+            tag=${dir:+$dir/}$version
+            if ! git ls-remote --tags --exit-code \
+                   "https://github.com/openabstractions/$repo" "refs/tags/$tag" > /dev/null; then
+              printf 'FAIL  %s has no tag %s, so %s is built from a version nobody can clone\n' \
+                "$repo" "$tag" "$path"
+              rc=1
+              continue
+            fi
             if curl -fsS "https://proxy.golang.org/$mod/@v/$version.info" -o "info-$n.json"; then
-              printf 'ok    %-12s %s  %s\n' "$path" "$module" "$(cat "info-$n.json")"
+              printf 'ok    %-12s %s  tag %s  %s\n' "$path" "$module" "$tag" "$(cat "info-$n.json")"
             else
-              printf 'FAIL  %s is not on proxy.golang.org, so nothing outside this org can build %s\n' \
-                "$module" "$path"
+              printf 'FAIL  %s is a tag and proxy.golang.org has not served it, so nothing outside\n' "$tag"
+              printf '      this org can go install %s\n' "$path"
               rc=1
             fi
           done < <(rows tools.tsv)
@@ -72,12 +98,19 @@ jobs:
           rows() { grep -v '^>' "$1" | sed '/^[[:space:]]*$/d' | tail -n +2 | tr -s '\t'; }
           root=$PWD
           for arch in amd64 arm64; do
-            while IFS=$'\t' read -r path module package feature; do
+            while IFS=$'\t' read -r path module package feature subsystem; do
               mod=${module%@*}
               version=${module##*@}
               case "$package" in
                 .) target="$mod@$version" ;;
                 *) target="$mod/$package@$version" ;;
+              esac
+              ld='-s -w -buildid='
+              case "$subsystem" in
+                windows) ld="$ld -H=windowsgui" ;;
+                console) ;;
+                *) printf 'FAIL  %s has subsystem %s, which is console or windows\n' \
+                     "$path" "$subsystem"; exit 1 ;;
               esac
               # GOBIN refuses a cross-compiled install, so these land in
               # GOPATH/bin under a name go chooses — at the root for the
@@ -88,7 +121,7 @@ jobs:
               for pass in a b; do
                 mkdir -p "$root/$pass/$arch"
                 rm -rf "$gobin"
-                GOARCH="$arch" go install -ldflags '-s -w -buildid=' "$target"
+                GOARCH="$arch" go install -ldflags "$ld" "$target"
                 built=$(find "$gobin" -type f -name '*.exe')
                 n=$(printf '%s\n' "$built" | sed '/^$/d' | wc -l)
                 if [ "$n" -ne 1 ]; then
@@ -173,12 +206,23 @@ jobs:
           path: dist/
           if-no-files-found: error
 
+  # This package has two scopes and, until today, this job exercised one of
+  # them: `msiexec /i /qn` with no scope named, on a runner that is an
+  # administrator. That green never reached the custom action that registers
+  # the supervisor, so the machine scope shipped for days calling a `jobd` verb
+  # no `jobd` had. The cheap half passing is not the package passing.
+  #
+  # So: each leg names its scope on the command line, and asserts what the
+  # install did rather than what the package promised. A manifest is checked by
+  # windows/validate.py, before anything is built; nothing below reads one.
   verify:
     needs: windows
     runs-on: windows-latest
     permissions:
       contents: read
       actions: read
+    outputs:
+      machine-service: ${{ steps.instance.outputs.state }}
     steps:
       - name: fetch the package
         env:
@@ -191,34 +235,72 @@ jobs:
       - name: the checksum file is true
         run: (cd pkg && sha256sum -c SHA256SUMS.windows)
 
-      - name: install
+      # A per-user service instance is created at logon, so whether one can
+      # appear here at all is a property of the runner and not of the package.
+      # It is measured before anything is installed, because it decides what the
+      # machine leg is allowed to conclude from an absence.
+      - name: what this runner can show
+        shell: pwsh
+        run: |
+          $me = (Get-Process -Id $PID).SessionId
+          "this job runs in session $me"
+          try { & query.exe session } catch { 'query.exe is not on this runner' }
+          $interactive = if ($me -eq 0) { 0 } else { 1 }
+          if ($interactive -eq 0) {
+            'UNPROVEN here: this job runs in session 0. The service manager clones a per-user service into a session at logon, and there is no session for it to clone into. The template, its configuration and its recovery policy are provable on this runner; a running instance is not.'
+          } else {
+            "an interactive session exists, so a clone of the template must appear and this job holds the machine scope to it"
+          }
+          "interactive=$interactive" >> $env:GITHUB_ENV
+
+      # ----- just for me -----------------------------------------------------
+      #
+      # MSIINSTALLPERUSER is named even though the package defaults to it. The
+      # Property table carries ALLUSERS=2, which WixUI resolves against
+      # Privileged: an unscoped command on an administrator's machine picks a
+      # scope by itself, and a scope picked by itself is what this job exists to
+      # stop being the thing that proves the package.
+      - name: install just for me
         shell: pwsh
         run: |
           $msi = (Resolve-Path pkg\abstraction-x64.msi).Path
-          $p = Start-Process msiexec -Wait -PassThru -ArgumentList @('/i', $msi, '/qn', '/norestart', '/l*v', 'install.log')
-          if ($p.ExitCode -ne 0) { Get-Content install.log -Tail 60; throw "msiexec /i exited $($p.ExitCode)" }
+          $p = Start-Process msiexec -Wait -PassThru -ArgumentList @('/i', $msi, '/qn', '/norestart', 'ALLUSERS=2', 'MSIINSTALLPERUSER=1', '/l*v', 'user-install.log')
+          if ($p.ExitCode -ne 0) { Get-Content user-install.log -Tail 60; throw "msiexec /i exited $($p.ExitCode)" }
 
-      - name: what it changed
+      - name: what a per-user install did, and what it must not have done
         shell: pwsh
         run: |
-          $dir = Join-Path $env:LOCALAPPDATA 'Programs\Abstraction'
-          foreach ($f in 'jobd.exe','dl.exe','jobctl.exe') {
-            if (-not (Test-Path (Join-Path $dir $f))) { throw "$f was not installed" }
+          $dir = Join-Path $env:LOCALAPPDATA 'Programs\OpenAbstractions'
+          $tools = Join-Path $dir 'tools'
+          if (-not (Test-Path $tools)) { throw "a per-user install did not land in $tools" }
+          foreach ($f in 'jobd.exe','jobdw.exe','dl.exe','jobctl.exe') {
+            if (-not (Test-Path (Join-Path $tools $f))) { throw "$f was not installed" }
           }
           $path = (Get-ItemProperty 'HKCU:\Environment' -Name Path -ErrorAction Stop).Path
-          if ($path -notlike "*$dir*") { throw "PATH does not carry $dir" }
-          if (-not (Get-ScheduledTask -TaskName 'jobd' -ErrorAction SilentlyContinue)) {
-            throw 'the five-minute sweep task was not registered, so nothing finishes a transfer after the shell closes'
+          if ($path -notlike "*$tools*") { throw "the user PATH does not carry $tools" }
+
+          # What this scope promises instead of a service, in the words the
+          # feature text uses: a Startup shortcut, and nothing that replaces the
+          # supervisor if it dies before the next sign-in.
+          $lnk = Join-Path $env:APPDATA 'Microsoft\Windows\Start Menu\Programs\Startup\Abstraction supervisor.lnk'
+          if (-not (Test-Path $lnk)) { throw 'the Startup shortcut is what a per-user install gets instead of a service, and it is not there' }
+          if ((Get-ItemProperty 'HKCU:\Software\OpenAbstractions\Abstraction\Supervisor' -Name atLogon).atLogon -ne 1) {
+            throw 'the per-user supervisor marker is not set'
           }
-          # This runner is an administrator and the buyer is not. The package
-          # registers one task for that reason; a logon task needs either
-          # elevation or a password, and an install that asked for neither
-          # cannot have made one. If this ever finds one, the package acquired
-          # a step that will fail 1603 for every normal user and pass here.
-          if (Get-ScheduledTask -TaskName 'jobd-logon' -ErrorAction SilentlyContinue) {
-            throw 'a jobd-logon task exists. This job runs elevated; a person does not, and for them that task cannot be created at all.'
+
+          # And what it must not have done. Every one of these is a machine-scope
+          # act, and an install that had no administrator token and did them
+          # anyway would have done them badly.
+          if (Test-Path 'HKLM:\Software\OpenAbstractions') { throw 'a per-user install wrote the machine registry key' }
+          if (Test-Path (Join-Path $env:ProgramData 'abstraction')) { throw 'a per-user install created the machine config folder it cannot protect' }
+          & sc.exe qc OpenAbstractionsSupervisor | Out-Null
+          if ($LASTEXITCODE -eq 0) { throw 'a per-user install registered a service. It has no administrator token, so whatever it registered, it registered wrong.' }
+          foreach ($t in 'jobd','jobd-logon') {
+            if (Get-ScheduledTask -TaskName $t -ErrorAction SilentlyContinue) {
+              throw "a scheduled task named $t exists. This package registered one until it was replaced by the service and the Startup shortcut; a task coming back is that mechanism returning unannounced."
+            }
           }
-          'ok    three programs, a PATH entry, one sweep task and no logon task'
+          'ok    programs, a user PATH entry, a Startup shortcut — and no service, no machine key, no task'
 
       # These three binaries come from three separately tagged modules, so the
       # package contains three builds of one store format. Only writing with one
@@ -232,7 +314,7 @@ jobs:
       - name: the three programs agree about the store
         shell: pwsh
         run: |
-          $dir = Join-Path $env:LOCALAPPDATA 'Programs\Abstraction'
+          $tools = Join-Path $env:LOCALAPPDATA 'Programs\OpenAbstractions\tools'
           $work = Join-Path $env:RUNNER_TEMP 'agree'
           New-Item -ItemType Directory -Force -Path "$work\serve","$work\out","$work\store" | Out-Null
           $env:ABSTRACTION_STORE = "$work\store"
@@ -246,7 +328,7 @@ jobs:
               try { Invoke-WebRequest 'http://127.0.0.1:8099/thing.bin' -UseBasicParsing | Out-Null; break }
               catch { Start-Sleep -Milliseconds 200 }
             }
-            $fetched = & "$dir\dl.exe" 'http://127.0.0.1:8099/thing.bin' -o "$work\out" 2>&1
+            $fetched = & "$tools\dl.exe" 'http://127.0.0.1:8099/thing.bin' -o "$work\out" 2>&1
             $fetched
             if ($LASTEXITCODE -ne 0) { throw "dl exited $LASTEXITCODE" }
             if (-not (Test-Path "$work\out\thing.bin")) { throw 'dl reported success and delivered nothing' }
@@ -254,21 +336,21 @@ jobs:
             if (-not $named) { throw 'dl did not name the job it created' }
             $id = $named.Matches[0].Groups[1].Value
 
-            $seen = & "$dir\jobd.exe" status
+            $seen = & "$tools\jobd.exe" status
             $seen
             if (-not ($seen | Select-String -SimpleMatch 'thing.bin')) {
               throw 'jobd could not see the download dl completed in the store they share'
             }
 
             $env:JOB_STORE = "$work\store"
-            $shown = & "$dir\jobctl.exe" show $id
+            $shown = & "$tools\jobctl.exe" show $id
             if ($LASTEXITCODE -ne 0) { throw "jobctl show exited $LASTEXITCODE on the job dl wrote" }
             if (-not ($shown | Select-String -SimpleMatch $id)) {
               throw 'jobctl read the store and did not find the record dl wrote there'
             }
 
             Remove-Item Env:JOB_STORE
-            $without = & "$dir\jobctl.exe" show $id 2>&1
+            $without = & "$tools\jobctl.exe" show $id 2>&1
             if ($LASTEXITCODE -ne 0) {
               $without
               throw 'jobctl found the store only under JOB_STORE. The other two read ABSTRACTION_STORE, so one installation would hold two stores.'
@@ -281,19 +363,184 @@ jobs:
           }
           'ok    dl wrote it, jobd saw it, jobctl read the record back — one store format, two environment variables'
 
-      - name: uninstall
+      - name: uninstall just for me
         shell: pwsh
         run: |
           $msi = (Resolve-Path pkg\abstraction-x64.msi).Path
-          $p = Start-Process msiexec -Wait -PassThru -ArgumentList @('/x', $msi, '/qn', '/norestart', '/l*v', 'uninstall.log')
-          if ($p.ExitCode -ne 0) { Get-Content uninstall.log -Tail 60; throw "msiexec /x exited $($p.ExitCode)" }
-          $dir = Join-Path $env:LOCALAPPDATA 'Programs\Abstraction'
+          $p = Start-Process msiexec -Wait -PassThru -ArgumentList @('/x', $msi, '/qn', '/norestart', '/l*v', 'user-uninstall.log')
+          if ($p.ExitCode -ne 0) { Get-Content user-uninstall.log -Tail 60; throw "msiexec /x exited $($p.ExitCode)" }
+          $dir = Join-Path $env:LOCALAPPDATA 'Programs\OpenAbstractions'
           if (Test-Path $dir) { throw 'the install folder survived uninstall' }
           if (Test-Path 'HKCU:\Software\OpenAbstractions') { throw 'the registry key survived uninstall' }
-          if (Get-ScheduledTask -TaskName 'jobd' -ErrorAction SilentlyContinue) { throw 'the sweep task survived uninstall' }
+          if (Test-Path (Join-Path $env:APPDATA 'Microsoft\Windows\Start Menu\Programs\Startup\Abstraction supervisor.lnk')) {
+            throw 'the Startup shortcut survived uninstall'
+          }
           $path = (Get-ItemProperty 'HKCU:\Environment' -Name Path -ErrorAction Stop).Path
-          if ($path -like '*Programs\Abstraction*') { throw 'the PATH entry survived uninstall' }
-          'ok    uninstall reversed it: no folder, no registry key, no task, no PATH entry'
+          if ($path -like '*Programs\OpenAbstractions*') { throw 'the PATH entry survived uninstall' }
+          'ok    uninstall reversed it: no folder, no registry key, no shortcut, no PATH entry'
+
+      # ----- for everyone ----------------------------------------------------
+      #
+      # This is the leg that never ran. A GitHub runner is an administrator and
+      # a workstation is not, which is exactly why this belongs here: the
+      # machine scope cannot be proved on the machine the package is written on.
+      - name: install for everyone
+        shell: pwsh
+        run: |
+          $msi = (Resolve-Path pkg\abstraction-x64.msi).Path
+          $p = Start-Process msiexec -Wait -PassThru -ArgumentList @('/i', $msi, '/qn', '/norestart', 'ALLUSERS=1', 'MSIINSTALLPERUSER=', '/l*v', 'machine-install.log')
+          if ($p.ExitCode -ne 0) {
+            Get-Content machine-install.log -Tail 120
+            throw "msiexec /i ALLUSERS=1 exited $($p.ExitCode). RegisterSupervisor is Return=check, so a supervisor that could not be registered fails and rolls back the install rather than leaving a package that installed the programs and nothing that runs them."
+          }
+
+      - name: what a per-machine install did, and what it must not have done
+        shell: pwsh
+        run: |
+          $dir = Join-Path $env:ProgramFiles 'OpenAbstractions'
+          $tools = Join-Path $dir 'tools'
+          if (-not (Test-Path $tools)) { throw "a per-machine install did not land in $tools" }
+          foreach ($f in 'jobd.exe','jobdw.exe','dl.exe','jobctl.exe') {
+            if (-not (Test-Path (Join-Path $tools $f))) { throw "$f was not installed" }
+          }
+          $key = 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Environment'
+          if ((Get-ItemProperty $key -Name Path).Path -notlike "*$tools*") { throw "the machine PATH does not carry $tools" }
+          if (-not (Test-Path 'HKLM:\Software\OpenAbstractions\Abstraction')) { throw 'the machine registry key was not written' }
+
+          # %ProgramData% grants BUILTIN\Users create-file by inheritance, and
+          # config refuses a machine file no administrator owns. The component
+          # replaces the inherited ACL; if it stops doing so, the machine rung
+          # becomes squattable and nothing else says so.
+          $cfg = Join-Path $env:ProgramData 'abstraction'
+          if (-not (Test-Path $cfg)) { throw 'the machine config folder was not created' }
+          $bad = (Get-Acl $cfg).Access | Where-Object {
+            $_.IdentityReference -like '*\Users' -and $_.FileSystemRights -match 'CreateFiles|Write|FullControl|Modify'
+          }
+          if ($bad) { $bad | Format-List; throw 'Users can write into the machine config folder, so the machine rung can be squatted' }
+
+          # The per-user arm must not also have fired. Both arms installing is
+          # the same defect as neither: the scope stopped meaning anything.
+          if (Test-Path (Join-Path $env:APPDATA 'Microsoft\Windows\Start Menu\Programs\Startup\Abstraction supervisor.lnk')) {
+            throw 'a per-machine install also created the Startup shortcut, which is the per-user arm. Both arms fired, so ALLUSERS is not deciding between them.'
+          }
+          'ok    programs in Program Files, a machine PATH entry, a protected config folder, and no Startup shortcut'
+
+      - name: the supervisor is registered, and registered as what it claims
+        shell: pwsh
+        run: |
+          $qc = & sc.exe qc OpenAbstractionsSupervisor
+          $qc
+          if ($LASTEXITCODE -ne 0) {
+            throw "sc qc exited $LASTEXITCODE. The install reported success and registered no supervisor: the Background supervisor feature promises a service for everyone, and there is none."
+          }
+          $text = $qc -join "`n"
+          if ($text -notmatch 'TYPE\s*:\s*50\s+USER_OWN_PROCESS\s+TEMPLATE') {
+            throw 'the service is not a SERVICE_USER_OWN_PROCESS template. Any other type is a service running as someone, and this design stores no password because it runs as whoever signs in.'
+          }
+          if ($text -notmatch 'START_TYPE\s*:\s*2\s+AUTO_START') { throw 'the template is not AUTO_START, so nothing clones it at sign-in' }
+          if ($text -notmatch 'jobdw\.exe" service run') {
+            throw 'the registered image is not jobdw.exe with the service verb. jobd.exe is the console image, and the loader gives a console image a window in the session it runs in — a window at every sign-in is what this whole mechanism removed.'
+          }
+
+          # The restart is the entire reason this is a service and not a
+          # shortcut. A template with no recovery policy is the Startup shortcut
+          # with extra steps.
+          $qf = (& sc.exe qfailure OpenAbstractionsSupervisor) -join "`n"
+          $qf
+          if ($qf -notmatch 'RESET_PERIOD[^:]*:\s*3600') { throw 'the reset period is not 3600, so three restarts are a budget for the life of the machine rather than a crash-loop brake' }
+          foreach ($ms in 3000, 10000, 30000) {
+            if ($qf -notmatch "RESTART -- Delay = $ms milliseconds") { throw "the $ms ms restart action is not configured" }
+          }
+          $qff = (& sc.exe qfailureflag OpenAbstractionsSupervisor) -join "`n"
+          $qff
+          if ($qff -notmatch 'FAILURE_ACTIONS_ON_NONCRASH_FAILURES\s*:\s*TRUE') {
+            throw 'recovery fires only on a process that died without reporting SERVICE_STOPPED. A supervisor that reports a tidy stop after failing to open its store is the case we most want restarted.'
+          }
+          'ok    a USER_OWN_PROCESS template, auto-start, pointing at jobdw.exe, with three restarts and the non-crash flag'
+
+      - name: an instance, and whether it is up
+        id: instance
+        shell: pwsh
+        run: |
+          $clones = @(Get-Service -Name 'OpenAbstractionsSupervisor_*' -ErrorAction SilentlyContinue)
+          $clones | Format-Table -AutoSize Name, Status
+          if ($clones.Count -eq 0) {
+            if ($env:interactive -ne '0') {
+              throw 'an interactive session exists on this runner and the service manager cloned no instance into it. The template is registered and nothing is supervising anything.'
+            }
+            'UNPROVEN  machine scope, the running instance. This runner has no interactive session, the service manager clones a per-user service at logon, and so no instance can appear here. What is proven above: the template, its type, its image, its start type and its recovery policy. What is not: that the clone appears, that it answers the service control dispatcher, and that a killed instance comes back. That ladder is research/svcreg245/RESULTS.md section 8 and it needs a person at a real sign-in.'
+            "state=unproven" >> $env:GITHUB_OUTPUT
+            "UNPROVEN: the machine scope's running instance. No interactive session on this runner." >> $env:GITHUB_STEP_SUMMARY
+          } else {
+            $up = @($clones | Where-Object { $_.Status -eq 'Running' })
+            if ($up.Count -eq 0) {
+              $clones | Format-List Name, Status
+              throw 'the service manager cloned the template and no instance is Running. A process that does not reach StartServiceCtrlDispatcher within ServicesPipeTimeout is a start failure, and a start failure is the one failure the recovery policy does not fire on.'
+            }
+            $procs = @(Get-Process jobdw -ErrorAction SilentlyContinue)
+            $procs | Format-Table -AutoSize Id, SessionId
+            if (@($procs | Where-Object { $_.SessionId -ne 0 }).Count -eq 0) {
+              throw 'an instance reports Running and no jobdw process is in an interactive session. A per-user service runs in the session it was cloned into.'
+            }
+            "ok    $($up.Count) instance(s) Running, in an interactive session"
+            "state=proven" >> $env:GITHUB_OUTPUT
+          }
+
+      - name: uninstall for everyone
+        shell: pwsh
+        run: |
+          $msi = (Resolve-Path pkg\abstraction-x64.msi).Path
+          $p = Start-Process msiexec -Wait -PassThru -ArgumentList @('/x', $msi, '/qn', '/norestart', '/l*v', 'machine-uninstall.log')
+          if ($p.ExitCode -ne 0) { Get-Content machine-uninstall.log -Tail 60; throw "msiexec /x exited $($p.ExitCode)" }
+          & sc.exe qc OpenAbstractionsSupervisor | Out-Null
+          if ($LASTEXITCODE -eq 0) { throw 'the service template survived uninstall' }
+
+          # Deleting the template does not delete the instances the service
+          # manager cloned from it: the owner's own probe outlived sc delete and
+          # stayed AUTO_START. An uninstall that leaves one leaks a service per
+          # account that has ever signed in.
+          $left = @(Get-Service -Name 'OpenAbstractionsSupervisor_*' -ErrorAction SilentlyContinue)
+          if ($left.Count -ne 0) { $left | Format-List Name, Status; throw 'a per-session instance survived uninstall' }
+          if (Test-Path (Join-Path $env:ProgramFiles 'OpenAbstractions')) { throw 'the install folder survived uninstall' }
+          if (Test-Path 'HKLM:\Software\OpenAbstractions') { throw 'the machine registry key survived uninstall' }
+          if (Test-Path (Join-Path $env:ProgramData 'abstraction')) { throw 'the machine config folder survived uninstall' }
+          $key = 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Environment'
+          if ((Get-ItemProperty $key -Name Path).Path -like '*OpenAbstractions*') { throw 'the machine PATH entry survived uninstall' }
+          'ok    uninstall reversed it: no template, no instance, no folder, no key, no config folder, no PATH entry'
+
+      # ----- the command nobody names a scope on -----------------------------
+      #
+      # `msiexec /i /qn` is what a script writes and it is what this job used to
+      # run. The Property table carries ALLUSERS=2, and WixUI's own sequence
+      # rows resolve the install folder from Privileged while the components
+      # resolve their scope from ALLUSERS after the installer has reset it. If
+      # those two ever disagree the package lands in Program Files with the
+      # per-user arm — the machine folder and none of the machine behaviour,
+      # which is a per-user fallback that happened by itself.
+      #
+      # This leg does not say which answer is right. It says the two halves
+      # agree, and it is the only place that question is asked of a real
+      # installation.
+      - name: an unscoped install lands in one scope, not half of each
+        shell: pwsh
+        run: |
+          $msi = (Resolve-Path pkg\abstraction-x64.msi).Path
+          $p = Start-Process msiexec -Wait -PassThru -ArgumentList @('/i', $msi, '/qn', '/norestart', '/l*v', 'unscoped.log')
+          if ($p.ExitCode -ne 0) { Get-Content unscoped.log -Tail 120; throw "msiexec /i with no scope named exited $($p.ExitCode)" }
+          $machineDir = Test-Path (Join-Path $env:ProgramFiles 'OpenAbstractions')
+          $userDir = Test-Path (Join-Path $env:LOCALAPPDATA 'Programs\OpenAbstractions')
+          & sc.exe qc OpenAbstractionsSupervisor | Out-Null
+          $service = $LASTEXITCODE -eq 0
+          $lnk = Test-Path (Join-Path $env:APPDATA 'Microsoft\Windows\Start Menu\Programs\Startup\Abstraction supervisor.lnk')
+          "folder: machine=$machineDir user=$userDir   arm: service=$service shortcut=$lnk"
+          if ($machineDir -eq $userDir) { throw 'an unscoped install landed in both folders or in neither' }
+          if ($service -eq $lnk) { throw 'an unscoped install installed both supervisor arms or neither' }
+          if ($machineDir -ne $service) {
+            throw 'an unscoped install put the files in one scope and the supervisor in the other. A person who reads the folder believes one thing and the machine does the other.'
+          }
+          $p = Start-Process msiexec -Wait -PassThru -ArgumentList @('/x', $msi, '/qn', '/norestart')
+          if ($p.ExitCode -ne 0) { throw "msiexec /x exited $($p.ExitCode)" }
+          'ok    an unscoped install chose one scope and did all of it'
 
   linux:
     runs-on: ubuntu-latest
@@ -307,12 +554,14 @@ jobs:
           go version
           git rev-parse HEAD
 
-      - name: the modules resolve for a stranger
+      # The repository first, the proxy second, for the reason the windows job
+      # states: a cache that never forgets cannot say whether a tag exists.
+      - name: the tags exist, and the modules resolve for a stranger
         run: |
           rows() { grep -v '^>' "$1" | sed '/^[[:space:]]*$/d' | tail -n +2 | tr -s '\t'; }
           n=0
           rc=0
-          while IFS=$'\t' read -r path module package feature; do
+          while IFS=$'\t' read -r path module package feature subsystem; do
             n=$((n + 1))
             mod=${module%@*}
             version=${module##*@}
@@ -320,11 +569,22 @@ jobs:
               v[0-9]*) ;;
               *) printf 'FAIL  %s names %s, which is not a published version\n' "$path" "$version"; rc=1; continue ;;
             esac
+            rest=${mod#github.com/openabstractions/}
+            repo=${rest%%/*}
+            dir=${rest#"$repo"}; dir=${dir#/}
+            tag=${dir:+$dir/}$version
+            if ! git ls-remote --tags --exit-code \
+                   "https://github.com/openabstractions/$repo" "refs/tags/$tag" > /dev/null; then
+              printf 'FAIL  %s has no tag %s, so %s is built from a version nobody can clone\n' \
+                "$repo" "$tag" "$path"
+              rc=1
+              continue
+            fi
             if curl -fsS "https://proxy.golang.org/$mod/@v/$version.info" -o "info-$n.json"; then
-              printf 'ok    %-12s %s  %s\n' "$path" "$module" "$(cat "info-$n.json")"
+              printf 'ok    %-12s %s  tag %s  %s\n' "$path" "$module" "$tag" "$(cat "info-$n.json")"
             else
-              printf 'FAIL  %s is not on proxy.golang.org, so nothing outside this org can build %s\n' \
-                "$module" "$path"
+              printf 'FAIL  %s is a tag and proxy.golang.org has not served it, so nothing outside\n' "$tag"
+              printf '      this org can go install %s\n' "$path"
               rc=1
             fi
           done < <(rows tools.tsv)
@@ -347,7 +607,11 @@ jobs:
           rows() { grep -v '^>' "$1" | sed '/^[[:space:]]*$/d' | tail -n +2 | tr -s '\t'; }
           root=$PWD
           for arch in amd64 arm64; do
-            while IFS=$'\t' read -r path module package feature; do
+            while IFS=$'\t' read -r path module package feature subsystem; do
+              if [ "$subsystem" = windows ]; then
+                printf 'note  %s is a windows-subsystem image and is not in a Linux package\n' "$path"
+                continue
+              fi
               mod=${module%@*}
               version=${module##*@}
               case "$package" in
@@ -606,7 +870,11 @@ jobs:
           rows() { grep -v '^>' "$1" | sed '/^[[:space:]]*$/d' | tail -n +2 | tr -s '\t'; }
           root=$PWD
           mkdir -p universal
-          while IFS=$'\t' read -r path module package feature; do
+          while IFS=$'\t' read -r path module package feature subsystem; do
+            if [ "$subsystem" = windows ]; then
+              printf 'note  %s is a windows-subsystem image and is not in a macOS package\n' "$path"
+              continue
+            fi
             mod=${module%@*}
             version=${module##*@}
             case "$package" in
@@ -798,6 +1066,31 @@ jobs:
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
 
+      # The owner's ruling, VISION.md 2026-09-10: hold the release until the
+      # service passes; an explicitly incomplete preview is acceptable and a
+      # fallback that happens by itself is not. A tag push cannot set the
+      # preview input, so a tag whose machine scope was not proved stops here
+      # and says which leg was not proved. Somebody choosing to publish anyway
+      # does it by name, on a run they started, and the release body says so.
+      - name: the machine scope is proven, or a person asked for a preview
+        env:
+          MACHINE_SERVICE: ${{ needs.verify.outputs.machine-service }}
+          PREVIEW: ${{ inputs.preview }}
+        run: |
+          if [ "$MACHINE_SERVICE" = proven ]; then
+            printf 'ok    the machine scope registered a supervisor and an instance was running\n'
+            exit 0
+          fi
+          printf 'UNPROVEN  the machine scope: verify reports "%s"\n' "${MACHINE_SERVICE:-nothing}"
+          if [ "$PREVIEW" != true ]; then
+            printf 'FAIL  this release is held. The Background supervisor feature promises a service\n'
+            printf '      to everyone who installs for everyone, and no run has seen one running.\n'
+            printf '      Re-run this workflow by hand with preview=true to draft it anyway; the\n'
+            printf '      body will say what was not proved.\n'
+            exit 1
+          fi
+          printf 'note  drafting anyway: preview=true was asked for by a person\n'
+
       - name: fetch the packages
         env:
           GH_TOKEN: ${{ github.token }}
@@ -835,6 +1128,7 @@ jobs:
         env:
           MACOS_STATE: ${{ needs.macos.outputs.state }}
           MACOS_MISSING: ${{ needs.macos.outputs.missing }}
+          MACHINE_SERVICE: ${{ needs.verify.outputs.machine-service }}
         run: |
           [ -f NOTES.md ] || { printf 'FAIL  NOTES.md is not in this repository, and generated notes are not what this project ships\n'; exit 1; }
           rc=0
@@ -866,6 +1160,15 @@ jobs:
               printf 'in transit and nothing about who made them.\n'
             fi
             printf '\n## Absent from this release\n\n'
+            if [ "$MACHINE_SERVICE" != proven ]; then
+              printf -- '- **The Windows machine-scope supervisor was not proved on this run.**\n'
+              printf -- '  Installing for everyone registers a per-user service, and this run saw\n'
+              printf -- '  the registration and its restart policy but never saw an instance\n'
+              printf -- '  running: the service manager clones one into a session at sign-in and\n'
+              printf -- '  the runner had no session to clone into. Installing just for you is\n'
+              printf -- '  unaffected and gets a Startup shortcut, which is what it has always\n'
+              printf -- '  got.\n'
+            fi
             case "$MACOS_STATE" in
               signed) ;;
               partial)
