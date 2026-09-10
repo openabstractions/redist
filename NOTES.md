@@ -19,9 +19,9 @@ workflow refuses to build if one of them does not, so this package is made of
 the same artifacts a stranger gets from `go install` and cannot quietly drift
 into being built from something else.
 
-**`jobctl` is not the friendly one.** `jobd` and `dl` find the store from
-`ABSTRACTION_STORE`; `jobctl` reads **`JOB_STORE`** and nothing else, and will
-say `JOB_STORE is not set` if you have only set the other. Its verbs are
+**`jobctl` is not the friendly one.** All three find the store from
+`ABSTRACTION_STORE`. `jobctl` also accepts `JOB_STORE`, which wins where it is
+set, so one shell can point it at a store the other two are not using. Its verbs are
 `submit`, `claim`, `progress`, `finish`, `show`, `cancel`, `intent`, `recall`
 and `orphans` — there is no `jobctl list`. It is the low-level tool for the job
 store, and it is in this package because it is what is published, not because
@@ -111,8 +111,8 @@ MSIs themselves become signing targets.
   writes a job with `dl`, requires `jobd` to see it and `jobctl show` to return
   it, and fails if they disagree. That is one scenario, not a compatibility
   proof.
-- **`jobctl` takes `JOB_STORE`, the other two take `ABSTRACTION_STORE`**, as
-  above. Setting one does not set the other.
+- **`JOB_STORE` overrides `ABSTRACTION_STORE` for `jobctl` alone**, as above.
+  Set it and `jobctl` will be looking at a store `jobd` and `dl` are not.
 - **Windows on ARM is unrun**, as above.
 - A partly fetched download does not resume across a reinstall.
 - Nothing here has been measured on a machine that is not a CI runner.

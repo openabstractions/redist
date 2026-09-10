@@ -224,10 +224,11 @@ jobs:
       # package contains three builds of one store format. Only writing with one
       # and reading with the others says they agree.
       #
-      # jobd and dl take the store from ABSTRACTION_STORE; the published jobctl
-      # reads JOB_STORE and nothing else. That divergence is asserted here, not
-      # worked around: the day jobctl learns ABSTRACTION_STORE this step goes
-      # red and somebody updates the release notes that describe it.
+      # All three take the store from ABSTRACTION_STORE. jobctl also accepts
+      # JOB_STORE, which wins where it is set, because the cross-language
+      # harness points three implementations at one directory with it. Both
+      # names are exercised: the divergence this step used to assert was a
+      # pinned jobctl two releases old, and it went red the day the pin moved.
       - name: the three programs agree about the store
         shell: pwsh
         run: |
@@ -267,9 +268,13 @@ jobs:
             }
 
             Remove-Item Env:JOB_STORE
-            & "$dir\jobctl.exe" show $id 2>&1 | Out-Null
-            if ($LASTEXITCODE -eq 0) {
-              throw 'jobctl now works without JOB_STORE. That is an improvement, and the release notes say it does not: update them.'
+            $without = & "$dir\jobctl.exe" show $id 2>&1
+            if ($LASTEXITCODE -ne 0) {
+              $without
+              throw 'jobctl found the store only under JOB_STORE. The other two read ABSTRACTION_STORE, so one installation would hold two stores.'
+            }
+            if (-not ($without | Select-String -SimpleMatch $id)) {
+              throw 'jobctl exited 0 without JOB_STORE and did not find the record dl wrote'
             }
           } finally {
             Stop-Process -Id $srv.Id -Force
@@ -517,7 +522,7 @@ jobs:
       # on one leg of three.
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
-          go-version: '1.24.13'
+          go-version: '1.26.0'
 
       - name: state
         run: |
