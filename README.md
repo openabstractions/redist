@@ -53,8 +53,19 @@ It resolves them through `proxy.golang.org`, and the proxy serves a version it
 has cached for good — including one whose tag was deleted. So that check cannot
 see a deleted tag; `git ls-remote --tags` on the repository is what does.
 
-The workflow drafts a release; it never publishes one. Publishing is a person's
-decision.
+Start the release workflow manually from the reviewed branch commit with a new
+`version` such as `v0.1.5`. It pins that commit, builds the published modules and
+packages, and runs the existing installer and signing gates before creating any
+version tag. A build failure leaves the proposed tag absent. Existing tags are
+refused and never moved, including tags left by older failed release workflows.
+
+After verification, it creates the tag at the exact tested commit and drafts a
+release using that run's already checked artifacts, without rebuilding. An
+explicit `preview` retains the existing machine-scope evidence exception; it
+does not bypass compilation, packaging or installer checks. The workflow never
+publishes the draft. Publishing is a person's decision. If drafting fails after
+tag creation, inspect that run's artifacts and recover explicitly; rerunning
+with the existing version will refuse it rather than replace it.
 
 ## What is not here
 

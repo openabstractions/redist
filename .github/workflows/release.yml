@@ -1,17 +1,23 @@
 name: release
 
 on:
-  push:
-    tags: ['v*']
   workflow_dispatch:
     inputs:
+      version:
+        description: New release version (vMAJOR.MINOR.PATCH); the tag is created only after verification
+        type: string
+        required: true
       preview:
         description: >-
           Draft the release even though the machine scope was not proven on this
-          run. A tag push cannot set this, so an incomplete release is something
+          run. An incomplete release is something
           a person asked for by name and never something a run decided.
         type: boolean
         default: false
+
+concurrency:
+  group: redist-release-${{ inputs.version }}
+  cancel-in-progress: false
 
 permissions:
   contents: read
@@ -24,10 +30,40 @@ env:
   WIX_VERSION: '5.0.2'
 
 jobs:
+  candidate:
+    runs-on: ubuntu-latest
+    outputs:
+      sha: ${{ steps.candidate.outputs.sha }}
+      version: ${{ steps.candidate.outputs.version }}
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+        with:
+          ref: ${{ github.sha }}
+      - name: validate an untagged candidate
+        id: candidate
+        env:
+          RELEASE_VERSION: ${{ inputs.version }}
+        run: |
+          [[ "$RELEASE_VERSION" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]] || {
+            echo 'FAIL version must be vMAJOR.MINOR.PATCH'; exit 1;
+          }
+          [ "$GITHUB_REF_TYPE" != tag ] || { echo 'FAIL dispatch from a branch, not an existing tag'; exit 1; }
+          sha=$(git rev-parse HEAD)
+          [ "$sha" = "$GITHUB_SHA" ] || { echo 'FAIL checkout differs from dispatch commit'; exit 1; }
+          # A failed lookup must not be confused with an absent tag.
+          refs=$(git ls-remote --tags origin "refs/tags/$RELEASE_VERSION")
+          [ -z "$refs" ] || { echo 'FAIL release tag already exists; choose a new version'; exit 1; }
+          printf 'sha=%s\nversion=%s\n' "$sha" "${RELEASE_VERSION#v}" >> "$GITHUB_OUTPUT"
+
   windows:
+    needs: candidate
+    env:
+      CANDIDATE_VERSION: ${{ needs.candidate.outputs.version }}
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+        with:
+          ref: ${{ needs.candidate.outputs.sha }}
 
       - name: state
         run: |
@@ -166,9 +202,10 @@ jobs:
       # checkouts, and a row with no source here is named and gated out, the way
       # posix/build.py does it.
       - name: package
+        env:
+          CANDIDATE_VERSION: ${{ needs.candidate.outputs.version }}
         run: |
-          ref=${GITHUB_REF_NAME#v}
-          case "$ref" in [0-9]*.[0-9]*.[0-9]*) version=$ref ;; *) version=0.0.0 ;; esac
+          version=$CANDIDATE_VERSION
 
           wix extension add -g "WixToolset.UI.wixext/$WIX_VERSION"
 
@@ -543,9 +580,14 @@ jobs:
           'ok    an unscoped install chose one scope and did all of it'
 
   linux:
+    needs: candidate
+    env:
+      CANDIDATE_VERSION: ${{ needs.candidate.outputs.version }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+        with:
+          ref: ${{ needs.candidate.outputs.sha }}
 
       - name: state
         run: |
@@ -659,9 +701,10 @@ jobs:
       # of them would be one file with two homes. build.py names every row it
       # leaves out for that reason, and stops if a program is ever one of them.
       - name: package
+        env:
+          CANDIDATE_VERSION: ${{ needs.candidate.outputs.version }}
         run: |
-          ref=${GITHUB_REF_NAME#v}
-          case "$ref" in [0-9]*.[0-9]*.[0-9]*) version=$ref ;; *) version=0.0.0 ;; esac
+          version=$CANDIDATE_VERSION
           mkdir -p dist
           for arch in amd64 arm64; do
             python3 posix/build.py --platform linux --arch "$arch" --version "$version" \
@@ -775,12 +818,17 @@ jobs:
   # package as a workflow artifact and says UNPROVEN in the summary and in the
   # release notes; a signed run attaches it and says which it was.
   macos:
+    needs: candidate
+    env:
+      CANDIDATE_VERSION: ${{ needs.candidate.outputs.version }}
     runs-on: macos-latest
     outputs:
       state: ${{ steps.material.outputs.state }}
       missing: ${{ steps.material.outputs.missing }}
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+        with:
+          ref: ${{ needs.candidate.outputs.sha }}
 
       # This image carries no Go, and `go version` belongs in the state line, so
       # Go is installed before the first number rather than the state line
@@ -922,9 +970,10 @@ jobs:
           done
 
       - name: package
+        env:
+          CANDIDATE_VERSION: ${{ needs.candidate.outputs.version }}
         run: |
-          ref=${GITHUB_REF_NAME#v}
-          case "$ref" in [0-9]*.[0-9]*.[0-9]*) version=$ref ;; *) version=0.0.0 ;; esac
+          version=$CANDIDATE_VERSION
           mkdir -p dist
           python3 posix/build.py --platform macos --version "$version" \
             --out dist --bin universal --license LICENSE
@@ -1058,18 +1107,20 @@ jobs:
           printf 'ok    the keychain this run made is gone\n'
 
   draft:
-    needs: [windows, verify, linux, linux-verify, macos]
+    needs: [candidate, windows, verify, linux, linux-verify, macos]
     runs-on: ubuntu-latest
     permissions:
       contents: write
       actions: read
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+        with:
+          ref: ${{ needs.candidate.outputs.sha }}
 
       # The owner's ruling, VISION.md 2026-09-10: hold the release until the
       # service passes; an explicitly incomplete preview is acceptable and a
-      # fallback that happens by itself is not. A tag push cannot set the
-      # preview input, so a tag whose machine scope was not proved stops here
+      # fallback that happens by itself is not. A candidate whose machine
+      # scope was not proved stops here
       # and says which leg was not proved. Somebody choosing to publish anyway
       # does it by name, on a run they started, and the release body says so.
       - name: the machine scope is proven, or a person asked for a preview
@@ -1182,8 +1233,6 @@ jobs:
                 printf -- '  and a download that cannot be opened is worse than a platform that\n'
                 printf -- '  says it has no package. `go install` is the route on macOS.\n' ;;
             esac
-            printf -- '- **Abstraction Panel**, the graphical front end: published from nowhere,\n'
-            printf -- '  so no package here contains it.\n'
             printf -- '- **The C++ developer headers**: carried by no module.\n'
             printf -- '- **The Python packages**: published on their own registry, so no package\n'
             printf -- '  here carries a second copy of them.\n'
@@ -1227,15 +1276,22 @@ jobs:
 
       # A draft, always. A release is permanent and public the moment it is not
       # a draft, and that is the owner's decision to make, not this workflow's.
-      - name: draft the release
+      - name: tag the verified commit and draft its existing artifacts
         env:
+          CANDIDATE_SHA: ${{ needs.candidate.outputs.sha }}
+          CANDIDATE_VERSION: ${{ needs.candidate.outputs.version }}
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
           MACOS_STATE: ${{ needs.macos.outputs.state }}
         run: |
-          tag=$GITHUB_REF_NAME
+          tag=v${CANDIDATE_VERSION}
+          [ "$(git rev-parse HEAD)" = "$CANDIDATE_SHA" ] || { echo 'FAIL candidate checkout changed'; exit 1; }
+          # The refs API creates only; an existing tag causes failure, including
+          # concurrent/manual creation after candidate validation. Never force it.
+          gh api --method POST "repos/$GH_REPO/git/refs" \
+            -f "ref=refs/tags/$tag" -f "sha=$CANDIDATE_SHA"
           set -- dist/abstraction-x64.msi dist/abstraction-arm64.msi \
             dist/*-linux-amd64.tar.gz dist/*-linux-arm64.tar.gz dist/SHA256SUMS
           if [ "$MACOS_STATE" = signed ]; then set -- "$@" dist/*.pkg; fi
-          gh release create "$tag" --draft --title "$tag" --notes-file "$RUNNER_TEMP/NOTES.md" "$@"
+          gh release create "$tag" --verify-tag --target "$CANDIDATE_SHA" --draft --title "$tag" --notes-file "$RUNNER_TEMP/NOTES.md" "$@"
           printf 'ok    drafted %s with %s assets. It is not published until a person publishes it.\n' "$tag" "$#"
