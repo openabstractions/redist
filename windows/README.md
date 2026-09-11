@@ -6,14 +6,14 @@ shape .NET and Git for Windows already use:
 | feature | default | what it is |
 |---|---|---|
 | Background supervisor | on, cannot be unticked | `jobd`, and whatever starts it: a per-user service for everyone, a Startup shortcut for just you |
-| Command-line tools and examples | on | `dl`, `jobctl`, three examples that run against this install, and the panel when there is one to pack |
+| Command-line tools and examples | on | `dl`, `jobctl`, `openabstractions`, three examples that run against this install, and the panel when there is one to pack |
 | Add to PATH | on, a tick of its own | `tools\` on `PATH`; untick it and the tools are still installed |
 | Developer files | off | headers, the Python packages, the Go module paths |
 
 ## What lands where
 
     OpenAbstractions\
-      tools\      dl.exe, jobctl.exe, jobd.exe, the panel — the one folder on PATH
+      tools\      dl.exe, jobctl.exe, openabstractions.exe, jobd.exe, jobdw.exe, the panel — the one folder on PATH
       examples\   three folders, each one runnable .cmd and the source it runs
       dev\        USING.txt, and the headers and Python packages when packed
 
@@ -81,6 +81,11 @@ exact experience being removed from a different program of ours.
 `APPLICATIONFOLDER=` overrides the install folder. `ALLUSERS=1` asks for the
 machine scope.
 
+The `openabstractions` console tool supplies foreground capability commands:
+`openabstractions serve logging`, `openabstractions serve config`, and
+`openabstractions serve router-v1`. The installer does not register these as
+background services; its existing supervisor registration remains separate.
+
 ## Build it
 
 WiX needs no .NET SDK. Unzip the two NuGet packages and run the tool:
@@ -92,7 +97,8 @@ WiX needs no .NET SDK. Unzip the two NuGet packages and run the tool:
     py -3 installer/build.py --arch x64 --version 0.2.0 \
       --wix wix/tools/net6.0/any/wix.exe \
       --ext ui/wixext5/WixToolset.UI.wixext.dll --out dist \
-      --src self=. --src download=<abstraction-download> --src job=<abstraction-job>
+      --src self=<service-jobd> --src download=<abstraction-download> \
+      --src job=<abstraction-job> --src charter=<abstractions>
 
 `build.py` stages every `payload.tsv` row, writes `license.rtf` through
 `mklicense.py`, runs `validate.py` and calls `wix build`. A source not named
@@ -129,11 +135,11 @@ cannot gate away.
 
 ## What may break
 
-- **The panel and the C++ header have no publishable source.** Their rows in
-  `payload.tsv` name `UNRESOLVED`, the workflow leaves them out and says so, and
-  `abstraction.wxs` gates them on `$(var.Panel)` and `$(var.Cpp)`. The panel's
-  home and the `tools.tsv` row it needs are written out in
-  the loader gives it no console.
+- **The optional curl adapter header has no verified public commit.** Its
+  declared home is `abstraction-download-over-curl`, but the public repository
+  had no refs when checked on 2026-09-12. Its row remains `UNRESOLVED` and gated
+  by `$(var.Cpp)`. Panel has a public module and a `tools.tsv` row; it is included
+  when its prebuilt executable or source is supplied.
 - **The Python packages are in the release build and not in the release
   package.** `$(var.Dev)` is the third gate. Those rows have a source, and a
   build assembled out of published module versions has no checkout to copy them
@@ -141,11 +147,10 @@ cannot gate away.
   and `--src download` carries them and the release does not; `dev/USING.txt`
   names both cases and points at the registry, and where a person is told to
   get them is still one sentence in a text file rather than a page anywhere.
-- **The machine scope has never been installed.** Everything above about
-  `%ProgramFiles%`, the machine `PATH`, `HKLM` and the per-user service is read
-  from the built package's tables and from one refusal; no elevated install has
-  been run by anybody. What remains is the list of commands
-  that closes it, and § 3.3 says `UNPROVEN` in those words.
+- **Machine-scope evidence depends on the release run.** The workflow checks
+  registration, configuration and recovery policy; a running per-user service
+  instance also requires a suitable session. Read the run result and any
+  explicit preview limitation; source tables alone do not prove installation.
 - **A hosted runner is an administrator and a person is not.** Anything the
   release workflow's `verify` job asserts is asserted as an administrator, and
   that is the one privilege it cannot test.

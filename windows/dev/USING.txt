@@ -15,7 +15,9 @@ same registry every other Python package does.
 
 C++ — one header, no library and no dependency beyond curl on PATH. If
 include\abstraction\ is beside this file, include from it; a release package
-carries it in no form, because over_curl.hpp publishes from no repository yet.
+omits this optional header. Its declared home is abstraction-download-over-curl,
+but no public commit was available at the 2026-09-12 check. This curl adapter
+is separate from the generated service clients and shared IPC runtime.
 
     cl /std:c++17 /I .\include yourprogram.cpp
 

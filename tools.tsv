@@ -41,3 +41,4 @@ jobdw.exe	github.com/openabstractions/service-jobd@v0.3.0		.		service		windows
 dl.exe		github.com/openabstractions/abstraction-download/go@v0.4.1	cmd/dl		tools		console
 jobctl.exe	github.com/openabstractions/abstraction-job/go@v0.4.1	cmd/jobctl	tools		console
 Abstraction Panel.exe	github.com/openabstractions/abstractions/monitor@v0.1.0	.		tools		windows
+openabstractions.exe	github.com/openabstractions/abstractions/serve@v0.1.0	.	tools	console

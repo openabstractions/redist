@@ -310,7 +310,7 @@ jobs:
           $dir = Join-Path $env:LOCALAPPDATA 'Programs\OpenAbstractions'
           $tools = Join-Path $dir 'tools'
           if (-not (Test-Path $tools)) { throw "a per-user install did not land in $tools" }
-          foreach ($f in 'jobd.exe','jobdw.exe','dl.exe','jobctl.exe') {
+          foreach ($f in 'jobd.exe','jobdw.exe','dl.exe','jobctl.exe','openabstractions.exe') {
             if (-not (Test-Path (Join-Path $tools $f))) { throw "$f was not installed" }
           }
           $path = (Get-ItemProperty 'HKCU:\Environment' -Name Path -ErrorAction Stop).Path
@@ -437,7 +437,7 @@ jobs:
           $dir = Join-Path $env:ProgramFiles 'OpenAbstractions'
           $tools = Join-Path $dir 'tools'
           if (-not (Test-Path $tools)) { throw "a per-machine install did not land in $tools" }
-          foreach ($f in 'jobd.exe','jobdw.exe','dl.exe','jobctl.exe') {
+          foreach ($f in 'jobd.exe','jobdw.exe','dl.exe','jobctl.exe','openabstractions.exe') {
             if (-not (Test-Path (Join-Path $tools $f))) { throw "$f was not installed" }
           }
           $key = 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Environment'
@@ -754,13 +754,13 @@ jobs:
 
       - name: what it installed
         run: |
-          for f in jobd dl jobctl; do
+          for f in jobd dl jobctl openabstractions; do
             [ -x "$HOME/.local/bin/$f" ] || { printf 'FAIL  %s was not installed\n' "$f"; exit 1; }
           done
           [ -f "$HOME/.local/share/abstraction/MANIFEST" ] || { printf 'FAIL  no MANIFEST, so uninstall.sh cannot know what to remove\n'; exit 1; }
           [ -x "$HOME/.local/share/abstraction/uninstall.sh" ] || { printf 'FAIL  no uninstall.sh\n'; exit 1; }
           [ -f "$HOME/.local/share/abstraction/LICENSE" ] || { printf 'FAIL  no LICENSE in the package\n'; exit 1; }
-          printf 'ok    three programs, a MANIFEST, an uninstaller and a licence\n'
+          printf 'ok    four programs, a MANIFEST, an uninstaller and a licence\n'
           cat "$HOME/.local/share/abstraction/MANIFEST"
 
       - name: the three programs agree about the store
@@ -802,7 +802,7 @@ jobs:
         run: |
           "$HOME/.local/share/abstraction/uninstall.sh"
           left=0
-          for f in jobd dl jobctl; do
+          for f in jobd dl jobctl openabstractions; do
             [ -e "$HOME/.local/bin/$f" ] && { printf 'FAIL  %s survived uninstall\n' "$f"; left=1; }
           done
           [ -e "$HOME/.local/share/abstraction" ] && { printf 'FAIL  the share directory survived uninstall\n'; ls -la "$HOME/.local/share/abstraction"; left=1; }
@@ -1038,7 +1038,7 @@ jobs:
         run: |
           pkg=$(ls dist/*.pkg)
           pkgutil --expand-full "$pkg" "$RUNNER_TEMP/expanded"
-          for name in jobd dl jobctl; do
+          for name in jobd dl jobctl openabstractions; do
             f=$(find "$RUNNER_TEMP/expanded" -type f -name "$name" | head -1)
             [ -n "$f" ] || { printf 'FAIL  %s is not in the package\n' "$name"; exit 1; }
             codesign --verify --strict --verbose=2 "$f"
@@ -1055,7 +1055,7 @@ jobs:
           {
             if [ "$STATE" = signed ]; then
               printf '\n### macOS — signed and notarised\n\n'
-              printf 'The universal `.pkg` is **attached to the release**. Its three programs\n'
+              printf 'The universal `.pkg` is **attached to the release**. Its four programs\n'
               printf 'are signed with a Developer ID Application certificate with the hardened\n'
               printf 'runtime enabled; the package is signed with a Developer ID Installer\n'
               printf 'certificate, notarised by Apple and stapled. `spctl -a -vv -t install`\n'
@@ -1200,7 +1200,7 @@ jobs:
             printf -- '  scheme for them here.\n'
             if [ "$MACOS_STATE" = signed ]; then
               printf -- '- **macOS** — the `.pkg` **is signed**: a Developer ID Installer\n'
-              printf -- '  certificate, notarised by Apple and stapled, and the three programs\n'
+              printf -- '  certificate, notarised by Apple and stapled, and the four programs\n'
               printf -- '  inside it signed with a Developer ID Application certificate with the\n'
               printf -- '  hardened runtime enabled. It has still never been installed on a Mac.\n'
               printf -- '  Gatekeeper opening a package is not the claim that the package works.\n'

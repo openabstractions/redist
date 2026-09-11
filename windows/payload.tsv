@@ -21,10 +21,12 @@
 > and still left out of a --bin one. sources.tsv says which sources those are.
 > A row the --bin route cannot fill must be gated in abstraction.wxs, because a
 > gate is what turns a missing file into a smaller package instead of a red
-> build: that is why jobd's windows-subsystem twin has no row here yet.
+> build. jobd.exe and jobdw.exe are separate console/windowless links of the
+> same supervisor source and both have required rows below.
 >
-> over_curl.hpp is the C++ package and bindings/download-over-curl is in no
-> repository rule, so it publishes nowhere: its source stays UNRESOLVED.
+> over_curl.hpp has a declared abstraction-download-over-curl repository rule,
+> but no public refs were present at the 2026-09-12 check. Until a public commit
+> is verified, its optional source stays UNRESOLVED.
 >
 > The Panel ships no side-by-side manifest. Its two elements were a dpiAware
 > setting that monitor/win/win_windows.go already applies by calling
@@ -59,3 +61,4 @@ developer	dev/python/job/pyproject.toml			copy		job		python/pyproject.toml				no
 developer	dev/python/download/abstraction_download.py	copy		download	python/abstraction_download.py			no	-
 developer	dev/python/download/pyproject.toml		copy		download	python/pyproject.toml				no	-
 developer	dev/include/abstraction/download/over_curl.hpp	copy		UNRESOLVED	include/abstraction/download/over_curl.hpp	no	-
+tools	tools/openabstractions.exe	gobuild	charter	serve	yes	console

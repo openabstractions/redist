@@ -3,13 +3,14 @@
 **The Open Abstractions redistributable: one installer per platform, built from
 published tags.**
 
-Three command-line programs in one package — `jobd`, which keeps downloads
-running when no application is open; `dl`, which fetches a URL resumably and
-verifies its digest; and `jobctl`, which lists and controls what they are
-doing. Get them from [Releases](https://github.com/openabstractions/redist/releases).
+The package contains `jobd`, which supervises downloads; `dl`, which fetches
+and verifies them; `jobctl`, which inspects and controls jobs; and
+`openabstractions`, which exposes the individual capability services. Windows
+also includes the Panel and the windowless supervisor image. Get them from [Releases](https://github.com/openabstractions/redist/releases).
 
-**In development. No published release yet.** Today the route is `go install`,
-below.
+**In development.** Check the selected release and its build evidence for
+actual assets, signing and installation coverage; a draft is not a published
+release.
 
 ## Installing
 
@@ -20,9 +21,19 @@ on your `PATH`, and needs no administrator rights.
 
     sha256sum -c SHA256SUMS
 
-**The packages are not signed.** SmartScreen will warn, and the publisher will
-show as unknown. Each release says so on its own page, with what follows from
-it.
+**Check the release-specific signing notes.** Windows MSI and Linux tarball
+assets are unsigned in the current workflow; macOS assets are attached only
+after its signing and notarization gates. A checksum is not a signature.
+
+The central CLI is available on PATH, for example:
+
+    openabstractions serve logging
+    openabstractions serve config
+    openabstractions serve router-v1
+
+Run one selected command in the foreground. Installing the binary does not
+register these capability processes to start automatically. The existing
+background registration belongs to the download supervisor.
 
 ## Without an installer
 
@@ -33,8 +44,9 @@ from:
 
     go install <module>
 
-Nothing else in this repository types a version: two lists of the same three
-versions are two lists that disagree.
+Use the module and package columns together: for a package other than `.`,
+append its package path before the `@version`. The suite installer version is
+separate from the versions of the modules it contains.
 
 ## What this repository is
 
@@ -70,7 +82,9 @@ with the existing version will refuse it rather than replace it.
 ## What is not here
 
 - **No source for the programs.** They are built from the modules above.
-- **macOS and Linux packages.** Neither is built yet; `go install` works on
-  both.
+- **Automatic startup of the central capability services.** The CLI is
+  installed; capability registration is not added by this package.
+- **Uniform platform evidence.** The workflow builds Linux tarballs and macOS
+  packages, but each release reports which checks ran and which assets ship.
 - **A container.** `jobd` for a NAS is
   [docker-jobd](https://github.com/openabstractions/docker-jobd).

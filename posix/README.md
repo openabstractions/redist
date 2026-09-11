@@ -44,7 +44,7 @@ review. Reinstalling over an existing install is how you upgrade, and
 
 | what | where |
 |---|---|
-| `jobd`, `dl`, `jobctl` | `~/.local/bin/` |
+| `jobd`, `dl`, `jobctl`, `openabstractions` | `~/.local/bin/` |
 | the sweep unit and its timer | `~/.config/systemd/user/abstraction-jobd.{service,timer}` |
 | the Python packages and `USING.txt` | `~/.local/share/abstraction/dev/` |
 | `LICENSE` | `~/.local/share/abstraction/` |
@@ -59,7 +59,7 @@ It does **not** edit any shell profile. If `~/.local/bin` is not on `PATH` it
 prints the one line to add and says why it will not add it for you.
 
 It does **not** fail when there is no systemd user manager — a container, WSL
-without systemd, a machine with no user bus. It installs the three programs,
+without systemd, a machine with no user bus. It installs the four programs,
 prints that nothing will sweep in the background and what to run instead, and
 records `timer no` in the manifest. Absence is reported, never passed.
 
@@ -83,7 +83,7 @@ destination the installer offers is the current user's home.
 
 | what | where |
 |---|---|
-| `jobd`, `dl`, `jobctl`, universal | `~/.local/bin/` |
+| `jobd`, `dl`, `jobctl`, `openabstractions`, universal | `~/.local/bin/` |
 | the LaunchAgent | `~/Library/LaunchAgents/com.openabstractions.jobd.plist` |
 | the Python packages and `USING.txt` | `~/.local/share/abstraction/dev/` |
 | `LICENSE` | `~/.local/share/abstraction/` |
@@ -106,6 +106,11 @@ directories, runs `pkgutil --forget com.openabstractions.abstraction`, and
 prints the command for `~/.abstraction` and
 `~/Library/Application Support/abstraction`.
 
+`openabstractions serve logging`, `openabstractions serve config`, and
+`openabstractions serve router-v1` run the selected capability in the foreground.
+The package supplies the executable but does not add automatic registration
+for these commands. Its existing timer/LaunchAgent belongs to jobd.
+
 ## Build it
 
 Both build from published sources checked out at the commits `sources.tsv`
@@ -114,11 +119,11 @@ each checkout and refuses a build where it does not match.
 
     py -3 installer/posix/build.py --platform linux --arch amd64 --version 0.3.0 \
       --out dist --src jobd=<service-jobd> --src download=<abstraction-download> \
-      --src job=<abstraction-job>
+      --src job=<abstraction-job> --src charter=<abstractions>
 
     python3 installer/posix/build.py --platform macos --version 0.3.0 \
       --out dist --src jobd=<service-jobd> --src download=<abstraction-download> \
-      --src job=<abstraction-job>
+      --src job=<abstraction-job> --src charter=<abstractions>
 
 The Linux tarball is deterministic: fixed mtimes, uid 0, sorted names, gzip with
 no timestamp. Two builds of one commit are byte-identical. The macOS package is
@@ -129,8 +134,10 @@ name on a machine that has none of them rather than skipping the package.
 
 ## Signing
 
-**Nothing here is signed.** The tarball says so on its last line, the macOS
-welcome and conclusion panes say so, and the release notes say so.
+The local packager emits unsigned packages. The redist workflow can sign and
+notarize the macOS package and its programs; it attaches a macOS asset only
+after those gates pass. Linux tarballs remain unsigned. Consult the selected
+release for its actual signing and installation evidence.
 
 Signing needs material only the project owner can produce, and what he has to
 produce is not a stranger's business: it names a certificate, a person and a
@@ -138,9 +145,10 @@ team identifier. It is kept in the private tree.
 
 ## What may break
 
-- **Nothing on macOS has been executed.** `pkgbuild`, `productbuild`,
-  `lipo`, the postinstall script, `launchctl bootstrap` and `pkgutil --forget`
-  have never run. They are `UNPROVEN` until a `macos-latest` runner runs them.
+- **Building and signing are not installation proof.** The hosted workflow
+  builds the macOS package and conditionally signs/notarizes it. This does not
+  establish that its postinstall, LaunchAgent or uninstall behavior was tested
+  on an actual user installation.
 - **The `enable_currentUserHome` install location is the least-travelled part.**
   A component built with `--install-location /` and installed into the home
   domain lands relative to the home directory; if that turns out to be wrong on
@@ -150,9 +158,10 @@ team identifier. It is kept in the private tree.
   or macOS and it tells you to type Windows commands. These packages therefore
   register the timer and the agent themselves, and now three places own the
   shape of that schedule instead of two.
-- **`jobd` has no published tag.** `openabstractions/service-jobd` carries no
-  tags at all, so `sources.tsv` pins it to a commit on `main` and marks the tag
-  column `-`. `dl` and `jobctl` come from `go/v0.3.0` in their own repositories.
+- **Source-build pins and release module versions differ.** `sources.tsv`
+  describes explicit checkout builds; redist builds programs from its
+  `tools.tsv` module versions and passes them with `--bin`. A historical `-`
+  tag field is not a statement about all tags now in that repository.
 - **`~/.local/bin` is on `PATH` by default on most Linux distributions and on no
   macOS.** Both installers print the line; neither writes it.
 - **The Windows package offers three features and these offer none.** A tarball
@@ -160,7 +169,7 @@ team identifier. It is kept in the private tree.
   developer files included. That is a deliberate divergence from
   `abstraction.wxs`, which makes Developer opt-in.
 - **The Windows package ships runnable examples and these ship none.** Both
-  packages agree on the tools — all three programs in one directory on `PATH`,
+  packages agree on the tools — all four programs in one directory on `PATH`,
   `~/.local/bin` here and `OpenAbstractions\tools\` there — and `installer/examples/`
   has no counterpart on either platform. Its three `.cmd` files are Windows
   shells; a person on Linux or macOS is given `USING.txt` and nothing to run.

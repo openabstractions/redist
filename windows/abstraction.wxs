@@ -225,6 +225,9 @@
 
     <ComponentGroup Id="ToolFiles" Directory="ToolsFolder">
       <Component>
+        <File Id="openabstractions.exe" Source="payload/tools/openabstractions.exe" KeyPath="yes" />
+      </Component>
+      <Component>
         <File Id="dl.exe" Source="payload/tools/dl.exe" KeyPath="yes" />
       </Component>
       <Component>

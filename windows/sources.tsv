@@ -10,17 +10,17 @@
 >         nothing to take. It becomes a commit on the day the split publishes
 >         the files there, and never moves afterwards.
 >
-> UNRESOLVED is a source that has no published home at all. A payload row naming
+> UNRESOLVED is a source with no verified published commit. A payload row naming
 > it must be gated by a preprocessor variable in abstraction.wxs, and the
 > workflow leaves it out of the package and says so in the job summary. It is not
 > a placeholder to be filled in silently: somebody has to decide where that file
-> is published from.
+> is published from and verify its commit.
 >
 > panel is the control panel, published into openabstractions/abstractions as the
 > module github.com/openabstractions/abstractions/monitor. The directory reaches
 > that repository through scripts/split.manifest's "tree monitor monitor"; the
-> tag a module in a subdirectory takes is monitor/vX.Y.Z, and until one exists
-> the release route has no row in redist/tools.tsv to build the program from.
+> tag a module in a subdirectory takes is monitor/vX.Y.Z. The release route
+> builds its Panel executable from the module version in redist/tools.tsv.
 
 id		repo						ref
 self		-						-
@@ -29,3 +29,4 @@ download	openabstractions/abstraction-download		b344af364b44468c590e1f2cb1e61812
 job		openabstractions/abstraction-job		5c396e8b5ed0c3aa91bc5872fa0785d11624b35c
 panel		openabstractions/abstractions			fc273d2f6bffc54623081a0b28e5c2701ccc4651
 UNRESOLVED	-						-
+charter	openabstractions/abstractions	3ef816c8bbd62a9e1da21c8e51ce69f99b70af41

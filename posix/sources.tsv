@@ -20,3 +20,4 @@ id		repo					tag		commit
 jobd		openabstractions/service-jobd		-		415161ab6aed348050071f10fc1cafc5811e6c81
 download	openabstractions/abstraction-download	go/v0.3.0	9093166ef9d87c65993d254f711b0904fe9035da
 job		openabstractions/abstraction-job		go/v0.3.0	28fc45e7592877e70b9a99b5989ac584bd55c38e
+charter	openabstractions/abstractions	serve/v0.1.0	3ef816c8bbd62a9e1da21c8e51ce69f99b70af41

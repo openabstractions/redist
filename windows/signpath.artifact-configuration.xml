@@ -6,6 +6,7 @@
       <pe-file path="tools/jobdw.exe"><authenticode-sign /></pe-file>
       <pe-file path="tools/dl.exe"><authenticode-sign /></pe-file>
       <pe-file path="tools/jobctl.exe"><authenticode-sign /></pe-file>
+      <pe-file path="tools/openabstractions.exe"><authenticode-sign /></pe-file>
       <pe-file path="tools/Abstraction Panel.exe"><authenticode-sign /></pe-file>
       <authenticode-sign />
     </msi-file>
@@ -14,6 +15,7 @@
       <pe-file path="tools/jobdw.exe"><authenticode-sign /></pe-file>
       <pe-file path="tools/dl.exe"><authenticode-sign /></pe-file>
       <pe-file path="tools/jobctl.exe"><authenticode-sign /></pe-file>
+      <pe-file path="tools/openabstractions.exe"><authenticode-sign /></pe-file>
       <pe-file path="tools/Abstraction Panel.exe"><authenticode-sign /></pe-file>
       <authenticode-sign />
     </msi-file>
