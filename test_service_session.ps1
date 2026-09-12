@@ -57,11 +57,33 @@ function Write-Diagnostic([string]$Text) {
     $Text | Write-Output
     $Text | Add-Content -Encoding UTF8 'service-session.log'
 }
+# Process.Start retains the creation handle, including for an already-exited
+# child. Start-Process -PassThru on Windows PowerShell can return a PID-only
+# wrapper whose ExitCode becomes null after redirected child exit.
+function Invoke-StatusProcess([Diagnostics.ProcessStartInfo]$StartInfo) {
+    $process = New-Object Diagnostics.Process
+    $process.StartInfo = $StartInfo
+    try {
+        if (-not $process.Start()) { throw 'Runtime status process did not start' }
+        $output = $process.StandardOutput.ReadToEndAsync()
+        $diagnostics = $process.StandardError.ReadToEndAsync()
+        if (-not $process.WaitForExit(10000)) {
+            $process.Kill()
+            if (-not $process.WaitForExit(5000)) { throw 'Runtime status termination was not observed' }
+            throw 'Runtime status exceeded its waiting budget'
+        }
+        if (-not $output.Wait(5000) -or -not $diagnostics.Wait(5000)) { throw 'Runtime status output did not close' }
+        $code = $process.ExitCode
+        if ($null -eq $code) { throw 'Runtime status exit code was not observed' }
+        return [pscustomobject]@{ ExitCode=$code; Output=$output.Result; Diagnostics=$diagnostics.Result }
+    } finally { $process.Dispose() }
+}
 # Only fixed vocabulary reaches the artifact; captured CLI text may contain paths or secrets.
-function Format-StatusFailure([int]$ExitCode, [string]$Json, [string]$Diagnostics) {
+function Format-StatusFailure([Nullable[int]]$ExitCode, [string]$Json, [string]$Diagnostics) {
     $Json = $Json.Substring(0, [Math]::Min(4096, $Json.Length))
     $Diagnostics = $Diagnostics.Substring(0, [Math]::Min(4096, $Diagnostics.Length))
-    $fields = @("exit=$ExitCode")
+    $exitText = if ($null -eq $ExitCode) { 'unobserved' } else { [string]$ExitCode }
+    $fields = @("exit=$exitText")
     $errorText = $Diagnostics
     try {
         $report = ConvertFrom-Json -InputObject $Json -ErrorAction Stop
@@ -69,7 +91,7 @@ function Format-StatusFailure([int]$ExitCode, [string]$Json, [string]$Diagnostic
         $fields += 'json=parsed'
         foreach ($name in @('abstraction.logging','abstraction.config')) {
             $items = @($report.capabilities | Where-Object { $_.capability -ceq $name })
-            if ($items.Count -eq 1 -and $items[0].status -cin @('resolved','unavailable','refused','unsupported')) {
+            if ($items.Count -eq 1 -and $items[0].status -cin @('resolved','unavailable','forbidden','incompatible','unmet_requirements','not_ready','invalid_request')) {
                 $fields += "$name=$($items[0].status)"
             } else { $fields += "$name=missing-or-invalid" }
         }
@@ -270,32 +292,36 @@ try {
     }
     $script:lastStatusFailure = $null
     function Test-RuntimeReady {
-        $output = [IO.Path]::GetTempFileName()
-        $errors = [IO.Path]::GetTempFileName()
         $previousEndpoint = $env:ABSTRACTION_RUNTIME_ENDPOINT
-        $probe = $null
         try {
             $env:ABSTRACTION_RUNTIME_ENDPOINT = $null
-            # The diagnostic derives bootstrap from the fresh user's process token.
-            $probe = Start-Process -FilePath $runtimeImage -ArgumentList @('status','--json','--timeout','5s') -Credential $credential -LoadUserProfile -WorkingDirectory (Split-Path $runtimeImage) -WindowStyle Hidden -PassThru -RedirectStandardOutput $output -RedirectStandardError $errors
-            if (-not $probe.WaitForExit(10000)) { $probe.Kill(); $probe.WaitForExit(); throw 'Runtime status exceeded its waiting budget' }
-            $probe.Refresh()
+            # Keep the creation handle and derive bootstrap from the fresh user's token.
+            $info = New-Object Diagnostics.ProcessStartInfo
+            $info.FileName = $runtimeImage
+            $info.Arguments = 'status --json --timeout 5s'
+            $info.UseShellExecute = $false
+            $info.CreateNoWindow = $true
+            $info.WorkingDirectory = Split-Path $runtimeImage
+            $info.RedirectStandardOutput = $true
+            $info.RedirectStandardError = $true
+            $info.UserName = $credential.GetNetworkCredential().UserName
+            $info.Domain = $credential.GetNetworkCredential().Domain
+            $info.Password = $credential.Password
+            $info.LoadUserProfile = $true
+            $probe = Invoke-StatusProcess $info
+            if ($null -eq $probe.ExitCode) { throw 'Runtime status exit code was not observed' }
             if ($probe.ExitCode -ne 0) {
-                $line = Format-StatusFailure $probe.ExitCode (Get-Content -LiteralPath $output -Raw) (Get-Content -LiteralPath $errors -Raw)
+                $line = Format-StatusFailure $probe.ExitCode $probe.Output $probe.Diagnostics
                 if ($line -ne $script:lastStatusFailure) { Write-Diagnostic $line | Out-Null; $script:lastStatusFailure = $line }
                 return $false
             }
-            $result = Get-Content -LiteralPath $output -Raw | ConvertFrom-Json
+            $result = ConvertFrom-Json -InputObject $probe.Output
             foreach ($capability in @('abstraction.logging','abstraction.config')) {
                 $matches = @($result.capabilities | Where-Object { $_.capability -eq $capability -and $_.status -eq 'resolved' })
                 if ($matches.Count -ne 1) { throw "Runtime diagnostic omitted ready $capability" }
             }
             return $true
-        } finally {
-            $env:ABSTRACTION_RUNTIME_ENDPOINT = $previousEndpoint
-            if ($probe) { $probe.Dispose() }
-            Remove-Item -LiteralPath $output,$errors -ErrorAction SilentlyContinue
-        }
+        } finally { $env:ABSTRACTION_RUNTIME_ENDPOINT = $previousEndpoint }
     }
     $runtime = Wait-Condition { Find-Runtime ([int]$first.ProcessId) } 60 'runtime child in fresh user session'
     Wait-Condition { Test-RuntimeReady } 60 'logging and config capability readiness' | Out-Null

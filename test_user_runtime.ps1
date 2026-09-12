@@ -12,16 +12,36 @@ if ($Mode -eq 'ValidateOnly') {
 if ($env:GITHUB_ACTIONS -ne 'true' -or $env:RUNNER_ENVIRONMENT -ne 'github-hosted') {
     throw 'This mutating fixture requires a disposable GitHub-hosted runner.'
 }
-function Invoke-Bounded([string]$Image, [string[]]$Arguments, [int]$Seconds = 90) {
-    $process = Start-Process -FilePath $Image -ArgumentList $Arguments -WindowStyle Hidden -PassThru
+function Invoke-FixtureProcess([Diagnostics.ProcessStartInfo]$StartInfo, [int]$Seconds) {
+    $StartInfo.UseShellExecute = $false
+    $StartInfo.CreateNoWindow = $true
+    $StartInfo.WindowStyle = [Diagnostics.ProcessWindowStyle]::Hidden
+    if (-not $StartInfo.WorkingDirectory) { $StartInfo.WorkingDirectory = (Get-Location).Path }
+    $StartInfo.RedirectStandardOutput = $true
+    $StartInfo.RedirectStandardError = $true
+    $process = New-Object Diagnostics.Process
+    $process.StartInfo = $StartInfo
     try {
+        if (-not $process.Start()) { throw 'Fixture process did not start' }
+        $output = $process.StandardOutput.ReadToEndAsync()
+        $diagnostics = $process.StandardError.ReadToEndAsync()
         if (-not $process.WaitForExit($Seconds * 1000)) {
-            $process.Kill(); $process.WaitForExit(5000) | Out-Null
-            throw "Process exceeded ${Seconds}s: $([IO.Path]::GetFileName($Image))"
+            $process.Kill()
+            if (-not $process.WaitForExit(5000)) { throw 'Fixture process termination was not observed' }
+            throw "Fixture process exceeded ${Seconds}s"
         }
-        $process.Refresh()
-        if ($process.ExitCode -ne 0) { throw "$([IO.Path]::GetFileName($Image)) exited $($process.ExitCode)" }
+        if (-not $output.Wait(5000) -or -not $diagnostics.Wait(5000)) { throw 'Fixture process output did not close' }
+        $code = $process.ExitCode
+        if ($null -eq $code) { throw 'Fixture process exit code was not observed' }
+        return [pscustomobject]@{ ExitCode=$code; Output=$output.Result; Diagnostics=$diagnostics.Result }
     } finally { $process.Dispose() }
+}
+function Invoke-Bounded([string]$Image, [string[]]$Arguments, [int]$Seconds = 90) {
+    $info = New-Object Diagnostics.ProcessStartInfo
+    $info.FileName = $Image
+    $info.Arguments = $Arguments -join ' '
+    $result = Invoke-FixtureProcess $info $Seconds
+    if ($result.ExitCode -ne 0) { throw "$([IO.Path]::GetFileName($Image)) exited $($result.ExitCode)" }
 }
 function Assert-NoRuntime([string]$Sid) {
     $deadline = [DateTime]::UtcNow.AddSeconds(10)
@@ -65,12 +85,13 @@ if ($Mode -eq 'User') {
         Push-Location $shortcut.WorkingDirectory
         try { Invoke-Bounded $shortcut.TargetPath @($shortcut.Arguments) 30 } finally { Pop-Location }
         $central = Join-Path $tools 'openabstractions.exe'
-        $probe = Start-Process -FilePath $central -ArgumentList @('status','--json','--timeout','5s') -WindowStyle Hidden -PassThru -RedirectStandardOutput 'runtime-status.json' -RedirectStandardError 'runtime-status.err'
-        try {
-            if (-not $probe.WaitForExit(10000)) { $probe.Kill(); $probe.WaitForExit(5000) | Out-Null; throw 'Runtime status deadline' }
-            $probe.Refresh()
-            if ($probe.ExitCode -ne 0) { throw 'Runtime status failed' }
-        } finally { $probe.Dispose() }
+        $probeInfo = New-Object Diagnostics.ProcessStartInfo
+        $probeInfo.FileName = $central
+        $probeInfo.Arguments = 'status --json --timeout 5s'
+        $probe = Invoke-FixtureProcess $probeInfo 10
+        $probe.Output | Set-Content -Encoding UTF8 'runtime-status.json'
+        $probe.Diagnostics | Set-Content -Encoding UTF8 'runtime-status.err'
+        if ($probe.ExitCode -ne 0) { throw "Runtime status exited $($probe.ExitCode)" }
         $status = Get-Content 'runtime-status.json' -Raw | ConvertFrom-Json
         foreach ($capability in @('abstraction.logging','abstraction.config')) {
             if (@($status.capabilities | Where-Object { $_.capability -eq $capability -and $_.status -eq 'resolved' }).Count -ne 1) {
@@ -101,7 +122,6 @@ if (@(Get-Service | Where-Object { $_.Name -like 'OpenAbstractionsSupervisor*' }
 $user = 'oa_ci_' + [Guid]::NewGuid().ToString('N').Substring(0,10)
 $directory = Join-Path $env:ProgramData ('OA-User-Test-' + [Guid]::NewGuid().ToString('N'))
 $account = $null
-$child = $null
 $bytes = New-Object byte[] 30
 $rng = [Security.Cryptography.RandomNumberGenerator]::Create()
 try { $rng.GetBytes($bytes) } finally { $rng.Dispose() }
@@ -115,15 +135,32 @@ try {
     if ($LASTEXITCODE -ne 0) { throw 'Cannot grant private fixture directory access' }
     Copy-Item -LiteralPath $MsiPath -Destination (Join-Path $directory 'package.msi')
     Copy-Item -LiteralPath $PSCommandPath -Destination (Join-Path $directory 'fixture.ps1')
+    # Credential logon creates a fresh environment. This parent has already
+    # checked both runner markers; carry only those markers to the child.
+    $launcher = @'
+$ErrorActionPreference = 'Stop'
+$env:GITHUB_ACTIONS = 'true'
+$env:RUNNER_ENVIRONMENT = 'github-hosted'
+& (Join-Path $PSScriptRoot 'fixture.ps1') @args
+exit $LASTEXITCODE
+'@
+    Set-Content -LiteralPath (Join-Path $directory 'launcher.ps1') -Value $launcher -Encoding UTF8
     $credential = New-Object Management.Automation.PSCredential("$env:COMPUTERNAME\$user", (ConvertTo-SecureString $password -AsPlainText -Force))
-    $arguments = @('-NoProfile','-ExecutionPolicy','Bypass','-File',"`"$directory\fixture.ps1`"",'-Mode','User','-MsiPath',"`"$directory\package.msi`"",'-ExpectedSid',$account.SID.Value)
-    $child = Start-Process powershell.exe -ArgumentList $arguments -Credential $credential -LoadUserProfile -WorkingDirectory $directory -WindowStyle Hidden -PassThru -RedirectStandardOutput (Join-Path $directory 'fixture.log') -RedirectStandardError (Join-Path $directory 'fixture.err')
-    if (-not $child.WaitForExit(300000)) { $child.Kill(); $child.WaitForExit(5000) | Out-Null; throw 'Per-user fixture exceeded five minutes' }
-    $child.Refresh()
+    $arguments = @('-NoProfile','-ExecutionPolicy','Bypass','-File',"`"$directory\launcher.ps1`"",'-Mode','User','-MsiPath',"`"$directory\package.msi`"",'-ExpectedSid',$account.SID.Value)
+    $childInfo = New-Object Diagnostics.ProcessStartInfo
+    $childInfo.FileName = 'powershell.exe'
+    $childInfo.Arguments = $arguments -join ' '
+    $childInfo.WorkingDirectory = $directory
+    $childInfo.UserName = $user
+    $childInfo.Domain = $env:COMPUTERNAME
+    $childInfo.Password = $credential.Password
+    $childInfo.LoadUserProfile = $true
+    $child = Invoke-FixtureProcess $childInfo 300
+    $child.Output | Set-Content -Encoding UTF8 (Join-Path $directory 'fixture.log')
+    $child.Diagnostics | Set-Content -Encoding UTF8 (Join-Path $directory 'fixture.err')
     if ($child.ExitCode -ne 0) { throw "Per-user fixture exited $($child.ExitCode); inspect diagnostics" }
     Assert-NoRuntime $account.SID.Value
 } finally {
-    if ($child) { $child.Dispose() }
     try {
         if (Test-Path -LiteralPath $directory) {
             New-Item -ItemType Directory -Force -Path $ResultDirectory | Out-Null
