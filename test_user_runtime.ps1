@@ -84,6 +84,54 @@ function Assert-RuntimeReady([string]$central, [string]$Evidence) {
         }
     }
 }
+function Protect-DiagnosticText([string]$Text) {
+    $Text = $Text.Substring(0, [Math]::Min(8192, $Text.Length))
+    $Text = $Text -replace '(?i)(password|token|secret|authorization|api[_-]?key)(\s*[:=]\s*)\S+', '$1$2[redacted]'
+    $Text = $Text -replace '(?i)Bearer\s+\S+', 'Bearer [redacted]'
+    return $Text -replace '(https?://)[^/\s@]+@', '$1[redacted]@'
+}
+function Save-ActivationFailure([string]$Tools) {
+    $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+    $principal = New-Object Security.Principal.WindowsPrincipal($identity)
+    $profile = Get-ProfileFolder UserProfile
+    $context = [ordered]@{
+        purpose='diagnostic retry only; original MSI failure remains failure'
+        session=(Get-Process -Id $PID).SessionId
+        expectedSidMatches=($identity.User.Value -eq $ExpectedSid)
+        administrator=$principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+        workingDirectory=(Get-Location).Path
+        userProfile=$profile
+        environmentProfileMatches=($env:USERPROFILE -eq $profile)
+        localApplicationData=(Get-ProfileFolder LocalApplicationData)
+        defaultStoreExists=(Test-Path -LiteralPath (Join-Path $profile '.abstraction') -PathType Container)
+        legacyStoreExists=(Test-Path -LiteralPath (Join-Path $profile '.modelget') -PathType Container)
+        overridesPresent=@('ABSTRACTION_STORE','MODELGET_STORE','ABSTRACTION_RUNTIME_ENDPOINT','ABSTRACTION_NAS_STORE' | Where-Object { [Environment]::GetEnvironmentVariable($_) })
+    }
+    $context | ConvertTo-Json | Set-Content -Encoding UTF8 'activation-failure-context.json'
+    $image = Join-Path $Tools 'jobdw.exe'
+    if (-not (Test-Path -LiteralPath $image -PathType Leaf)) {
+        'Installed jobdw unavailable for diagnostic retry' | Set-Content 'activation-diagnostic-retry.txt'
+        return
+    }
+    $info = New-Object Diagnostics.ProcessStartInfo
+    $info.FileName = $image
+    $info.Arguments = 'start --runtime --require-unelevated'
+    # Retain the same fixture working directory and environment as its MSI call.
+    $result = Invoke-FixtureProcess $info 30
+    [ordered]@{
+        purpose='diagnostic retry; never post-install activation evidence'
+        exitCode=$result.ExitCode
+        stdout=(Protect-DiagnosticText $result.Output)
+        stderr=(Protect-DiagnosticText $result.Diagnostics)
+    } | ConvertTo-Json | Set-Content -Encoding UTF8 'activation-diagnostic-retry.json'
+}
+function Invoke-InstallWithDiagnostics([scriptblock]$Install, [scriptblock]$Diagnose) {
+    try { & $Install } catch {
+        $original = $_
+        try { & $Diagnose } catch { Write-Warning ('Activation diagnostics failed: ' + (Protect-DiagnosticText $_.Exception.Message)) }
+        throw $original
+    }
+}
 if ($Mode -eq 'User') {
     $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
     $principal = New-Object Security.Principal.WindowsPrincipal($identity)
@@ -98,7 +146,9 @@ if ($Mode -eq 'User') {
     $installAttempted = $false
     try {
         $installAttempted = $true
-        Invoke-Bounded msiexec.exe @('/i', "`"$MsiPath`"", '/qn', '/norestart', 'ALLUSERS=2', 'MSIINSTALLPERUSER=1', '/l*v', 'user-install.log')
+        Invoke-InstallWithDiagnostics {
+            Invoke-Bounded msiexec.exe @('/i', "`"$MsiPath`"", '/qn', '/norestart', 'ALLUSERS=2', 'MSIINSTALLPERUSER=1', '/l*v', 'user-install.log')
+        } { Save-ActivationFailure $tools }
         $installed = $true
         $central = Join-Path $tools 'openabstractions.exe'
         Assert-RuntimeReady $central post-install-status
