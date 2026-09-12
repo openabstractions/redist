@@ -30,12 +30,18 @@ public static class OASessions {
   [DllImport("wtsapi32.dll", SetLastError=true)] public static extern bool WTSLogoffSession(IntPtr h, int id, bool wait);
   public static int[] ForUser(string user) {
     IntPtr data; int count;
+    var timer=System.Diagnostics.Stopwatch.StartNew();
+    Console.WriteLine("WTS enumerate start");
     if (!WTSEnumerateSessions(IntPtr.Zero,0,1,out data,out count)) throw new System.ComponentModel.Win32Exception();
+    Console.WriteLine("WTS enumerate done: {0}ms",timer.ElapsedMilliseconds);
     var result = new List<int>();
     try { for (int n=0;n<count;n++) {
       var s=(Info)Marshal.PtrToStructure(IntPtr.Add(data,n*Marshal.SizeOf(typeof(Info))),typeof(Info));
       IntPtr name; int bytes;
+      timer.Restart();
+      Console.WriteLine("WTS username query start: session {0}",s.Id);
       if (!WTSQuerySessionInformation(IntPtr.Zero,s.Id,5,out name,out bytes)) throw new System.ComponentModel.Win32Exception();
+      Console.WriteLine("WTS username query done: session {0}, {1}ms",s.Id,timer.ElapsedMilliseconds);
       try { if (String.Equals(Marshal.PtrToStringUni(name),user,StringComparison.OrdinalIgnoreCase)) result.Add(s.Id); }
       finally { WTSFreeMemory(name); }
     }} finally { WTSFreeMemory(data); }
@@ -169,6 +175,9 @@ try {
             $description = $client.GetErrorDescription($hostControl.DisconnectReason,$extended)
             throw "RDP disconnected: reason=$($hostControl.DisconnectReason) extended=$extended description=$description"
         }
+        # WTS queries are synchronous: keep this STA pumping RDP callbacks until
+        # logon completes, rather than querying a session that is still initializing.
+        if (-not $hostControl.LoginComplete -or $client.Connected -ne 1) { return }
         $ids = @([OASessions]::ForUser($user))
         if ($hostControl.LoginComplete -and $client.Connected -eq 1 -and $ids.Count -eq 1 -and $ids[0] -gt 0) { $ids[0] }
     } 90 'fresh RDP account session'
