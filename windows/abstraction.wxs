@@ -150,6 +150,12 @@
          and removable by hand. -->
     <CustomAction Id="UnregisterSupervisor" FileRef="jobd.exe" ExeCommand="service uninstall"
                   Execute="deferred" Impersonate="no" Return="ignore" />
+    <!-- Activation follows the committed install. A failure reports an error
+         with installed files retained; it cannot promise transaction rollback.
+         The executable checks its process token before any start/bus lookup. -->
+    <CustomAction Id="StartUserRuntime" FileRef="jobdw.exe"
+                  ExeCommand="start --runtime --require-unelevated"
+                  Execute="immediate" Impersonate="yes" Return="check" />
 
     <InstallExecuteSequence>
       <Custom Action="UnregisterSupervisor" Before="RemoveFiles"
@@ -158,6 +164,8 @@
               Condition="ALLUSERS AND NOT (REMOVE=&quot;ALL&quot;)" />
       <Custom Action="RegisterSupervisor" After="RollbackSupervisor"
               Condition="ALLUSERS AND NOT (REMOVE=&quot;ALL&quot;)" />
+      <Custom Action="StartUserRuntime" After="InstallFinalize"
+              Condition="NOT ALLUSERS AND NOT (REMOVE=&quot;ALL&quot;) AND NOT UPGRADINGPRODUCTCODE" />
     </InstallExecuteSequence>
 
     <ComponentGroup Id="SupervisorService" Directory="APPLICATIONFOLDER">
@@ -319,7 +327,7 @@
 
     <Feature Id="Service" Level="1" AllowAbsent="no" AllowAdvertise="no"
              Title="Background supervisor"
-             Description="Finishes transfers after the program that started them has closed. For everyone, this is a service: Windows starts it in your own session at every sign-in, stores no password, and restarts it if it dies — and the install fails and rolls back if that registration does not happen, rather than leaving you the lesser one. Just for you, it is a Startup shortcut instead: it runs at sign-in and nothing replaces it if it dies before the next one. That is all a person without an administrator gets, and this package will not pretend otherwise.">
+             Description="Finishes transfers after the calling program closes. For everyone, Windows starts the supervisor in each user's session at sign-in and restarts it after failure. For your account, installation starts the runtime and supervisor, and a Startup shortcut starts them at sign-in. A per-user supervisor that exits starts again at the next sign-in.">
       <ComponentGroupRef Id="ServiceFiles" />
       <ComponentGroupRef Id="SupervisorService" />
       <ComponentGroupRef Id="LogonStart" />

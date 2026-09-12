@@ -131,11 +131,75 @@ jobs:
         run: |
           gh run download $env:GITHUB_RUN_ID -n verified-windows-package -D .
           if ($LASTEXITCODE -ne 0) { throw 'Verified package download failed' }
+      - name: configure disposable consumer MSI policy
+        shell: pwsh
+        run: |
+          if ($env:GITHUB_ACTIONS -ne 'true' -or $env:RUNNER_ENVIRONMENT -ne 'github-hosted' -or $env:RUNNER_OS -ne 'Windows') { throw 'MSI policy fixture requires a disposable GitHub Windows runner' }
+          if ((Get-CimInstance Win32_OperatingSystem -ErrorAction Stop).ProductType -ne 3) { throw 'MSI policy fixture requires Windows Server' }
+          $policy = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\Installer'
+          $statePath = Join-Path $env:RUNNER_TEMP 'oa-msi-policy.json'
+          if (Test-Path -LiteralPath $statePath -ErrorAction Stop) { throw 'MSI policy baseline already exists' }
+          $keyExists = Test-Path -LiteralPath $policy -ErrorAction Stop
+          $state = @{ KeyExisted=$keyExists; ValueExisted=$false; Value=$null; Restored=$false }
+          if ($keyExists) {
+              $key = Get-Item -LiteralPath $policy -ErrorAction Stop
+              try {
+                  $state.ValueExisted = $key.GetValueNames() -contains 'DisableMSI'
+                  if ($state.ValueExisted) {
+                      if ($key.GetValueKind('DisableMSI') -ne [Microsoft.Win32.RegistryValueKind]::DWord) { throw 'Unexpected DisableMSI registry type' }
+                      $state.Value = $key.GetValue('DisableMSI')
+                      if ($state.Value -notin @(0,1,2)) { throw 'Unexpected DisableMSI registry value' }
+                  }
+              } finally { $key.Close() }
+          }
+          # Persist the original state before the first mutation, including setup failures.
+          $state | ConvertTo-Json | Set-Content -LiteralPath $statePath -Encoding utf8 -ErrorAction Stop
+          "DisableMSI baseline: key=$keyExists present=$($state.ValueExisted) value=$($state.Value)" | Tee-Object msi-policy.log
+          if (-not $keyExists) { New-Item -Path $policy -Force -ErrorAction Stop | Out-Null }
+          New-ItemProperty -LiteralPath $policy -Name DisableMSI -Value 0 -PropertyType DWord -Force -ErrorAction Stop | Out-Null
+          if ((Get-ItemPropertyValue -LiteralPath $policy -Name DisableMSI -ErrorAction Stop) -ne 0) { throw 'DisableMSI test configuration did not take effect' }
+          'Disposable test environment: DisableMSI=0 permits standard-user unmanaged installation' | Tee-Object -Append msi-policy.log
+          exit 0
       - name: private non-admin shortcut activation and removal
         shell: pwsh
         run: |
           & powershell.exe -NoProfile -ExecutionPolicy Bypass -File test_user_runtime.ps1 -Mode Verify -MsiPath (Resolve-Path pkg/abstraction-x64.msi).Path
           if ($LASTEXITCODE -ne 0) { throw "Per-user runtime verification exited $LASTEXITCODE" }
+      - name: restore disposable consumer MSI policy
+        if: always()
+        shell: pwsh
+        run: |
+          if ($env:GITHUB_ACTIONS -ne 'true' -or $env:RUNNER_ENVIRONMENT -ne 'github-hosted' -or $env:RUNNER_OS -ne 'Windows') { throw 'MSI policy fixture requires a disposable GitHub Windows runner' }
+          if ((Get-CimInstance Win32_OperatingSystem -ErrorAction Stop).ProductType -ne 3) { throw 'MSI policy fixture requires Windows Server' }
+          $policy = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\Installer'
+          $statePath = Join-Path $env:RUNNER_TEMP 'oa-msi-policy.json'
+          if (-not (Test-Path -LiteralPath $statePath -ErrorAction Stop)) { 'No MSI policy mutation was recorded'; exit 0 }
+          $state = Get-Content -LiteralPath $statePath -Raw -ErrorAction Stop | ConvertFrom-Json
+          if ($state.KeyExisted -isnot [bool] -or $state.ValueExisted -isnot [bool] -or ($state.ValueExisted -and (-not $state.KeyExisted -or $state.Value -notin @(0,1,2)))) { throw 'Invalid MSI policy baseline' }
+          if ($state.ValueExisted) {
+              New-ItemProperty -LiteralPath $policy -Name DisableMSI -Value $state.Value -PropertyType DWord -Force -ErrorAction Stop | Out-Null
+          } elseif (Test-Path -LiteralPath $policy -ErrorAction Stop) {
+              $key = Get-Item -LiteralPath $policy -ErrorAction Stop
+              try { $present = $key.GetValueNames() -contains 'DisableMSI' } finally { $key.Close() }
+              if ($present) { Remove-ItemProperty -LiteralPath $policy -Name DisableMSI -ErrorAction Stop }
+          }
+          if (Test-Path -LiteralPath $policy -ErrorAction Stop) {
+              $key = Get-Item -LiteralPath $policy -ErrorAction Stop
+              try {
+                  $present = $key.GetValueNames() -contains 'DisableMSI'
+                  if ($present -ne $state.ValueExisted) { throw 'DisableMSI presence was not restored' }
+                  if ($present -and ($key.GetValueKind('DisableMSI') -ne [Microsoft.Win32.RegistryValueKind]::DWord -or $key.GetValue('DisableMSI') -ne $state.Value)) { throw 'DisableMSI value was not restored' }
+                  $empty = $key.GetValueNames().Count -eq 0 -and $key.GetSubKeyNames().Count -eq 0
+              } finally { $key.Close() }
+              if (-not $state.KeyExisted) {
+                  if (-not $empty) { throw 'Refusing to remove a policy key with unrelated values' }
+                  Remove-Item -LiteralPath $policy -ErrorAction Stop
+              }
+          } elseif ($state.KeyExisted) { throw 'Original MSI policy key disappeared' }
+          $state.Restored = $true
+          $state | ConvertTo-Json | Set-Content -LiteralPath $statePath -Encoding utf8 -ErrorAction Stop
+          'DisableMSI baseline restored and verified' | Tee-Object -Append msi-policy.log
+          exit 0
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         if: always()
         with:
@@ -143,3 +207,5 @@ jobs:
           path: |
             package-source.txt
             user-runtime-diagnostics/
+            msi-policy.log
+            ${{ runner.temp }}/oa-msi-policy.json

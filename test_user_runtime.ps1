@@ -69,6 +69,21 @@ function Assert-NoRuntime([string]$Sid) {
     } while ([DateTime]::UtcNow -lt $deadline)
     throw 'Uninstall left account runtime processes or capability endpoints'
 }
+function Assert-RuntimeReady([string]$central, [string]$Evidence) {
+    $probeInfo = New-Object Diagnostics.ProcessStartInfo
+    $probeInfo.FileName = $central
+    $probeInfo.Arguments = 'status --json --timeout 5s'
+    $probe = Invoke-FixtureProcess $probeInfo 10
+    $probe.Output | Set-Content -Encoding UTF8 "$Evidence.json"
+    $probe.Diagnostics | Set-Content -Encoding UTF8 "$Evidence.err"
+    if ($probe.ExitCode -ne 0) { throw "Runtime status exited $($probe.ExitCode)" }
+    $status = Get-Content "$Evidence.json" -Raw | ConvertFrom-Json
+    foreach ($capability in @('abstraction.logging','abstraction.config')) {
+        if (@($status.capabilities | Where-Object { $_.capability -eq $capability -and $_.status -eq 'resolved' }).Count -ne 1) {
+            throw "Missing ready capability: $capability"
+        }
+    }
+}
 if ($Mode -eq 'User') {
     $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
     $principal = New-Object Security.Principal.WindowsPrincipal($identity)
@@ -80,9 +95,14 @@ if ($Mode -eq 'User') {
     $env:MODELGET_STORE = $null
     $tools = Join-Path (Get-ProfileFolder LocalApplicationData) 'Programs\OpenAbstractions\tools'
     $installed = $false
+    $installAttempted = $false
     try {
+        $installAttempted = $true
         Invoke-Bounded msiexec.exe @('/i', "`"$MsiPath`"", '/qn', '/norestart', 'ALLUSERS=2', 'MSIINSTALLPERUSER=1', '/l*v', 'user-install.log')
         $installed = $true
+        $central = Join-Path $tools 'openabstractions.exe'
+        Assert-RuntimeReady $central post-install-status
+        'ok: logging/config ready immediately after MSI completion' | Set-Content 'post-install-activation.txt'
         $shortcutPath = Join-Path (Get-ProfileFolder Startup) 'Abstraction supervisor.lnk'
         if (@(Get-Service | Where-Object { $_.Name -like 'OpenAbstractionsSupervisor*' }).Count) { throw 'Per-user install registered a service' }
         if (-not (Test-Path -LiteralPath $shortcutPath)) { throw 'Installed Startup shortcut missing' }
@@ -93,23 +113,11 @@ if ($Mode -eq 'User') {
         }
         Push-Location $shortcut.WorkingDirectory
         try { Invoke-Bounded $shortcut.TargetPath @($shortcut.Arguments) 30 } finally { Pop-Location }
-        $central = Join-Path $tools 'openabstractions.exe'
-        $probeInfo = New-Object Diagnostics.ProcessStartInfo
-        $probeInfo.FileName = $central
-        $probeInfo.Arguments = 'status --json --timeout 5s'
-        $probe = Invoke-FixtureProcess $probeInfo 10
-        $probe.Output | Set-Content -Encoding UTF8 'runtime-status.json'
-        $probe.Diagnostics | Set-Content -Encoding UTF8 'runtime-status.err'
-        if ($probe.ExitCode -ne 0) { throw "Runtime status exited $($probe.ExitCode)" }
-        $status = Get-Content 'runtime-status.json' -Raw | ConvertFrom-Json
-        foreach ($capability in @('abstraction.logging','abstraction.config')) {
-            if (@($status.capabilities | Where-Object { $_.capability -eq $capability -and $_.status -eq 'resolved' }).Count -ne 1) {
-                throw "Missing ready capability: $capability"
-            }
-        }
+        Assert-RuntimeReady $central runtime-status
         'ok: installed shortcut invocation resolved logging/config as a non-admin account' | Set-Content 'activation.txt'
         Invoke-Bounded msiexec.exe @('/x', "`"$MsiPath`"", '/qn', '/norestart', '/l*v', 'user-uninstall.log')
         $installed = $false
+        $installAttempted = $false
         # These assertions precede outer fixture cleanup and its process termination.
         Assert-NoRuntime $ExpectedSid
         if (Test-Path -LiteralPath $shortcutPath) { throw 'Startup shortcut survived uninstall' }
@@ -118,7 +126,8 @@ if ($Mode -eq 'User') {
         }
         'ok: uninstall removed processes, endpoints, shortcut and runtime binaries before fixture cleanup' | Set-Content 'removal.txt'
     } finally {
-        if ($installed) {
+        if ($installed -or $installAttempted) {
+            # A post-InstallFinalize activation error can leave committed files.
             try { Invoke-Bounded msiexec.exe @('/x', "`"$MsiPath`"", '/qn', '/norestart', '/l*v', 'user-cleanup-uninstall.log') } catch { Write-Warning $_ }
         }
     }
