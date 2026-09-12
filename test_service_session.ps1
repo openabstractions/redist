@@ -1,5 +1,5 @@
 param(
-    [ValidateSet('Verify','Cleanup','ValidateOnly')][string]$Mode = 'ValidateOnly',
+    [ValidateSet('Verify','VerifyRemoved','Cleanup','ValidateOnly')][string]$Mode = 'ValidateOnly',
     [string]$StatePath = (Join-Path $env:TEMP 'oa-service-session.json')
 )
 $ErrorActionPreference = 'Stop'
@@ -57,6 +57,40 @@ function Write-Diagnostic([string]$Text) {
     $Text | Write-Output
     $Text | Add-Content -Encoding UTF8 'service-session.log'
 }
+# Only fixed vocabulary reaches the artifact; captured CLI text may contain paths or secrets.
+function Format-StatusFailure([int]$ExitCode, [string]$Json, [string]$Diagnostics) {
+    $Json = $Json.Substring(0, [Math]::Min(4096, $Json.Length))
+    $Diagnostics = $Diagnostics.Substring(0, [Math]::Min(4096, $Diagnostics.Length))
+    $fields = @("exit=$ExitCode")
+    $errorText = $Diagnostics
+    try {
+        $report = ConvertFrom-Json -InputObject $Json -ErrorAction Stop
+        if ($null -eq $report -or $report -is [array] -or $report -is [string]) { throw 'Expected status object' }
+        $fields += 'json=parsed'
+        foreach ($name in @('abstraction.logging','abstraction.config')) {
+            $items = @($report.capabilities | Where-Object { $_.capability -ceq $name })
+            if ($items.Count -eq 1 -and $items[0].status -cin @('resolved','unavailable','refused','unsupported')) {
+                $fields += "$name=$($items[0].status)"
+            } else { $fields += "$name=missing-or-invalid" }
+        }
+        if ($report.error -is [string]) { $errorText += ' ' + $report.error.Substring(0, [Math]::Min(4096, $report.error.Length)) }
+    } catch { $fields += 'json=invalid' }
+    $classes = @()
+    foreach ($entry in @(
+        @('timeout','(?i)timeout|timed out|deadline exceeded'),
+        @('access-denied','(?i)access.*denied|permission denied'),
+        @('refused','(?i)refused|refusal'),
+        @('unavailable','(?i)unavailable|cannot find|not found|no such file'),
+        @('disconnected','(?i)broken pipe|disconnected|end of file|\bEOF\b'),
+        @('invalid','(?i)invalid|malformed'),
+        @('identity','(?i)identity|principal|impersonat')
+    )) { if ($errorText -match $entry[1]) { $classes += $entry[0] } }
+    if ($classes.Count -eq 0) { $classes = @('unclassified') }
+    $fields += 'error-classes=' + ($classes -join ',')
+    $fields += "stderr-present=$([bool]$Diagnostics.Length)"
+    $line = 'runtime status failed: ' + ($fields -join ' ')
+    return $line.Substring(0, [Math]::Min(768, $line.Length))
+}
 function Write-ServerDiagnostics {
     foreach ($log in @('Microsoft-Windows-TerminalServices-LocalSessionManager/Operational',
         'Microsoft-Windows-TerminalServices-RemoteConnectionManager/Operational',
@@ -99,6 +133,30 @@ function Wait-Condition([scriptblock]$Check, [int]$Seconds, [string]$Description
     } while ([DateTime]::UtcNow -lt $deadline)
     Get-CimInstance Win32_Service -Filter "Name LIKE 'OpenAbstractionsSupervisor%'" | Format-Table Name,State,ProcessId | Out-Host
     throw "Timed out after ${Seconds}s: $Description"
+}
+# Removal is checked before Cleanup logs off the account and can terminate its processes.
+if ($Mode -eq 'VerifyRemoved') {
+    $state = Get-Content $StatePath -Raw | ConvertFrom-Json
+    if ($state.User -notmatch '^oa_ci_[0-9a-f]{10}$' -or -not $state.RuntimeVerified) {
+        throw 'Removal verification requires a completed fresh-user runtime test'
+    }
+    Wait-Condition {
+        $children = @(Get-CimInstance Win32_Process -Filter "Name='openabstractions.exe'" | Where-Object {
+            if ($_.SessionId -eq $state.Session) {
+                $owner = Invoke-CimMethod -InputObject $_ -MethodName GetOwnerSid
+                if ($owner.ReturnValue -ne 0) { throw 'Cannot verify runtime process owner during removal' }
+                $owner.Sid -eq $state.Sid
+            }
+        })
+        $services = @(Get-CimInstance Win32_Service -Filter "Name LIKE 'OpenAbstractionsSupervisor%'")
+        $prefix = "openabstractions-user-$($state.Sid)-"
+        $pipes = @([IO.Directory]::GetFiles('\\.\pipe\') | Where-Object {
+            [IO.Path]::GetFileName($_) -in @("${prefix}runtime-v1", "${prefix}logging-v1", "${prefix}config-v1", "${prefix}job-acceptance-v1")
+        })
+        if ($children.Count -eq 0 -and $services.Count -eq 0 -and $pipes.Count -eq 0) { $true }
+    } 30 'uninstall removed runtime processes, capability endpoints and SCM registrations' | Out-Null
+    Write-Diagnostic 'ok: runtime and capability endpoints absent before account cleanup'
+    exit 0
 }
 if ($Mode -eq 'Cleanup') {
     if (-not (Test-Path $StatePath)) { exit 0 }
@@ -196,6 +254,64 @@ try {
         }
     }
     $first = Wait-Condition { Find-Instance } 60 'SCM-created instance Running in fresh session'
+    $runtimeImage = Join-Path $env:ProgramFiles 'OpenAbstractions\tools\openabstractions.exe'
+    $credential = New-Object Management.Automation.PSCredential("$env:COMPUTERNAME\$user", (ConvertTo-SecureString $password -AsPlainText -Force))
+    function Find-Runtime([int]$ParentPid) {
+        $found = @(Get-CimInstance Win32_Process -Filter "Name='openabstractions.exe'" | Where-Object {
+            $_.ParentProcessId -eq $ParentPid -and $_.SessionId -eq $session
+        })
+        foreach ($proc in $found) {
+            $owner = Invoke-CimMethod -InputObject $proc -MethodName GetOwnerSid
+            if ($owner.ReturnValue -ne 0 -or $owner.Sid -ne $state.Sid) { throw 'Runtime child has wrong principal' }
+            if ($proc.ExecutablePath -ne $runtimeImage) { throw 'Runtime child has wrong executable' }
+        }
+        if ($found.Count -gt 1) { throw 'Multiple runtime children for one supervisor' }
+        if ($found.Count -eq 1) { $found[0] }
+    }
+    $script:lastStatusFailure = $null
+    function Test-RuntimeReady {
+        $output = [IO.Path]::GetTempFileName()
+        $errors = [IO.Path]::GetTempFileName()
+        $previousEndpoint = $env:ABSTRACTION_RUNTIME_ENDPOINT
+        $probe = $null
+        try {
+            $env:ABSTRACTION_RUNTIME_ENDPOINT = $null
+            # The diagnostic derives bootstrap from the fresh user's process token.
+            $probe = Start-Process -FilePath $runtimeImage -ArgumentList @('status','--json','--timeout','5s') -Credential $credential -LoadUserProfile -WorkingDirectory (Split-Path $runtimeImage) -WindowStyle Hidden -PassThru -RedirectStandardOutput $output -RedirectStandardError $errors
+            if (-not $probe.WaitForExit(10000)) { $probe.Kill(); $probe.WaitForExit(); throw 'Runtime status exceeded its waiting budget' }
+            $probe.Refresh()
+            if ($probe.ExitCode -ne 0) {
+                $line = Format-StatusFailure $probe.ExitCode (Get-Content -LiteralPath $output -Raw) (Get-Content -LiteralPath $errors -Raw)
+                if ($line -ne $script:lastStatusFailure) { Write-Diagnostic $line | Out-Null; $script:lastStatusFailure = $line }
+                return $false
+            }
+            $result = Get-Content -LiteralPath $output -Raw | ConvertFrom-Json
+            foreach ($capability in @('abstraction.logging','abstraction.config')) {
+                $matches = @($result.capabilities | Where-Object { $_.capability -eq $capability -and $_.status -eq 'resolved' })
+                if ($matches.Count -ne 1) { throw "Runtime diagnostic omitted ready $capability" }
+            }
+            return $true
+        } finally {
+            $env:ABSTRACTION_RUNTIME_ENDPOINT = $previousEndpoint
+            if ($probe) { $probe.Dispose() }
+            Remove-Item -LiteralPath $output,$errors -ErrorAction SilentlyContinue
+        }
+    }
+    $runtime = Wait-Condition { Find-Runtime ([int]$first.ProcessId) } 60 'runtime child in fresh user session'
+    Wait-Condition { Test-RuntimeReady } 60 'logging and config capability readiness' | Out-Null
+    $oldRuntimePid = [int]$runtime.ProcessId
+    Stop-Process -Id $oldRuntimePid -Force -ErrorAction Stop
+    $recovered = Wait-Condition {
+        $parent = Find-Instance
+        if ($parent) {
+            $child = Find-Runtime ([int]$parent.ProcessId)
+            if ($child -and $child.ProcessId -ne $oldRuntimePid) { $child }
+        }
+    } 60 'runtime child replacement after child death'
+    Wait-Condition { Test-RuntimeReady } 60 'capability readiness after runtime child death' | Out-Null
+    $first = Find-Instance
+    if (-not $first) { throw 'Supervisor disappeared after runtime recovery' }
+    $oldRuntimePid = [int]$recovered.ProcessId
     $oldPid = [int]$first.ProcessId
     # Only the verified test-account service process is terminated; no service is fabricated or manually started.
     Stop-Process -Id $oldPid -Force -ErrorAction Stop
@@ -203,6 +319,16 @@ try {
         $next = Find-Instance
         if ($next -and $next.Name -eq $first.Name -and $next.ProcessId -ne $oldPid) { $next }
     } 60 'SCM restart with replacement PID'
+    Wait-Condition {
+        if (-not (Get-Process -Id $oldRuntimePid -ErrorAction SilentlyContinue)) { $true }
+    } 30 'old runtime child exited after supervisor death' | Out-Null
+    $finalRuntime = Wait-Condition { Find-Runtime ([int]$replacement.ProcessId) } 60 'runtime child after SCM recovery'
+    Wait-Condition { Test-RuntimeReady } 60 'capability readiness after SCM recovery' | Out-Null
+    $state.Session = $session
+    $state.RuntimeVerified = $true
+    $state.RuntimePid = [int]$finalRuntime.ProcessId
+    $state | ConvertTo-Json | Set-Content -Encoding UTF8 $StatePath
+    Write-Diagnostic "ok: runtime child death and supervisor death recovered logging/config readiness"
     Write-Diagnostic "ok: $($first.Name), session $session, PID $oldPid replaced by $($replacement.ProcessId)"
     # Disconnect retains the session so MSI uninstall must remove the live clone before Cleanup logs off.
 } catch {

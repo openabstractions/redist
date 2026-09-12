@@ -61,4 +61,4 @@ developer	dev/python/job/pyproject.toml			copy		job		python/pyproject.toml				no
 developer	dev/python/download/abstraction_download.py	copy		download	python/abstraction_download.py			no	-
 developer	dev/python/download/pyproject.toml		copy		download	python/pyproject.toml				no	-
 developer	dev/include/abstraction/download/over_curl.hpp	copy		UNRESOLVED	include/abstraction/download/over_curl.hpp	no	-
-tools	tools/openabstractions.exe	gobuild	charter	serve	yes	console
+service	tools/openabstractions.exe	gobuild	charter	serve	yes	console

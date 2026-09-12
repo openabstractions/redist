@@ -537,6 +537,8 @@ jobs:
           if (Test-Path (Join-Path $env:ProgramData 'abstraction')) { throw 'the machine config folder survived uninstall' }
           $key = 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Environment'
           if ((Get-ItemProperty $key -Name Path).Path -like '*OpenAbstractions*') { throw 'the machine PATH entry survived uninstall' }
+          & powershell.exe -NoProfile -ExecutionPolicy Bypass -STA -File session-fixture/test_service_session.ps1 -Mode VerifyRemoved -StatePath "$env:RUNNER_TEMP/oa-service-session.json"
+          if ($LASTEXITCODE -ne 0) { throw "Runtime removal verification exited $LASTEXITCODE" }
           'ok    uninstall reversed it: no template, no instance, no folder, no key, no config folder, no PATH entry'
           exit 0
 

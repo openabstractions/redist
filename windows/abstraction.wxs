@@ -106,6 +106,9 @@
          service's ImagePath is written by jobd from its own os.Executable(). -->
     <ComponentGroup Id="ServiceFiles">
       <Component Directory="ToolsFolder">
+        <File Id="openabstractions.exe" Source="payload/tools/openabstractions.exe" KeyPath="yes" />
+      </Component>
+      <Component Directory="ToolsFolder">
         <File Id="jobd.exe" Source="payload/tools/jobd.exe" KeyPath="yes" />
       </Component>
       <Component Directory="ToolsFolder">
@@ -137,7 +140,7 @@
          Every one of these is conditioned on ALLUSERS. A per-user install has
          no administrator token, and an action that needs one there is the 1603
          the logon schtasks returned. -->
-    <CustomAction Id="RegisterSupervisor" FileRef="jobd.exe" ExeCommand="service install"
+    <CustomAction Id="RegisterSupervisor" FileRef="jobd.exe" ExeCommand="service install --runtime"
                   Execute="deferred" Impersonate="no" Return="check" />
     <CustomAction Id="RollbackSupervisor" FileRef="jobd.exe" ExeCommand="service uninstall"
                   Execute="rollback" Impersonate="no" Return="ignore" />
@@ -167,22 +170,16 @@
       </Component>
     </ComponentGroup>
 
-    <!-- What a per-user install gets instead, and it is less: the shortcut runs
-         at sign-in and nothing watches the supervisor afterwards. A logon task
-         does not restart it either: a killed
-         one four restart intervals over and it stayed dead. `jobd start` is
-         idempotent by the pipe name rather than by timing, which is what lets a
-         person, a tool and this shortcut all call it without producing two.
-
-         Show="minimized" because jobd.exe is a console image: the window is
-         created by the loader whatever we pass, and minimized is the only thing
-         the shell lets us say about it. -->
+    <!-- Per-user activation runs at sign-in. The windowless supervisor starts
+         the contained sibling runtime and retains its download worker. Start
+         checks logging/config availability even when a supervisor already
+         answers. The shortcut supplies no recovery after the supervisor dies. -->
     <ComponentGroup Id="LogonStart" Directory="StartupFolder">
       <Component Id="LogonStartShortcut" Guid="C84BB684-4B58-4B42-9B05-8F12DAFAABDE"
                  Condition="NOT ALLUSERS">
         <Shortcut Id="LogonStartFile" Name="Abstraction supervisor"
-                  Description="Makes sure the supervisor that finishes downloads is running"
-                  Target="[#jobdw.exe]" Arguments="start"
+                  Description="Starts the download supervisor and shared runtime"
+                  Target="[#jobdw.exe]" Arguments="start --runtime"
                   WorkingDirectory="ToolsFolder" />
         <RegistryValue Root="HKCU" Key="Software\OpenAbstractions\Abstraction\Supervisor"
                        Name="atLogon" Type="integer" Value="1" KeyPath="yes" />
@@ -224,9 +221,6 @@
     </ComponentGroup>
 
     <ComponentGroup Id="ToolFiles" Directory="ToolsFolder">
-      <Component>
-        <File Id="openabstractions.exe" Source="payload/tools/openabstractions.exe" KeyPath="yes" />
-      </Component>
       <Component>
         <File Id="dl.exe" Source="payload/tools/dl.exe" KeyPath="yes" />
       </Component>

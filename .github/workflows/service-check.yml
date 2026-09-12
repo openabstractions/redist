@@ -3,7 +3,7 @@ on:
   workflow_dispatch:
     inputs:
       artifact_run:
-        description: Completed release workflow run with a successful Windows package job
+        description: Completed release or Windows candidate run with successful Windows packaging
         required: true
         type: string
       windows_image:
@@ -17,7 +17,7 @@ permissions:
   contents: read
   actions: read
 jobs:
-  service:
+  package:
     runs-on: ${{ inputs.windows_image == 'windows-2022' && 'windows-2022' || 'windows-latest' }}
     timeout-minutes: 12
     steps:
@@ -32,7 +32,9 @@ jobs:
           if ($env:ARTIFACT_RUN -notmatch '^[0-9]+$') { throw 'Expected a numeric workflow run ID' }
           $run = gh api "repos/$env:GH_REPO/actions/runs/$env:ARTIFACT_RUN" | ConvertFrom-Json
           if ($LASTEXITCODE -ne 0) { throw 'Cannot read source run' }
-          if ($run.path -ne '.github/workflows/release.yml' -or $run.status -ne 'completed' -or $run.repository.full_name -ne $env:GH_REPO) { throw 'Expected a completed release workflow in this repository' }
+          $candidate = $run.path -eq '.github/workflows/candidate.yml'
+          if (($run.path -ne '.github/workflows/release.yml' -and -not $candidate) -or $run.status -ne 'completed' -or $run.repository.full_name -ne $env:GH_REPO) { throw 'Expected a completed release or candidate workflow in this repository' }
+          if ($candidate -and ($run.head_sha -ne $env:GITHUB_SHA -or $run.event -ne 'workflow_dispatch')) { throw 'Candidate package and fixture must use the same dispatched commit' }
           $jobs = gh run view $env:ARTIFACT_RUN --json jobs | ConvertFrom-Json
           if ($LASTEXITCODE -ne 0) { throw 'Cannot read source jobs' }
           if (@($jobs.jobs | Where-Object { $_.name -eq 'windows' -and $_.conclusion -eq 'success' }).Count -ne 1) { throw 'Source Windows packaging did not pass' }
@@ -49,6 +51,25 @@ jobs:
           }
           if ($checked.Count -ne 2) { throw 'Expected checksums for both Windows packages' }
           exit 0
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: verified-windows-package
+          path: |
+            pkg/
+            package-source.txt
+  service:
+    needs: package
+    runs-on: ${{ inputs.windows_image == 'windows-2022' && 'windows-2022' || 'windows-latest' }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
+      - name: download verified package
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: pwsh
+        run: |
+          gh run download $env:GITHUB_RUN_ID -n verified-windows-package -D .
+          if ($LASTEXITCODE -ne 0) { throw 'Verified package download failed' }
       - name: install machine scope
         id: install
         shell: pwsh
@@ -57,7 +78,7 @@ jobs:
           $p = Start-Process msiexec -Wait -PassThru -ArgumentList @('/i',$msi,'/qn','/norestart','ALLUSERS=1','MSIINSTALLPERUSER=','/l*v','machine-install.log')
           if ($p.ExitCode -ne 0) { Get-Content machine-install.log -Tail 120; throw "Install exited $($p.ExitCode)" }
       - name: fresh sign-in and recovery
-        timeout-minutes: 5
+        timeout-minutes: 10
         shell: pwsh
         run: |
           & powershell.exe -NoProfile -ExecutionPolicy Bypass -STA -File test_service_session.ps1 -Mode Verify -StatePath "$env:RUNNER_TEMP/oa-service-session.json"
@@ -71,6 +92,8 @@ jobs:
           $p = Start-Process msiexec -Wait -PassThru -ArgumentList @('/x',$msi,'/qn','/norestart','/l*v','machine-uninstall.log')
           if ($p.ExitCode -ne 0) { throw "Uninstall exited $($p.ExitCode)" }
           if (@(Get-Service -Name 'OpenAbstractionsSupervisor*' -ErrorAction SilentlyContinue).Count) { throw 'Service survived uninstall' }
+          & powershell.exe -NoProfile -ExecutionPolicy Bypass -STA -File test_service_session.ps1 -Mode VerifyRemoved -StatePath "$env:RUNNER_TEMP/oa-service-session.json"
+          if ($LASTEXITCODE -ne 0) { throw "Runtime removal verification exited $LASTEXITCODE" }
       - name: remove disposable session
         if: always()
         shell: pwsh
@@ -88,3 +111,28 @@ jobs:
             machine-uninstall.log
             service-session.log
             service-session-cleanup.log
+  per-user:
+    needs: package
+    runs-on: ${{ inputs.windows_image == 'windows-2022' && 'windows-2022' || 'windows-latest' }}
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
+      - name: download verified package
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: pwsh
+        run: |
+          gh run download $env:GITHUB_RUN_ID -n verified-windows-package -D .
+          if ($LASTEXITCODE -ne 0) { throw 'Verified package download failed' }
+      - name: private non-admin shortcut activation and removal
+        shell: pwsh
+        run: |
+          & powershell.exe -NoProfile -ExecutionPolicy Bypass -File test_user_runtime.ps1 -Mode Verify -MsiPath (Resolve-Path pkg/abstraction-x64.msi).Path
+          if ($LASTEXITCODE -ne 0) { throw "Per-user runtime verification exited $LASTEXITCODE" }
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        if: always()
+        with:
+          name: per-user-runtime-diagnostics
+          path: |
+            package-source.txt
+            user-runtime-diagnostics/

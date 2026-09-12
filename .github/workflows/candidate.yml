@@ -1,0 +1,166 @@
+name: Windows runtime candidate
+on:
+  workflow_dispatch:
+    inputs:
+      redist_sha:
+        description: Exact redist commit containing this workflow and the installer fixture
+        required: true
+        type: string
+      charter_sha:
+        description: Published abstractions commit containing the central runtime and status command
+        required: true
+        type: string
+      service_jobd_sha:
+        description: Published service-jobd commit containing runtime supervision registration
+        required: true
+        type: string
+      download_sha:
+        description: Published abstraction-download commit required by both parent and central command
+        required: true
+        type: string
+      version:
+        description: MSI test version in MAJOR.MINOR.PATCH form; no tag or release is created
+        required: true
+        type: string
+permissions:
+  contents: read
+jobs:
+  windows:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    env:
+      GOWORK: 'off'
+      GOFLAGS: '-mod=readonly -trimpath'
+      CGO_ENABLED: '0'
+      REDIST_SHA: ${{ inputs.redist_sha }}
+      CHARTER_SHA: ${{ inputs.charter_sha }}
+      SERVICE_JOBD_SHA: ${{ inputs.service_jobd_sha }}
+      DOWNLOAD_SHA: ${{ inputs.download_sha }}
+      CANDIDATE_VERSION: ${{ inputs.version }}
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
+      - name: validate immutable inputs
+        shell: python
+        run: |
+          import os, re, subprocess
+          for key in ('REDIST_SHA', 'CHARTER_SHA', 'SERVICE_JOBD_SHA', 'DOWNLOAD_SHA'):
+              if not re.fullmatch('[0-9a-f]{40}', os.environ[key]):
+                  raise SystemExit(f'{key} must be a full lowercase public commit SHA')
+          if os.environ['REDIST_SHA'] != os.environ['GITHUB_SHA']:
+              raise SystemExit('Dispatched redist commit differs from redist_sha')
+          if subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip() != os.environ['REDIST_SHA']:
+              raise SystemExit('Redist checkout differs from requested commit')
+          version = os.environ['CANDIDATE_VERSION']
+          if not re.fullmatch(r'(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)', version):
+              raise SystemExit('MSI version must be MAJOR.MINOR.PATCH')
+          if any(int(n) > bound for n, bound in zip(version.split('.'), (255, 255, 65535))):
+              raise SystemExit('MSI version exceeds Windows Installer limits')
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
+        with:
+          repository: openabstractions/abstractions
+          ref: ${{ inputs.charter_sha }}
+          path: source-charter
+          persist-credentials: false
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
+        with:
+          repository: openabstractions/service-jobd
+          ref: ${{ inputs.service_jobd_sha }}
+          path: source-jobd
+          persist-credentials: false
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
+        with:
+          repository: openabstractions/abstraction-download
+          ref: ${{ inputs.download_sha }}
+          path: source-download
+          persist-credentials: false
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16
+        with:
+          go-version: '1.26.0'
+          cache: false
+      - name: verify source and dependency provenance
+        shell: python
+        run: |
+          import json, os, pathlib, subprocess
+          sources = {'source-charter': 'CHARTER_SHA', 'source-jobd': 'SERVICE_JOBD_SHA', 'source-download': 'DOWNLOAD_SHA'}
+          evidence = {'redist': os.environ['REDIST_SHA'], 'sources': {}, 'dependencies': {}}
+          for directory, key in sources.items():
+              actual = subprocess.check_output(['git', '-C', directory, 'rev-parse', 'HEAD'], text=True).strip()
+              if actual != os.environ[key]:
+                  raise SystemExit(f'{directory} checkout differs from requested commit')
+              evidence['sources'][directory] = actual
+          module = 'github.com/openabstractions/abstraction-download/go'
+          for directory in ('source-charter/serve', 'source-jobd'):
+              selected = json.loads(subprocess.check_output(['go', 'list', '-m', '-json', module], cwd=directory, text=True))
+              if selected.get('Replace'):
+                  raise SystemExit(f'{directory} replaces its published download dependency')
+              downloaded = json.loads(subprocess.check_output(['go', 'mod', 'download', '-json', module+'@'+selected['Version']], cwd=directory, text=True))
+              if downloaded.get('Origin', {}).get('Hash') != os.environ['DOWNLOAD_SHA']:
+                  raise SystemExit(f'{directory} download dependency does not identify download_sha')
+              evidence['dependencies'][directory] = downloaded
+          pathlib.Path('dist').mkdir()
+          pathlib.Path('dist/source-provenance.json').write_text(json.dumps(evidence, indent=2))
+          pathlib.Path('dist/tools.tsv').write_bytes(pathlib.Path('tools.tsv').read_bytes())
+      - name: build Windows programs from pinned public sources
+        shell: python
+        run: |
+          import os, pathlib, subprocess
+          # The Panel filename contains spaces; columns are separated by tabs.
+          rows = [[part.strip() for part in line.split('\t') if part.strip()] for line in pathlib.Path('tools.tsv').read_text().splitlines() if line.strip() and not line.startswith('>')][1:]
+          overrides = {'jobd.exe': ('source-jobd', '.'), 'jobdw.exe': ('source-jobd', '.'), 'openabstractions.exe': ('source-charter/serve', '.'), 'dl.exe': ('source-download/go', './cmd/dl')}
+          names = [row[0] for row in rows]
+          if len(names) != len(set(names)) or not set(overrides).issubset(names):
+              raise SystemExit('tools.tsv must contain each required runtime program exactly once')
+          for arch in ('amd64', 'arm64'):
+              output = pathlib.Path('binaries', arch).resolve()
+              output.mkdir(parents=True)
+              env = dict(os.environ, GOOS='windows', GOARCH=arch)
+              for name, module_version, package, feature, subsystem in rows:
+                  if pathlib.PureWindowsPath(name).name != name or subsystem not in ('console', 'windows'):
+                      raise SystemExit('Invalid program filename or subsystem')
+                  flags = '-s -w -buildid=' + (' -H=windowsgui' if subsystem == 'windows' else '')
+                  if name in overrides:
+                      directory, target = overrides[name]
+                      subprocess.run(['go', 'build', '-ldflags='+flags, '-o', str(output/name), target], cwd=directory, env=env, check=True)
+                  else:
+                      module, version = module_version.rsplit('@', 1)
+                      prefix = 'github.com/openabstractions/'
+                      if not module.startswith(prefix):
+                          raise SystemExit('Expected an OpenAbstractions module')
+                      repo, _, subdir = module[len(prefix):].partition('/')
+                      tag = (subdir+'/' if subdir else '')+version
+                      subprocess.run(['git', 'ls-remote', '--tags', '--exit-code', 'https://github.com/openabstractions/'+repo, 'refs/tags/'+tag], check=True)
+                      target = module + ('/'+package if package != '.' else '') + '@' + version
+                      install_env = dict(env, GOBIN='', GOPATH=str(pathlib.Path('go-install', arch).resolve()))
+                      subprocess.run(['go', 'install', '-ldflags='+flags, target], env=install_env, check=True)
+                      base = pathlib.PurePosixPath(module if package == '.' else package).name+'.exe'
+                      built = pathlib.Path(install_env['GOPATH'], 'bin', 'windows_'+arch, base)
+                      if not built.exists():
+                          built = pathlib.Path(install_env['GOPATH'], 'bin', base)
+                      built.replace(output/name)
+      - name: assemble unsigned Windows packages
+        shell: pwsh
+        run: |
+          dotnet tool install --global wix --version 5.0.2
+          if ($LASTEXITCODE -ne 0) { throw 'WiX installation failed' }
+          $env:PATH += ";$env:USERPROFILE\.dotnet\tools"
+          wix extension add -g WixToolset.UI.wixext/5.0.2
+          if ($LASTEXITCODE -ne 0) { throw 'WiX extension failed' }
+          foreach ($arch in @('x64','arm64')) {
+            $goarch = if ($arch -eq 'x64') { 'amd64' } else { 'arm64' }
+            python windows/build.py --arch $arch --version $env:CANDIDATE_VERSION --out "package-$arch" --bin "binaries/$goarch" --license LICENSE
+            if ($LASTEXITCODE -ne 0) { throw "Package $arch failed" }
+            python windows/validate.py "package-$arch/abstraction-$arch.msi"
+            if ($LASTEXITCODE -ne 0) { throw "Package $arch validation failed" }
+            Copy-Item "package-$arch/abstraction-$arch.msi" dist/
+          }
+          $lines = foreach ($arch in @('x64','arm64')) {
+            $name = "abstraction-$arch.msi"
+            $hash = (Get-FileHash "dist/$name" -Algorithm SHA256).Hash.ToLowerInvariant()
+            "$hash  $name"
+          }
+          $lines | Set-Content -Encoding ascii dist/SHA256SUMS.windows
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: abstraction-windows-unsigned
+          path: dist/
+          if-no-files-found: error
