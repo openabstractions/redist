@@ -15,10 +15,11 @@ public class OARdpHost : AxHost {
   public object Client { get { return GetOcx(); } }
   public bool LoginComplete;
   public int DisconnectReason;
+  public bool Disconnected;
   public void HookEvents() {
     var iid = new Guid("336d5562-efa8-482e-8cb3-c5c0fc7a7db6");
     ComEventsHelper.Combine(Client,iid,3,new Action(() => { LoginComplete=true; }));
-    ComEventsHelper.Combine(Client,iid,4,new Action<int>(n => { DisconnectReason=n; }));
+    ComEventsHelper.Combine(Client,iid,4,new Action<int>(n => { DisconnectReason=n; Disconnected=true; }));
   }
 }
 public static class OASessions {
@@ -49,6 +50,24 @@ if ($env:GITHUB_ACTIONS -ne 'true' -or $env:RUNNER_ENVIRONMENT -ne 'github-hoste
 function Write-Diagnostic([string]$Text) {
     $Text | Write-Output
     $Text | Add-Content -Encoding UTF8 'service-session.log'
+}
+function Write-ServerDiagnostics {
+    foreach ($log in @('Microsoft-Windows-TerminalServices-LocalSessionManager/Operational',
+        'Microsoft-Windows-TerminalServices-RemoteConnectionManager/Operational','Security')) {
+        try {
+            $filter = @{ LogName=$log; StartTime=$started }
+            if ($log -eq 'Security') { $filter.Id=4625 }
+            $events = @(Get-WinEvent -FilterHashtable $filter -MaxEvents 20 -ErrorAction Stop)
+            foreach ($event in $events) {
+                [xml]$xml = $event.ToXml()
+                # Do not dump rendered event messages, account names, addresses, or credential-bearing fields.
+                $codes = @($xml.Event.EventData.Data | Where-Object {
+                    $_.Name -in @('Status','SubStatus','FailureReason','LogonType','ErrorCode','ResultCode','SessionID')
+                } | ForEach-Object { "$($_.Name)=$($_.'#text')" }) -join ' '
+                Write-Diagnostic "event log=$log id=$($event.Id) time=$($event.TimeCreated.ToUniversalTime().ToString('o')) $codes"
+            }
+        } catch { Write-Diagnostic "event log=$log unavailable or no matching events (details omitted)" }
+    }
 }
 $rdpKey = 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server'
 function Wait-Condition([scriptblock]$Check, [int]$Seconds, [string]$Description) {
@@ -82,6 +101,7 @@ if ($Mode -eq 'Cleanup') {
 }
 if ([Threading.Thread]::CurrentThread.ApartmentState -ne 'STA') { throw 'Use powershell.exe -STA -File for ActiveX hosting' }
 if (Test-Path $StatePath) { throw 'State already exists; clean previous fixture first' }
+$started = Get-Date
 $user = 'oa_ci_' + [Guid]::NewGuid().ToString('N').Substring(0,10)
 $random = New-Object byte[] 30
 $rng = [Security.Cryptography.RandomNumberGenerator]::Create()
@@ -102,6 +122,9 @@ $group = Get-LocalGroup -SID 'S-1-5-32-555'
 Add-LocalGroupMember -Group $group -Member $account
 Set-ItemProperty $rdpKey -Name fDenyTSConnections -Value 0
 Start-Service TermService
+$settings = Get-CimInstance -Namespace root/cimv2/terminalservices -ClassName Win32_TerminalServiceSetting
+Write-Diagnostic "TerminalServerMode=$($settings.TerminalServerMode) LicensingType=$($settings.LicensingType) AllowTSConnections=$($settings.AllowTSConnections)"
+Wait-Condition { if (Get-NetTCPConnection -State Listen -LocalPort 3389 -ErrorAction SilentlyContinue) { $true } } 30 'RDP listener ready' | Out-Null
 $form = New-Object System.Windows.Forms.Form
 $form.ShowInTaskbar = $false
 $form.WindowState = 'Minimized'
@@ -122,6 +145,11 @@ try {
     $client.Connect()
     # Connect is asynchronous. A token/process alone is not evidence of a completed GUI logon.
     $session = Wait-Condition {
+        if ($hostControl.Disconnected) {
+            $extended = [int]$client.ExtendedDisconnectReason
+            $description = $client.GetErrorDescription($hostControl.DisconnectReason,$extended)
+            throw "RDP disconnected: reason=$($hostControl.DisconnectReason) extended=$extended description=$description"
+        }
         $ids = @([OASessions]::ForUser($user))
         if ($hostControl.LoginComplete -and $client.Connected -eq 1 -and $ids.Count -eq 1 -and $ids[0] -gt 0) { $ids[0] }
     } 90 'fresh RDP account session'
@@ -149,6 +177,11 @@ try {
     Write-Diagnostic "ok: $($first.Name), session $session, PID $oldPid replaced by $($replacement.ProcessId)"
     # Disconnect retains the session so MSI uninstall must remove the live clone before Cleanup logs off.
 } catch {
+    try {
+        $extended = [int]$client.ExtendedDisconnectReason
+        Write-Diagnostic "RDP extended=$extended description=$($client.GetErrorDescription($hostControl.DisconnectReason,$extended))"
+    } catch { Write-Diagnostic 'RDP extended error unavailable' }
+    Write-ServerDiagnostics
     Write-Diagnostic "RDP loginComplete=$($hostControl.LoginComplete) disconnectReason=$($hostControl.DisconnectReason); $($_.Exception.Message)"
     throw
 } finally {
