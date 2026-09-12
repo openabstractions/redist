@@ -1,0 +1,14 @@
+[Unit]
+Description=OpenAbstractions user capability runtime
+
+[Service]
+Type=exec
+ExecStart="%h/.local/bin/openabstractions" serve runtime
+Restart=on-failure
+RestartSec=2s
+TimeoutStopSec=10s
+KillMode=control-group
+SendSIGKILL=yes
+
+[Install]
+WantedBy=default.target

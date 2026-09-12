@@ -4,6 +4,9 @@ Documentation=https://github.com/openabstractions/service-jobd
 
 [Service]
 Type=oneshot
-ExecStart=@BIN@/jobd once --quiet
+ExecStart="%h/.local/bin/jobd" once --quiet
+TimeoutStopSec=10s
+KillMode=control-group
+SendSIGKILL=yes
 Nice=10
 IOSchedulingClass=idle

@@ -25,12 +25,46 @@ prune() {
 	done | sort -ru | while IFS= read -r d; do rmdir -- "$d" 2>/dev/null || true; done
 }
 
-launchctl bootout "gui/$(id -u)/com.openabstractions.jobd" 2>/dev/null || true
+uid=$(id -u)
+service=gui/$uid/com.openabstractions.jobd
+# list enumerates the current bootstrap. Refuse other contexts instead of
+# inferring GUI absence from a query against an SSH/background namespace.
+manager_uid=$(launchctl manageruid)
+manager_name=$(launchctl managername)
+[ "$manager_uid" = "$uid" ] && [ "$manager_name" = Aqua ] || {
+    echo "uninstall.sh: run from this user's graphical login session; payload retained" >&2
+    exit 1
+}
+agent_state() {
+    jobs=$(launchctl list) || return 1
+    # The native list command documents PID, status, label columns. Unknown
+    # formats and query errors cannot establish absence.
+    printf '%s\n' "$jobs" | awk '
+        NR == 1 { if (NF != 3 || $1 != "PID" || $2 != "Status" || $3 != "Label") bad=1; next }
+        NF < 3 || $1 !~ /^(-|[0-9]+)$/ || $2 !~ /^-?[0-9]+$/ { bad=1 }
+        NF == 3 && $3 == "com.openabstractions.jobd" { found=1 }
+        END { if (bad || NR == 0) exit 2; print found ? "present" : "absent" }
+    '
+}
+state=$(agent_state)
+if [ "$state" = present ]; then
+    # ExitTimeOut bounds launchd's cooperative interval; escalation is possible.
+    launchctl bootout "$service"
+    state=$(agent_state)
+fi
+[ "$state" = absent ] || {
+    echo "uninstall.sh: LaunchAgent remains registered; payload retained" >&2
+    exit 1
+}
+echo "ok    LaunchAgent absence verified (graceful exit is not independently established)"
 
 grep '^/' "$manifest" | while IFS= read -r f; do rm -f -- "$f"; done
 grep '^/' "$manifest" | prune
 
-pkgutil --forget com.openabstractions.abstraction >/dev/null 2>&1 || true
+if ! pkgutil --forget com.openabstractions.abstraction; then
+    echo "uninstall.sh: files removed, but package receipt cleanup failed; retry receipt removal" >&2
+    exit 1
+fi
 
 rm -f -- "$manifest" "$share/FILES" "$share/uninstall.sh"
 echo "$share/." | prune

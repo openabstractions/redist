@@ -18,6 +18,12 @@
 
     <Property Id="ARPURLINFOABOUT" Value="https://github.com/openabstractions" />
     <Property Id="ARPNOREPAIR" Value="1" />
+    <!-- Native GUI session handling closes the per-user supervisor and its
+         contained runtime. Keep graceful Restart Manager shutdown enabled. -->
+    <Property Id="MSIRESTARTMANAGERCONTROL" Value="0" />
+    <Property Id="MSIRMSHUTDOWN" Value="0" />
+    <SetProperty Id="MSIDISABLERMRESTART" Value="1" Before="InstallValidate"
+                 Condition="NOT ALLUSERS AND REMOVE=&quot;ALL&quot;" />
 
     <!-- A build that was not handed a source drops the files it would have
          carried, and every one of those drops is silent: build.py prints a

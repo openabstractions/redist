@@ -18,6 +18,8 @@
 	<string>Background</string>
 	<key>LowPriorityIO</key>
 	<true/>
+	<key>ExitTimeOut</key>
+	<integer>10</integer>
 	<key>AbandonProcessGroup</key>
 	<false/>
 </dict>

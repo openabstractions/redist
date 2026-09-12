@@ -45,12 +45,18 @@ review. Reinstalling over an existing install is how you upgrade, and
 | what | where |
 |---|---|
 | `jobd`, `dl`, `jobctl`, `openabstractions` | `~/.local/bin/` |
+| shared runtime | `~/.config/systemd/user/abstraction-runtime.service` |
 | the sweep unit and its timer | `~/.config/systemd/user/abstraction-jobd.{service,timer}` |
 | the Python packages and `USING.txt` | `~/.local/share/abstraction/dev/` |
 | `LICENSE` | `~/.local/share/abstraction/` |
 | the uninstaller and the list it works from | `~/.local/share/abstraction/{uninstall.sh,MANIFEST}` |
 
-`install.sh` then runs `systemctl --user enable --now abstraction-jobd.timer`.
+`install.sh` enables the timer and `abstraction-runtime.service` through the
+systemd user manager. The runtime executes `openabstractions serve runtime` and
+restarts on failure. Installation polls the installed read-only `status` command
+within 15 seconds and reports failure if logging/config resolution is unavailable.
+The runtime receives no job-store flags: durable job admission remains opt-in,
+and the existing jobd timer continues to own its download sweep.
 The timer fires 30 seconds after the user manager starts — which is your login —
 and every 5 minutes after that, which is the same shape as the two Windows
 scheduled tasks, `jobd-logon` and `jobd`.
@@ -60,15 +66,22 @@ prints the one line to add and says why it will not add it for you.
 
 It does **not** fail when there is no systemd user manager — a container, WSL
 without systemd, a machine with no user bus. It installs the four programs,
-prints that nothing will sweep in the background and what to run instead, and
+prints that automatic background services are unavailable and what to run instead, and
 records `timer no` in the manifest. Absence is reported, never passed.
 
 Removal, exactly:
 
     ~/.local/share/abstraction/uninstall.sh
 
-It disables and stops the timer, deletes every path in `MANIFEST` and nothing
-else, removes every directory that is then empty up to your home directory, and
+It stops the timer, sweep service, and runtime before disabling registration.
+Each service has `TimeoutStopSec=10s` and `KillMode=control-group`: systemd sends
+SIGTERM, then can force remaining cgroup members to exit. The uninstaller records
+the service result; a forced stop is reported separately from graceful completion.
+Manager commands have a 20-second external bound (plus a two-second kill margin).
+`timeout` from coreutils is required. A failed stop, active service, or unavailable
+previously registered manager retains the payload and returns failure. Upgrade
+also stops existing units before replacing files. After verified stops, removal
+deletes every path in `MANIFEST` and nothing else, removes every directory that is then empty up to your home directory, and
 prints the command for the two things it deliberately leaves: `~/.abstraction`,
 your job store, and `~/.config/abstraction`, what `jobd setup` recorded.
 
@@ -92,24 +105,41 @@ destination the installer offers is the current user's home.
 **LaunchAgent identifier: `com.openabstractions.jobd`**, at
 `~/Library/LaunchAgents/com.openabstractions.jobd.plist`. `RunAtLoad` is the
 logon task; `StartInterval 300` is the five-minute sweep. `scripts/postinstall`
-substitutes the absolute path of `jobd`, writes `MANIFEST`, chowns everything to
-the installing user, and runs `launchctl bootstrap gui/<uid>`. If that user has
-no graphical session right now, it says so and the agent loads at the next
-login; it does not fail the install.
+substitutes the absolute path of `jobd`, writes `MANIFEST`, changes ownership of
+listed payload files and their ancestor directories below the verified home, and runs `launchctl bootstrap gui/<uid>`. Manager-query,
+bootout, enable, or bootstrap errors fail installation. Register from the target
+user's graphical login session; the installed plist remains available after an
+activation failure.
 
 Removal, exactly the same command as on Linux:
 
     ~/.local/share/abstraction/uninstall.sh
 
-It runs `launchctl bootout`, deletes every path in `MANIFEST`, prunes the empty
+Removal runs from the installing user's graphical login session: `manageruid`
+and `managername` must identify that user's Aqua bootstrap. A successful,
+validated `launchctl list` enumeration establishes presence or absence. An already
+absent agent permits removal, including after a failed registration. A present
+agent requires successful `bootout` followed by verified absence. Query errors,
+unknown output, and SSH/other bootstrap contexts retain the payload and fail.
+Directory ownership restoration walks installed paths only, refuses symlink
+ancestors, and preserves unrelated sibling files.
+`ExitTimeOut=10` bounds launchd's cooperative shutdown interval, and
+`AbandonProcessGroup=false` retains launchd's process-group cleanup. This does not
+establish that shutdown was graceful, or impose a verified wall-clock bound on
+launchctl IPC. After stop verification it deletes every path in `MANIFEST`, prunes the empty
 directories, runs `pkgutil --forget com.openabstractions.abstraction`, and
 prints the command for `~/.abstraction` and
 `~/Library/Application Support/abstraction`.
 
 `openabstractions serve logging`, `openabstractions serve config`, and
 `openabstractions serve router-v1` run the selected capability in the foreground.
-The package supplies the executable but does not add automatic registration
-for these commands. Its existing timer/LaunchAgent belongs to jobd.
+Linux automatically registers the shared runtime described above. macOS registers
+the existing jobd LaunchAgent only: the current macOS peer proof cannot establish
+the Program identity required by shared runtime clients. This package makes no
+macOS capability-readiness promise. Native macOS lifecycle verification remains
+required. Neither deleting a tarball nor deleting a `.pkg` performs uninstall;
+the installed `uninstall.sh` is the supported removal entry point. Receipt cleanup
+failure is reported even if macOS payload deletion already completed.
 
 ## Build it
 

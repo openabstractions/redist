@@ -52,3 +52,5 @@ macos		Library/LaunchAgents/com.openabstractions.jobd.plist		authored	posix		mac
 macos		.local/share/abstraction/FILES					generated	posix		-						644
 macos		.local/share/abstraction/uninstall.sh				authored	posix		macos/uninstall.sh				755
 both	.local/bin/openabstractions	gobuild	charter	serve	755
+linux	.config/systemd/user/abstraction-runtime.service	authored	posix	linux/abstraction-runtime.service	644
+linux	.local/share/abstraction/lifecycle.sh	authored	posix	linux/lifecycle.sh	644

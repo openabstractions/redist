@@ -19,6 +19,17 @@ if [ ! -d "$payload" ]; then
 	exit 1
 fi
 
+# Check existing registrations before replacing any executable or manifest.
+. "$payload/.local/share/abstraction/lifecycle.sh"
+command -v timeout >/dev/null 2>&1 || { echo "install.sh: timeout is required" >&2; exit 1; }
+managed=no
+if command -v systemctl >/dev/null 2>&1 && manager show-environment >/dev/null 2>&1; then
+    managed=yes
+    stop_installed
+elif [ -f "$share/MANIFEST" ] && grep -q '^timer yes$' "$share/MANIFEST"; then
+    echo "install.sh: registered user manager unavailable; payload retained" >&2
+    exit 1
+fi
 mkdir -p "$share"
 manifest=$share/MANIFEST
 : > "$manifest"
@@ -34,21 +45,21 @@ manifest=$share/MANIFEST
 	echo "$dst" >> "$manifest"
 done
 
-units=$HOME/.config/systemd/user
-for u in abstraction-jobd.service abstraction-jobd.timer; do
-	[ -f "$units/$u" ] || continue
-	tmp=$units/$u.new
-	sed "s|@BIN@|$bin|g" "$units/$u" > "$tmp"
-	mv -- "$tmp" "$units/$u"
-done
-
 n=$(wc -l < "$manifest" | tr -d ' ')
 echo "ok    $n files under $HOME"
 
 timer=no
-if command -v systemctl >/dev/null 2>&1 && systemctl --user show-environment >/dev/null 2>&1; then
-	systemctl --user daemon-reload
-	systemctl --user enable --now abstraction-jobd.timer
+if [ "$managed" = yes ]; then
+	manager daemon-reload
+	# Record manager ownership before a partial registration can fail.
+    echo "timer yes" >> "$manifest"
+    manager enable --now abstraction-jobd.timer abstraction-runtime.service
+    manager is-active --quiet abstraction-runtime.service
+    # Startup includes listener initialization; poll read-only readiness within one budget.
+    timeout --kill-after=2s 15s sh -c '
+        until "$1" status --timeout 1s; do sleep 0.2; done
+    ' sh "$bin/openabstractions"
+    echo "ok    user runtime started; status probe completed"
 	timer=yes
 	echo "ok    abstraction-jobd.timer enabled: once 30s after login, then every 5 minutes"
 else

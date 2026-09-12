@@ -10,6 +10,8 @@ case "$home" in
 /*) ;;
 *) home=$2 ;;
 esac
+home=$(CDPATH= cd -- "$home" && pwd -P)
+[ "$home" != / ] || { echo "postinstall: target must be a user home" >&2; exit 1; }
 share=$home/.local/share/abstraction
 bin=$home/.local/bin
 plist=$home/Library/LaunchAgents/com.openabstractions.jobd.plist
@@ -27,17 +29,39 @@ while read -r rel; do
 	echo "$home/$rel" >> "$share/MANIFEST"
 done < "$share/FILES"
 
-chown -R "$uid:$gid" "$share" "$bin" "$plist"
+# Restore ownership and directory access along each installed path. This walks
+# ancestors only; unrelated siblings in ~/.local/bin or Library stay untouched.
+own_path() {
+    installed=$1
+    case "$installed" in "$home"/*) ;; *) echo "postinstall: path outside target home" >&2; exit 1;; esac
+    case "$installed" in */../*|*/..|*/./*) echo "postinstall: noncanonical payload path" >&2; exit 1;; esac
+    [ ! -L "$installed" ] || { echo "postinstall: symlink payload refused" >&2; exit 1; }
+    dir=${installed%/*}
+    while [ "$dir" != "$home" ]; do
+        [ -d "$dir" ] && [ ! -L "$dir" ] || { echo "postinstall: unsafe payload directory" >&2; exit 1; }
+        dir=${dir%/*}
+    done
+    chown "$uid:$gid" "$installed"
+    dir=${installed%/*}
+    while [ "$dir" != "$home" ]; do
+        chown "$uid:$gid" "$dir"
+        chmod u+rwx "$dir"
+        dir=${dir%/*}
+    done
+}
+while IFS= read -r installed; do own_path "$installed"; done < "$share/MANIFEST"
+own_path "$share/MANIFEST"
 
-launchctl bootout "gui/$uid/com.openabstractions.jobd" 2>/dev/null || true
-if launchctl bootstrap "gui/$uid" "$plist" 2>/dev/null; then
-	launchctl enable "gui/$uid/com.openabstractions.jobd" 2>/dev/null || true
-	echo "ok    com.openabstractions.jobd loaded: at login, then every 300 seconds"
-else
-	echo "note  the LaunchAgent could not be loaded into gui/$uid — no graphical"
-	echo "note  session for that user right now. It is installed and will load at"
-	echo "note  the next login. To load it now, as that person, run:"
-	echo "note      launchctl bootstrap gui/\$(id -u) $plist"
+domain=gui/$uid
+service=$domain/com.openabstractions.jobd
+# A failed manager query/registration is an installation error. The plist remains
+# available for the user to register later in a graphical login session.
+launchctl print "$domain" >/dev/null
+if launchctl print "$service" >/dev/null 2>&1; then
+    launchctl bootout "$service"
 fi
-
+launchctl enable "$service"
+launchctl bootstrap "$domain" "$plist"
+launchctl print "$service" >/dev/null
+echo "ok    com.openabstractions.jobd registered: at login, then every 300 seconds"
 exit 0
