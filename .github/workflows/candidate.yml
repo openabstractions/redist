@@ -311,7 +311,7 @@ jobs:
             for name in names:
                 output = 'binaries/universal/'+name
                 subprocess.run(['lipo', '-create', 'binaries/amd64/'+name, 'binaries/arm64/'+name, '-output', output], check=True)
-                subprocess.run(['lipo', '-verify_arch', 'x86_64', 'arm64', output], check=True)
+                subprocess.run(['lipo', output, '-verify_arch', 'x86_64', 'arm64'], check=True)
                 hashes['universal/'+name] = hashlib.sha256(pathlib.Path(output).read_bytes()).hexdigest()
         provenance = pathlib.Path('dist/source-provenance.json')
         evidence = json.loads(provenance.read_text())
@@ -389,6 +389,23 @@ jobs:
         evidence['installed_lifecycle'] = 'passed_disposable_user_systemd'
         p.write_text(json.dumps(evidence, indent=2))
         PY
+    - name: capture disposable Linux runtime diagnostics
+      if: always() && matrix.platform == 'linux'
+      shell: bash
+      run: |
+        set -euo pipefail
+        state=$RUNNER_TEMP/oa-posix-account
+        [ -f "$state" ] || exit 0
+        [ "${GITHUB_ACTIONS:-}" = true ] && [ "${RUNNER_ENVIRONMENT:-}" = github-hosted ] && [ "${RUNNER_OS:-}" = Linux ] || exit 1
+        read -r account uid < "$state"
+        [ "$account" = "oa-ci-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" ] && [ "$(id -u "$account")" = "$uid" ] || exit 1
+        {
+          # status returns nonzero for stopped/failed units; retain that diagnostic
+          # without changing the preceding install step's failure conclusion.
+          sudo -u "$account" env HOME="/home/$account" XDG_RUNTIME_DIR="/run/user/$uid" DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$uid/bus" \
+            timeout --kill-after=2s 10s systemctl --user status abstraction-runtime.service abstraction-jobd.service --no-pager --full || true
+          sudo timeout --kill-after=2s 10s journalctl --no-pager -n 60 "_UID=$uid" _SYSTEMD_USER_UNIT=abstraction-runtime.service
+        } 2>&1 | tee dist/linux-runtime-diagnostics.log
     - name: remove only the disposable Linux account
       if: always() && matrix.platform == 'linux'
       shell: bash

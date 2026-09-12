@@ -69,6 +69,16 @@ function Assert-NoRuntime([string]$Sid) {
     } while ([DateTime]::UtcNow -lt $deadline)
     throw 'Uninstall left account runtime processes or capability endpoints'
 }
+function Assert-InstalledShortcut($Shortcut, [string]$Tools) {
+    $expectedTarget = [IO.Path]::GetFullPath((Join-Path $Tools 'jobdw.exe'))
+    $expectedDirectory = [IO.Path]::GetFullPath($Tools).TrimEnd([char[]]'\/')
+    $actualTarget = if ($Shortcut.TargetPath) { [IO.Path]::GetFullPath($Shortcut.TargetPath) } else { '' }
+    $actualDirectory = if ($Shortcut.WorkingDirectory) { [IO.Path]::GetFullPath($Shortcut.WorkingDirectory).TrimEnd([char[]]'\/') } else { '' }
+    if ($actualTarget -ne $expectedTarget -or $Shortcut.Arguments -ne 'start --runtime' -or $actualDirectory -ne $expectedDirectory) {
+        throw 'Installed shortcut target, runtime arguments or working directory differ'
+    }
+}
+
 function Assert-RuntimeReady([string]$central, [string]$Evidence) {
     $probeInfo = New-Object Diagnostics.ProcessStartInfo
     $probeInfo.FileName = $central
@@ -158,9 +168,7 @@ if ($Mode -eq 'User') {
         if (-not (Test-Path -LiteralPath $shortcutPath)) { throw 'Installed Startup shortcut missing' }
         $shell = New-Object -ComObject WScript.Shell
         $shortcut = $shell.CreateShortcut($shortcutPath)
-        if ($shortcut.TargetPath -ne (Join-Path $tools 'jobdw.exe') -or $shortcut.Arguments -ne 'start --runtime' -or $shortcut.WorkingDirectory -ne $tools) {
-            throw 'Installed shortcut target, runtime arguments or working directory differ'
-        }
+        Assert-InstalledShortcut $shortcut $tools
         Push-Location $shortcut.WorkingDirectory
         try { Invoke-Bounded $shortcut.TargetPath @($shortcut.Arguments) 30 } finally { Pop-Location }
         Assert-RuntimeReady $central runtime-status
