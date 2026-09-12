@@ -431,6 +431,7 @@ jobs:
           $msi = (Resolve-Path pkg\abstraction-x64.msi).Path
           $p = Start-Process msiexec -Wait -PassThru -ArgumentList @('/i', $msi, '/qn', '/norestart', 'ALLUSERS=1', 'MSIINSTALLPERUSER=', '/l*v', 'machine-install.log')
           if ($p.ExitCode -ne 0) {
+            Select-String -Path machine-install.log -Pattern 'Return value 3','Error [0-9]+','CustomAction .* returned' -Context 12,4 | Out-String -Width 300 | Write-Output
             Get-Content machine-install.log -Tail 120
             throw "msiexec /i ALLUSERS=1 exited $($p.ExitCode). RegisterSupervisor is Return=check, so a supervisor that could not be registered fails and rolls back the install rather than leaving a package that installed the programs and nothing that runs them."
           }
@@ -586,6 +587,19 @@ jobs:
           if ($p.ExitCode -ne 0) { throw "msiexec /x exited $($p.ExitCode)" }
           'ok    an unscoped install chose one scope and did all of it'
           exit 0
+
+      - name: preserve installer diagnostics
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: windows-installer-logs
+          path: |
+            user-install.log
+            user-uninstall.log
+            machine-install.log
+            machine-uninstall.log
+            unscoped.log
+          if-no-files-found: ignore
 
   linux:
     needs: candidate
