@@ -369,7 +369,20 @@ jobs:
         sudo loginctl enable-linger "$account"
         sudo systemctl start "user@$uid.service"
         user() { sudo -u "$account" env HOME="$home" XDG_RUNTIME_DIR="/run/user/$uid" DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$uid/bus" "$@"; }
+        configure_disposable_runtime_environment() {
+          [ "$(id -u "$account")" = "$uid" ] || { echo 'Disposable account identity changed'; return 1; }
+          expected=/run/user/$uid
+          [ "$(stat -c '%F %u %a' "$expected")" = "directory $uid 700" ] || { echo 'Private account runtime directory unavailable'; return 1; }
+          # Hosted Ubuntu globally exports the runner's XDG_RUNTIME_DIR (runner-images#14649).
+          # Correct only this new account's manager; direct sudo env does not reach services.
+          before=$(user timeout --kill-after=2s 10s systemctl --user show-environment | sed -n 's/^XDG_RUNTIME_DIR=//p') || return 1
+          printf 'Disposable manager runtime directory: %s -> %s\n' "$before" "$expected"
+          user timeout --kill-after=2s 10s systemctl --user set-environment "XDG_RUNTIME_DIR=$expected" || return 1
+          after=$(user timeout --kill-after=2s 10s systemctl --user show-environment | sed -n 's/^XDG_RUNTIME_DIR=//p') || return 1
+          [ "$after" = "$expected" ] || { echo 'Disposable manager runtime environment was not established'; return 1; }
+        }
         {
+          configure_disposable_runtime_environment
           user sh "$home/fixtures/test_systemd.sh" --run
           user mkdir -p "$home/.abstraction"
           user sh -c 'printf preserved > "$HOME/.abstraction/candidate-data"'
@@ -400,6 +413,14 @@ jobs:
         read -r account uid < "$state"
         [ "$account" = "oa-ci-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" ] && [ "$(id -u "$account")" = "$uid" ] || exit 1
         {
+          printf 'Disposable principal: '; id "$account"
+          # Inspect only identity/runtime settings; never dump the full manager environment.
+          sudo -u "$account" env HOME="/home/$account" XDG_RUNTIME_DIR="/run/user/$uid" DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$uid/bus" \
+            timeout --kill-after=2s 10s systemctl --user show-environment | grep -E '^(HOME|USER|LOGNAME|XDG_RUNTIME_DIR)=' || true
+          # Include the exact directory named by failed run 34693195412.
+          for directory in "/run/user/$uid" /run/user/1001; do
+            sudo stat -c '%A %u:%g %n' "$directory" "$directory/openabstractions-logging-v1.sock.lock" 2>&1 || true
+          done
           # status returns nonzero for stopped/failed units; retain that diagnostic
           # without changing the preceding install step's failure conclusion.
           sudo -u "$account" env HOME="/home/$account" XDG_RUNTIME_DIR="/run/user/$uid" DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$uid/bus" \
