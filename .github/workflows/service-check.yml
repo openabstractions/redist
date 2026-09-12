@@ -6,6 +6,10 @@ on:
         description: Completed release or Windows candidate run with successful Windows packaging
         required: true
         type: string
+      package_sha:
+        description: Exact lowercase 40-hex source commit of the package run
+        required: true
+        type: string
       windows_image:
         description: Windows image for the same fresh-session assertions
         type: choice
@@ -27,14 +31,17 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
           ARTIFACT_RUN: ${{ inputs.artifact_run }}
+          PACKAGE_SHA: ${{ inputs.package_sha }}
         shell: pwsh
         run: |
           if ($env:ARTIFACT_RUN -notmatch '^[0-9]+$') { throw 'Expected a numeric workflow run ID' }
+          if ($env:PACKAGE_SHA -cnotmatch '^[0-9a-f]{40}$') { throw 'Expected a full lowercase package SHA' }
           $run = gh api "repos/$env:GH_REPO/actions/runs/$env:ARTIFACT_RUN" | ConvertFrom-Json
           if ($LASTEXITCODE -ne 0) { throw 'Cannot read source run' }
           $candidate = $run.path -eq '.github/workflows/candidate.yml'
           if (($run.path -ne '.github/workflows/release.yml' -and -not $candidate) -or $run.status -ne 'completed' -or $run.repository.full_name -ne $env:GH_REPO) { throw 'Expected a completed release or candidate workflow in this repository' }
-          if ($candidate -and ($run.head_sha -ne $env:GITHUB_SHA -or $run.event -ne 'workflow_dispatch')) { throw 'Candidate package and fixture must use the same dispatched commit' }
+          if ($run.head_sha -cne $env:PACKAGE_SHA) { throw 'Package source does not match the requested SHA' }
+          if ($candidate -and $run.event -ne 'workflow_dispatch') { throw 'Candidate package must come from workflow_dispatch' }
           $jobs = gh run view $env:ARTIFACT_RUN --json jobs | ConvertFrom-Json
           if ($LASTEXITCODE -ne 0) { throw 'Cannot read source jobs' }
           if (@($jobs.jobs | Where-Object { $_.name -eq 'windows' -and $_.conclusion -eq 'success' }).Count -ne 1) { throw 'Source Windows packaging did not pass' }

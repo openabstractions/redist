@@ -43,6 +43,15 @@ function Invoke-Bounded([string]$Image, [string[]]$Arguments, [int]$Seconds = 90
     $result = Invoke-FixtureProcess $info $Seconds
     if ($result.ExitCode -ne 0) { throw "$([IO.Path]::GetFileName($Image)) exited $($result.ExitCode)" }
 }
+function Get-ProfileFolder([Environment+SpecialFolder]$Folder, [scriptblock]$Resolve = {
+    param($Name, $Option)
+    [Environment]::GetFolderPath($Name, $Option)
+}) {
+    # A newly loaded profile may have a configured folder which is not on disk.
+    $path = & $Resolve $Folder ([Environment+SpecialFolderOption]::DoNotVerify)
+    if ([string]::IsNullOrWhiteSpace($path)) { throw "Profile folder is unavailable: $Folder" }
+    return $path
+}
 function Assert-NoRuntime([string]$Sid) {
     $deadline = [DateTime]::UtcNow.AddSeconds(10)
     do {
@@ -69,12 +78,12 @@ if ($Mode -eq 'User') {
     $env:ABSTRACTION_RUNTIME_ENDPOINT = $null
     $env:ABSTRACTION_STORE = $null
     $env:MODELGET_STORE = $null
-    $tools = Join-Path ([Environment]::GetFolderPath('LocalApplicationData')) 'Programs\OpenAbstractions\tools'
-    $shortcutPath = Join-Path ([Environment]::GetFolderPath('Startup')) 'Abstraction supervisor.lnk'
+    $tools = Join-Path (Get-ProfileFolder LocalApplicationData) 'Programs\OpenAbstractions\tools'
     $installed = $false
     try {
         Invoke-Bounded msiexec.exe @('/i', "`"$MsiPath`"", '/qn', '/norestart', 'ALLUSERS=2', 'MSIINSTALLPERUSER=1', '/l*v', 'user-install.log')
         $installed = $true
+        $shortcutPath = Join-Path (Get-ProfileFolder Startup) 'Abstraction supervisor.lnk'
         if (@(Get-Service | Where-Object { $_.Name -like 'OpenAbstractionsSupervisor*' }).Count) { throw 'Per-user install registered a service' }
         if (-not (Test-Path -LiteralPath $shortcutPath)) { throw 'Installed Startup shortcut missing' }
         $shell = New-Object -ComObject WScript.Shell
