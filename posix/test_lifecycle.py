@@ -12,7 +12,7 @@ class Lifecycle(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
-        self.root = Path(self.tmp.name)
+        self.root = Path(self.tmp.name).resolve()
         self.home = self.root / "user home"
         self.share = self.home / ".local/share/abstraction"
         self.share.mkdir(parents=True)
@@ -20,6 +20,10 @@ class Lifecycle(unittest.TestCase):
         self.bin.mkdir()
         self.env = dict(os.environ, HOME=str(self.home), PATH=str(self.bin)+":"+os.environ["PATH"], LOG=str(self.root/"calls"))
         self.command("id", 'echo 1000')
+        # Manager commands are mocked on both native hosts; Python bounds tests.
+        # macOS has no bundled GNU timeout. Real Linux timeout is exercised by
+        # test_systemd.sh separately.
+        self.command("timeout", 'shift; shift; exec "$@"')
         self.command("systemctl", r'''echo "$*" >> "$LOG"
 case "$*" in
 *show-environment*) [ "${FAIL:-}" != manager ];;

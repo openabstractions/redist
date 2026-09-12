@@ -164,3 +164,262 @@ jobs:
           name: abstraction-windows-unsigned
           path: dist/
           if-no-files-found: error
+
+  posix:
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+        - runner: ubuntu-latest
+          platform: linux
+        - runner: macos-latest
+          platform: macos
+    env:
+      GOWORK: 'off'
+      GOFLAGS: -mod=readonly -trimpath
+      CGO_ENABLED: '0'
+      REDIST_SHA: ${{ inputs.redist_sha }}
+      CHARTER_SHA: ${{ inputs.charter_sha }}
+      SERVICE_JOBD_SHA: ${{ inputs.service_jobd_sha }}
+      DOWNLOAD_SHA: ${{ inputs.download_sha }}
+      CANDIDATE_VERSION: ${{ inputs.version }}
+      PACKAGE_PLATFORM: ${{ matrix.platform }}
+    steps:
+    - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
+    - name: validate immutable inputs
+      shell: python
+      run: |
+        import os, re, subprocess
+        for key in ('REDIST_SHA', 'CHARTER_SHA', 'SERVICE_JOBD_SHA', 'DOWNLOAD_SHA'):
+            if not re.fullmatch('[0-9a-f]{40}', os.environ[key]):
+                raise SystemExit(f'{key} must be a full lowercase public commit SHA')
+        if os.environ['REDIST_SHA'] != os.environ['GITHUB_SHA']:
+            raise SystemExit('Dispatched redist commit differs from redist_sha')
+        if subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip() != os.environ['REDIST_SHA']:
+            raise SystemExit('Redist checkout differs from requested commit')
+        version = os.environ['CANDIDATE_VERSION']
+        if not re.fullmatch(r'(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)', version):
+            raise SystemExit('MSI version must be MAJOR.MINOR.PATCH')
+        if any(int(n) > bound for n, bound in zip(version.split('.'), (255, 255, 65535))):
+            raise SystemExit('MSI version exceeds Windows Installer limits')
+    - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
+      with:
+        repository: openabstractions/abstractions
+        ref: ${{ inputs.charter_sha }}
+        path: source-charter
+        persist-credentials: false
+    - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
+      with:
+        repository: openabstractions/service-jobd
+        ref: ${{ inputs.service_jobd_sha }}
+        path: source-jobd
+        persist-credentials: false
+    - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
+      with:
+        repository: openabstractions/abstraction-download
+        ref: ${{ inputs.download_sha }}
+        path: source-download
+        persist-credentials: false
+    - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16
+      with:
+        go-version: 1.26.0
+        cache: false
+    - name: verify source and dependency provenance
+      shell: python
+      run: |
+        import json, os, pathlib, subprocess
+        sources = {'source-charter': 'CHARTER_SHA', 'source-jobd': 'SERVICE_JOBD_SHA', 'source-download': 'DOWNLOAD_SHA'}
+        evidence = {'redist': os.environ['REDIST_SHA'], 'sources': {}, 'dependencies': {}}
+        for directory, key in sources.items():
+            actual = subprocess.check_output(['git', '-C', directory, 'rev-parse', 'HEAD'], text=True).strip()
+            if actual != os.environ[key]:
+                raise SystemExit(f'{directory} checkout differs from requested commit')
+            evidence['sources'][directory] = actual
+        module = 'github.com/openabstractions/abstraction-download/go'
+        for directory in ('source-charter/serve', 'source-jobd'):
+            selected = json.loads(subprocess.check_output(['go', 'list', '-m', '-json', module], cwd=directory, text=True))
+            if selected.get('Replace'):
+                raise SystemExit(f'{directory} replaces its published download dependency')
+            downloaded = json.loads(subprocess.check_output(['go', 'mod', 'download', '-json', module+'@'+selected['Version']], cwd=directory, text=True))
+            if downloaded.get('Origin', {}).get('Hash') != os.environ['DOWNLOAD_SHA']:
+                raise SystemExit(f'{directory} download dependency does not identify download_sha')
+            evidence['dependencies'][directory] = downloaded
+        pathlib.Path('dist').mkdir()
+        pathlib.Path('dist/source-provenance.json').write_text(json.dumps(evidence, indent=2))
+        pathlib.Path('dist/tools.tsv').write_bytes(pathlib.Path('tools.tsv').read_bytes())
+    - name: native POSIX shell fixtures
+      shell: bash
+      run: |
+        python3 posix/test_lifecycle.py
+    - name: build POSIX programs from pinned public sources
+      shell: python
+      run: |
+        import hashlib, importlib.util, json, os, pathlib, re, subprocess
+        spec = importlib.util.spec_from_file_location('packager', 'posix/build.py')
+        packager = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(packager)
+        platform = os.environ['PACKAGE_PLATFORM']
+        if platform not in ('linux', 'macos'):
+            raise SystemExit('Unsupported POSIX package platform')
+        items = packager.payload(platform)
+        names = [pathlib.PurePosixPath(path).name for path, kind, *_ in items if kind == 'gobuild']
+        if len(names) != len(set(names)) or not {'jobd', 'dl', 'openabstractions'}.issubset(names):
+            raise SystemExit('Required POSIX runtime payload is missing or duplicated')
+        rows = [[part.strip() for part in line.split('\t') if part.strip()] for line in pathlib.Path('tools.tsv').read_text().splitlines() if line.strip() and not line.startswith('>')][1:]
+        if any(len(row) != 5 for row in rows) or len({row[0] for row in rows}) != len(rows):
+            raise SystemExit('Invalid or duplicate tools.tsv rows')
+        tools = {row[0]: row for row in rows}
+        overrides = {'jobd': ('source-jobd', '.'), 'openabstractions': ('source-charter/serve', '.'), 'dl': ('source-download/go', './cmd/dl')}
+        plan, pins = {}, {}
+        for name in names:
+            if name+'.exe' not in tools or tools[name+'.exe'][4] != 'console':
+                raise SystemExit('POSIX payload requires an explicit console tools.tsv entry')
+            if name in overrides:
+                plan[name] = overrides[name]
+                continue
+            _, module_version, package, _, _ = tools[name+'.exe']
+            module, version = module_version.rsplit('@', 1)
+            if not re.fullmatch(r'github.com/openabstractions/[a-z0-9-]+(?:/[a-z0-9-]+)*', module) or not re.fullmatch(r'v[0-9]+\.[0-9]+\.[0-9]+(?:-[A-Za-z0-9.-]+)?', version):
+                raise SystemExit('Other programs require reviewed immutable OpenAbstractions module tags')
+            if package != '.' and not re.fullmatch(r'[A-Za-z0-9_-]+(?:/[A-Za-z0-9_-]+)*', package):
+                raise SystemExit('Invalid module package path')
+            repo, _, subdir = module.removeprefix('github.com/openabstractions/').partition('/')
+            tag = 'refs/tags/'+(subdir+'/' if subdir else '')+version
+            refs = subprocess.check_output(['git', 'ls-remote', '--tags', '--exit-code', 'https://github.com/openabstractions/'+repo, tag, tag+'^{}'], text=True)
+            refs = dict(line.split()[::-1] for line in refs.splitlines())
+            if tag not in refs or set(refs)-{tag, tag+'^{}'} or any(not re.fullmatch('[0-9a-f]{40}', sha) for sha in refs.values()):
+                raise SystemExit('Exact public module tag is missing or malformed')
+            commit = refs.get(tag+'^{}', refs[tag])
+            selected = json.loads(subprocess.check_output(['go', 'mod', 'download', '-json', module_version], text=True))
+            if selected.get('Replace') or selected.get('Origin', {}).get('Hash') != commit or not selected.get('Dir'):
+                raise SystemExit('Module download does not match its exact public tag')
+            plan[name] = (selected['Dir'], '.' if package == '.' else './'+package)
+            pins[name] = {'module': module_version, 'tag': tag, 'sha': commit, 'sum': selected.get('Sum')}
+        goos = 'linux' if platform == 'linux' else 'darwin'
+        hashes = {}
+        for arch in ('amd64', 'arm64'):
+            output = pathlib.Path('binaries', arch).resolve()
+            output.mkdir(parents=True)
+            env = dict(os.environ, GOOS=goos, GOARCH=arch)
+            for name, (directory, target) in plan.items():
+                subprocess.run(['go', 'build', '-ldflags=-s -w -buildid=', '-o', str(output/name), target], cwd=directory, env=env, check=True)
+                hashes[arch+'/'+name] = hashlib.sha256((output/name).read_bytes()).hexdigest()
+        if platform == 'macos':
+            pathlib.Path('binaries/universal').mkdir()
+            for name in names:
+                output = 'binaries/universal/'+name
+                subprocess.run(['lipo', '-create', 'binaries/amd64/'+name, 'binaries/arm64/'+name, '-output', output], check=True)
+                subprocess.run(['lipo', '-verify_arch', 'x86_64', 'arm64', output], check=True)
+                hashes['universal/'+name] = hashlib.sha256(pathlib.Path(output).read_bytes()).hexdigest()
+        provenance = pathlib.Path('dist/source-provenance.json')
+        evidence = json.loads(provenance.read_text())
+        evidence.update(platform=platform, tools=pins, binary_sha256=hashes)
+        provenance.write_text(json.dumps(evidence, indent=2))
+    - name: assemble and inspect POSIX packages
+      shell: python
+      run: |
+        import hashlib, importlib.util, json, os, pathlib, subprocess, tarfile
+        platform, version = os.environ['PACKAGE_PLATFORM'], os.environ['CANDIDATE_VERSION']
+        if platform not in ('linux', 'macos'):
+            raise SystemExit('Unsupported package platform')
+        packages = []
+        for arch in (('amd64', 'arm64') if platform == 'linux' else ('universal',)):
+            command = ['python3', 'posix/build.py', '--platform', platform, '--version', version, '--out', 'dist', '--bin', 'binaries/'+arch, '--license', 'LICENSE']
+            if platform == 'linux':
+                command += ['--arch', arch]
+            subprocess.run(command, check=True)
+            name = f'abstraction-{version}-linux-{arch}.tar.gz' if platform == 'linux' else f'abstraction-{version}-macos-universal.pkg'
+            artifact = pathlib.Path('dist', name)
+            if not artifact.is_file() or artifact.stat().st_size == 0:
+                raise SystemExit('Packager did not produce the expected artifact')
+            if platform == 'linux':
+                with tarfile.open(artifact) as archive:
+                    for program in ('jobd', 'dl', 'jobctl', 'openabstractions'):
+                        member = archive.getmember(f'abstraction-{version}-linux-{arch}/payload/.local/bin/'+program)
+                        if not member.isfile() or member.mode & 0o111 != 0o111 or archive.extractfile(member).read() != pathlib.Path('binaries', arch, program).read_bytes():
+                            raise SystemExit('Linux package executable differs from verified input')
+            else:
+                subprocess.run(['pkgutil', '--expand-full', str(artifact), 'package-inspect'], check=True)
+                for program in ('jobd', 'dl', 'jobctl', 'openabstractions'):
+                    matches = list(pathlib.Path('package-inspect').glob('*/Payload/.local/bin/'+program))
+                    if len(matches) != 1 or matches[0].read_bytes() != pathlib.Path('binaries/universal', program).read_bytes():
+                        raise SystemExit('macOS package executable differs from verified universal input')
+            packages.append(name)
+        pathlib.Path('dist/SHA256SUMS.'+platform).write_text(''.join(hashlib.sha256(pathlib.Path('dist', name).read_bytes()).hexdigest()+'  '+name+'\n' for name in packages))
+        pathlib.Path('dist/package-verification.json').write_text(json.dumps({'platform': platform, 'package_build': 'passed', 'installed_lifecycle': 'pending' if platform == 'linux' else 'not_exercised', 'macos_limit': 'Unsigned package build and native shell fixtures; Aqua login lifecycle unproven' if platform == 'macos' else None, 'packages': packages}, indent=2))
+    - name: Linux disposable-account installed lifecycle
+      if: matrix.platform == 'linux'
+      shell: bash
+      run: |
+        set -euo pipefail
+        [ "${GITHUB_ACTIONS:-}" = true ] && [ "${RUNNER_ENVIRONMENT:-}" = github-hosted ] && [ "${RUNNER_OS:-}" = Linux ] || { echo 'Disposable GitHub Linux runner required'; exit 1; }
+        account=oa-ci-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}
+        case "$account" in oa-ci-[0-9]*-[0-9]*) ;; *) exit 1;; esac
+        if getent passwd "$account" >/dev/null; then echo 'Test account already exists'; exit 1; fi
+        sudo useradd --user-group --create-home --shell /bin/sh "$account"
+        uid=$(id -u "$account")
+        printf '%s %s\n' "$account" "$uid" > "$RUNNER_TEMP/oa-posix-account"
+        home=/home/$account
+        sudo mkdir "$home/package" "$home/fixtures"
+        sudo tar -xzf "dist/abstraction-$CANDIDATE_VERSION-linux-amd64.tar.gz" -C "$home/package" --no-same-owner
+        sudo cp -R posix/. "$home/fixtures/"
+        sudo chown -R "$account:$account" "$home/package" "$home/fixtures"
+        sudo loginctl enable-linger "$account"
+        sudo systemctl start "user@$uid.service"
+        user() { sudo -u "$account" env HOME="$home" XDG_RUNTIME_DIR="/run/user/$uid" DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$uid/bus" "$@"; }
+        {
+          user sh "$home/fixtures/test_systemd.sh" --run
+          user mkdir -p "$home/.abstraction"
+          user sh -c 'printf preserved > "$HOME/.abstraction/candidate-data"'
+          user sh "$home/package/abstraction-$CANDIDATE_VERSION-linux-amd64/install.sh"
+          for program in jobd dl jobctl openabstractions; do user test -x "$home/.local/bin/$program"; done
+          user "$home/.local/bin/openabstractions" status --timeout 5s
+          user sh "$home/.local/share/abstraction/uninstall.sh"
+          for program in jobd dl jobctl openabstractions; do user test ! -e "$home/.local/bin/$program"; done
+          for unit in abstraction-jobd.timer abstraction-jobd.service abstraction-runtime.service; do user test ! -e "$home/.config/systemd/user/$unit"; done
+          [ "$(user cat "$home/.abstraction/candidate-data")" = preserved ]
+          echo 'PASS Linux installed runtime readiness, native stop/removal and user-data preservation'
+        } 2>&1 | tee dist/linux-installed-lifecycle.log
+        python3 - <<'PY'
+        import json, pathlib
+        p = pathlib.Path('dist/package-verification.json')
+        evidence = json.loads(p.read_text())
+        evidence['installed_lifecycle'] = 'passed_disposable_user_systemd'
+        p.write_text(json.dumps(evidence, indent=2))
+        PY
+    - name: remove only the disposable Linux account
+      if: always() && matrix.platform == 'linux'
+      shell: bash
+      run: |
+        set -euo pipefail
+        state=$RUNNER_TEMP/oa-posix-account
+        [ -f "$state" ] || exit 0
+        [ "${GITHUB_ACTIONS:-}" = true ] && [ "${RUNNER_ENVIRONMENT:-}" = github-hosted ] && [ "${RUNNER_OS:-}" = Linux ] || exit 1
+        read -r account uid < "$state"
+        [ "$account" = "oa-ci-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" ] && [ "$(id -u "$account")" = "$uid" ] || exit 1
+        {
+          # Cleanup after a failed assertion is explicit containment, not lifecycle PASS.
+          sudo loginctl disable-linger "$account"
+          sudo systemctl stop "user@$uid.service"
+          sudo userdel --remove "$account"
+          if getent passwd "$account" >/dev/null; then echo 'Disposable account survived cleanup'; exit 1; fi
+          rm "$state"
+          echo 'PASS disposable account cleanup'
+        } 2>&1 | tee dist/linux-account-cleanup.log
+    - name: record candidate proof scope
+      if: always()
+      shell: python
+      run: |
+        import os, pathlib
+        path = pathlib.Path('dist/package-verification.json')
+        if path.exists():
+            with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as summary:
+                summary.write('\nPOSIX candidate evidence (unsigned, no release tag):\n```json\n'+path.read_text()+'\n```\n')
+    - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+      if: always()
+      with:
+        name: abstraction-${{ matrix.platform }}-unsigned
+        path: dist/*.*
+        if-no-files-found: error
