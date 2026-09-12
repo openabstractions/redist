@@ -53,20 +53,33 @@ function Write-Diagnostic([string]$Text) {
 }
 function Write-ServerDiagnostics {
     foreach ($log in @('Microsoft-Windows-TerminalServices-LocalSessionManager/Operational',
-        'Microsoft-Windows-TerminalServices-RemoteConnectionManager/Operational','Security')) {
+        'Microsoft-Windows-TerminalServices-RemoteConnectionManager/Operational',
+        'Microsoft-Windows-RemoteDesktopServices-RdpCoreTS/Operational',
+        'Microsoft-Windows-Winlogon/Operational',
+        'Microsoft-Windows-User Profile Service/Operational',
+        'Microsoft-Windows-AppReadiness/Admin','Microsoft-Windows-AppReadiness/Operational',
+        'Application','System','Security')) {
         try {
             $filter = @{ LogName=$log; StartTime=$started }
             if ($log -eq 'Security') { $filter.Id=4625 }
+            if ($log -eq 'Application') { $filter.ProviderName=@('Microsoft-Windows-User Profiles Service','Microsoft-Windows-Winlogon','Application Error') }
+            if ($log -eq 'System') { $filter.ProviderName=@('Microsoft-Windows-Winlogon','Service Control Manager','TermDD') }
             $events = @(Get-WinEvent -FilterHashtable $filter -MaxEvents 20 -ErrorAction Stop)
             foreach ($event in $events) {
                 [xml]$xml = $event.ToXml()
                 # Do not dump rendered event messages, account names, addresses, or credential-bearing fields.
                 $codes = @($xml.Event.EventData.Data | Where-Object {
-                    $_.Name -in @('Status','SubStatus','FailureReason','LogonType','ErrorCode','ResultCode','SessionID')
+                    $_.Name -in @('Status','SubStatus','FailureReason','LogonType','ErrorCode','ResultCode','SessionID','Reason','DisconnectReason','Error','HResult','State','StatusCode')
                 } | ForEach-Object { "$($_.Name)=$($_.'#text')" }) -join ' '
                 Write-Diagnostic "event log=$log id=$($event.Id) time=$($event.TimeCreated.ToUniversalTime().ToString('o')) $codes"
             }
-        } catch { Write-Diagnostic "event log=$log unavailable or no matching events (details omitted)" }
+        } catch {
+            if ($_.FullyQualifiedErrorId -like 'NoMatchingEventsFound*') {
+                Write-Diagnostic "event log=$log no matching events"
+            } else {
+                Write-Diagnostic "event log=$log unavailable errorId=$($_.FullyQualifiedErrorId)"
+            }
+        }
     }
 }
 $rdpKey = 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server'
@@ -127,7 +140,10 @@ Write-Diagnostic "TerminalServerMode=$($settings.TerminalServerMode) LicensingTy
 Wait-Condition { if (Get-NetTCPConnection -State Listen -LocalPort 3389 -ErrorAction SilentlyContinue) { $true } } 30 'RDP listener ready' | Out-Null
 $form = New-Object System.Windows.Forms.Form
 $form.ShowInTaskbar = $false
-$form.WindowState = 'Minimized'
+# Establish an actual desktop-sized ActiveX surface before connection. DesktopWidth/
+# Height otherwise default to the control dimensions, including minimized geometry.
+$form.ClientSize = New-Object System.Drawing.Size(1024,768)
+$form.WindowState = 'Normal'
 $hostControl = New-Object OARdpHost
 $hostControl.Dock = 'Fill'
 $form.Controls.Add($hostControl)
@@ -135,6 +151,9 @@ try {
     $form.Show()
     $client = $hostControl.Client
     $hostControl.HookEvents()
+    $client.DesktopWidth = 1024
+    $client.DesktopHeight = 768
+    Write-Diagnostic "RDP requestedDesktop=$($client.DesktopWidth)x$($client.DesktopHeight) control=$($hostControl.Width)x$($hostControl.Height)"
     $client.Server = '127.0.0.1'
     $client.UserName = $user
     $client.Domain = $env:COMPUTERNAME
@@ -153,6 +172,7 @@ try {
         $ids = @([OASessions]::ForUser($user))
         if ($hostControl.LoginComplete -and $client.Connected -eq 1 -and $ids.Count -eq 1 -and $ids[0] -gt 0) { $ids[0] }
     } 90 'fresh RDP account session'
+    $form.WindowState = 'Minimized'
     if ($session -eq (Get-Process -Id $PID).SessionId) { throw 'Fresh account reused runner session' }
     $expectedImage = Join-Path $env:ProgramFiles 'OpenAbstractions\tools\jobdw.exe'
     function Find-Instance {
