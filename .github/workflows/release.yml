@@ -426,6 +426,7 @@ jobs:
       # a workstation is not, which is exactly why this belongs here: the
       # machine scope cannot be proved on the machine the package is written on.
       - name: install for everyone
+        id: machine-install
         shell: pwsh
         run: |
           $msi = (Resolve-Path pkg\abstraction-x64.msi).Path
@@ -500,35 +501,22 @@ jobs:
           }
           'ok    a USER_OWN_PROCESS template, auto-start, pointing at jobdw.exe, with three restarts and the non-crash flag'
 
-      - name: an instance, and whether it is up
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+        with:
+          ref: ${{ github.sha }}
+          path: session-fixture
+      - name: fresh interactive session and crash recovery
         id: instance
         shell: pwsh
+        timeout-minutes: 5
         run: |
-          $clones = @(Get-Service -Name 'OpenAbstractionsSupervisor_*' -ErrorAction SilentlyContinue)
-          $clones | Format-Table -AutoSize Name, Status
-          if ($clones.Count -eq 0) {
-            if ($env:interactive -ne '0') {
-              throw 'an interactive session exists on this runner and the service manager cloned no instance into it. The template is registered and nothing is supervising anything.'
-            }
-            'UNPROVEN  machine scope, the running instance. This runner has no interactive session, the service manager clones a per-user service at logon, and so no instance can appear here. What is proven above: the template, its type, its image, its start type and its recovery policy. What is not: that the clone appears, that it answers the service control dispatcher, and that a killed instance comes back. That ladder is research/svcreg245/RESULTS.md section 8 and it needs a person at a real sign-in.'
-            "state=unproven" >> $env:GITHUB_OUTPUT
-            "UNPROVEN: the machine scope's running instance. No interactive session on this runner." >> $env:GITHUB_STEP_SUMMARY
-          } else {
-            $up = @($clones | Where-Object { $_.Status -eq 'Running' })
-            if ($up.Count -eq 0) {
-              $clones | Format-List Name, Status
-              throw 'the service manager cloned the template and no instance is Running. A process that does not reach StartServiceCtrlDispatcher within ServicesPipeTimeout is a start failure, and a start failure is the one failure the recovery policy does not fire on.'
-            }
-            $procs = @(Get-Process jobdw -ErrorAction SilentlyContinue)
-            $procs | Format-Table -AutoSize Id, SessionId
-            if (@($procs | Where-Object { $_.SessionId -ne 0 }).Count -eq 0) {
-              throw 'an instance reports Running and no jobdw process is in an interactive session. A per-user service runs in the session it was cloned into.'
-            }
-            "ok    $($up.Count) instance(s) Running, in an interactive session"
-            "state=proven" >> $env:GITHUB_OUTPUT
-          }
+          & powershell.exe -NoProfile -ExecutionPolicy Bypass -STA -File session-fixture/test_service_session.ps1 -Mode Verify -StatePath "$env:RUNNER_TEMP/oa-service-session.json"
+          if ($LASTEXITCODE -ne 0) { throw "Fresh logon/recovery fixture exited $LASTEXITCODE" }
+          "state=proven" >> $env:GITHUB_OUTPUT
+          exit 0
 
       - name: uninstall for everyone
+        if: always() && steps.machine-install.outcome == 'success'
         shell: pwsh
         run: |
           $msi = (Resolve-Path pkg\abstraction-x64.msi).Path
@@ -550,6 +538,17 @@ jobs:
           $key = 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Environment'
           if ((Get-ItemProperty $key -Name Path).Path -like '*OpenAbstractions*') { throw 'the machine PATH entry survived uninstall' }
           'ok    uninstall reversed it: no template, no instance, no folder, no key, no config folder, no PATH entry'
+          exit 0
+
+      - name: remove only the disposable test session
+        if: always()
+        shell: pwsh
+        timeout-minutes: 2
+        run: |
+          if (Test-Path session-fixture/test_service_session.ps1) {
+            & powershell.exe -NoProfile -ExecutionPolicy Bypass -STA -File session-fixture/test_service_session.ps1 -Mode Cleanup -StatePath "$env:RUNNER_TEMP/oa-service-session.json" 2>&1 | Tee-Object service-session-cleanup.log
+            if ($LASTEXITCODE -ne 0) { throw "Session cleanup exited $LASTEXITCODE" }
+          }
           exit 0
 
       # ----- the command nobody names a scope on -----------------------------
@@ -598,6 +597,8 @@ jobs:
             user-uninstall.log
             machine-install.log
             machine-uninstall.log
+            service-session.log
+            service-session-cleanup.log
             unscoped.log
           if-no-files-found: ignore
 
