@@ -1255,7 +1255,9 @@ jobs:
                 printf -- '  and a download that cannot be opened is worse than a platform that\n'
                 printf -- '  says it has no package. `go install` is the route on macOS.\n' ;;
             esac
-            printf -- '- **The C++ developer headers**: carried by no module.\n'
+            printf -- '- **C++ development libraries** are not bundled in this redistributable.\n'
+            printf -- '  Standalone CMake packages are available from the layer repositories, including\n'
+            printf -- '  [abstraction-cas](https://github.com/openabstractions/abstraction-cas).\n'
             printf -- '- **The Python packages**: published on their own registry, so no package\n'
             printf -- '  here carries a second copy of them.\n'
             printf -- '- **A container**: `jobd` for a NAS is a separate image,\n'

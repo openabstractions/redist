@@ -29,15 +29,15 @@
 >
 > A program with no published module has no row. It is named as absent in the
 > release notes instead; there is no placeholder here to be filled in silently.
-> Absent today: the C++ developer headers, which no module carries. The panel
+> C++ development libraries are distributed separately by their layers. The panel
 > and jobdw.exe were absent until 2026-09-10, when abstractions/monitor and
 > service-jobd got their first tags; jobd.exe and jobdw.exe are two links of one
 > source and share a tag, because two images on two tags are two programs
 > wearing a pair's name.
 
 path		module							package		feature		subsystem
-jobd.exe	github.com/openabstractions/service-jobd@v0.3.1		.		service		console
-jobdw.exe	github.com/openabstractions/service-jobd@v0.3.1		.		service		windows
+jobd.exe	github.com/openabstractions/service-jobd@v0.3.2		.		service		console
+jobdw.exe	github.com/openabstractions/service-jobd@v0.3.2		.		service		windows
 dl.exe		github.com/openabstractions/abstraction-download/go@v0.4.2	cmd/dl		tools		console
 jobctl.exe	github.com/openabstractions/abstraction-job/go@v0.4.2	cmd/jobctl	tools		console
 Abstraction Panel.exe	github.com/openabstractions/abstractions/monitor@v0.1.1	.		tools		windows
