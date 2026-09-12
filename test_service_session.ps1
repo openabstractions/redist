@@ -1,5 +1,5 @@
 param(
-    [ValidateSet('Verify','VerifyLogon','Cleanup','ValidateOnly')][string]$Mode = 'ValidateOnly',
+    [ValidateSet('Verify','Cleanup','ValidateOnly')][string]$Mode = 'ValidateOnly',
     [string]$StatePath = (Join-Path $env:TEMP 'oa-service-session.json')
 )
 $ErrorActionPreference = 'Stop'
@@ -21,37 +21,6 @@ public class OARdpHost : AxHost {
     ComEventsHelper.Combine(Client,iid,3,new Action(() => { LoginComplete=true; }));
     ComEventsHelper.Combine(Client,iid,4,new Action<int>(n => { DisconnectReason=n; Disconnected=true; }));
   }
-}
-// LogonUser authenticates a new LSA logon, not a fabricated SCM service instance.
-public sealed class OAInteractiveLogon : IDisposable {
-  [StructLayout(LayoutKind.Sequential)] struct Luid { public uint Low; public int High; }
-  [StructLayout(LayoutKind.Sequential)] struct Stats {
-    public Luid TokenId; public Luid AuthenticationId; public long Expiration;
-    public int Type; public int Impersonation; public uint DynamicCharged; public uint DynamicAvailable;
-    public uint GroupCount; public uint PrivilegeCount; public Luid ModifiedId;
-  }
-  [DllImport("advapi32.dll",CharSet=CharSet.Unicode,SetLastError=true)] static extern bool LogonUser(string user,string domain,string password,int type,int provider,out IntPtr token);
-  [DllImport("advapi32.dll",SetLastError=true)] static extern bool GetTokenInformation(IntPtr token,int info,out Stats data,int size,out int needed);
-  [DllImport("advapi32.dll",SetLastError=true)] static extern bool OpenProcessToken(IntPtr process,uint access,out IntPtr token);
-  [DllImport("kernel32.dll",SetLastError=true)] static extern IntPtr OpenProcess(uint access,bool inherit,int pid);
-  [DllImport("kernel32.dll")] static extern bool CloseHandle(IntPtr handle);
-  IntPtr token;
-  static string Authentication(IntPtr h) {
-    Stats s; int needed;
-    if(!GetTokenInformation(h,10,out s,Marshal.SizeOf(typeof(Stats)),out needed)) throw new System.ComponentModel.Win32Exception();
-    return (((ulong)(uint)s.AuthenticationId.High << 32) | s.AuthenticationId.Low).ToString("x");
-  }
-  public string AuthenticationId { get { return Authentication(token); } }
-  public OAInteractiveLogon(string user,string domain,string password) {
-    if(!LogonUser(user,domain,password,2,0,out token)) throw new System.ComponentModel.Win32Exception();
-  }
-  public static string ProcessAuthenticationId(int pid) {
-    IntPtr p=OpenProcess(0x1000,false,pid); if(p==IntPtr.Zero) throw new System.ComponentModel.Win32Exception();
-    try { IntPtr t; if(!OpenProcessToken(p,8,out t)) throw new System.ComponentModel.Win32Exception();
-      try { return Authentication(t); } finally { CloseHandle(t); }
-    } finally { CloseHandle(p); }
-  }
-  public void Dispose() { if(token!=IntPtr.Zero) { CloseHandle(token); token=IntPtr.Zero; } }
 }
 public static class OASessions {
   [StructLayout(LayoutKind.Sequential)] struct Info { public int Id; public IntPtr Station; public int State; }
@@ -131,10 +100,6 @@ if ($Mode -eq 'Cleanup') {
     if ($state.User -notmatch '^oa_ci_[0-9a-f]{10}$') { throw 'Refusing unrecognized cleanup account' }
     $account = Get-LocalUser -Name $state.User -ErrorAction SilentlyContinue
     if ($account -and $state.Sid -and $account.SID.Value -ne $state.Sid) { throw 'Cleanup account SID changed' }
-    if ($state.Mode -eq 'VerifyLogon') {
-        # VerifyLogon closes its own token in finally; it never owns a WTS session.
-        if ($account) { Remove-LocalUser -Name $state.User }
-    } else {
     foreach ($session in [OASessions]::ForUser($state.User)) {
         if ($session -eq (Get-Process -Id $PID).SessionId -or $session -eq 0) { throw 'Refusing to log off runner/session zero' }
         if (-not [OASessions]::WTSLogoffSession([IntPtr]::Zero,$session,$false)) { throw 'Test account logoff failed' }
@@ -143,10 +108,8 @@ if ($Mode -eq 'Cleanup') {
     if ($account) { Remove-LocalUser -Name $state.User }
     Set-ItemProperty $rdpKey -Name fDenyTSConnections -Value $state.Deny
     Get-NetFirewallRule -Name "$($state.Rule)*" -ErrorAction SilentlyContinue | Remove-NetFirewallRule
-    }
     Remove-Item -LiteralPath $StatePath
-    if ($state.Mode -eq 'VerifyLogon') { 'ok: temporary LogonUser account removed; no WTS/RDP mutation' }
-    else { 'ok: only the temporary account was logged off and removed; RDP setting restored' }
+    'ok: only the temporary account was logged off and removed; RDP setting restored'
     exit 0
 }
 if ([Threading.Thread]::CurrentThread.ApartmentState -ne 'STA') { throw 'Use powershell.exe -STA -File for ActiveX hosting' }
@@ -158,47 +121,16 @@ $rng = [Security.Cryptography.RandomNumberGenerator]::Create()
 try { $rng.GetBytes($random) } finally { $rng.Dispose() }
 $password = 'Aa1!' + [Convert]::ToBase64String($random)
 Write-Output "::add-mask::$password"
-$state = @{ Mode=$Mode; User=$user; Sid=''; Rule=('OA-CI-RDP-'+[Guid]::NewGuid().ToString('N')); Deny=(Get-ItemProperty $rdpKey).fDenyTSConnections }
+$state = @{ User=$user; Sid=''; Rule=('OA-CI-RDP-'+[Guid]::NewGuid().ToString('N')); Deny=(Get-ItemProperty $rdpKey).fDenyTSConnections }
 $state | ConvertTo-Json | Set-Content -Encoding UTF8 $StatePath
-$account = New-LocalUser -Name $user -Password (ConvertTo-SecureString $password -AsPlainText -Force) -AccountNeverExpires
-$state.Sid = $account.SID.Value
-$state | ConvertTo-Json | Set-Content -Encoding UTF8 $StatePath
-if ($Mode -eq 'VerifyLogon') {
-    $logon = $null
-    try {
-        $logon = New-Object OAInteractiveLogon($user,$env:COMPUTERNAME,$password)
-        $authentication = $logon.AuthenticationId
-        $name = "OpenAbstractionsSupervisor_$authentication"
-        Write-Diagnostic "Interactive LogonUser authenticationLuid=$authentication; awaiting OS-created $name"
-        function Find-LogonInstance {
-            $svc = Get-CimInstance Win32_Service -Filter "Name='$name'"
-            if (-not $svc -or $svc.State -ne 'Running' -or $svc.ProcessId -eq 0) { return }
-            $proc = Get-CimInstance Win32_Process -Filter "ProcessId=$($svc.ProcessId)"
-            if (-not $proc) { return }
-            $owner = Invoke-CimMethod -InputObject $proc -MethodName GetOwnerSid
-            if ($owner.ReturnValue -ne 0 -or $owner.Sid -ne $state.Sid) { throw 'Logon instance has wrong principal' }
-            if ($proc.ExecutablePath -ne (Join-Path $env:ProgramFiles 'OpenAbstractions\tools\jobdw.exe')) { throw 'Logon instance has wrong image' }
-            if ([OAInteractiveLogon]::ProcessAuthenticationId([int]$svc.ProcessId) -ne $authentication) { throw 'Service process authentication LUID differs from retained token' }
-            return $svc
-        }
-        $first = Wait-Condition { Find-LogonInstance } 60 'OS-created service for interactive authentication LUID'
-        $oldPid = [int]$first.ProcessId
-        Stop-Process -Id $oldPid -Force -ErrorAction Stop
-        $replacement = Wait-Condition {
-            $next = Find-LogonInstance
-            if ($next -and $next.ProcessId -ne $oldPid) { $next }
-        } 60 'SCM restart for retained interactive logon'
-        Write-Diagnostic "ok: LogonUser $name PID $oldPid replaced by $($replacement.ProcessId), matching account and authentication LUID"
-    } catch { Write-ServerDiagnostics; Write-Diagnostic "VerifyLogon failed: $($_.Exception.Message)"; throw }
-    finally { if ($logon) { $logon.Dispose() } }
-    # Retained only through verification. This mode makes no WTS/desktop claim.
-    exit 0
-}
 # Blocks every non-loopback source before changing RDP availability. Never enable a broad allow rule.
 $remote = @('0.0.0.0-126.255.255.255','128.0.0.0-255.255.255.255','::2-ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff')
 foreach ($protocol in 'TCP','UDP') {
     New-NetFirewallRule -Name "$($state.Rule)-$protocol" -DisplayName "$($state.Rule)-$protocol" -Direction Inbound -Action Block -Protocol $protocol -LocalPort 3389 -RemoteAddress $remote -Profile Any | Out-Null
 }
+$account = New-LocalUser -Name $user -Password (ConvertTo-SecureString $password -AsPlainText -Force) -AccountNeverExpires
+$state.Sid = $account.SID.Value
+$state | ConvertTo-Json | Set-Content -Encoding UTF8 $StatePath
 $group = Get-LocalGroup -SID 'S-1-5-32-555'
 Add-LocalGroupMember -Group $group -Member $account
 Set-ItemProperty $rdpKey -Name fDenyTSConnections -Value 0

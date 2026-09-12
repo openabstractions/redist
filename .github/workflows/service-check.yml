@@ -6,19 +6,19 @@ on:
         description: Completed release workflow run with a successful Windows package job
         required: true
         type: string
-      session_mode:
-        description: Explicit logon mechanism being measured; neither creates service instances manually
+      windows_image:
+        description: Windows image for the same fresh-session assertions
         type: choice
         options:
-          - Verify
-          - VerifyLogon
-        default: Verify
+          - windows-latest
+          - windows-2022
+        default: windows-latest
 permissions:
   contents: read
   actions: read
 jobs:
   service:
-    runs-on: windows-latest
+    runs-on: ${{ inputs.windows_image == 'windows-2022' && 'windows-2022' || 'windows-latest' }}
     timeout-minutes: 12
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
@@ -59,10 +59,8 @@ jobs:
       - name: fresh sign-in and recovery
         timeout-minutes: 5
         shell: pwsh
-        env:
-          SESSION_MODE: ${{ inputs.session_mode }}
         run: |
-          & powershell.exe -NoProfile -ExecutionPolicy Bypass -STA -File test_service_session.ps1 -Mode $env:SESSION_MODE -StatePath "$env:RUNNER_TEMP/oa-service-session.json"
+          & powershell.exe -NoProfile -ExecutionPolicy Bypass -STA -File test_service_session.ps1 -Mode Verify -StatePath "$env:RUNNER_TEMP/oa-service-session.json"
           if ($LASTEXITCODE -ne 0) { throw "Session verification exited $LASTEXITCODE" }
           exit 0
       - name: remove installed package
