@@ -289,6 +289,8 @@ jobs:
             "an interactive session exists, so a clone of the template must appear and this job holds the machine scope to it"
           }
           "interactive=$interactive" >> $env:GITHUB_ENV
+          # query.exe is diagnostic; do not propagate its stale native exit code.
+          exit 0
 
       # ----- just for me -----------------------------------------------------
       #
@@ -310,7 +312,7 @@ jobs:
           $dir = Join-Path $env:LOCALAPPDATA 'Programs\OpenAbstractions'
           $tools = Join-Path $dir 'tools'
           if (-not (Test-Path $tools)) { throw "a per-user install did not land in $tools" }
-          foreach ($f in 'jobd.exe','jobdw.exe','dl.exe','jobctl.exe','openabstractions.exe') {
+          foreach ($f in 'jobd.exe','jobdw.exe','dl.exe','jobctl.exe','openabstractions.exe','Abstraction Panel.exe') {
             if (-not (Test-Path (Join-Path $tools $f))) { throw "$f was not installed" }
           }
           $path = (Get-ItemProperty 'HKCU:\Environment' -Name Path -ErrorAction Stop).Path
@@ -332,12 +334,14 @@ jobs:
           if (Test-Path (Join-Path $env:ProgramData 'abstraction')) { throw 'a per-user install created the machine config folder it cannot protect' }
           & sc.exe qc OpenAbstractionsSupervisor | Out-Null
           if ($LASTEXITCODE -eq 0) { throw 'a per-user install registered a service. It has no administrator token, so whatever it registered, it registered wrong.' }
+          if ($LASTEXITCODE -ne 1060) { throw "sc qc could not establish service absence: exit $LASTEXITCODE" }
           foreach ($t in 'jobd','jobd-logon') {
             if (Get-ScheduledTask -TaskName $t -ErrorAction SilentlyContinue) {
               throw "a scheduled task named $t exists. This package registered one until it was replaced by the service and the Startup shortcut; a task coming back is that mechanism returning unannounced."
             }
           }
           'ok    programs, a user PATH entry, a Startup shortcut — and no service, no machine key, no task'
+          exit 0
 
       # These three binaries come from three separately tagged modules, so the
       # package contains three builds of one store format. Only writing with one
@@ -437,7 +441,7 @@ jobs:
           $dir = Join-Path $env:ProgramFiles 'OpenAbstractions'
           $tools = Join-Path $dir 'tools'
           if (-not (Test-Path $tools)) { throw "a per-machine install did not land in $tools" }
-          foreach ($f in 'jobd.exe','jobdw.exe','dl.exe','jobctl.exe','openabstractions.exe') {
+          foreach ($f in 'jobd.exe','jobdw.exe','dl.exe','jobctl.exe','openabstractions.exe','Abstraction Panel.exe') {
             if (-not (Test-Path (Join-Path $tools $f))) { throw "$f was not installed" }
           }
           $key = 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Environment'
@@ -531,6 +535,7 @@ jobs:
           if ($p.ExitCode -ne 0) { Get-Content machine-uninstall.log -Tail 60; throw "msiexec /x exited $($p.ExitCode)" }
           & sc.exe qc OpenAbstractionsSupervisor | Out-Null
           if ($LASTEXITCODE -eq 0) { throw 'the service template survived uninstall' }
+          if ($LASTEXITCODE -ne 1060) { throw "sc qc could not establish service absence: exit $LASTEXITCODE" }
 
           # Deleting the template does not delete the instances the service
           # manager cloned from it: the owner's own probe outlived sc delete and
@@ -544,6 +549,7 @@ jobs:
           $key = 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Environment'
           if ((Get-ItemProperty $key -Name Path).Path -like '*OpenAbstractions*') { throw 'the machine PATH entry survived uninstall' }
           'ok    uninstall reversed it: no template, no instance, no folder, no key, no config folder, no PATH entry'
+          exit 0
 
       # ----- the command nobody names a scope on -----------------------------
       #
@@ -567,6 +573,7 @@ jobs:
           $machineDir = Test-Path (Join-Path $env:ProgramFiles 'OpenAbstractions')
           $userDir = Test-Path (Join-Path $env:LOCALAPPDATA 'Programs\OpenAbstractions')
           & sc.exe qc OpenAbstractionsSupervisor | Out-Null
+          if ($LASTEXITCODE -notin @(0, 1060)) { throw "sc qc could not establish service state: exit $LASTEXITCODE" }
           $service = $LASTEXITCODE -eq 0
           $lnk = Test-Path (Join-Path $env:APPDATA 'Microsoft\Windows\Start Menu\Programs\Startup\Abstraction supervisor.lnk')
           "folder: machine=$machineDir user=$userDir   arm: service=$service shortcut=$lnk"
@@ -578,6 +585,7 @@ jobs:
           $p = Start-Process msiexec -Wait -PassThru -ArgumentList @('/x', $msi, '/qn', '/norestart')
           if ($p.ExitCode -ne 0) { throw "msiexec /x exited $($p.ExitCode)" }
           'ok    an unscoped install chose one scope and did all of it'
+          exit 0
 
   linux:
     needs: candidate
