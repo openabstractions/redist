@@ -1,108 +1,88 @@
-The Open Abstractions redistributable: three command-line programs in one
-package per platform, built from our own published module versions rather than
-from a source tree.
-
-Which packages this release carries, and which of them is signed, are stated at
-the end of this page by the run that built it. Nothing above that point is a
-claim about this particular run.
+The Open Abstractions redistributable packages programs built from published
+module versions. The build appends this release's asset and signing state at
+the end of these notes; those facts apply to this release only.
 
 ## What is in it
 
-| program | what it does |
-|---|---|
-| `jobd` | keeps downloads running when no application is open |
-| `dl` | fetches a URL, resumably, verifying a digest if you give one |
-| `jobctl` | drives the job store directly, for scripts and debugging |
+| program | what it does | platforms |
+|---|---|---|
+| `jobd` | supervises downloads after the requesting application closes | Windows, Linux, macOS |
+| `jobdw` | the same supervisor built without a console window | Windows |
+| `dl` | fetches URLs resumably and verifies a supplied digest | Windows, Linux, macOS |
+| `jobctl` | operates directly on the job store for scripts and debugging | Windows, Linux, macOS |
+| `Abstraction Panel` | graphical view of local activity | Windows |
+| `openabstractions` | hosts capability services through its `serve` command | Windows, Linux, macOS |
 
-Each is built from a published module version, and `tools.tsv` in this
-repository at this tag is the list of them. It is the file the release workflow
-reads, so it is the only place those versions are written down.
+There are six Windows executables and four Linux/macOS programs. `jobd` and `jobdw`
+are two builds of the same source. [`tools.tsv`](tools.tsv) at this release's
+commit names the exact module versions and packages the workflow builds.
+Resolving a module through the Go proxy proves it is fetchable; the proxy may
+retain versions after a tag is deleted.
 
-The workflow refuses to build if one of them does not resolve, so this package
-is made of the same artifacts a stranger gets from `go install` and cannot
-quietly drift into being built from something else. It resolves them through
-`proxy.golang.org`, which goes on serving a version whose tag was later
-deleted — so that check proves the artifact is fetchable, not that the tag is
-still there.
-
-**`jobctl` is not the friendly one.** All three find the store from
-`ABSTRACTION_STORE`. `jobctl` also accepts `JOB_STORE`, which wins where it is
-set, so one shell can point it at a store the other two are not using. Its verbs are
-`submit`, `claim`, `progress`, `finish`, `show`, `cancel`, `intent`, `recall`
-and `orphans` — there is no `jobctl list`. It is the low-level tool for the job
-store, and it is in this package because it is what is published, not because
-it is the command-line experience we want. `dl list` is the friendly view of
-your own downloads.
-
-The three programs do agree about the **store format**, which is the thing that
-matters: the release workflow has `dl` fetch a file, then requires `jobd` to
-see that download and `jobctl show` to return the record `dl` wrote. It fails
-if any of them disagrees.
+`jobctl` is a low-level tool, not the download browser: use `dl list` for your
+own downloads. Its store override `JOB_STORE` takes precedence over
+`ABSTRACTION_STORE`, so it can address a different store from `dl` and `jobd`.
+The workflow's cross-tool check writes a download with `dl` and reads it with
+`jobd` and `jobctl`; that scenario is not a complete compatibility proof.
 
 ## Installing
 
-**Windows.** Download `abstraction-x64.msi` — or `abstraction-arm64.msi` on
-Windows on ARM — check it against `SHA256SUMS`, then run it. It installs to
-`%LOCALAPPDATA%\Programs\OpenAbstractions` — the programs in `tools\`, runnable
-examples in `examples\` — adds `tools\` to your `PATH`, and asks for no
-administrator rights. Open a new terminal afterwards, or `PATH` will still be
-the old one.
+**Windows.** Choose the x64 or arm64 MSI for your machine and compare it with
+`SHA256SUMS`. The default *Just me* scope installs under
+`%LOCALAPPDATA%\Programs\OpenAbstractions` without administrator rights.
+*Everyone* installs under `%ProgramFiles%\OpenAbstractions` and requires
+elevation. Programs live in `tools\`; runnable examples live in `examples\`.
 
-    dl https://example.com/some/file.bin -o D:\downloads
+**Add to PATH is optional.** Select it to use the commands from a new terminal;
+leave it unchecked to invoke them by full path. The per-user supervisor starts
+through a Startup shortcut and is not automatically replaced after a crash.
+The elevated scope registers the Windows service arrangement, which starts the
+user's supervisor at sign-in and restarts it after a crash. Uninstall through
+Windows' installed-apps settings or `msiexec /x <package.msi>`.
 
-Uninstall from Apps & features, or `msiexec /x abstraction-x64.msi`. The
-release workflow installs and uninstalls the x64 package on a clean machine on
-every run and fails if anything is left behind.
+**Linux.** Unpack the tarball for your architecture and run its `install.sh`.
+It installs four programs under `~/.local/bin` and the uninstaller and manifest
+under `~/.local/share/abstraction`. It does not edit shell profiles; follow its
+PATH guidance if needed. Background scheduling needs a systemd user manager;
+the installer reports when it is unavailable.
 
-**Linux.** Unpack the tarball for your architecture and run the `install.sh`
-inside it. It puts the three programs in `~/.local/bin`, and an `uninstall.sh`
-with the `MANIFEST` it removes in `~/.local/share/abstraction`. The release
-workflow unpacks, installs and uninstalls the amd64 tarball on every run.
+**macOS.** When attached to the release, the universal `.pkg` carries both
+x86_64 and arm64 programs and installs for the current user. Consult the
+appended asset/signing state before downloading: a successful build alone does
+not mean a package was signed, notarised or attached.
 
 ## Checking what you downloaded
 
-`SHA256SUMS` is `sha256sum` output — one line per file, the hash, two spaces,
-the filename. With `sha256sum` available (Git for Windows, WSL, macOS, Linux),
-in the folder holding the downloads:
+In the folder containing the assets and checksum file:
 
     sha256sum -c SHA256SUMS
 
-It prints `abstraction-x64.msi: OK`. In PowerShell, with nothing installed:
+In PowerShell, a single-file comparison can use:
 
     (Get-FileHash abstraction-x64.msi -Algorithm SHA256).Hash.ToLower()
     Select-String abstraction-x64.msi SHA256SUMS
 
-The two strings match, or you did not get the file we built.
+Checksums establish agreement with the published checksum file, not independent
+proof of origin. Signing, notarisation, attached assets and platform verification
+must be read as per-release facts. The **Signatures** section appended below
+states the signing outcome; consult the linked release build for its install
+and uninstall checks. Building an architecture does not prove installation on
+that architecture. Do not infer a Windows install result from Linux verification,
+or an installed macOS service from a signed package.
 
-**What this does and does not prove.** It proves the bytes did not change
-between this page and your disk. It does not prove they came from us: the
-checksum file sits on the same page as the downloads, so anyone who could
-replace one could replace the other. A signature is what proves origin, and
-**Signatures** below says which of these files carries one. Both MSIs are built
-twice in one job and compared byte for byte, and so are the Go binaries that go
-into every package: a difference in the binaries fails the release, a
-difference in an MSI is reported and does not, and the inputs are identical
-either way.
+## Limitations
 
-## What may break
-
-- The three programs come from three separately tagged modules, so they are
-  three builds of one store format in a single package. The release workflow
-  writes a job with `dl`, requires `jobd` to see it and `jobctl show` to return
-  it, and fails if they disagree. That is one scenario, not a compatibility
-  proof.
-- **`JOB_STORE` overrides `ABSTRACTION_STORE` for `jobctl` alone**, as above.
-  Set it and `jobctl` will be looking at a store `jobd` and `dl` are not.
-- **The arm64 packages are unrun**: built on every release, installed by no
-  arm64 machine, on either Windows or Linux.
+- `JOB_STORE` can point `jobctl` at a different store, as described above.
+- Cross-tool compatibility checks cover particular scenarios, not every operation.
 - A partly fetched download does not resume across a reinstall.
-- Nothing here has been measured on a machine that is not a CI runner.
+- CI runner checks do not establish behavior on every user's machine.
 
 ## Source
 
-Every program in this package is built from a public module. Nothing in the
-package is built from a private tree.
+Programs are built from public modules; packaging does not build them from a
+private source tree.
 
 - [service-jobd](https://github.com/openabstractions/service-jobd)
 - [abstraction-download](https://github.com/openabstractions/abstraction-download)
 - [abstraction-job](https://github.com/openabstractions/abstraction-job)
+- [abstractions: service host and panel](https://github.com/openabstractions/abstractions)

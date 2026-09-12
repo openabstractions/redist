@@ -1,23 +1,27 @@
 # redist
 
-**The Open Abstractions redistributable: one installer per platform, built from
-published tags.**
+The Open Abstractions redistributable packages programs built from published
+module versions: `jobd`, `dl`, `jobctl` and the `openabstractions` service host.
+Windows also includes the windowless `jobdw` supervisor and Abstraction Panel.
 
-The package contains `jobd`, which supervises downloads; `dl`, which fetches
-and verifies them; `jobctl`, which inspects and controls jobs; and
-`openabstractions`, which exposes the individual capability services. Windows
-also includes the Panel and the windowless supervisor image. Get them from [Releases](https://github.com/openabstractions/redist/releases).
-
-**In development.** Check the selected release and its build evidence for
-actual assets, signing and installation coverage; a draft is not a published
-release.
+See [Releases](https://github.com/openabstractions/redist/releases) for available
+downloads and their release-specific verification. Draft builds are not releases.
 
 ## Installing
 
-Download `abstraction-x64.msi` from the latest release, check it against
-`SHA256SUMS`, and run it. It installs to
-`%LOCALAPPDATA%\Programs\OpenAbstractions`, puts the `tools\` folder inside it
-on your `PATH`, and needs no administrator rights.
+The Windows MSI defaults to *Just me*, under
+`%LOCALAPPDATA%\Programs\OpenAbstractions`. *Everyone* installs under
+`%ProgramFiles%\OpenAbstractions` and requires elevation. **Add to PATH** is
+optional; programs remain available by full path when it is unchecked.
+
+Linux tarballs install for the current user through `install.sh`. The macOS
+universal `.pkg`, when attached, also installs for the current user.
+[Release notes](NOTES.md) explain the contents and installation choices.
+Each release's appended notes name its actual assets and signing state;
+consult that release's build for platform verification. Availability, signatures
+and installation results are not promises made by this general README.
+
+Compare downloads against the release's `SHA256SUMS`:
 
     sha256sum -c SHA256SUMS
 
@@ -37,23 +41,19 @@ background registration belongs to the download supervisor.
 
 ## Without an installer
 
-Every program here is a published Go module, so the installer is a convenience
-and never the only route. The `module` column of [`tools.tsv`](tools.tsv) is
-the module path and version of each, and is what the release workflow builds
-from:
-
-    go install <module>
-
-Use the module and package columns together: for a package other than `.`,
-append its package path before the `@version`. The suite installer version is
-separate from the versions of the modules it contains.
+[`tools.tsv`](tools.tsv) names each published module version and package.
+Build the package at that version with `go install <package>@<version>`.
+The windowless Windows executables additionally need the build flags specified by
+the release workflow; plain `go install` does not reproduce their subsystem.
 
 ## What this repository is
 
-One repository, not one per platform: a suite split across three would drift
-into three versions with three release cadences. `tools.tsv` names each program
-and the published module version it is built from; the platform-specific
-packaging lives in a directory of its own — `windows/` holds the WiX sources.
+One packaging repository for Windows, Linux and macOS. `tools.tsv` is the
+version list consumed by the workflow; `windows/` and `posix/` hold packaging.
+Programs' source stays in their own public modules. The workflow resolves the
+pinned modules and drafts a release; publishing remains a separate decision.
+Go's proxy may retain a version after its repository tag is deleted, so fetching
+an artifact alone does not prove that the tag still exists.
 
 `tools.tsv` may name only versions that are tags on their repositories. The
 release workflow resolves every one before it builds anything, so a module we
@@ -86,5 +86,4 @@ with the existing version will refuse it rather than replace it.
   installed; capability registration is not added by this package.
 - **Uniform platform evidence.** The workflow builds Linux tarballs and macOS
   packages, but each release reports which checks ran and which assets ship.
-- **A container.** `jobd` for a NAS is
-  [docker-jobd](https://github.com/openabstractions/docker-jobd).
+For NAS delivery, see [docker-jobd](https://github.com/openabstractions/docker-jobd).
