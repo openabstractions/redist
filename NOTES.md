@@ -6,11 +6,11 @@ the end of these notes; those facts apply to this release only.
 
 | program | what it does | platforms |
 |---|---|---|
-| `jobd` | supervises downloads after the requesting application closes | Windows, Linux, macOS |
+| `jobd` | supervises downloads and the installed capability runtime | Windows, Linux, macOS |
 | `jobdw` | the same supervisor built without a console window | Windows |
 | `dl` | fetches URLs resumably and verifies a supplied digest | Windows, Linux, macOS |
 | `jobctl` | operates directly on the job store for scripts and debugging | Windows, Linux, macOS |
-| `Abstraction Panel` | graphical view of local activity | Windows |
+| `Abstraction Panel` | service readiness, configuration and local activity | Windows |
 | `openabstractions` | hosts capability services through its `serve` command | Windows, Linux, macOS |
 
 There are six Windows executables and four Linux/macOS programs. `jobd` and `jobdw`
@@ -75,7 +75,8 @@ or an installed macOS service from a signed package.
 
 - `JOB_STORE` can point `jobctl` at a different store, as described above.
 - Cross-tool compatibility checks cover particular scenarios, not every operation.
-- A partly fetched download does not resume across a reinstall.
+- Removal preserves user data. Resume across upgrades depends on the job and provider;
+  retained-data checks alone do not establish transfer recovery.
 - CI runner checks do not establish behavior on every user's machine.
 
 ## Source

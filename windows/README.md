@@ -157,9 +157,9 @@ cannot gate away.
   registration, configuration and recovery policy; a running per-user service
   instance also requires a suitable session. Read the run result and any
   explicit preview limitation; source tables alone do not prove installation.
-- **A hosted runner is an administrator and a person is not.** Anything the
-  release workflow's `verify` job asserts is asserted as an administrator, and
-  that is the one privilege it cannot test.
+- **Per-user verification uses a fresh non-administrator account.** The release
+  workflow checks immediate readiness, removal, upgrade from 0.1.5 and same-version
+  reinstall in that account. The release run records their actual outcomes.
 - **`jobd install` prints `schtasks` lines this package no longer registers.**
   Its sweep and logon lines are a second, hand-driven answer to the question the
   Startup shortcut now answers, and nothing compares them.

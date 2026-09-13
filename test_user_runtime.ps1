@@ -4,6 +4,9 @@ param(
     [string]$ExpectedSid,
     [switch]$CheckTools,
     [string]$PythonPath,
+    [string]$PredecessorMsiPath,
+    [string]$PredecessorSHA256,
+    [string]$ExpectedVersion,
     [string]$ResultDirectory = (Join-Path (Get-Location) 'user-runtime-diagnostics')
 )
 $ErrorActionPreference = 'Stop'
@@ -57,7 +60,7 @@ function Get-ProfileFolder([Environment+SpecialFolder]$Folder, [scriptblock]$Res
 function Assert-NoRuntime([string]$Sid) {
     $deadline = [DateTime]::UtcNow.AddSeconds(10)
     do {
-    $remaining = @(Get-CimInstance Win32_Process -Filter "Name='jobdw.exe' OR Name='openabstractions.exe'" | Where-Object {
+    $remaining = @(Get-CimInstance Win32_Process -Filter "Name='jobd.exe' OR Name='jobdw.exe' OR Name='openabstractions.exe'" | Where-Object {
         $owner = Invoke-CimMethod -InputObject $_ -MethodName GetOwnerSid
         if ($owner.ReturnValue -ne 0) { throw 'Cannot establish runtime process owner' }
         $owner.Sid -eq $Sid
@@ -148,6 +151,93 @@ function Invoke-InstallWithDiagnostics([scriptblock]$Install, [scriptblock]$Diag
         try { & $Diagnose } catch { Write-Warning ('Activation diagnostics failed: ' + (Protect-DiagnosticText $_.Exception.Message)) }
         throw $original
     }
+}
+function Assert-PackageHash([string]$Path, [string]$Expected) {
+    $stream = [IO.File]::OpenRead($Path)
+    $sha = [Security.Cryptography.SHA256]::Create()
+    try { $actual = ([BitConverter]::ToString($sha.ComputeHash($stream))).Replace('-','').ToLowerInvariant() }
+    finally { $sha.Dispose(); $stream.Dispose() }
+    if ($Expected -notmatch '^[0-9a-f]{64}$' -or $actual -ne $Expected) {
+        throw 'Predecessor package differs from the verified release checksum'
+    }
+}
+function Get-PackageProperty([string]$Path, [ValidateSet('ProductVersion','ProductCode','UpgradeCode')][string]$Property) {
+    $installer = New-Object -ComObject WindowsInstaller.Installer
+    $database = $installer.OpenDatabase($Path, 0)
+    $view = $database.OpenView("SELECT ``Value`` FROM ``Property`` WHERE ``Property``='$Property'")
+    try {
+        $view.Execute()
+        $record = $view.Fetch()
+        if (-not $record) { throw "MSI property absent: $Property" }
+        return $record.StringData(1)
+    } finally {
+        $view.Close()
+        [void][Runtime.InteropServices.Marshal]::FinalReleaseComObject($view)
+        [void][Runtime.InteropServices.Marshal]::FinalReleaseComObject($database)
+        [void][Runtime.InteropServices.Marshal]::FinalReleaseComObject($installer)
+    }
+}
+function Assert-InstalledVersion([string]$Version, [string]$ProductCode) {
+    $products = @(Get-ItemProperty 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*' -ErrorAction SilentlyContinue | Where-Object { $_.DisplayName -eq 'Abstraction' })
+    if ($products.Count -ne 1 -or $products[0].DisplayVersion -ne $Version -or $products[0].PSChildName -ne $ProductCode) {
+        throw 'Expected one per-user registration with the exact candidate version/product code'
+    }
+}
+function Assert-RetainedSentinel([string]$Path, [string]$Value) {
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf) -or [IO.File]::ReadAllText($Path) -ne $Value) { throw 'User-data sentinel changed or disappeared' }
+}
+function Assert-RemovedRegistration {
+    if (@(Get-ItemProperty 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*' -ErrorAction SilentlyContinue | Where-Object { $_.DisplayName -eq 'Abstraction' }).Count) {
+        throw 'Per-user product registration survived removal'
+    }
+}
+function Start-PredecessorSupervisor([string]$Tools) {
+    $shell = New-Object -ComObject WScript.Shell
+    $shortcut = $shell.CreateShortcut((Join-Path (Get-ProfileFolder Startup) 'Abstraction supervisor.lnk'))
+    try {
+        $targets = @('jobd.exe','jobdw.exe' | ForEach-Object { [IO.Path]::GetFullPath((Join-Path $Tools $_)) })
+        if ($shortcut.TargetPath -notin $targets -or $shortcut.Arguments -notin @('start','start --runtime') -or
+            $shortcut.WorkingDirectory.TrimEnd([char[]]'\/') -ne $Tools.TrimEnd([char[]]'\/')) {
+            throw 'Predecessor shortcut does not select its installed supervisor'
+        }
+        Push-Location $Tools
+        try { Invoke-Bounded $shortcut.TargetPath @($shortcut.Arguments) 30 } finally { Pop-Location }
+    } finally { [void][Runtime.InteropServices.Marshal]::FinalReleaseComObject($shell) }
+}
+function Get-RunningFixtureProcesses([string]$Tools, [string]$Sid) {
+    $retained = @()
+    try {
+        foreach ($candidate in @(Get-CimInstance Win32_Process -Filter "Name='jobd.exe' OR Name='jobdw.exe' OR Name='openabstractions.exe'")) {
+            $owner = Invoke-CimMethod -InputObject $candidate -MethodName GetOwnerSid
+            if ($owner.ReturnValue -ne 0) { throw 'Cannot establish fixture process owner' }
+            if ($owner.Sid -ne $Sid) { continue }
+            $process = [Diagnostics.Process]::GetProcessById($candidate.ProcessId)
+            try {
+                # Force a retained process handle before replacement; a later PID lookup is insufficient.
+                $null = $process.Handle
+                if ($process.HasExited -or $process.MainModule.FileName -ne (Join-Path $Tools $candidate.Name) -or
+                    [Math]::Abs(($process.StartTime.ToUniversalTime() - $candidate.CreationDate.ToUniversalTime()).TotalMilliseconds) -ge 1) {
+                    throw 'Fixture process identity changed during capture'
+                }
+                $retained += $process
+            } catch { $process.Dispose(); throw }
+        }
+        if (-not @($retained | Where-Object { $_.ProcessName -in @('jobd','jobdw') }).Count) {
+            throw 'Upgrade requires a live installed predecessor supervisor'
+        }
+        return $retained
+    } catch { foreach ($process in $retained) { $process.Dispose() }; throw }
+}
+function Assert-PreviousProcessesExited($Processes) {
+    foreach ($process in $Processes) {
+        if (-not $process.WaitForExit(0)) { throw 'Package replacement left a previous installed process running' }
+    }
+}
+function Assert-SameVersionReinstall([string]$Package, [string]$Version, [string]$ProductCode, [string]$Central, [string]$Sentinel, [string]$Value) {
+    Invoke-Bounded msiexec.exe @('/i',"`"$Package`"",'/qn','/norestart','ALLUSERS=2','MSIINSTALLPERUSER=1','REINSTALL=ALL','REINSTALLMODE=vomus','/l*v','user-reinstall.log')
+    Assert-InstalledVersion $Version $ProductCode
+    Assert-RuntimeReady $Central reinstall-status
+    Assert-RetainedSentinel $Sentinel $Value
 }
 function Invoke-CheckedTool([string]$Image, [string[]]$Arguments) {
     $info = New-Object Diagnostics.ProcessStartInfo
@@ -252,15 +342,42 @@ if ($Mode -eq 'User') {
     $tools = Join-Path (Get-ProfileFolder LocalApplicationData) 'Programs\OpenAbstractions\tools'
     $installed = $false
     $installAttempted = $false
+    $predecessorAttempted = $false
+    $previousProcesses = @()
+    $sentinel = $null
     try {
+        if ($PredecessorMsiPath) {
+            Assert-PackageHash $PredecessorMsiPath $PredecessorSHA256
+            if ($ExpectedVersion -notmatch '^\d+\.\d+\.\d+$' -or [version]$ExpectedVersion -le [version]'0.1.5') { throw 'Upgrade requires an explicit candidate version newer than 0.1.5' }
+            if ((Get-PackageProperty $PredecessorMsiPath ProductVersion) -ne '0.1.5' -or (Get-PackageProperty $MsiPath ProductVersion) -ne $ExpectedVersion) { throw 'Unexpected predecessor or candidate MSI version' }
+            if ((Get-PackageProperty $PredecessorMsiPath UpgradeCode) -ne (Get-PackageProperty $MsiPath UpgradeCode)) { throw 'Packages do not share the product upgrade identity' }
+            $productCode = Get-PackageProperty $MsiPath ProductCode
+            $sentinel = Join-Path (Get-ProfileFolder LocalApplicationData) 'openabstractions\runtime-v1\qualification-sentinel.txt'
+            $sentinelValue = [Guid]::NewGuid().ToString('N')
+            New-Item -ItemType Directory -Force (Split-Path -Parent $sentinel) | Out-Null
+            [IO.File]::WriteAllText($sentinel, $sentinelValue)
+            $predecessorAttempted = $true
+            Invoke-Bounded msiexec.exe @('/i',"`"$PredecessorMsiPath`"",'/qn','/norestart','ALLUSERS=2','MSIINSTALLPERUSER=1','/l*v','predecessor-install.log')
+            Assert-InstalledVersion '0.1.5' (Get-PackageProperty $PredecessorMsiPath ProductCode)
+            Assert-RetainedSentinel $sentinel $sentinelValue
+            Start-PredecessorSupervisor $tools
+            $previousProcesses = @(Get-RunningFixtureProcesses $tools $ExpectedSid)
+        }
         $installAttempted = $true
         Invoke-InstallWithDiagnostics {
             Invoke-Bounded msiexec.exe @('/i', "`"$MsiPath`"", '/qn', '/norestart', 'ALLUSERS=2', 'MSIINSTALLPERUSER=1', '/l*v', 'user-install.log')
         } { Save-ActivationFailure $tools }
         $installed = $true
+        if ($PredecessorMsiPath) { Assert-PreviousProcessesExited $previousProcesses }
         if ($CheckTools) { Assert-InstalledUserTools $tools; Assert-ToolStoreCompatibility $tools $PythonPath }
         $central = Join-Path $tools 'openabstractions.exe'
         Assert-RuntimeReady $central post-install-status
+        if ($PredecessorMsiPath) {
+            Assert-InstalledVersion $ExpectedVersion $productCode
+            Assert-RetainedSentinel $sentinel $sentinelValue
+            Assert-SameVersionReinstall $MsiPath $ExpectedVersion $productCode $central $sentinel $sentinelValue
+            'Predecessor upgrade and same-version reinstall passed' | Set-Content upgrade.txt
+        }
         'ok: logging/config ready immediately after MSI completion' | Set-Content 'post-install-activation.txt'
         $shortcutPath = Join-Path (Get-ProfileFolder Startup) 'Abstraction supervisor.lnk'
         if (@(Get-Service | Where-Object { $_.Name -like 'OpenAbstractionsSupervisor*' }).Count) { throw 'Per-user install registered a service' }
@@ -277,6 +394,7 @@ if ($Mode -eq 'User') {
         $installAttempted = $false
         # These assertions precede outer fixture cleanup and its process termination.
         Assert-NoRuntime $ExpectedSid
+        if ($sentinel) { Assert-RetainedSentinel $sentinel $sentinelValue; Assert-RemovedRegistration }
         if ($CheckTools) {
             if (Test-Path (Split-Path -Parent $tools)) { throw 'Install folder survived removal' }
             if (Test-Path 'HKCU:\Software\OpenAbstractions') { throw 'User registry key survived removal' }
@@ -289,9 +407,16 @@ if ($Mode -eq 'User') {
         }
         'ok: uninstall removed processes, endpoints, shortcut and runtime binaries before fixture cleanup' | Set-Content 'removal.txt'
     } finally {
+        foreach ($process in $previousProcesses) { $process.Dispose() }
         if ($installed -or $installAttempted) {
             # A post-InstallFinalize activation error can leave committed files.
             try { Invoke-Bounded msiexec.exe @('/x', "`"$MsiPath`"", '/qn', '/norestart', '/l*v', 'user-cleanup-uninstall.log') } catch { Write-Warning $_ }
+        }
+        if ($predecessorAttempted) {
+            $oldCode = Get-PackageProperty $PredecessorMsiPath ProductCode
+            if (Test-Path "HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\$oldCode") {
+                try { Invoke-Bounded msiexec.exe @('/x',"`"$PredecessorMsiPath`"",'/qn','/norestart','/l*v','predecessor-cleanup.log') } catch { Write-Warning $_ }
+            }
         }
     }
     exit 0
@@ -315,6 +440,11 @@ try {
     & icacls.exe $directory /grant "*$($account.SID.Value):(OI)(CI)M" | Out-Null
     if ($LASTEXITCODE -ne 0) { throw 'Cannot grant private fixture directory access' }
     Copy-Item -LiteralPath $MsiPath -Destination (Join-Path $directory 'package.msi')
+    if ($PredecessorMsiPath) {
+        $PredecessorMsiPath = (Resolve-Path -LiteralPath $PredecessorMsiPath).Path
+        Assert-PackageHash $PredecessorMsiPath $PredecessorSHA256
+        Copy-Item -LiteralPath $PredecessorMsiPath -Destination (Join-Path $directory 'predecessor.msi')
+    }
     Copy-Item -LiteralPath $PSCommandPath -Destination (Join-Path $directory 'fixture.ps1')
     # Credential logon creates a fresh environment. This parent has already
     # checked both runner markers; carry only those markers to the child.
@@ -328,6 +458,7 @@ exit $LASTEXITCODE
     Set-Content -LiteralPath (Join-Path $directory 'launcher.ps1') -Value $launcher -Encoding UTF8
     $credential = New-Object Management.Automation.PSCredential("$env:COMPUTERNAME\$user", (ConvertTo-SecureString $password -AsPlainText -Force))
     $arguments = @('-NoProfile','-ExecutionPolicy','Bypass','-File',"`"$directory\launcher.ps1`"",'-Mode','User','-MsiPath',"`"$directory\package.msi`"",'-ExpectedSid',$account.SID.Value)
+    if ($PredecessorMsiPath) { $arguments += @('-PredecessorMsiPath',"`"$directory\predecessor.msi`"",'-PredecessorSHA256',$PredecessorSHA256,'-ExpectedVersion',$ExpectedVersion) }
     if ($CheckTools) {
         if (-not $PythonPath -or -not (Test-Path -LiteralPath $PythonPath -PathType Leaf)) { throw 'Release tools check requires an explicit existing Python executable' }
         $arguments += @('-CheckTools','-PythonPath',"`"$PythonPath`"")
@@ -340,7 +471,7 @@ exit $LASTEXITCODE
     $childInfo.Domain = $env:COMPUTERNAME
     $childInfo.Password = $credential.Password
     $childInfo.LoadUserProfile = $true
-    $child = Invoke-FixtureProcess $childInfo 300
+    $child = Invoke-FixtureProcess $childInfo $(if ($PredecessorMsiPath) { 600 } else { 300 })
     $child.Output | Set-Content -Encoding UTF8 (Join-Path $directory 'fixture.log')
     $child.Diagnostics | Set-Content -Encoding UTF8 (Join-Path $directory 'fixture.err')
     if ($child.ExitCode -ne 0) { throw "Per-user fixture exited $($child.ExitCode); inspect diagnostics" }
@@ -356,7 +487,7 @@ exit $LASTEXITCODE
         $current = Get-LocalUser -Name $user -ErrorAction SilentlyContinue
         if (-not $current -or $current.SID.Value -ne $account.SID.Value) { throw 'Cleanup account identity changed' }
         # Account-owned leftovers are cleanup only; no assertion becomes green here.
-        foreach ($process in @(Get-CimInstance Win32_Process -Filter "Name='jobdw.exe' OR Name='openabstractions.exe'")) {
+        foreach ($process in @(Get-CimInstance Win32_Process -Filter "Name='jobd.exe' OR Name='jobdw.exe' OR Name='openabstractions.exe'")) {
             $owner = Invoke-CimMethod -InputObject $process -MethodName GetOwnerSid
             if ($owner.ReturnValue -eq 0 -and $owner.Sid -eq $account.SID.Value) {
                 Stop-Process -Id $process.ProcessId -Force -ErrorAction SilentlyContinue

@@ -297,6 +297,31 @@ jobs:
         with:
           ref: ${{ github.sha }}
           path: user-fixture
+      - name: fetch reviewed predecessor package
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: pwsh
+        run: |
+          gh release download v0.1.5 --repo openabstractions/redist --pattern abstraction-x64.msi --pattern SHA256SUMS --dir predecessor
+          if ($LASTEXITCODE -ne 0) { throw 'Published predecessor download failed' }
+      - name: verify predecessor checksum
+        shell: python
+        run: |
+          import hashlib, json, os, pathlib, re
+          package = pathlib.Path('predecessor/abstraction-x64.msi')
+          if not package.is_file() or package.stat().st_size == 0:
+              raise SystemExit('Published predecessor MSI is missing or empty')
+          entries = []
+          for line in pathlib.Path('predecessor/SHA256SUMS').read_text().splitlines():
+              match = re.fullmatch(r'([0-9a-f]{64}) [ *]abstraction-x64\.msi', line)
+              if match:
+                  entries.append(match[1])
+          actual = hashlib.sha256(package.read_bytes()).hexdigest()
+          if entries != [actual]:
+              raise SystemExit('Published predecessor checksum is absent, duplicated or mismatched')
+          pathlib.Path('predecessor-source.json').write_text(json.dumps({'release': 'v0.1.5', 'repository': 'openabstractions/redist', 'file': package.name, 'sha256': actual}, indent=2))
+          with open(os.environ['GITHUB_ENV'], 'a') as output:
+              output.write('PREDECESSOR_SHA256='+actual+'\n')
       - name: configure disposable consumer MSI policy
         shell: pwsh
         run: |
@@ -332,6 +357,13 @@ jobs:
         run: |
           & powershell.exe -NoProfile -ExecutionPolicy Bypass -File user-fixture/test_user_runtime.ps1 -Mode Verify -MsiPath (Resolve-Path pkg/abstraction-x64.msi).Path -CheckTools -PythonPath (Get-Command python.exe -ErrorAction Stop).Source
           if ($LASTEXITCODE -ne 0) { throw "Per-user release verification exited $LASTEXITCODE" }
+      - name: private non-admin predecessor upgrade and reinstall
+        shell: pwsh
+        timeout-minutes: 12
+        run: |
+          $version = '${{ inputs.version }}'.Substring(1)
+          & powershell.exe -NoProfile -ExecutionPolicy Bypass -File user-fixture/test_user_runtime.ps1 -Mode Verify -MsiPath (Resolve-Path pkg/abstraction-x64.msi).Path -PredecessorMsiPath (Resolve-Path predecessor/abstraction-x64.msi).Path -PredecessorSHA256 $env:PREDECESSOR_SHA256 -ExpectedVersion $version -ResultDirectory user-upgrade-diagnostics
+          if ($LASTEXITCODE -ne 0) { throw "Per-user upgrade verification exited $LASTEXITCODE" }
       - name: restore disposable consumer MSI policy
         if: always()
         shell: pwsh
@@ -373,6 +405,8 @@ jobs:
           name: release-per-user-diagnostics
           path: |
             user-runtime-diagnostics/
+            user-upgrade-diagnostics/
+            predecessor-source.json
             msi-policy.log
             ${{ runner.temp }}/oa-msi-policy.json
 
