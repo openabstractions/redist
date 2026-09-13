@@ -18,6 +18,10 @@ on:
         description: Published abstraction-download commit required by both parent and central command
         required: true
         type: string
+      job_sha:
+        description: Published abstraction-job commit containing jobctl and the selected job module
+        required: true
+        type: string
       version:
         description: MSI test version in MAJOR.MINOR.PATCH form; no tag or release is created
         required: true
@@ -36,6 +40,7 @@ jobs:
       CHARTER_SHA: ${{ inputs.charter_sha }}
       SERVICE_JOBD_SHA: ${{ inputs.service_jobd_sha }}
       DOWNLOAD_SHA: ${{ inputs.download_sha }}
+      JOB_SHA: ${{ inputs.job_sha }}
       CANDIDATE_VERSION: ${{ inputs.version }}
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
@@ -43,7 +48,7 @@ jobs:
         shell: python
         run: |
           import os, re, subprocess
-          for key in ('REDIST_SHA', 'CHARTER_SHA', 'SERVICE_JOBD_SHA', 'DOWNLOAD_SHA'):
+          for key in ('REDIST_SHA', 'CHARTER_SHA', 'SERVICE_JOBD_SHA', 'DOWNLOAD_SHA', 'JOB_SHA'):
               if not re.fullmatch('[0-9a-f]{40}', os.environ[key]):
                   raise SystemExit(f'{key} must be a full lowercase public commit SHA')
           if os.environ['REDIST_SHA'] != os.environ['GITHUB_SHA']:
@@ -73,6 +78,12 @@ jobs:
           ref: ${{ inputs.download_sha }}
           path: source-download
           persist-credentials: false
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
+        with:
+          repository: openabstractions/abstraction-job
+          ref: ${{ inputs.job_sha }}
+          path: source-job
+          persist-credentials: false
       - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16
         with:
           go-version: '1.26.0'
@@ -81,34 +92,55 @@ jobs:
         shell: python
         run: |
           import json, os, pathlib, subprocess
-          sources = {'source-charter': 'CHARTER_SHA', 'source-jobd': 'SERVICE_JOBD_SHA', 'source-download': 'DOWNLOAD_SHA'}
+          sources = {'source-charter': 'CHARTER_SHA', 'source-jobd': 'SERVICE_JOBD_SHA', 'source-download': 'DOWNLOAD_SHA', 'source-job': 'JOB_SHA'}
           evidence = {'redist': os.environ['REDIST_SHA'], 'sources': {}, 'dependencies': {}}
           for directory, key in sources.items():
               actual = subprocess.check_output(['git', '-C', directory, 'rev-parse', 'HEAD'], text=True).strip()
               if actual != os.environ[key]:
                   raise SystemExit(f'{directory} checkout differs from requested commit')
               evidence['sources'][directory] = actual
-          module = 'github.com/openabstractions/abstraction-download/go'
-          for directory in ('source-charter/serve', 'source-jobd'):
-              selected = json.loads(subprocess.check_output(['go', 'list', '-m', '-json', module], cwd=directory, text=True))
-              if selected.get('Replace'):
-                  raise SystemExit(f'{directory} replaces its published download dependency')
-              downloaded = json.loads(subprocess.check_output(['go', 'mod', 'download', '-json', module+'@'+selected['Version']], cwd=directory, text=True))
-              if downloaded.get('Origin', {}).get('Hash') != os.environ['DOWNLOAD_SHA']:
-                  raise SystemExit(f'{directory} download dependency does not identify download_sha')
-              evidence['dependencies'][directory] = downloaded
+          def modules(raw):
+              decoder = json.JSONDecoder()
+              while raw.strip():
+                  value, end = decoder.raw_decode(raw.lstrip())
+                  yield value
+                  raw = raw.lstrip()[end:]
+          expected = {'github.com/openabstractions/abstraction-download/go': os.environ['DOWNLOAD_SHA'],
+                      'github.com/openabstractions/abstraction-job/go': os.environ['JOB_SHA']}
+          for directory in ('source-charter/serve', 'source-charter/monitor', 'source-jobd', 'source-download/go', 'source-job/go'):
+              selected = list(modules(subprocess.check_output(['go', 'list', '-m', '-json', 'all'], cwd=directory, text=True)))
+              if not selected or sum(bool(item.get('Main')) for item in selected) != 1:
+                  raise SystemExit(f'{directory} must select one main module')
+              if directory in ('source-charter/serve', 'source-jobd') and 'github.com/openabstractions/abstraction-download/go' not in {item.get('Path') for item in selected}:
+                  raise SystemExit(f'{directory} is missing its required download dependency')
+              closure = []
+              for item in selected:
+                  if item.get('Replace') or item.get('Error'):
+                      raise SystemExit(f'{directory} has a replaced or unresolved module: {item.get("Path")}')
+                  if item.get('Main'):
+                      closure.append(item)
+                      continue
+                  if not item.get('Path') or not item.get('Version'):
+                      raise SystemExit(f'{directory} dependency lacks an immutable module version')
+                  downloaded = json.loads(subprocess.check_output(['go', 'mod', 'download', '-json', item['Path']+'@'+item['Version']], cwd=directory, text=True))
+                  if downloaded.get('Replace') or downloaded.get('Error') or not downloaded.get('Sum') or not downloaded.get('GoModSum'):
+                      raise SystemExit(f'{directory} dependency lacks verified downloaded content: {item["Path"]}')
+                  if item['Path'] in expected and downloaded.get('Origin', {}).get('Hash') != expected[item['Path']]:
+                      raise SystemExit(f'{directory} dependency does not identify the requested source SHA: {item["Path"]}')
+                  closure.append({'selected': item, 'download': downloaded})
+              evidence['dependencies'][directory] = closure
           pathlib.Path('dist').mkdir()
           pathlib.Path('dist/source-provenance.json').write_text(json.dumps(evidence, indent=2))
           pathlib.Path('dist/tools.tsv').write_bytes(pathlib.Path('tools.tsv').read_bytes())
       - name: build Windows programs from pinned public sources
         shell: python
         run: |
-          import os, pathlib, subprocess
+          import json, os, pathlib, subprocess
           # The Panel filename contains spaces; columns are separated by tabs.
           rows = [[part.strip() for part in line.split('\t') if part.strip()] for line in pathlib.Path('tools.tsv').read_text().splitlines() if line.strip() and not line.startswith('>')][1:]
-          overrides = {'jobd.exe': ('source-jobd', '.'), 'jobdw.exe': ('source-jobd', '.'), 'openabstractions.exe': ('source-charter/serve', '.'), 'dl.exe': ('source-download/go', './cmd/dl')}
+          overrides = {'jobd.exe': ('source-jobd', '.'), 'jobdw.exe': ('source-jobd', '.'), 'openabstractions.exe': ('source-charter/serve', '.'), 'dl.exe': ('source-download/go', './cmd/dl'), 'jobctl.exe': ('source-job/go', './cmd/jobctl'), 'Abstraction Panel.exe': ('source-charter/monitor', '.')}
           names = [row[0] for row in rows]
-          if len(names) != len(set(names)) or not set(overrides).issubset(names):
+          if len(names) != len(set(names)) or set(names) != set(overrides):
               raise SystemExit('tools.tsv must contain each required runtime program exactly once')
           for arch in ('amd64', 'arm64'):
               output = pathlib.Path('binaries', arch).resolve()
@@ -118,25 +150,12 @@ jobs:
                   if pathlib.PureWindowsPath(name).name != name or subsystem not in ('console', 'windows'):
                       raise SystemExit('Invalid program filename or subsystem')
                   flags = '-s -w -buildid=' + (' -H=windowsgui' if subsystem == 'windows' else '')
-                  if name in overrides:
-                      directory, target = overrides[name]
-                      subprocess.run(['go', 'build', '-ldflags='+flags, '-o', str(output/name), target], cwd=directory, env=env, check=True)
-                  else:
-                      module, version = module_version.rsplit('@', 1)
-                      prefix = 'github.com/openabstractions/'
-                      if not module.startswith(prefix):
-                          raise SystemExit('Expected an OpenAbstractions module')
-                      repo, _, subdir = module[len(prefix):].partition('/')
-                      tag = (subdir+'/' if subdir else '')+version
-                      subprocess.run(['git', 'ls-remote', '--tags', '--exit-code', 'https://github.com/openabstractions/'+repo, 'refs/tags/'+tag], check=True)
-                      target = module + ('/'+package if package != '.' else '') + '@' + version
-                      install_env = dict(env, GOBIN='', GOPATH=str(pathlib.Path('go-install', arch).resolve()))
-                      subprocess.run(['go', 'install', '-ldflags='+flags, target], env=install_env, check=True)
-                      base = pathlib.PurePosixPath(module if package == '.' else package).name+'.exe'
-                      built = pathlib.Path(install_env['GOPATH'], 'bin', 'windows_'+arch, base)
-                      if not built.exists():
-                          built = pathlib.Path(install_env['GOPATH'], 'bin', base)
-                      built.replace(output/name)
+                  directory, target = overrides[name]
+                  subprocess.run(['go', 'build', '-ldflags='+flags, '-o', str(output/name), target], cwd=directory, env=env, check=True)
+          evidence_path = pathlib.Path('dist/source-provenance.json')
+          evidence = json.loads(evidence_path.read_text())
+          evidence['programs'] = {name: {'directory': directory, 'package': target} for name, (directory, target) in overrides.items()}
+          evidence_path.write_text(json.dumps(evidence, indent=2))
       - name: assemble unsigned Windows packages
         shell: pwsh
         run: |
@@ -184,6 +203,7 @@ jobs:
       CHARTER_SHA: ${{ inputs.charter_sha }}
       SERVICE_JOBD_SHA: ${{ inputs.service_jobd_sha }}
       DOWNLOAD_SHA: ${{ inputs.download_sha }}
+      JOB_SHA: ${{ inputs.job_sha }}
       CANDIDATE_VERSION: ${{ inputs.version }}
       PACKAGE_PLATFORM: ${{ matrix.platform }}
     steps:
@@ -192,7 +212,7 @@ jobs:
       shell: python
       run: |
         import os, re, subprocess
-        for key in ('REDIST_SHA', 'CHARTER_SHA', 'SERVICE_JOBD_SHA', 'DOWNLOAD_SHA'):
+        for key in ('REDIST_SHA', 'CHARTER_SHA', 'SERVICE_JOBD_SHA', 'DOWNLOAD_SHA', 'JOB_SHA'):
             if not re.fullmatch('[0-9a-f]{40}', os.environ[key]):
                 raise SystemExit(f'{key} must be a full lowercase public commit SHA')
         if os.environ['REDIST_SHA'] != os.environ['GITHUB_SHA']:
@@ -222,6 +242,12 @@ jobs:
         ref: ${{ inputs.download_sha }}
         path: source-download
         persist-credentials: false
+    - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
+      with:
+        repository: openabstractions/abstraction-job
+        ref: ${{ inputs.job_sha }}
+        path: source-job
+        persist-credentials: false
     - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16
       with:
         go-version: 1.26.0
@@ -230,22 +256,43 @@ jobs:
       shell: python
       run: |
         import json, os, pathlib, subprocess
-        sources = {'source-charter': 'CHARTER_SHA', 'source-jobd': 'SERVICE_JOBD_SHA', 'source-download': 'DOWNLOAD_SHA'}
+        sources = {'source-charter': 'CHARTER_SHA', 'source-jobd': 'SERVICE_JOBD_SHA', 'source-download': 'DOWNLOAD_SHA', 'source-job': 'JOB_SHA'}
         evidence = {'redist': os.environ['REDIST_SHA'], 'sources': {}, 'dependencies': {}}
         for directory, key in sources.items():
             actual = subprocess.check_output(['git', '-C', directory, 'rev-parse', 'HEAD'], text=True).strip()
             if actual != os.environ[key]:
                 raise SystemExit(f'{directory} checkout differs from requested commit')
             evidence['sources'][directory] = actual
-        module = 'github.com/openabstractions/abstraction-download/go'
-        for directory in ('source-charter/serve', 'source-jobd'):
-            selected = json.loads(subprocess.check_output(['go', 'list', '-m', '-json', module], cwd=directory, text=True))
-            if selected.get('Replace'):
-                raise SystemExit(f'{directory} replaces its published download dependency')
-            downloaded = json.loads(subprocess.check_output(['go', 'mod', 'download', '-json', module+'@'+selected['Version']], cwd=directory, text=True))
-            if downloaded.get('Origin', {}).get('Hash') != os.environ['DOWNLOAD_SHA']:
-                raise SystemExit(f'{directory} download dependency does not identify download_sha')
-            evidence['dependencies'][directory] = downloaded
+        def modules(raw):
+            decoder = json.JSONDecoder()
+            while raw.strip():
+                value, end = decoder.raw_decode(raw.lstrip())
+                yield value
+                raw = raw.lstrip()[end:]
+        expected = {'github.com/openabstractions/abstraction-download/go': os.environ['DOWNLOAD_SHA'],
+                    'github.com/openabstractions/abstraction-job/go': os.environ['JOB_SHA']}
+        for directory in ('source-charter/serve', 'source-charter/monitor', 'source-jobd', 'source-download/go', 'source-job/go'):
+            selected = list(modules(subprocess.check_output(['go', 'list', '-m', '-json', 'all'], cwd=directory, text=True)))
+            if not selected or sum(bool(item.get('Main')) for item in selected) != 1:
+                raise SystemExit(f'{directory} must select one main module')
+            if directory in ('source-charter/serve', 'source-jobd') and 'github.com/openabstractions/abstraction-download/go' not in {item.get('Path') for item in selected}:
+                raise SystemExit(f'{directory} is missing its required download dependency')
+            closure = []
+            for item in selected:
+                if item.get('Replace') or item.get('Error'):
+                    raise SystemExit(f'{directory} has a replaced or unresolved module: {item.get("Path")}')
+                if item.get('Main'):
+                    closure.append(item)
+                    continue
+                if not item.get('Path') or not item.get('Version'):
+                    raise SystemExit(f'{directory} dependency lacks an immutable module version')
+                downloaded = json.loads(subprocess.check_output(['go', 'mod', 'download', '-json', item['Path']+'@'+item['Version']], cwd=directory, text=True))
+                if downloaded.get('Replace') or downloaded.get('Error') or not downloaded.get('Sum') or not downloaded.get('GoModSum'):
+                    raise SystemExit(f'{directory} dependency lacks verified downloaded content: {item["Path"]}')
+                if item['Path'] in expected and downloaded.get('Origin', {}).get('Hash') != expected[item['Path']]:
+                    raise SystemExit(f'{directory} dependency does not identify the requested source SHA: {item["Path"]}')
+                closure.append({'selected': item, 'download': downloaded})
+            evidence['dependencies'][directory] = closure
         pathlib.Path('dist').mkdir()
         pathlib.Path('dist/source-provenance.json').write_text(json.dumps(evidence, indent=2))
         pathlib.Path('dist/tools.tsv').write_bytes(pathlib.Path('tools.tsv').read_bytes())
@@ -271,32 +318,16 @@ jobs:
         if any(len(row) != 5 for row in rows) or len({row[0] for row in rows}) != len(rows):
             raise SystemExit('Invalid or duplicate tools.tsv rows')
         tools = {row[0]: row for row in rows}
-        overrides = {'jobd': ('source-jobd', '.'), 'openabstractions': ('source-charter/serve', '.'), 'dl': ('source-download/go', './cmd/dl')}
+        overrides = {'jobd': ('source-jobd', '.'), 'openabstractions': ('source-charter/serve', '.'), 'dl': ('source-download/go', './cmd/dl'), 'jobctl': ('source-job/go', './cmd/jobctl')}
         plan, pins = {}, {}
         for name in names:
             if name+'.exe' not in tools or tools[name+'.exe'][4] != 'console':
                 raise SystemExit('POSIX payload requires an explicit console tools.tsv entry')
-            if name in overrides:
-                plan[name] = overrides[name]
-                continue
-            _, module_version, package, _, _ = tools[name+'.exe']
-            module, version = module_version.rsplit('@', 1)
-            if not re.fullmatch(r'github.com/openabstractions/[a-z0-9-]+(?:/[a-z0-9-]+)*', module) or not re.fullmatch(r'v[0-9]+\.[0-9]+\.[0-9]+(?:-[A-Za-z0-9.-]+)?', version):
-                raise SystemExit('Other programs require reviewed immutable OpenAbstractions module tags')
-            if package != '.' and not re.fullmatch(r'[A-Za-z0-9_-]+(?:/[A-Za-z0-9_-]+)*', package):
-                raise SystemExit('Invalid module package path')
-            repo, _, subdir = module.removeprefix('github.com/openabstractions/').partition('/')
-            tag = 'refs/tags/'+(subdir+'/' if subdir else '')+version
-            refs = subprocess.check_output(['git', 'ls-remote', '--tags', '--exit-code', 'https://github.com/openabstractions/'+repo, tag, tag+'^{}'], text=True)
-            refs = dict(line.split()[::-1] for line in refs.splitlines())
-            if tag not in refs or set(refs)-{tag, tag+'^{}'} or any(not re.fullmatch('[0-9a-f]{40}', sha) for sha in refs.values()):
-                raise SystemExit('Exact public module tag is missing or malformed')
-            commit = refs.get(tag+'^{}', refs[tag])
-            selected = json.loads(subprocess.check_output(['go', 'mod', 'download', '-json', module_version], text=True))
-            if selected.get('Replace') or selected.get('Origin', {}).get('Hash') != commit or not selected.get('Dir'):
-                raise SystemExit('Module download does not match its exact public tag')
-            plan[name] = (selected['Dir'], '.' if package == '.' else './'+package)
-            pins[name] = {'module': module_version, 'tag': tag, 'sha': commit, 'sum': selected.get('Sum')}
+            plan[name] = overrides[name]
+            directory, target = plan[name]
+            source = directory.split('/')[0]
+            source_key = {'source-jobd': 'SERVICE_JOBD_SHA', 'source-charter': 'CHARTER_SHA', 'source-download': 'DOWNLOAD_SHA', 'source-job': 'JOB_SHA'}[source]
+            pins[name] = {'directory': directory, 'package': target, 'sha': os.environ[source_key]}
         goos = 'linux' if platform == 'linux' else 'darwin'
         hashes = {}
         for arch in ('amd64', 'arm64'):

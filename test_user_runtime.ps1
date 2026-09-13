@@ -2,6 +2,8 @@ param(
     [ValidateSet('ValidateOnly','Verify','User')][string]$Mode = 'ValidateOnly',
     [string]$MsiPath,
     [string]$ExpectedSid,
+    [switch]$CheckTools,
+    [string]$PythonPath,
     [string]$ResultDirectory = (Join-Path (Get-Location) 'user-runtime-diagnostics')
 )
 $ErrorActionPreference = 'Stop'
@@ -147,6 +149,97 @@ function Invoke-InstallWithDiagnostics([scriptblock]$Install, [scriptblock]$Diag
         throw $original
     }
 }
+function Invoke-CheckedTool([string]$Image, [string[]]$Arguments) {
+    $info = New-Object Diagnostics.ProcessStartInfo
+    $info.FileName=$Image; $info.Arguments=$Arguments -join ' '
+    $result=Invoke-FixtureProcess $info 60
+    $result.Diagnostics | Write-Host
+    if ($result.ExitCode -ne 0) { throw "Tool exited $($result.ExitCode): $Image" }
+    return ($result.Output -split '\r?\n')
+}
+function Assert-InstalledUserTools([string]$Tools) {
+$dir = Split-Path -Parent $tools
+if (-not (Test-Path $tools)) { throw "a per-user install did not land in $tools" }
+foreach ($f in 'jobd.exe','jobdw.exe','dl.exe','jobctl.exe','openabstractions.exe','Abstraction Panel.exe') {
+  if (-not (Test-Path (Join-Path $tools $f))) { throw "$f was not installed" }
+}
+$path = (Get-ItemProperty 'HKCU:\Environment' -Name Path -ErrorAction Stop).Path
+if ($path -notlike "*$tools*") { throw "the user PATH does not carry $tools" }
+
+# What this scope promises instead of a service, in the words the
+# feature text uses: a Startup shortcut, and nothing that replaces the
+# supervisor if it dies before the next sign-in.
+$lnk = Join-Path $env:APPDATA 'Microsoft\Windows\Start Menu\Programs\Startup\Abstraction supervisor.lnk'
+if (-not (Test-Path $lnk)) { throw 'the Startup shortcut is what a per-user install gets instead of a service, and it is not there' }
+if ((Get-ItemProperty 'HKCU:\Software\OpenAbstractions\Abstraction\Supervisor' -Name atLogon).atLogon -ne 1) {
+  throw 'the per-user supervisor marker is not set'
+}
+
+# And what it must not have done. Every one of these is a machine-scope
+# act, and an install that had no administrator token and did them
+# anyway would have done them badly.
+if (Test-Path 'HKLM:\Software\OpenAbstractions') { throw 'a per-user install wrote the machine registry key' }
+if (Test-Path (Join-Path $env:ProgramData 'abstraction')) { throw 'a per-user install created the machine config folder it cannot protect' }
+& sc.exe qc OpenAbstractionsSupervisor | Out-Null
+if ($LASTEXITCODE -eq 0) { throw 'a per-user install registered a service. It has no administrator token, so whatever it registered, it registered wrong.' }
+if ($LASTEXITCODE -ne 1060) { throw "sc qc could not establish service absence: exit $LASTEXITCODE" }
+foreach ($t in 'jobd','jobd-logon') {
+  if (Get-ScheduledTask -TaskName $t -ErrorAction SilentlyContinue) {
+    throw "a scheduled task named $t exists. This package registered one until it was replaced by the service and the Startup shortcut; a task coming back is that mechanism returning unannounced."
+  }
+}
+'ok    programs, a user PATH entry, a Startup shortcut — and no service, no machine key, no task'
+}
+function Assert-ToolStoreCompatibility([string]$Tools, [string]$PythonPath) {
+$work = Join-Path (Get-Location) 'agree'
+$oldStore=$env:ABSTRACTION_STORE; $oldJobStore=$env:JOB_STORE
+New-Item -ItemType Directory -Force -Path "$work\serve","$work\out","$work\store" | Out-Null
+$env:ABSTRACTION_STORE = "$work\store"
+Set-Content "$work\serve\thing.bin" 'three modules, one store format'
+$srv = Start-Process -FilePath $PythonPath -WindowStyle Hidden -PassThru -RedirectStandardOutput agree-server.log -RedirectStandardError agree-server.err -WorkingDirectory "$work\serve" -ArgumentList '-m','http.server','8099','--bind','127.0.0.1'
+try {
+    # Bound HTTP readiness independently of each tool's process deadline.
+    $ready=$false
+    $readyUntil=[DateTime]::UtcNow.AddSeconds(10)
+    while ([DateTime]::UtcNow -lt $readyUntil) {
+      try { Invoke-WebRequest 'http://127.0.0.1:8099/thing.bin' -UseBasicParsing -TimeoutSec 1 | Out-Null; $ready=$true; break }
+      catch { Start-Sleep -Milliseconds 200 }
+    }
+    if (-not $ready) { throw 'Isolated HTTP source did not become ready' }
+    $fetched = Invoke-CheckedTool "$tools\dl.exe" @('http://127.0.0.1:8099/thing.bin','-o',"`"$work\out`"")
+    $fetched
+
+    if (-not (Test-Path "$work\out\thing.bin")) { throw 'dl reported success and delivered nothing' }
+    $named = $fetched | Select-String -Pattern '^\s*job\s+(\S+)'
+    if (-not $named) { throw 'dl did not name the job it created' }
+    $id = $named.Matches[0].Groups[1].Value
+
+    $seen = Invoke-CheckedTool "$tools\jobd.exe" @('status')
+    $seen
+    if (-not ($seen | Select-String -SimpleMatch 'thing.bin')) {
+      throw 'jobd could not see the download dl completed in the store they share'
+    }
+
+    $env:JOB_STORE = "$work\store"
+    $shown = Invoke-CheckedTool "$tools\jobctl.exe" @('show',$id)
+
+    if (-not ($shown | Select-String -SimpleMatch $id)) {
+      throw 'jobctl read the store and did not find the record dl wrote there'
+    }
+
+    Remove-Item Env:JOB_STORE
+    $without = Invoke-CheckedTool "$tools\jobctl.exe" @('show',$id)
+    if (-not ($without | Select-String -SimpleMatch $id)) {
+      throw 'jobctl exited 0 without JOB_STORE and did not find the record dl wrote'
+    }
+} finally {
+    $env:ABSTRACTION_STORE=$oldStore; $env:JOB_STORE=$oldJobStore
+    if (-not $srv.HasExited) { $srv.Kill() }
+    if (-not $srv.WaitForExit(5000)) { throw 'HTTP fixture process termination was not observed' }
+    $srv.Dispose()
+}
+    'Cross-tool store compatibility passed' | Set-Content tool-compatibility.txt
+}
 if ($Mode -eq 'User') {
     $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
     $principal = New-Object Security.Principal.WindowsPrincipal($identity)
@@ -165,6 +258,7 @@ if ($Mode -eq 'User') {
             Invoke-Bounded msiexec.exe @('/i', "`"$MsiPath`"", '/qn', '/norestart', 'ALLUSERS=2', 'MSIINSTALLPERUSER=1', '/l*v', 'user-install.log')
         } { Save-ActivationFailure $tools }
         $installed = $true
+        if ($CheckTools) { Assert-InstalledUserTools $tools; Assert-ToolStoreCompatibility $tools $PythonPath }
         $central = Join-Path $tools 'openabstractions.exe'
         Assert-RuntimeReady $central post-install-status
         'ok: logging/config ready immediately after MSI completion' | Set-Content 'post-install-activation.txt'
@@ -183,6 +277,12 @@ if ($Mode -eq 'User') {
         $installAttempted = $false
         # These assertions precede outer fixture cleanup and its process termination.
         Assert-NoRuntime $ExpectedSid
+        if ($CheckTools) {
+            if (Test-Path (Split-Path -Parent $tools)) { throw 'Install folder survived removal' }
+            if (Test-Path 'HKCU:\Software\OpenAbstractions') { throw 'User registry key survived removal' }
+            $userPath = (Get-ItemProperty 'HKCU:\Environment' -Name Path -ErrorAction SilentlyContinue).Path
+            if ($userPath -like '*Programs\OpenAbstractions*') { throw 'User PATH entry survived removal' }
+        }
         if (Test-Path -LiteralPath $shortcutPath) { throw 'Startup shortcut survived uninstall' }
         foreach ($name in @('jobdw.exe','openabstractions.exe')) {
             if (Test-Path -LiteralPath (Join-Path $tools $name)) { throw "Installed $name survived uninstall" }
@@ -228,6 +328,10 @@ exit $LASTEXITCODE
     Set-Content -LiteralPath (Join-Path $directory 'launcher.ps1') -Value $launcher -Encoding UTF8
     $credential = New-Object Management.Automation.PSCredential("$env:COMPUTERNAME\$user", (ConvertTo-SecureString $password -AsPlainText -Force))
     $arguments = @('-NoProfile','-ExecutionPolicy','Bypass','-File',"`"$directory\launcher.ps1`"",'-Mode','User','-MsiPath',"`"$directory\package.msi`"",'-ExpectedSid',$account.SID.Value)
+    if ($CheckTools) {
+        if (-not $PythonPath -or -not (Test-Path -LiteralPath $PythonPath -PathType Leaf)) { throw 'Release tools check requires an explicit existing Python executable' }
+        $arguments += @('-CheckTools','-PythonPath',"`"$PythonPath`"")
+    }
     $childInfo = New-Object Diagnostics.ProcessStartInfo
     $childInfo.FileName = 'powershell.exe'
     $childInfo.Arguments = $arguments -join ' '

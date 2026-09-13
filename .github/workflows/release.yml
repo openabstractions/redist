@@ -292,133 +292,89 @@ jobs:
           # query.exe is diagnostic; do not propagate its stale native exit code.
           exit 0
 
-      # ----- just for me -----------------------------------------------------
-      #
-      # MSIINSTALLPERUSER is named even though the package defaults to it. The
-      # Property table carries ALLUSERS=2, which WixUI resolves against
-      # Privileged: an unscoped command on an administrator's machine picks a
-      # scope by itself, and a scope picked by itself is what this job exists to
-      # stop being the thing that proves the package.
-      - name: install just for me
+      # Per-user assertions run with the fresh standard-user token.
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
+        with:
+          ref: ${{ github.sha }}
+          path: user-fixture
+      - name: configure disposable consumer MSI policy
         shell: pwsh
         run: |
-          $msi = (Resolve-Path pkg\abstraction-x64.msi).Path
-          $p = Start-Process msiexec -Wait -PassThru -ArgumentList @('/i', $msi, '/qn', '/norestart', 'ALLUSERS=2', 'MSIINSTALLPERUSER=1', '/l*v', 'user-install.log')
-          if ($p.ExitCode -ne 0) { Get-Content user-install.log -Tail 60; throw "msiexec /i exited $($p.ExitCode)" }
-
-      - name: what a per-user install did, and what it must not have done
-        shell: pwsh
-        run: |
-          $dir = Join-Path $env:LOCALAPPDATA 'Programs\OpenAbstractions'
-          $tools = Join-Path $dir 'tools'
-          if (-not (Test-Path $tools)) { throw "a per-user install did not land in $tools" }
-          foreach ($f in 'jobd.exe','jobdw.exe','dl.exe','jobctl.exe','openabstractions.exe','Abstraction Panel.exe') {
-            if (-not (Test-Path (Join-Path $tools $f))) { throw "$f was not installed" }
+          if ($env:GITHUB_ACTIONS -ne 'true' -or $env:RUNNER_ENVIRONMENT -ne 'github-hosted' -or $env:RUNNER_OS -ne 'Windows') { throw 'MSI policy fixture requires a disposable GitHub Windows runner' }
+          if ((Get-CimInstance Win32_OperatingSystem -ErrorAction Stop).ProductType -ne 3) { throw 'MSI policy fixture requires Windows Server' }
+          $policy = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\Installer'
+          $statePath = Join-Path $env:RUNNER_TEMP 'oa-msi-policy.json'
+          if (Test-Path -LiteralPath $statePath -ErrorAction Stop) { throw 'MSI policy baseline already exists' }
+          $keyExists = Test-Path -LiteralPath $policy -ErrorAction Stop
+          $state = @{ KeyExisted=$keyExists; ValueExisted=$false; Value=$null; Restored=$false }
+          if ($keyExists) {
+              $key = Get-Item -LiteralPath $policy -ErrorAction Stop
+              try {
+                  $state.ValueExisted = $key.GetValueNames() -contains 'DisableMSI'
+                  if ($state.ValueExisted) {
+                      if ($key.GetValueKind('DisableMSI') -ne [Microsoft.Win32.RegistryValueKind]::DWord) { throw 'Unexpected DisableMSI registry type' }
+                      $state.Value = $key.GetValue('DisableMSI')
+                      if ($state.Value -notin @(0,1,2)) { throw 'Unexpected DisableMSI registry value' }
+                  }
+              } finally { $key.Close() }
           }
-          $path = (Get-ItemProperty 'HKCU:\Environment' -Name Path -ErrorAction Stop).Path
-          if ($path -notlike "*$tools*") { throw "the user PATH does not carry $tools" }
-
-          # What this scope promises instead of a service, in the words the
-          # feature text uses: a Startup shortcut, and nothing that replaces the
-          # supervisor if it dies before the next sign-in.
-          $lnk = Join-Path $env:APPDATA 'Microsoft\Windows\Start Menu\Programs\Startup\Abstraction supervisor.lnk'
-          if (-not (Test-Path $lnk)) { throw 'the Startup shortcut is what a per-user install gets instead of a service, and it is not there' }
-          if ((Get-ItemProperty 'HKCU:\Software\OpenAbstractions\Abstraction\Supervisor' -Name atLogon).atLogon -ne 1) {
-            throw 'the per-user supervisor marker is not set'
-          }
-
-          # And what it must not have done. Every one of these is a machine-scope
-          # act, and an install that had no administrator token and did them
-          # anyway would have done them badly.
-          if (Test-Path 'HKLM:\Software\OpenAbstractions') { throw 'a per-user install wrote the machine registry key' }
-          if (Test-Path (Join-Path $env:ProgramData 'abstraction')) { throw 'a per-user install created the machine config folder it cannot protect' }
-          & sc.exe qc OpenAbstractionsSupervisor | Out-Null
-          if ($LASTEXITCODE -eq 0) { throw 'a per-user install registered a service. It has no administrator token, so whatever it registered, it registered wrong.' }
-          if ($LASTEXITCODE -ne 1060) { throw "sc qc could not establish service absence: exit $LASTEXITCODE" }
-          foreach ($t in 'jobd','jobd-logon') {
-            if (Get-ScheduledTask -TaskName $t -ErrorAction SilentlyContinue) {
-              throw "a scheduled task named $t exists. This package registered one until it was replaced by the service and the Startup shortcut; a task coming back is that mechanism returning unannounced."
-            }
-          }
-          'ok    programs, a user PATH entry, a Startup shortcut — and no service, no machine key, no task'
+          # Persist the original state before the first mutation, including setup failures.
+          $state | ConvertTo-Json | Set-Content -LiteralPath $statePath -Encoding utf8 -ErrorAction Stop
+          "DisableMSI baseline: key=$keyExists present=$($state.ValueExisted) value=$($state.Value)" | Tee-Object msi-policy.log
+          if (-not $keyExists) { New-Item -Path $policy -Force -ErrorAction Stop | Out-Null }
+          New-ItemProperty -LiteralPath $policy -Name DisableMSI -Value 0 -PropertyType DWord -Force -ErrorAction Stop | Out-Null
+          if ((Get-ItemPropertyValue -LiteralPath $policy -Name DisableMSI -ErrorAction Stop) -ne 0) { throw 'DisableMSI test configuration did not take effect' }
+          'Disposable test environment: DisableMSI=0 permits standard-user unmanaged installation' | Tee-Object -Append msi-policy.log
           exit 0
-
-      # These three binaries come from three separately tagged modules, so the
-      # package contains three builds of one store format. Only writing with one
-      # and reading with the others says they agree.
-      #
-      # All three take the store from ABSTRACTION_STORE. jobctl also accepts
-      # JOB_STORE, which wins where it is set, because the cross-language
-      # harness points three implementations at one directory with it. Both
-      # names are exercised: the divergence this step used to assert was a
-      # pinned jobctl two releases old, and it went red the day the pin moved.
-      - name: the three programs agree about the store
+      - name: private non-admin installation and cross-tool compatibility
+        shell: pwsh
+        timeout-minutes: 8
+        run: |
+          & powershell.exe -NoProfile -ExecutionPolicy Bypass -File user-fixture/test_user_runtime.ps1 -Mode Verify -MsiPath (Resolve-Path pkg/abstraction-x64.msi).Path -CheckTools -PythonPath (Get-Command python.exe -ErrorAction Stop).Source
+          if ($LASTEXITCODE -ne 0) { throw "Per-user release verification exited $LASTEXITCODE" }
+      - name: restore disposable consumer MSI policy
+        if: always()
         shell: pwsh
         run: |
-          $tools = Join-Path $env:LOCALAPPDATA 'Programs\OpenAbstractions\tools'
-          $work = Join-Path $env:RUNNER_TEMP 'agree'
-          New-Item -ItemType Directory -Force -Path "$work\serve","$work\out","$work\store" | Out-Null
-          $env:ABSTRACTION_STORE = "$work\store"
-          Set-Content "$work\serve\thing.bin" 'three modules, one store format'
-          $srv = Start-Process python -PassThru -WorkingDirectory "$work\serve" -ArgumentList '-m','http.server','8099','--bind','127.0.0.1'
-          try {
-            # 200 ms of backoff, at most ten seconds of it: http.server has no
-            # readiness signal, so the first successful request is the only one
-            # there is to wait for.
-            for ($i = 0; $i -lt 50; $i++) {
-              try { Invoke-WebRequest 'http://127.0.0.1:8099/thing.bin' -UseBasicParsing | Out-Null; break }
-              catch { Start-Sleep -Milliseconds 200 }
-            }
-            $fetched = & "$tools\dl.exe" 'http://127.0.0.1:8099/thing.bin' -o "$work\out" 2>&1
-            $fetched
-            if ($LASTEXITCODE -ne 0) { throw "dl exited $LASTEXITCODE" }
-            if (-not (Test-Path "$work\out\thing.bin")) { throw 'dl reported success and delivered nothing' }
-            $named = $fetched | Select-String -Pattern '^\s*job\s+(\S+)'
-            if (-not $named) { throw 'dl did not name the job it created' }
-            $id = $named.Matches[0].Groups[1].Value
-
-            $seen = & "$tools\jobd.exe" status
-            $seen
-            if (-not ($seen | Select-String -SimpleMatch 'thing.bin')) {
-              throw 'jobd could not see the download dl completed in the store they share'
-            }
-
-            $env:JOB_STORE = "$work\store"
-            $shown = & "$tools\jobctl.exe" show $id
-            if ($LASTEXITCODE -ne 0) { throw "jobctl show exited $LASTEXITCODE on the job dl wrote" }
-            if (-not ($shown | Select-String -SimpleMatch $id)) {
-              throw 'jobctl read the store and did not find the record dl wrote there'
-            }
-
-            Remove-Item Env:JOB_STORE
-            $without = & "$tools\jobctl.exe" show $id 2>&1
-            if ($LASTEXITCODE -ne 0) {
-              $without
-              throw 'jobctl found the store only under JOB_STORE. The other two read ABSTRACTION_STORE, so one installation would hold two stores.'
-            }
-            if (-not ($without | Select-String -SimpleMatch $id)) {
-              throw 'jobctl exited 0 without JOB_STORE and did not find the record dl wrote'
-            }
-          } finally {
-            Stop-Process -Id $srv.Id -Force
+          if ($env:GITHUB_ACTIONS -ne 'true' -or $env:RUNNER_ENVIRONMENT -ne 'github-hosted' -or $env:RUNNER_OS -ne 'Windows') { throw 'MSI policy fixture requires a disposable GitHub Windows runner' }
+          if ((Get-CimInstance Win32_OperatingSystem -ErrorAction Stop).ProductType -ne 3) { throw 'MSI policy fixture requires Windows Server' }
+          $policy = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\Installer'
+          $statePath = Join-Path $env:RUNNER_TEMP 'oa-msi-policy.json'
+          if (-not (Test-Path -LiteralPath $statePath -ErrorAction Stop)) { 'No MSI policy mutation was recorded'; exit 0 }
+          $state = Get-Content -LiteralPath $statePath -Raw -ErrorAction Stop | ConvertFrom-Json
+          if ($state.KeyExisted -isnot [bool] -or $state.ValueExisted -isnot [bool] -or ($state.ValueExisted -and (-not $state.KeyExisted -or $state.Value -notin @(0,1,2)))) { throw 'Invalid MSI policy baseline' }
+          if ($state.ValueExisted) {
+              New-ItemProperty -LiteralPath $policy -Name DisableMSI -Value $state.Value -PropertyType DWord -Force -ErrorAction Stop | Out-Null
+          } elseif (Test-Path -LiteralPath $policy -ErrorAction Stop) {
+              $key = Get-Item -LiteralPath $policy -ErrorAction Stop
+              try { $present = $key.GetValueNames() -contains 'DisableMSI' } finally { $key.Close() }
+              if ($present) { Remove-ItemProperty -LiteralPath $policy -Name DisableMSI -ErrorAction Stop }
           }
-          'ok    dl wrote it, jobd saw it, jobctl read the record back — one store format, two environment variables'
-
-      - name: uninstall just for me
-        shell: pwsh
-        run: |
-          $msi = (Resolve-Path pkg\abstraction-x64.msi).Path
-          $p = Start-Process msiexec -Wait -PassThru -ArgumentList @('/x', $msi, '/qn', '/norestart', '/l*v', 'user-uninstall.log')
-          if ($p.ExitCode -ne 0) { Get-Content user-uninstall.log -Tail 60; throw "msiexec /x exited $($p.ExitCode)" }
-          $dir = Join-Path $env:LOCALAPPDATA 'Programs\OpenAbstractions'
-          if (Test-Path $dir) { throw 'the install folder survived uninstall' }
-          if (Test-Path 'HKCU:\Software\OpenAbstractions') { throw 'the registry key survived uninstall' }
-          if (Test-Path (Join-Path $env:APPDATA 'Microsoft\Windows\Start Menu\Programs\Startup\Abstraction supervisor.lnk')) {
-            throw 'the Startup shortcut survived uninstall'
-          }
-          $path = (Get-ItemProperty 'HKCU:\Environment' -Name Path -ErrorAction Stop).Path
-          if ($path -like '*Programs\OpenAbstractions*') { throw 'the PATH entry survived uninstall' }
-          'ok    uninstall reversed it: no folder, no registry key, no shortcut, no PATH entry'
+          if (Test-Path -LiteralPath $policy -ErrorAction Stop) {
+              $key = Get-Item -LiteralPath $policy -ErrorAction Stop
+              try {
+                  $present = $key.GetValueNames() -contains 'DisableMSI'
+                  if ($present -ne $state.ValueExisted) { throw 'DisableMSI presence was not restored' }
+                  if ($present -and ($key.GetValueKind('DisableMSI') -ne [Microsoft.Win32.RegistryValueKind]::DWord -or $key.GetValue('DisableMSI') -ne $state.Value)) { throw 'DisableMSI value was not restored' }
+                  $empty = $key.GetValueNames().Count -eq 0 -and $key.GetSubKeyNames().Count -eq 0
+              } finally { $key.Close() }
+              if (-not $state.KeyExisted) {
+                  if (-not $empty) { throw 'Refusing to remove a policy key with unrelated values' }
+                  Remove-Item -LiteralPath $policy -ErrorAction Stop
+              }
+          } elseif ($state.KeyExisted) { throw 'Original MSI policy key disappeared' }
+          $state.Restored = $true
+          $state | ConvertTo-Json | Set-Content -LiteralPath $statePath -Encoding utf8 -ErrorAction Stop
+          'DisableMSI baseline restored and verified' | Tee-Object -Append msi-policy.log
+          exit 0
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        if: always()
+        with:
+          name: release-per-user-diagnostics
+          path: |
+            user-runtime-diagnostics/
+            msi-policy.log
+            ${{ runner.temp }}/oa-msi-policy.json
 
       # ----- for everyone ----------------------------------------------------
       #
