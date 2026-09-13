@@ -2,6 +2,18 @@ The Open Abstractions redistributable packages programs built from published
 module versions. The build appends this release's asset and signing state at
 the end of these notes; those facts apply to this release only.
 
+## Changes in 0.1.6
+
+The installed supervisor starts the shared capability runtime. Application
+clients resolve local services through a common IPC boundary with independently
+selected installation trust. The Panel uses those services for configuration,
+readiness and job activity. Windows per-user installation starts the windowless
+runtime immediately.
+
+This release packages the runtime and tools. Language SDKs keep their own release
+versions. The architecture roadmap continues beyond this release. The known
+macOS caller-identity limitation still applies to verified service readiness.
+
 ## What is in it
 
 | program | what it does | platforms |

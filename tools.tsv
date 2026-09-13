@@ -36,9 +36,9 @@
 > wearing a pair's name.
 
 path		module							package		feature		subsystem
-jobd.exe	github.com/openabstractions/service-jobd@v0.3.2		.		service		console
-jobdw.exe	github.com/openabstractions/service-jobd@v0.3.2		.		service		windows
-dl.exe		github.com/openabstractions/abstraction-download/go@v0.4.2	cmd/dl		tools		console
-jobctl.exe	github.com/openabstractions/abstraction-job/go@v0.4.2	cmd/jobctl	tools		console
+jobd.exe	github.com/openabstractions/service-jobd@v0.3.3		.		service		console
+jobdw.exe	github.com/openabstractions/service-jobd@v0.3.3		.		service		windows
+dl.exe		github.com/openabstractions/abstraction-download/go@v0.4.3	cmd/dl		tools		console
+jobctl.exe	github.com/openabstractions/abstraction-job/go@v0.4.3	cmd/jobctl	tools		console
 Abstraction Panel.exe	github.com/openabstractions/abstractions/monitor@v0.1.1	.		tools		windows
 openabstractions.exe	github.com/openabstractions/abstractions/serve@v0.1.0	.	service	console
