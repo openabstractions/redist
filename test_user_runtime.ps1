@@ -184,12 +184,12 @@ function Get-UserProducts {
             foreach ($product in $products) {
                 try {
                     [pscustomobject]@{
-                        ProductCode = [string]$product.ProductCode
+                        ProductCode = [string]$product.GetType().InvokeMember('ProductCode', [Reflection.BindingFlags]::GetProperty, $null, $product, $null)
                         ProductName = [string]$product.InstallProperty('ProductName')
                         VersionString = [string]$product.InstallProperty('VersionString')
                         State = [string]$product.InstallProperty('State')
-                        Context = [int]$product.Context
-                        UserSid = [string]$product.UserSid
+                        Context = [int]$product.GetType().InvokeMember('Context', [Reflection.BindingFlags]::GetProperty, $null, $product, $null)
+                        UserSid = [string]$product.GetType().InvokeMember('UserSid', [Reflection.BindingFlags]::GetProperty, $null, $product, $null)
                     }
                 } finally { [void][Runtime.InteropServices.Marshal]::FinalReleaseComObject($product) }
             }
