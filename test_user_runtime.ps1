@@ -93,14 +93,11 @@ function Assert-RuntimeReady([string]$central, [string]$Evidence) {
     $probe.Diagnostics | Set-Content -Encoding UTF8 "$Evidence.err"
     if ($probe.ExitCode -ne 0) { throw "Runtime status exited $($probe.ExitCode)" }
     $status = Get-Content "$Evidence.json" -Raw | ConvertFrom-Json
-    foreach ($capability in @('abstraction.logging','abstraction.config')) {
-        if (@($status.capabilities | Where-Object { $_.capability -eq $capability -and $_.status -eq 'resolved' }).Count -ne 1) {
-            throw "Missing ready capability: $capability"
-        }
-    }
-    foreach ($contract in @('abstraction.job/acceptance@1','abstraction.job/operations@1')) {
-        if (@($status.capabilities | Where-Object { $_.capability -eq 'abstraction.job' -and $_.contract -eq $contract -and $_.status -eq 'resolved' }).Count -ne 1) {
-            throw "Missing ready contract: $contract"
+    foreach ($contract in @('abstraction.logging/sink@1','abstraction.config/reader@1','abstraction.config/editor@1','abstraction.job/acceptance@1','abstraction.job/operations@1')) {
+        $capability = $contract.Split('/')[0]
+        $matches = @($status.capabilities | Where-Object { $_.capability -eq $capability -and $_.contract -eq $contract })
+        if ($matches.Count -ne 1 -or $matches[0].status -ne 'resolved') {
+            throw "Expected exactly one ready contract: $contract"
         }
     }
 }
