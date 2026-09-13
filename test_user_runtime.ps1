@@ -174,18 +174,44 @@ function Get-PackageProperty([string]$Path, [ValidateSet('ProductVersion','Produ
         [void][Runtime.InteropServices.Marshal]::FinalReleaseComObject($installer)
     }
 }
+function Get-UserProducts {
+    $sid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+    $installer = New-Object -ComObject WindowsInstaller.Installer
+    try {
+        # MSIINSTALLCONTEXT_USERUNMANAGED=2; query the invoking fresh user only.
+        $products = $installer.ProductsEx('', $sid, 2)
+        try {
+            foreach ($product in $products) {
+                try {
+                    [pscustomobject]@{
+                        ProductCode = [string]$product.ProductCode
+                        ProductName = [string]$product.InstallProperty('ProductName')
+                        VersionString = [string]$product.InstallProperty('VersionString')
+                        State = [string]$product.InstallProperty('State')
+                        Context = [int]$product.Context
+                        UserSid = [string]$product.UserSid
+                    }
+                } finally { [void][Runtime.InteropServices.Marshal]::FinalReleaseComObject($product) }
+            }
+        } finally { [void][Runtime.InteropServices.Marshal]::FinalReleaseComObject($products) }
+    } finally { [void][Runtime.InteropServices.Marshal]::FinalReleaseComObject($installer) }
+}
 function Assert-InstalledVersion([string]$Version, [string]$ProductCode) {
-    $products = @(Get-ItemProperty 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*' -ErrorAction SilentlyContinue | Where-Object { $_.DisplayName -eq 'Abstraction' })
-    if ($products.Count -ne 1 -or $products[0].DisplayVersion -ne $Version -or $products[0].PSChildName -ne $ProductCode) {
-        throw 'Expected one per-user registration with the exact candidate version/product code'
+    $observed = @(Get-UserProducts)
+    $products = @($observed | Where-Object { $_.ProductName -eq 'Abstraction' -or $_.ProductCode -eq $ProductCode })
+    if ($products.Count -ne 1 -or $products[0].VersionString -ne $Version -or $products[0].ProductCode -ne $ProductCode -or
+        $products[0].ProductName -ne 'Abstraction' -or $products[0].State -ne '5' -or $products[0].Context -ne 2 -or
+        $products[0].UserSid -ne [Security.Principal.WindowsIdentity]::GetCurrent().User.Value) {
+        throw "Expected installed per-user product $ProductCode version $Version; observed: $($observed | ConvertTo-Json -Depth 3 -Compress)"
     }
 }
 function Assert-RetainedSentinel([string]$Path, [string]$Value) {
     if (-not (Test-Path -LiteralPath $Path -PathType Leaf) -or [IO.File]::ReadAllText($Path) -ne $Value) { throw 'User-data sentinel changed or disappeared' }
 }
 function Assert-RemovedRegistration {
-    if (@(Get-ItemProperty 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*' -ErrorAction SilentlyContinue | Where-Object { $_.DisplayName -eq 'Abstraction' }).Count) {
-        throw 'Per-user product registration survived removal'
+    $products = @(Get-UserProducts | Where-Object { $_.ProductName -eq 'Abstraction' })
+    if ($products.Count) {
+        throw "Per-user product registration survived removal: $($products | ConvertTo-Json -Depth 3 -Compress)"
     }
 }
 function Start-PredecessorSupervisor([string]$Tools) {
@@ -411,7 +437,7 @@ if ($Mode -eq 'User') {
         }
         if ($predecessorAttempted) {
             $oldCode = Get-PackageProperty $PredecessorMsiPath ProductCode
-            if (Test-Path "HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\$oldCode") {
+            if (@(Get-UserProducts | Where-Object { $_.ProductCode -eq $oldCode }).Count) {
                 try { Invoke-Bounded msiexec.exe @('/x',"`"$PredecessorMsiPath`"",'/qn','/norestart','/l*v','predecessor-cleanup.log') } catch { Write-Warning $_ }
             }
         }
