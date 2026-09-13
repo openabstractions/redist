@@ -163,12 +163,12 @@ function Get-PackageProperty([string]$Path, [ValidateSet('ProductVersion','Produ
     $database = $installer.OpenDatabase($Path, 0)
     $view = $database.OpenView("SELECT ``Value`` FROM ``Property`` WHERE ``Property``='$Property'")
     try {
-        $view.Execute()
+        [void]$view.Execute()
         $record = $view.Fetch()
         if (-not $record) { throw "MSI property absent: $Property" }
         return $record.StringData(1)
     } finally {
-        $view.Close()
+        [void]$view.Close()
         [void][Runtime.InteropServices.Marshal]::FinalReleaseComObject($view)
         [void][Runtime.InteropServices.Marshal]::FinalReleaseComObject($database)
         [void][Runtime.InteropServices.Marshal]::FinalReleaseComObject($installer)
