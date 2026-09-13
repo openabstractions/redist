@@ -1,0 +1,59 @@
+#!/bin/sh
+# Package preflight runs before payload replacement. The package scripts carry
+# the helper so an older installed helper cannot weaken this stop requirement.
+set -eu
+here=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+. "$here/lifecycle.sh"
+home=${HOME:-}
+case "$home" in /*) ;; *) home=${2:-};; esac
+[ -n "$home" ] || { echo "preinstall: target user home required" >&2; exit 1; }
+home=$(CDPATH= cd -- "$home" && pwd -P)
+[ "$home" != / ] || { echo "preinstall: target must be a user home" >&2; exit 1; }
+# Installer may also supply an installation target. A plausible user-owned
+# target must agree with HOME before any supervisor is observed or stopped.
+# The normal component root '/' does not identify a competing user home.
+target=${2:-}
+case "$target" in
+    /*)
+        if [ "$target" != / ] && [ -d "$target" ]; then
+            target=$(CDPATH= cd -- "$target" && pwd -P)
+            target_uid=$(stat -f %u "$target")
+            case "$target_uid" in
+                ''|*[!0-9]*) echo "preinstall: target owner unavailable" >&2; exit 1;;
+                0) ;;
+                *) [ "$target" = "$home" ] || {
+                    echo "preinstall: conflicting user-home targets; replacement refused" >&2
+                    exit 1
+                };;
+            esac
+        fi;;
+esac
+uid=$(stat -f %u "$home")
+case "$uid" in ''|*[!0-9]*|0) echo "preinstall: non-root target owner required" >&2; exit 1;; esac
+# Select and verify the target user's GUI bootstrap even when Installer is root.
+manager print "gui/$uid" >/dev/null
+manager_uid=$(manager asuser "$uid" /bin/launchctl manageruid)
+manager_name=$(manager asuser "$uid" /bin/launchctl managername)
+[ "$manager_uid" = "$uid" ] && [ "$manager_name" = Aqua ] || {
+    echo "preinstall: target graphical login session unavailable; replacement refused" >&2
+    exit 1
+}
+agent_state() {
+    jobs=$(manager asuser "$uid" /bin/launchctl list) || return 1
+    printf '%s\n' "$jobs" | awk '
+        NR == 1 { if (NF != 3 || $1 != "PID" || $2 != "Status" || $3 != "Label") bad=1; next }
+        NF < 3 || $1 !~ /^(-|[0-9]+)$/ || $2 !~ /^-?[0-9]+$/ { bad=1 }
+        NF == 3 && $3 == "com.openabstractions.jobd" { found=1 }
+        END { if (bad || NR == 0) exit 2; print found ? "present" : "absent" }
+    '
+}
+state=$(agent_state)
+if [ "$state" = present ]; then
+    manager bootout "gui/$uid/com.openabstractions.jobd"
+    state=$(agent_state)
+fi
+[ "$state" = absent ] || {
+    echo "preinstall: previous LaunchAgent remains registered; replacement refused" >&2
+    exit 1
+}
+echo "ok    previous LaunchAgent absence verified before replacement; graceful exit is not independently established"

@@ -93,6 +93,11 @@ function Assert-RuntimeReady([string]$central, [string]$Evidence) {
             throw "Missing ready capability: $capability"
         }
     }
+    foreach ($contract in @('abstraction.job/acceptance@1','abstraction.job/operations@1')) {
+        if (@($status.capabilities | Where-Object { $_.capability -eq 'abstraction.job' -and $_.contract -eq $contract -and $_.status -eq 'resolved' }).Count -ne 1) {
+            throw "Missing ready contract: $contract"
+        }
+    }
 }
 function Protect-DiagnosticText([string]$Text) {
     $Text = $Text.Substring(0, [Math]::Min(8192, $Text.Length))

@@ -320,6 +320,10 @@ try {
                 $matches = @($result.capabilities | Where-Object { $_.capability -eq $capability -and $_.status -eq 'resolved' })
                 if ($matches.Count -ne 1) { throw "Runtime diagnostic omitted ready $capability" }
             }
+            foreach ($contract in @('abstraction.job/acceptance@1','abstraction.job/operations@1')) {
+                $matches = @($result.capabilities | Where-Object { $_.capability -eq 'abstraction.job' -and $_.contract -eq $contract -and $_.status -eq 'resolved' })
+                if ($matches.Count -ne 1) { throw "Runtime diagnostic omitted ready $contract" }
+            }
             return $true
         } finally { $env:ABSTRACTION_RUNTIME_ENDPOINT = $previousEndpoint }
     }

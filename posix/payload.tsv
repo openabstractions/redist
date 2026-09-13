@@ -54,3 +54,5 @@ macos		.local/share/abstraction/uninstall.sh				authored	posix		macos/uninstall.
 both	.local/bin/openabstractions	gobuild	charter	serve	755
 linux	.config/systemd/user/abstraction-runtime.service	authored	posix	linux/abstraction-runtime.service	644
 linux	.local/share/abstraction/lifecycle.sh	authored	posix	linux/lifecycle.sh	644
+
+macos	.local/share/abstraction/lifecycle.sh	authored	posix	macos/lifecycle.sh	644

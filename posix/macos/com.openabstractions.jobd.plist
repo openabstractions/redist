@@ -6,14 +6,16 @@
 	<string>com.openabstractions.jobd</string>
 	<key>ProgramArguments</key>
 	<array>
-		<string>@BIN@/jobd</string>
-		<string>once</string>
-		<string>--quiet</string>
+		<string>@BIN@/openabstractions</string>
+		<string>serve</string>
+		<string>runtime</string>
 	</array>
 	<key>RunAtLoad</key>
 	<true/>
-	<key>StartInterval</key>
-	<integer>300</integer>
+	<key>KeepAlive</key>
+	<true/>
+	<key>ThrottleInterval</key>
+	<integer>10</integer>
 	<key>ProcessType</key>
 	<string>Background</string>
 	<key>LowPriorityIO</key>

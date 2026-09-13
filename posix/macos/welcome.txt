@@ -1,18 +1,16 @@
-Abstraction — downloads that survive the program that started them.
+OpenAbstractions user runtime
 
-This package installs for you alone. It asks for no administrator password, it
-writes nothing outside your home directory, and the background sweep it
-registers is a LaunchAgent in your own session — not a LaunchDaemon, and not
-anything that runs when you are logged out.
+This package installs programs into ~/.local/bin and registers a LaunchAgent in
+your graphical login session. The existing com.openabstractions.jobd label is
+retained for upgrades; its command now hosts openabstractions serve runtime.
+launchd restarts it after exit and removes its process group during shutdown.
 
-It installs:
+The package includes openabstractions, jobd, dl and jobctl, Python packages and
+~/.local/share/abstraction/uninstall.sh. It preserves application data.
 
-    ~/.local/bin/jobd, dl, jobctl
-    ~/Library/LaunchAgents/com.openabstractions.jobd.plist
-    ~/.local/share/abstraction/  — the Python packages, and an uninstaller
+Registration and process startup do not establish usable capability access.
+The existing macOS Program identity-proof limitation still causes protected
+service calls to refuse. This installer does not lower that requirement.
 
-THIS PACKAGE IS NOT SIGNED AND NOT NOTARISED. macOS will say the developer
-cannot be identified, and it is right: nothing here proves who built it. Check
-the SHA-256 published beside the download against the file you have before you
-open it. If you did not get it from github.com/openabstractions, do not install
-it.
+This package is unsigned and not notarised. Verify its published checksum and
+source before installation.

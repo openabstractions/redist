@@ -18,7 +18,7 @@ SCOPES = {"for everyone": True, "just for me": False}
 # What starts the supervisor, in each scope. Both arms exist or one scope
 # installs the programs and nothing that ever runs them.
 ARMS = {True: "SupervisorServiceMarker", False: "LogonStartShortcut"}
-SUPERVISOR_ACTIONS = ("RegisterSupervisor", "RollbackSupervisor", "UnregisterSupervisor")
+SUPERVISOR_ACTIONS = ("RegisterSupervisor", "RollbackSupervisor", "UnregisterSupervisor", "StopPreviousSupervisor")
 
 
 def rows(name):
@@ -32,6 +32,38 @@ def rows(name):
 
 def untag(el):
     return el.tag.split("}")[-1]
+
+
+def check_supervisor_removal(root):
+    actions = {el.get("Id"): el for el in root.iter() if untag(el) == "CustomAction"}
+    action = actions.get("UnregisterSupervisor")
+    if action is None or action.get("Return") != "check":
+        return ["abstraction.wxs: supervisor removal must propagate shutdown failure before payload removal"]
+    sequence = next((el for el in root.iter()
+                     if untag(el) == "Custom" and el.get("Action") == "UnregisterSupervisor"), None)
+    if sequence is None or sequence.get("Before") != "RemoveFiles":
+        return ["abstraction.wxs: checked supervisor removal must precede RemoveFiles"]
+    return []
+
+
+def check_upgrade_shutdown(root):
+    def find(tag, key=None, value=None):
+        return next((el for el in root.iter() if untag(el) == tag
+                     and (key is None or el.get(key) == value)), None)
+
+    expected = [
+        (find("MajorUpgrade"), {"Schedule": "afterInstallExecute"}),
+        (find("Binary", "Id", "UpgradeSupervisorCode"), {"SourceFile": "payload/tools/jobd.exe"}),
+        (find("CustomAction", "Id", "StopPreviousSupervisor"),
+         {"BinaryRef": "UpgradeSupervisorCode", "ExeCommand": "service stop",
+          "Execute": "deferred", "Impersonate": "no", "Return": "check"}),
+        (find("Custom", "Action", "StopPreviousSupervisor"),
+         {"After": "InstallInitialize", "Condition": "ALLUSERS AND WIX_UPGRADE_DETECTED AND NOT REMOVE"}),
+        (find("InstallExecute"), {"After": "StopPreviousSupervisor"}),
+    ]
+    if any(el is None or any(el.get(k) != v for k, v in attrs.items()) for el, attrs in expected):
+        return ["abstraction.wxs: incoming checked stop must execute before removal of the old product"]
+    return []
 
 
 def gated_sources(text):
@@ -239,6 +271,8 @@ def main():
 
     sequenced = {el.get("Action"): el.get("Condition", "")
                  for el in root.iter() if untag(el) == "Custom"}
+    bad.extend(check_supervisor_removal(root))
+    bad.extend(check_upgrade_shutdown(root))
     for action in SUPERVISOR_ACTIONS:
         if action not in sequenced:
             bad.append(f"abstraction.wxs: {action} is sequenced nowhere")

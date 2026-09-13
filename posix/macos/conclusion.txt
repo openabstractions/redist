@@ -1,23 +1,22 @@
-Installed.
+The shared-runtime LaunchAgent is registered for your graphical login session.
 
-The three programs are in ~/.local/bin, which macOS does not put on PATH. Add
-it once, in your shell profile:
+Programs are in ~/.local/bin. Add that directory to PATH in your shell profile
+if desired. The installer leaves shell profiles unchanged.
 
-    export PATH="$HOME/.local/bin:$PATH"
-
-Deliberately not written for you: an installer that edits a shell profile is an
-installer nobody can fully remove.
-
-The background sweep runs at login and then every five minutes. Check it:
-
+    ~/.local/bin/openabstractions start
+    ~/.local/bin/openabstractions status
     launchctl print gui/$(id -u)/com.openabstractions.jobd
 
-To remove everything this put on the machine, run exactly:
+Start activates the installed runtime and requires capability readiness. The
+closed macOS Program-proof limitation remains; registration alone cannot make
+those protected calls usable.
+
+Remove installed programs and registration from your graphical session with:
 
     ~/.local/share/abstraction/uninstall.sh
 
-That leaves your job store (~/.abstraction) and your settings
-(~/Library/Application Support/abstraction) alone; it prints the command that
-removes those too.
+Removal preserves accepted work and settings under your home directory.
+Failed stop or deregistration verification retains the payload. A successful
+bootout may include launchd forced shutdown; it is not a graceful-exit proof.
 
-This package was not signed and not notarised.
+This package is unsigned and not notarised.

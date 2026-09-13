@@ -5,6 +5,7 @@ set -eu
 
 share=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 manifest=$share/MANIFEST
+. "$share/lifecycle.sh"
 home=${HOME:-/}
 if [ ! -f "$manifest" ]; then
 	echo "uninstall.sh: no MANIFEST beside this script; refusing to guess what to delete." >&2
@@ -29,14 +30,14 @@ uid=$(id -u)
 service=gui/$uid/com.openabstractions.jobd
 # list enumerates the current bootstrap. Refuse other contexts instead of
 # inferring GUI absence from a query against an SSH/background namespace.
-manager_uid=$(launchctl manageruid)
-manager_name=$(launchctl managername)
+manager_uid=$(manager manageruid)
+manager_name=$(manager managername)
 [ "$manager_uid" = "$uid" ] && [ "$manager_name" = Aqua ] || {
     echo "uninstall.sh: run from this user's graphical login session; payload retained" >&2
     exit 1
 }
 agent_state() {
-    jobs=$(launchctl list) || return 1
+    jobs=$(manager list) || return 1
     # The native list command documents PID, status, label columns. Unknown
     # formats and query errors cannot establish absence.
     printf '%s\n' "$jobs" | awk '
@@ -49,7 +50,7 @@ agent_state() {
 state=$(agent_state)
 if [ "$state" = present ]; then
     # ExitTimeOut bounds launchd's cooperative interval; escalation is possible.
-    launchctl bootout "$service"
+    manager bootout "$service"
     state=$(agent_state)
 fi
 [ "$state" = absent ] || {
@@ -69,8 +70,9 @@ fi
 rm -f -- "$manifest" "$share/FILES" "$share/uninstall.sh"
 echo "$share/." | prune
 
-echo "ok    removed. Two things were deliberately left:"
-echo "        ~/.abstraction                                 your job store"
-echo "        ~/Library/Application Support/abstraction      what jobd setup recorded"
-echo "      Remove them yourself if you want them gone:"
-echo "        rm -rf ~/.abstraction \"\$HOME/Library/Application Support/abstraction\""
+echo "ok    removed installed payload and registration; retained user data:"
+echo "        ~/.abstraction                                      legacy job store"
+echo "        ~/Library/Application Support/abstraction           legacy settings"
+echo "        ~/Library/Application Support/openabstractions/runtime-v1  runtime state and accepted work"
+echo "        ~/Library/Caches/openabstractions                   user cache/logging data"
+echo "      Review retained data before removing it separately."

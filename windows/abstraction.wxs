@@ -12,7 +12,7 @@
 
     <SummaryInformation Description="Downloads that survive the program that started them" />
 
-    <MajorUpgrade AllowSameVersionUpgrades="yes"
+    <MajorUpgrade AllowSameVersionUpgrades="yes" Schedule="afterInstallExecute"
                   DowngradeErrorMessage="A newer Abstraction is already installed. Remove it from Apps and features before installing this one." />
     <MediaTemplate EmbedCab="yes" />
 
@@ -146,16 +146,18 @@
          Every one of these is conditioned on ALLUSERS. A per-user install has
          no administrator token, and an action that needs one there is the 1603
          the logon schtasks returned. -->
+    <!-- Execute incoming shutdown code before the cached old MSI can remove
+         files. The early InstallExecute flushes this deferred action alone. -->
+    <Binary Id="UpgradeSupervisorCode" SourceFile="payload/tools/jobd.exe" />
+    <CustomAction Id="StopPreviousSupervisor" BinaryRef="UpgradeSupervisorCode" ExeCommand="service stop"
+                  Execute="deferred" Impersonate="no" Return="check" />
     <CustomAction Id="RegisterSupervisor" FileRef="jobd.exe" ExeCommand="service install --runtime"
                   Execute="deferred" Impersonate="no" Return="check" />
     <CustomAction Id="RollbackSupervisor" FileRef="jobd.exe" ExeCommand="service uninstall"
                   Execute="rollback" Impersonate="no" Return="ignore" />
-    <!-- Return="ignore" on the way out, and it is a choice: a supervisor that
-         cannot be deregistered must not be a product that cannot be removed.
-         What it leaves behind is named by `jobd service uninstall` in jobd.log
-         and removable by hand. -->
+    <!-- Preserve the payload if supervisor shutdown cannot be confirmed. -->
     <CustomAction Id="UnregisterSupervisor" FileRef="jobd.exe" ExeCommand="service uninstall"
-                  Execute="deferred" Impersonate="no" Return="ignore" />
+                  Execute="deferred" Impersonate="no" Return="check" />
     <!-- Activation follows the committed install. A failure reports an error
          with installed files retained; it cannot promise transaction rollback.
          The executable checks its process token before any start/bus lookup. -->
@@ -164,6 +166,9 @@
                   Execute="immediate" Impersonate="yes" Return="check" />
 
     <InstallExecuteSequence>
+      <Custom Action="StopPreviousSupervisor" After="InstallInitialize"
+              Condition="ALLUSERS AND WIX_UPGRADE_DETECTED AND NOT REMOVE" />
+      <InstallExecute After="StopPreviousSupervisor" />
       <Custom Action="UnregisterSupervisor" Before="RemoveFiles"
               Condition="ALLUSERS AND (REMOVE=&quot;ALL&quot; OR UPGRADINGPRODUCTCODE)" />
       <Custom Action="RollbackSupervisor" After="InstallFiles"

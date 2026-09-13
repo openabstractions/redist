@@ -140,8 +140,11 @@ def tarball(root, files, out, top):
 def pkg(root, files, out, version, work):
     scripts = work / "scripts"
     scripts.mkdir(parents=True, exist_ok=True)
-    shutil.copyfile(HERE / "macos" / "postinstall", scripts / "postinstall")
-    (scripts / "postinstall").chmod(0o755)
+    for name in ("preinstall", "postinstall", "lifecycle.sh"):
+        # Both package hooks need LF regardless of the source checkout platform.
+        raw = (HERE / "macos" / name).read_bytes().replace(b"\r\n", b"\n")
+        (scripts / name).write_bytes(raw)
+        (scripts / name).chmod(0o755)
 
     manifest = root / ".local/share/abstraction/FILES"
     # io.open and not Path.write_text: newline= landed on write_text in 3.10, and

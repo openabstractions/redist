@@ -54,9 +54,9 @@ review. Reinstalling over an existing install is how you upgrade, and
 `install.sh` enables the timer and `abstraction-runtime.service` through the
 systemd user manager. The runtime executes `openabstractions serve runtime` and
 restarts on failure. Installation polls the installed read-only `status` command
-within 15 seconds and reports failure if logging/config resolution is unavailable.
-The runtime receives no job-store flags: durable job admission remains opt-in,
-and the existing jobd timer continues to own its download sweep.
+within 15 seconds and reports failure if any default runtime contract is unavailable.
+The runtime owns managed durable jobs alongside logging and configuration.
+The existing jobd timer continues to own its legacy download sweep.
 The timer fires 30 seconds after the user manager starts — which is your login —
 and every 5 minutes after that, which is the same shape as the two Windows
 scheduled tasks, `jobd-logon` and `jobd`.
@@ -80,7 +80,13 @@ the service result; a forced stop is reported separately from graceful completio
 Manager commands have a 20-second external bound (plus a two-second kill margin).
 `timeout` from coreutils is required. A failed stop, active service, or unavailable
 previously registered manager retains the payload and returns failure. Upgrade
-also stops existing units before replacing files. After verified stops, removal
+also stops existing units before replacing files. The candidate executable then
+runs `storage check` against the retained runtime state before the installer
+changes any payload file or the removal manifest. An incompatible store or busy
+participating host refuses the upgrade and preserves those files; the previously
+stopped services remain stopped for the operator to inspect. This check performs
+no migration. The runtime checks compatibility again when it takes ownership.
+After verified stops, removal
 deletes every path in `MANIFEST` and nothing else, removes every directory that is then empty up to your home directory, and
 prints the command for the two things it deliberately leaves: `~/.abstraction`,
 your job store, and `~/.config/abstraction`, what `jobd setup` recorded.
@@ -133,8 +139,8 @@ prints the command for `~/.abstraction` and
 
 `openabstractions serve logging`, `openabstractions serve config`, and
 `openabstractions serve router-v1` run the selected capability in the foreground.
-Linux automatically registers the shared runtime described above. macOS registers
-the existing jobd LaunchAgent only: the current macOS peer proof cannot establish
+Linux and macOS register the shared runtime described above. The macOS
+LaunchAgent runs `openabstractions serve runtime`. Current macOS peer proof cannot establish
 the Program identity required by shared runtime clients. This package makes no
 macOS capability-readiness promise. Native macOS lifecycle verification remains
 required. Neither deleting a tarball nor deleting a `.pkg` performs uninstall;

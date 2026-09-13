@@ -14,13 +14,16 @@ home=$(CDPATH= cd -- "$home" && pwd -P)
 [ "$home" != / ] || { echo "postinstall: target must be a user home" >&2; exit 1; }
 share=$home/.local/share/abstraction
 bin=$home/.local/bin
+. "$share/lifecycle.sh"
 plist=$home/Library/LaunchAgents/com.openabstractions.jobd.plist
 
 uid=$(stat -f %u "$home")
 gid=$(stat -f %g "$home")
 
 tmp=$plist.new
-sed "s|@BIN@|$bin|g" "$plist" > "$tmp"
+# Escape XML text first, then escape sed replacement metacharacters.
+replacement=$(printf '%s' "$bin" | sed 's/&/\&amp;/g; s/</\&lt;/g; s/>/\&gt;/g' | sed 's/[\\&|]/\\&/g')
+sed "s|@BIN@|$replacement|g" "$plist" > "$tmp"
 mv -- "$tmp" "$plist"
 
 : > "$share/MANIFEST"
@@ -56,12 +59,12 @@ domain=gui/$uid
 service=$domain/com.openabstractions.jobd
 # A failed manager query/registration is an installation error. The plist remains
 # available for the user to register later in a graphical login session.
-launchctl print "$domain" >/dev/null
-if launchctl print "$service" >/dev/null 2>&1; then
-    launchctl bootout "$service"
+manager print "$domain" >/dev/null
+if manager print "$service" >/dev/null 2>&1; then
+    manager bootout "$service"
 fi
-launchctl enable "$service"
-launchctl bootstrap "$domain" "$plist"
-launchctl print "$service" >/dev/null
-echo "ok    com.openabstractions.jobd registered: at login, then every 300 seconds"
+manager enable "$service"
+manager bootstrap "$domain" "$plist"
+manager print "$service" >/dev/null
+echo "ok    shared runtime LaunchAgent registered for this user; capability identity proof remains separately required"
 exit 0

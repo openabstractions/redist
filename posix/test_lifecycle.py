@@ -13,7 +13,7 @@ class Lifecycle(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.root = Path(self.tmp.name).resolve()
-        self.home = self.root / "user home"
+        self.home = self.root / "user & <home>|back\\slash"
         self.share = self.home / ".local/share/abstraction"
         self.share.mkdir(parents=True)
         self.bin = self.root / "commands"
@@ -54,6 +54,9 @@ print) case "$2" in */com.openabstractions.jobd) [ "${ACTIVE:-}" = active ];; *)
 *) exit 0;;
 esac''')
         self.command("pkgutil", 'exit 0')
+        self.mac_helper = (HERE/"macos/lifecycle.sh").read_text().replace('/bin/launchctl', '"'+str(self.bin/"launchctl")+'"')
+        (self.share/"lifecycle.sh").write_text(self.mac_helper)
+
         self.payload = self.home / ".local/bin/jobd"
         self.payload.parent.mkdir(parents=True)
         self.payload.write_text("payload")
@@ -69,8 +72,134 @@ esac''')
 
     def uninstall(self, platform, **env):
         shutil.copyfile(HERE/platform/"uninstall.sh", self.share/"uninstall.sh")
-        shutil.copyfile(HERE/"linux/lifecycle.sh", self.share/"lifecycle.sh")
+        if platform == "linux":
+            shutil.copyfile(HERE/"linux/lifecycle.sh", self.share/"lifecycle.sh")
+        else:
+            (self.share/"lifecycle.sh").write_text(self.mac_helper)
         return subprocess.run(["sh", str(self.share/"uninstall.sh")], env=dict(self.env, **env), text=True, capture_output=True, timeout=5)
+
+    def linux_package(self, name, retired=True):
+        package = self.root / name
+        payload = package / "payload"
+        for rel, text in [(".local/bin/jobd", name),
+                          (".local/bin/openabstractions", "#!/bin/sh\nexit 0\n")]:
+            target = payload / rel
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(text)
+            target.chmod(0o755)
+        if retired:
+            (payload / ".local/bin/jobctl").write_text("original retired payload")
+        for filename in ("lifecycle.sh", "uninstall.sh"):
+            target = payload / ".local/share/abstraction" / filename
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(HERE / "linux" / filename, target)
+        shutil.copyfile(HERE / "linux/install.sh", package / "install.sh")
+        return package
+
+    def install_linux(self, package):
+        return subprocess.run(["sh", str(package / "install.sh")], env=self.env,
+                              text=True, capture_output=True, timeout=8)
+
+    def test_linux_upgrade_retired_payload_is_removed_but_user_change_survives(self):
+        for modified in (False, True):
+            with self.subTest(modified=modified):
+                first = self.install_linux(self.linux_package("first" + str(modified)))
+                self.assertEqual(first.returncode, 0, first.stderr)
+                retired = self.home / ".local/bin/jobctl"
+                second = self.install_linux(self.linux_package("second" + str(modified), retired=False))
+                self.assertEqual(second.returncode, 0, second.stderr)
+                if modified:
+                    retired.write_text("user changed retired tool")
+                result = self.uninstall("linux")
+                self.assertEqual(result.returncode, 0, result.stderr)
+                if modified:
+                    self.assertEqual(retired.read_text(), "user changed retired tool")
+                    self.assertIn("preserv", result.stderr)
+                else:
+                    self.assertFalse(retired.exists())
+                self.assertEqual(self.data.read_text(), "accepted work")
+                self.share.mkdir(parents=True, exist_ok=True)
+
+    def test_linux_unhashed_legacy_retirement_preserves_file(self):
+        retired = self.home / ".local/bin/jobctl"
+        retired.write_text("old file with no baseline")
+        with (self.share / "MANIFEST").open("a") as ledger:
+            ledger.write(str(retired) + "\n")
+        result = self.install_linux(self.linux_package("legacy-retirement", retired=False))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        result = self.uninstall("linux")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(retired.read_text(), "old file with no baseline")
+        self.assertIn("no original hash", result.stderr)
+
+    def test_linux_unsafe_manifest_entries_refuse_whole_operation(self):
+        outside = self.root / "outside"
+        outside.mkdir()
+        victim = outside / "victim"
+        victim.write_text("user bytes")
+        link = self.share / "redirect"
+        link.symlink_to(outside, target_is_directory=True)
+        for bad in (str(link / "victim"), str(self.share / ".." / "victim"),
+                    "retired badhash " + str(self.payload),
+                    "sha256 " + "a" * 64 + " " + str(victim)):
+            with self.subTest(bad=bad):
+                manifest = self.share / "MANIFEST"
+                manifest.write_text(str(self.payload) + "\n" + bad + "\ntimer yes\n")
+                before = manifest.read_bytes()
+                result = self.uninstall("linux")
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(self.payload.read_text(), "payload")
+                self.assertEqual(victim.read_text(), "user bytes")
+                self.assertEqual(manifest.read_bytes(), before)
+
+    def test_linux_copy_failure_preserves_predecessor_ledger_and_payload(self):
+        previous = (self.share / "MANIFEST").read_bytes()
+        package = self.linux_package("copy-failure")
+        self.command("cp", 'for last do :; done; case "$last" in *jobctl) exit 7;; esac; exec /bin/cp "$@"')
+        result = self.install_linux(package)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual((self.share / "MANIFEST").read_bytes(), previous)
+        self.assertEqual(self.payload.read_text(), "payload")
+        self.assertEqual(self.data.read_text(), "accepted work")
+
+    def test_linux_checksum_failure_preserves_predecessor(self):
+        previous = (self.share / "MANIFEST").read_bytes()
+        package = self.linux_package("checksum-failure")
+        for body in ('printf "%064d  -\\n" 0; exit 7', 'echo malformed; exit 0'):
+            with self.subTest(body=body):
+                self.command("sha256sum", body)
+                result = self.install_linux(package)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual((self.share / "MANIFEST").read_bytes(), previous)
+                self.assertEqual(self.payload.read_text(), "payload")
+                self.assertFalse((self.home / ".local/bin/jobctl").exists())
+                self.assertEqual(self.data.read_text(), "accepted work")
+
+    def test_linux_replacement_failure_rolls_back_files_and_ledger(self):
+        previous = (self.share / "MANIFEST").read_bytes()
+        package = self.linux_package("replacement-failure")
+        self.command("mv", 'for last do :; done; case "$last" in "$HOME/.local/bin/openabstractions") exit 7;; esac; exec /bin/mv "$@"')
+        result = self.install_linux(package)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual((self.share / "MANIFEST").read_bytes(), previous)
+        self.assertEqual(self.payload.read_text(), "payload")
+        self.assertFalse((self.home / ".local/bin/jobctl").exists())
+
+    def test_linux_manifest_escape_refuses_before_any_removal_or_replacement(self):
+        outside = self.root / "outside-data"
+        outside.write_text("unrelated")
+        manifest = self.share / "MANIFEST"
+        manifest.write_text(str(self.payload) + "\n" + str(outside) + "\ntimer yes\n")
+        previous = manifest.read_bytes()
+        result = self.uninstall("linux")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(outside.read_text(), "unrelated")
+        self.assertEqual(self.payload.read_text(), "payload")
+        self.assertEqual(manifest.read_bytes(), previous)
+        result = self.install_linux(self.linux_package("escaped-ledger"))
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(manifest.read_bytes(), previous)
+        self.assertEqual(self.payload.read_text(), "payload")
 
     def test_linux_stops_trigger_before_workers_and_preserves_data(self):
         result = self.uninstall("linux")
@@ -146,13 +275,49 @@ esac''')
         executable = payload/".local/bin/openabstractions"
         executable.parent.mkdir(parents=True)
         executable.write_text('#!/bin/sh\necho "cli $*" >> "$LOG"\n')
+        executable.chmod(0o755)
         shutil.copyfile(HERE/"linux/install.sh", package/"install.sh")
         result = subprocess.run(["sh", str(package/"install.sh")], env=self.env, text=True, capture_output=True, timeout=10)
         self.assertEqual(result.returncode, 0, result.stderr)
         calls = (self.root/"calls").read_text()
         self.assertIn("enable --now abstraction-jobd.timer abstraction-runtime.service", calls)
         self.assertIn("cli status --timeout 1s", calls)
+        self.assertLess(calls.index("stop abstraction-runtime.service"), calls.index("cli storage check"))
+        self.assertLess(calls.index("cli storage check"), calls.index("enable --now"))
         self.assertTrue(self.data.exists())
+
+    def test_linux_upgrade_preflight_failure_preserves_payload_and_manifest(self):
+        package = self.root / "rejected-package"
+        candidate = package / "payload/.local/bin/openabstractions"
+        candidate.parent.mkdir(parents=True)
+        candidate.write_text('#!/bin/sh\necho "candidate $*" >> "$LOG"\nexit 1\n')
+        candidate.chmod(0o755)
+        helper = package / "payload/.local/share/abstraction/lifecycle.sh"
+        helper.parent.mkdir(parents=True)
+        shutil.copyfile(HERE / "linux/lifecycle.sh", helper)
+        installed = self.home / ".local/bin/openabstractions"
+        installed.write_text("previous runtime")
+        manifest = self.share / "MANIFEST"
+        before_manifest = manifest.read_bytes()
+        shutil.copyfile(HERE / "linux/install.sh", package / "install.sh")
+        stopped = subprocess.run(["sh", str(package / "install.sh")],
+                                 env=dict(self.env, FAIL="stop"), text=True,
+                                 capture_output=True, timeout=5)
+        self.assertNotEqual(stopped.returncode, 0)
+        self.assertNotIn("candidate", (self.root / "calls").read_text())
+        self.assertEqual(installed.read_text(), "previous runtime")
+        self.assertEqual(manifest.read_bytes(), before_manifest)
+        (self.root / "calls").unlink()
+        result = subprocess.run(["sh", str(package / "install.sh")],
+                                env=self.env, text=True, capture_output=True, timeout=5)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("installed payload retained", result.stderr)
+        self.assertEqual(installed.read_text(), "previous runtime")
+        self.assertEqual(manifest.read_bytes(), before_manifest)
+        self.assertEqual(self.data.read_text(), "accepted work")
+        calls = (self.root / "calls").read_text()
+        self.assertLess(calls.index("stop abstraction-runtime.service"), calls.index("candidate storage check"))
+        self.assertNotIn("enable --now", calls)
 
     def test_macos_bootstrap_failure_is_installation_failure(self):
         self.command("stat", "echo 1000")
@@ -177,6 +342,9 @@ esac''')
         (self.share/"FILES").write_text(".local/bin/jobd\nLibrary/LaunchAgents/com.openabstractions.jobd.plist\n")
         result = subprocess.run(["sh", str(HERE/"macos/postinstall")], env=dict(self.env, ACTIVE="active"), text=True, capture_output=True, timeout=5)
         self.assertEqual(result.returncode, 0, result.stderr)
+        import plistlib
+        parsed = plistlib.loads(plist.read_bytes())
+        self.assertEqual(parsed["ProgramArguments"], [str(self.home/".local/bin/openabstractions"), "serve", "runtime"])
         calls = (self.root/"calls").read_text().splitlines()
         for directory in [self.share, self.share.parent, self.home/".local", self.payload.parent, plist.parent, self.home/"Library"]:
             self.assertIn("chown:1000:1000 " + str(directory), calls)
@@ -213,6 +381,18 @@ esac''')
         plist = plistlib.loads((HERE/"macos/com.openabstractions.jobd.plist").read_bytes())
         self.assertEqual(plist["ExitTimeOut"], 10)
         self.assertFalse(plist["AbandonProcessGroup"])
+        self.assertEqual(plist["ProgramArguments"], ["@BIN@/openabstractions", "serve", "runtime"])
+        self.assertTrue(plist["KeepAlive"])
+        self.assertNotIn("StartInterval", plist)
+
+    def test_macos_manager_watchdog_bounds_only_its_child(self):
+        self.command("launchctl", 'trap "" TERM; exec sleep 5')
+        helper = self.mac_helper.replace("sleep 20", "sleep 0.05").replace("sleep 2", "sleep 0.05")
+        (self.share/"lifecycle.sh").write_text(helper)
+        result = subprocess.run(["sh", "-c", '. "$HOME/.local/share/abstraction/lifecycle.sh"; manager list'], env=self.env, text=True, capture_output=True, timeout=3)
+        self.assertEqual(result.returncode, 124, result.stderr)
+        self.assertIn("timed out", result.stderr)
+        self.assertTrue(self.payload.exists())
 
 if __name__ == "__main__":
     unittest.main()

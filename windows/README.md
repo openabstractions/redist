@@ -29,7 +29,7 @@ chooses.
 
 | chosen | goes to | `PATH` | markers | what supervises `jobd` | needs |
 |---|---|---|---|---|---|
-| **Just me** (the default) | `%LOCALAPPDATA%\Programs\OpenAbstractions` | the user's `PATH` | `HKCU` | a Startup shortcut, at your next sign-in and no sooner | nothing |
+| **Just me** (the default) | `%LOCALAPPDATA%\Programs\OpenAbstractions` | the user's `PATH` | `HKCU` | immediate runtime activation and a Startup shortcut for subsequent sign-ins | nothing |
 | Everyone | `%ProgramFiles%\OpenAbstractions` | the machine `PATH` | `HKLM` | a per-user service: your own session, no password stored, restarted when it dies | administrator |
 
 Per-user is the default and stays installable with no rights at all, because
@@ -47,25 +47,31 @@ registered with `SERVICE_USER_OWN_PROCESS`, which the operating system clones
 into every interactive session as `<name>_<luid>`, running as that person with
 no password stored and restarted when it dies. Registering the template needs
 an administrator once, which is what the machine scope has; a deferred custom
-action runs `jobd service install` during that install and `jobd service
+action runs `jobd service install --runtime` during that install and `jobd service
 uninstall` on the way out. A custom action is used because `ServiceInstall` cannot
 express it.
 
-**Installed just for you: a shortcut in the Startup folder** running
-`jobd start`, minimized, at your next sign-in and no sooner. Nothing replaces
-the supervisor if it dies before then, and that is the whole difference between
-the two scopes. `examples\what-this-machine-does\run.cmd` asks `sc qc` and
-prints which of the two this machine got.
+Machine removal checks shutdown before deleting payload files. Machine upgrades
+run the incoming binary's `service stop` from the MSI Binary table first. An early
+`InstallExecute` runs that checked action before `RemoveExistingProducts` invokes
+the cached predecessor MSI. Stop preserves registrations; removal deletes them
+only after confirmed shutdown. A failed check aborts before replacing the payload.
+The stop command shares one 60-second polling budget across all instances; native
+SCM calls retain their operating-system RPC behavior.
+This confirms the enumerated instances at that point. Preserved registrations
+can activate on a later logon or external start; transaction-wide activation
+exclusion and installed rollback verification remain open release requirements.
 
-`jobd start` is idempotent by the pipe name rather than by timing, so the
-shortcut, a tool and a person can all call it and one supervisor exists
-afterwards. It answers at `\\.\pipe\openabstractions-jobs-<your SID>`.
+**Installed just for you:** installation starts `jobdw start --runtime`
+after finalization, with an unelevated-token requirement. A Startup shortcut
+runs the same command at subsequent sign-ins. `jobdw` is the windowless launcher.
+The start operation is idempotent. Per-user Startup registration alone supplies
+no independent restart after the supervisor itself exits.
 
-**`jobd.exe` is a console program, so that shortcut shows a console window.**
-`Show="minimized"` is all the shell lets a shortcut say about it: the window is
-created by the loader, minimized, and goes away when `jobd start` exits. Making
-it invisible needs a launcher built for the windows subsystem, which is a
-program and not a packaging choice.
+The runtime supervises configured capability processes. Use
+`openabstractions status --json` to inspect capability readiness. Installed
+registration, a running process and successful identity verification each have
+separate evidence.
 
 There is **no scheduled task any more.** The five-minute `jobd once` sweep was
 a second writer over a store the supervisor already owns, and a console window
@@ -83,8 +89,8 @@ machine scope.
 
 The `openabstractions` console tool supplies foreground capability commands:
 `openabstractions serve logging`, `openabstractions serve config`, and
-`openabstractions serve router-v1`. The installer does not register these as
-background services; its existing supervisor registration remains separate.
+`openabstractions serve router-v1`. The installed runtime supervises its
+configured capabilities; these commands also allow individual foreground runs.
 
 ## Build it
 
@@ -159,12 +165,10 @@ cannot gate away.
   Startup shortcut now answers, and nothing compares them.
 - **`sources.tsv` is behind the published tags.** Both pins resolve, neither is a
   tag any more.
-- **No upgrade over an earlier version has been run.** `MajorUpgrade` schedules
-  `RemoveExistingProducts` after `InstallValidate`, so the old version is
-  removed whole — its files, its `PATH` entry and its service registration —
-  before this one is laid down, and nothing is left at a path this version no
-  longer uses. That is read from the package's sequence table; no upgrade has
-  been performed.
+- **The checked-shutdown upgrade sequence needs an installed test.** WiX linking
+  and MSI table inspection verify that incoming shutdown executes before old
+  product removal. Simulated SCM tests cover refusal and process exit. Actual
+  installed upgrade and rollback behavior remain unverified for this change.
 - **The paths in `signpath.artifact-configuration.xml` are how we think SignPath
   addresses a file inside an MSI, and nobody has submitted one.**
   the element vocabulary is as written

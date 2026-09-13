@@ -35,9 +35,11 @@ The central CLI is available on PATH, for example:
     openabstractions serve config
     openabstractions serve router-v1
 
-Run one selected command in the foreground. Installing the binary does not
-register these capability processes to start automatically. The existing
-background registration belongs to the download supervisor.
+These commands run individual capabilities in the foreground. Current source
+installers register the shared runtime, which supervises configured capabilities.
+Windows per-user installation starts it immediately and registers a windowless
+Startup launcher. Check `openabstractions status --json` for readiness. Consult
+the selected release notes for the behavior qualified in that release.
 
 ## Without an installer
 
@@ -82,8 +84,6 @@ with the existing version will refuse it rather than replace it.
 ## What is not here
 
 - **No source for the programs.** They are built from the modules above.
-- **Automatic startup of the central capability services.** The CLI is
-  installed; capability registration is not added by this package.
 - **Uniform platform evidence.** The workflow builds Linux tarballs and macOS
   packages, but each release reports which checks ran and which assets ship.
 For NAS delivery, see [docker-jobd](https://github.com/openabstractions/docker-jobd).

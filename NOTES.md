@@ -34,8 +34,9 @@ The workflow's cross-tool check writes a download with `dl` and reads it with
 elevation. Programs live in `tools\`; runnable examples live in `examples\`.
 
 **Add to PATH is optional.** Select it to use the commands from a new terminal;
-leave it unchecked to invoke them by full path. The per-user supervisor starts
-through a Startup shortcut and is not automatically replaced after a crash.
+leave it unchecked to invoke them by full path. Current source installers start
+the per-user runtime immediately and register a windowless Startup shortcut for
+subsequent sign-ins. Startup registration alone cannot replace a crashed supervisor.
 The elevated scope registers the Windows service arrangement, which starts the
 user's supervisor at sign-in and restarts it after a crash. Uninstall through
 Windows' installed-apps settings or `msiexec /x <package.msi>`.
