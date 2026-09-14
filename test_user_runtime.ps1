@@ -57,22 +57,172 @@ function Get-ProfileFolder([Environment+SpecialFolder]$Folder, [scriptblock]$Res
     if ([string]::IsNullOrWhiteSpace($path)) { throw "Profile folder is unavailable: $Folder" }
     return $path
 }
-function Assert-NoRuntime([string]$Sid) {
-    $deadline = [DateTime]::UtcNow.AddSeconds(10)
+function Assert-NoRuntime([string]$Sid, [string]$DiagnosticPath, [string]$Folder, [int]$Seconds = 10) {
+    $deadline = [DateTime]::UtcNow.AddSeconds($Seconds)
     do {
-    $remaining = @(Get-CimInstance Win32_Process -Filter "Name='jobd.exe' OR Name='jobdw.exe' OR Name='openabstractions.exe'" | Where-Object {
-        $owner = Invoke-CimMethod -InputObject $_ -MethodName GetOwnerSid
-        if ($owner.ReturnValue -ne 0) { throw 'Cannot establish runtime process owner' }
-        $owner.Sid -eq $Sid
-    })
-    $prefix = "openabstractions-user-$Sid-"
-    $pipes = @([IO.Directory]::GetFiles('\\.\pipe\') | Where-Object {
-        [IO.Path]::GetFileName($_) -in @("${prefix}runtime-v1", "${prefix}logging-v1", "${prefix}config-v1", "${prefix}job-acceptance-v1")
-    })
+        $remaining = @(Get-AccountFixtureProcesses $Sid)
+        $pipes = @(Get-CapabilityPipes $Sid)
         if ($remaining.Count -eq 0 -and $pipes.Count -eq 0) { return }
         Start-Sleep -Milliseconds 200
     } while ([DateTime]::UtcNow -lt $deadline)
+    # Diagnostics are evidence only. Their failure never changes the verdict.
+    if ($DiagnosticPath) {
+        try { Save-RuntimeSnapshot $DiagnosticPath $Sid 'removal-deadline' $Folder }
+        catch { Write-Warning ('Removal diagnostics failed: ' + (Protect-DiagnosticText $_.Exception.Message)) }
+    }
     throw 'Uninstall left account runtime processes or capability endpoints'
+}
+function Get-FixtureProcessCandidates {
+    Get-CimInstance Win32_Process -Filter "Name='jobd.exe' OR Name='jobdw.exe' OR Name='openabstractions.exe'"
+}
+function Get-FixtureProcessById($Id) {
+    Get-CimInstance Win32_Process -Filter "ProcessId=$([uint32]$Id)"
+}
+function Test-CimNotFound([Exception]$Exception) {
+    for ($e = $Exception; $e; $e = $e.InnerException) {
+        # WBEM_E_NOT_FOUND, surfaced as an HRESULT or as MI NativeErrorCode NotFound.
+        if ($e.HResult -eq -2147217406 -or $e.Message -match '0x80041002') { return $true }
+        $native = $e.PSObject.Properties['NativeErrorCode']
+        if ($native -and [string]$native.Value -eq 'NotFound') { return $true }
+    }
+    return $false
+}
+# A listed process is gone only when the owner query reported not-found (or no
+# error) and no process with the same PID and creation time exists any more.
+function Test-FixtureProcessGone($Candidate, [Exception]$Exception) {
+    if ($Exception -and -not (Test-CimNotFound $Exception)) { return $false }
+    foreach ($current in @(Get-FixtureProcessById $Candidate.ProcessId)) {
+        if ($current.CreationDate -eq $Candidate.CreationDate) { return $false }
+    }
+    return $true
+}
+# Returns the owner SID, or $null for a process that exited after enumeration.
+function Get-FixtureProcessOwner($Candidate) {
+    try { $owner = Invoke-CimMethod -InputObject $Candidate -MethodName GetOwnerSid -ErrorAction Stop }
+    catch {
+        if (Test-FixtureProcessGone $Candidate $_.Exception) { return $null }
+        throw
+    }
+    if ($owner.ReturnValue -ne 0) {
+        if (Test-FixtureProcessGone $Candidate $null) { return $null }
+        throw "Cannot establish owner of process $($Candidate.ProcessId): GetOwnerSid returned $($owner.ReturnValue)"
+    }
+    return [string]$owner.Sid
+}
+function Get-AccountFixtureProcesses([string]$Sid) {
+    foreach ($candidate in @(Get-FixtureProcessCandidates)) {
+        $owner = Get-FixtureProcessOwner $candidate
+        if ($null -ne $owner -and $owner -eq $Sid) { $candidate }
+    }
+}
+function Get-PipeNames { [IO.Directory]::GetFiles('\\.\pipe\') | ForEach-Object { [IO.Path]::GetFileName($_) } }
+function Get-CapabilityPipes([string]$Sid) {
+    $prefix = "openabstractions-user-$Sid-"
+    $names = @('runtime-v1','logging-v1','config-v1','job-acceptance-v1' | ForEach-Object { $prefix + $_ })
+    @(Get-PipeNames | Where-Object { $_ -in $names })
+}
+function Get-AccountProcessDetails([string]$Sid) {
+    foreach ($process in @(Get-AccountFixtureProcesses $Sid)) {
+        $parent = @(Get-FixtureProcessById $process.ParentProcessId | Select-Object -First 1)
+        # A parent created after its child holds a reused PID and names nothing.
+        $reused = $parent.Count -and $parent[0].CreationDate -gt $process.CreationDate
+        [ordered]@{
+            pid = [uint32]$process.ProcessId
+            parentPid = [uint32]$process.ParentProcessId
+            parentName = if ($parent.Count -and -not $reused) { [string]$parent[0].Name } else { $null }
+            parentPidReused = [bool]$reused
+            sessionId = [uint32]$process.SessionId
+            executablePath = [string]$process.ExecutablePath
+            commandLine = Protect-DiagnosticText ([string]$process.CommandLine)
+            creationDate = if ($process.CreationDate) { ([DateTime]$process.CreationDate).ToUniversalTime().ToString('o') } else { $null }
+        }
+    }
+}
+function Get-RestartManagerView([string]$Folder) {
+    if (-not $Folder -or -not (Test-Path -LiteralPath $Folder -PathType Container)) { return [ordered]@{ folder = $Folder; exists = $false } }
+    $files = @(Get-ChildItem -LiteralPath $Folder -File -Recurse -Force -ErrorAction Stop | Select-Object -First 512 -ExpandProperty FullName)
+    if (-not ('OaFixtureRestartManager' -as [type])) {
+        Add-Type -TypeDefinition @'
+using System;
+using System.ComponentModel;
+using System.Runtime.InteropServices;
+using System.Text;
+public static class OaFixtureRestartManager {
+    [StructLayout(LayoutKind.Sequential)]
+    public struct UniqueProcess { public int ProcessId; public uint StartLow; public uint StartHigh; }
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+    public struct ProcessInfo {
+        public UniqueProcess Process;
+        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 256)] public string AppName;
+        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 64)] public string ServiceShortName;
+        public int ApplicationType;
+        public uint AppStatus;
+        public uint SessionId;
+        [MarshalAs(UnmanagedType.Bool)] public bool Restartable;
+    }
+    [DllImport("rstrtmgr.dll", CharSet = CharSet.Unicode)] static extern int RmStartSession(out uint session, int flags, StringBuilder key);
+    [DllImport("rstrtmgr.dll")] static extern int RmEndSession(uint session);
+    [DllImport("rstrtmgr.dll", CharSet = CharSet.Unicode)] static extern int RmRegisterResources(uint session, uint fileCount, string[] files, uint processCount, UniqueProcess[] processes, uint serviceCount, string[] services);
+    [DllImport("rstrtmgr.dll", CharSet = CharSet.Unicode)] static extern int RmGetList(uint session, out uint needed, ref uint count, [In, Out] ProcessInfo[] info, out uint reasons);
+    public static ProcessInfo[] Query(string[] files, out uint reasons) {
+        uint session;
+        int code = RmStartSession(out session, 0, new StringBuilder(64));
+        if (code != 0) { throw new Win32Exception(code); }
+        try {
+            code = RmRegisterResources(session, (uint)files.Length, files, 0, null, 0, null);
+            if (code != 0) { throw new Win32Exception(code); }
+            for (int attempt = 0; attempt < 4; attempt++) {
+                uint needed;
+                uint count = 0;
+                code = RmGetList(session, out needed, ref count, null, out reasons);
+                if (code == 0) { return new ProcessInfo[0]; }
+                if (code != 234) { throw new Win32Exception(code); }
+                ProcessInfo[] info = new ProcessInfo[needed];
+                count = needed;
+                code = RmGetList(session, out needed, ref count, info, out reasons);
+                if (code == 0) { Array.Resize(ref info, (int)count); return info; }
+                if (code != 234) { throw new Win32Exception(code); }
+            }
+            throw new Win32Exception(234);
+        } finally { RmEndSession(session); }
+    }
+}
+'@
+    }
+    $types = @{ 0='RmUnknownApp'; 1='RmMainWindow'; 2='RmOtherWindow'; 3='RmService'; 4='RmExplorer'; 5='RmConsole'; 1000='RmCritical' }
+    $reasons = [uint32]0
+    $apps = if ($files.Count) { @([OaFixtureRestartManager]::Query([string[]]$files, [ref]$reasons)) } else { @() }
+    $reasonNames = @(@{ 1='PermissionDenied'; 2='SessionMismatch'; 4='CriticalProcess'; 8='CriticalService'; 16='DetectedSelf' }.GetEnumerator() |
+        Where-Object { $reasons -band $_.Key } | Sort-Object Key | ForEach-Object { $_.Value })
+    [ordered]@{
+        folder = $Folder
+        exists = $true
+        registeredFiles = $files.Count
+        rebootReasons = $reasons
+        rebootReasonNames = $reasonNames
+        applications = @(foreach ($app in $apps) {
+            $type = [int]$app.ApplicationType
+            [ordered]@{
+                pid = $app.Process.ProcessId
+                startTimeUtc = [DateTime]::FromFileTimeUtc(([long]$app.Process.StartHigh -shl 32) -bor [long]$app.Process.StartLow).ToString('o')
+                name = $app.AppName
+                serviceShortName = $app.ServiceShortName
+                type = if ($types.ContainsKey($type)) { $types[$type] } else { "$type" }
+                status = $app.AppStatus
+                sessionId = $app.SessionId
+                restartable = $app.Restartable
+            }
+        })
+    }
+}
+function Save-RuntimeSnapshot([string]$Path, [string]$Sid, [string]$Stage, [string]$Folder) {
+    $snapshot = [ordered]@{ stage = $Stage; capturedUtc = [DateTime]::UtcNow.ToString('o'); sid = $Sid; observerPid = $PID; processes = @(); pipes = @() }
+    try { $snapshot.processes = @(Get-AccountProcessDetails $Sid) } catch { $snapshot.processError = Protect-DiagnosticText $_.Exception.Message }
+    try { $snapshot.pipes = @(Get-CapabilityPipes $Sid) } catch { $snapshot.pipeError = Protect-DiagnosticText $_.Exception.Message }
+    if ($Folder) {
+        try { $snapshot.restartManager = Get-RestartManagerView $Folder } catch { $snapshot.restartManagerError = Protect-DiagnosticText $_.Exception.Message }
+    }
+    $snapshot | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $Path -Encoding UTF8
 }
 function Assert-InstalledShortcut($Shortcut, [string]$Tools) {
     $expectedTarget = [IO.Path]::GetFullPath((Join-Path $Tools 'jobdw.exe'))
@@ -230,11 +380,15 @@ function Start-PredecessorSupervisor([string]$Tools) {
 function Get-RunningFixtureProcesses([string]$Tools, [string]$Sid) {
     $retained = @()
     try {
-        foreach ($candidate in @(Get-CimInstance Win32_Process -Filter "Name='jobd.exe' OR Name='jobdw.exe' OR Name='openabstractions.exe'")) {
-            $owner = Invoke-CimMethod -InputObject $candidate -MethodName GetOwnerSid
-            if ($owner.ReturnValue -ne 0) { throw 'Cannot establish fixture process owner' }
-            if ($owner.Sid -ne $Sid) { continue }
-            $process = [Diagnostics.Process]::GetProcessById($candidate.ProcessId)
+        foreach ($candidate in @(Get-FixtureProcessCandidates)) {
+            $owner = Get-FixtureProcessOwner $candidate
+            if ($null -eq $owner -or $owner -ne $Sid) { continue }
+            try { $process = [Diagnostics.Process]::GetProcessById($candidate.ProcessId) }
+            catch {
+                # Exited after its owner was read; a gone process is not captured.
+                if (Test-FixtureProcessGone $candidate $null) { continue }
+                throw
+            }
             try {
                 # Force a retained process handle before replacement; a later PID lookup is insufficient.
                 $null = $process.Handle
@@ -414,11 +568,14 @@ if ($Mode -eq 'User') {
         try { Invoke-Bounded $shortcut.TargetPath @($shortcut.Arguments) 30 } finally { Pop-Location }
         Assert-RuntimeReady $central runtime-status
         'ok: installed shortcut invocation resolved logging/config as a non-admin account' | Set-Content 'activation.txt'
+        # The state Restart Manager is about to see, for comparison with a removal failure.
+        try { Save-RuntimeSnapshot 'pre-uninstall-snapshot.json' $ExpectedSid 'before-uninstall' (Split-Path -Parent $tools) }
+        catch { Write-Warning ('Pre-uninstall diagnostics failed: ' + (Protect-DiagnosticText $_.Exception.Message)) }
         Invoke-Bounded msiexec.exe @('/x', "`"$MsiPath`"", '/qn', '/norestart', '/l*v', 'user-uninstall.log')
         $installed = $false
         $installAttempted = $false
         # These assertions precede outer fixture cleanup and its process termination.
-        Assert-NoRuntime $ExpectedSid
+        Assert-NoRuntime $ExpectedSid 'removal-remaining.json' (Split-Path -Parent $tools)
         if ($sentinel) { Assert-RetainedSentinel $sentinel $sentinelValue; Assert-RemovedRegistration }
         if ($CheckTools) {
             if (Test-Path (Split-Path -Parent $tools)) { throw 'Install folder survived removal' }
@@ -500,7 +657,8 @@ exit $LASTEXITCODE
     $child.Output | Set-Content -Encoding UTF8 (Join-Path $directory 'fixture.log')
     $child.Diagnostics | Set-Content -Encoding UTF8 (Join-Path $directory 'fixture.err')
     if ($child.ExitCode -ne 0) { throw "Per-user fixture exited $($child.ExitCode); inspect diagnostics" }
-    Assert-NoRuntime $account.SID.Value
+    New-Item -ItemType Directory -Force -Path $ResultDirectory | Out-Null
+    Assert-NoRuntime $account.SID.Value (Join-Path $ResultDirectory 'account-removal-remaining.json')
 } finally {
     try {
         if (Test-Path -LiteralPath $directory) {
@@ -512,9 +670,9 @@ exit $LASTEXITCODE
         $current = Get-LocalUser -Name $user -ErrorAction SilentlyContinue
         if (-not $current -or $current.SID.Value -ne $account.SID.Value) { throw 'Cleanup account identity changed' }
         # Account-owned leftovers are cleanup only; no assertion becomes green here.
-        foreach ($process in @(Get-CimInstance Win32_Process -Filter "Name='jobd.exe' OR Name='jobdw.exe' OR Name='openabstractions.exe'")) {
-            $owner = Invoke-CimMethod -InputObject $process -MethodName GetOwnerSid
-            if ($owner.ReturnValue -eq 0 -and $owner.Sid -eq $account.SID.Value) {
+        foreach ($process in @(Get-FixtureProcessCandidates)) {
+            $owner = Get-FixtureProcessOwner $process
+            if ($null -ne $owner -and $owner -eq $account.SID.Value) {
                 Stop-Process -Id $process.ProcessId -Force -ErrorAction SilentlyContinue
             }
         }
