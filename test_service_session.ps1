@@ -97,6 +97,12 @@ function Format-StatusFailure([Nullable[int]]$ExitCode, [string]$Json, [string]$
         }
         if ($report.error -is [string]) { $errorText += ' ' + $report.error.Substring(0, [Math]::Min(4096, $report.error.Length)) }
     } catch { $fields += 'json=invalid' }
+    $fields += 'error-classes=' + (@(Get-ErrorClasses $errorText) -join ',')
+    $fields += "stderr-present=$([bool]$Diagnostics.Length)"
+    $line = 'runtime status failed: ' + ($fields -join ' ')
+    return $line.Substring(0, [Math]::Min(768, $line.Length))
+}
+function Get-ErrorClasses([string]$Text) {
     $classes = @()
     foreach ($entry in @(
         @('timeout','(?i)timeout|timed out|deadline exceeded'),
@@ -106,12 +112,89 @@ function Format-StatusFailure([Nullable[int]]$ExitCode, [string]$Json, [string]$
         @('disconnected','(?i)broken pipe|disconnected|end of file|\bEOF\b'),
         @('invalid','(?i)invalid|malformed'),
         @('identity','(?i)identity|principal|impersonat')
-    )) { if ($errorText -match $entry[1]) { $classes += $entry[0] } }
+    )) { if ($Text -match $entry[1]) { $classes += $entry[0] } }
     if ($classes.Count -eq 0) { $classes = @('unclassified') }
-    $fields += 'error-classes=' + ($classes -join ',')
-    $fields += "stderr-present=$([bool]$Diagnostics.Length)"
-    $line = 'runtime status failed: ' + ($fields -join ' ')
-    return $line.Substring(0, [Math]::Min(768, $line.Length))
+    return $classes
+}
+# The same required set as test_user_runtime.ps1 Assert-RuntimeReady. A report
+# that is malformed, duplicates or omits a required contract fails at once; a
+# parsed report whose required contracts are not all resolved is not yet ready.
+function Get-RuntimeReadiness([string]$Json) {
+    try { $report = ConvertFrom-Json -InputObject $Json -ErrorAction Stop } catch { throw 'Runtime status report is malformed: invalid JSON' }
+    # [pscustomobject] is PSObject here and matches any wrapped value; test the real type.
+    $object = [Management.Automation.PSCustomObject]
+    if ($null -eq $report -or $report -is [array] -or $report -isnot $object) { throw 'Runtime status report is malformed: expected an object' }
+    if ($null -eq $report.PSObject.Properties['capabilities'] -or $null -eq $report.capabilities) { throw 'Runtime status report is malformed: no capabilities' }
+    $entries = @($report.capabilities)
+    foreach ($entry in $entries) {
+        if ($entry -is [array] -or $entry -isnot $object -or $entry.capability -isnot [string] -or $entry.contract -isnot [string] -or $entry.status -isnot [string]) {
+            throw 'Runtime status report is malformed: a capability entry lacks capability, contract or status'
+        }
+    }
+    $known = @('resolved','unavailable','forbidden','incompatible','unmet_requirements','not_ready','invalid_request')
+    $fields = @()
+    $ready = $true
+    foreach ($contract in @('abstraction.logging/sink@1','abstraction.config/reader@1','abstraction.config/editor@1','abstraction.job/acceptance@1','abstraction.job/operations@1')) {
+        $found = @($entries | Where-Object { $_.contract -ceq $contract })
+        if ($found.Count -eq 0) { throw "Runtime status report omits required $contract" }
+        if ($found.Count -gt 1) { throw "Runtime status report lists $contract more than once" }
+        $entry = $found[0]
+        if ($entry.capability -cne $contract.Split('/')[0]) { throw "Runtime status report lists $contract under another capability" }
+        if ($entry.status -ceq 'resolved') { $fields += "$contract=resolved"; continue }
+        $ready = $false
+        $status = if ($entry.status -cin $known) { $entry.status } else { 'unrecognized' }
+        # Only fixed vocabulary reaches this line: error text becomes classes.
+        $text = @()
+        foreach ($source in @($entry, $entry.result)) {
+            if ($source -is [array] -or $source -isnot $object) { continue }
+            foreach ($name in @('error','reason','detail','message')) {
+                $value = $source.$name
+                if ($value -is [string]) { $text += $value }
+                elseif ($value -isnot [array] -and $value -is $object) { $text += @($value.PSObject.Properties | Where-Object { $_.Value -is [string] } | ForEach-Object { $_.Value }) }
+            }
+        }
+        $classes = if ($text.Count) { @(Get-ErrorClasses ($text -join ' ')) -join ',' } else { 'none' }
+        $fields += "$contract=$status error-classes=$classes"
+    }
+    return [pscustomobject]@{ Ready = $ready; Summary = ($fields -join '; ') }
+}
+function Protect-StatusText([string]$Text) {
+    $Text = $Text.Substring(0, [Math]::Min(16384, $Text.Length)) -replace '\r?\n', ' '
+    $Text = $Text -replace '(?i)("(?:password|token|secret|authorization|api[_-]?key)"\s*:\s*")[^"]*', '$1[redacted]'
+    $Text = $Text -replace '(?i)(password|token|secret|authorization|api[_-]?key)(\s*[:=]\s*)[^\s",}]+', '$1$2[redacted]'
+    $Text = $Text -replace '(?i)Bearer\s+[^\s",}]+', 'Bearer [redacted]'
+    return $Text -replace '(https?://)[^/\s@"]+@', '$1[redacted]@'
+}
+function Test-CimNotFound([Exception]$Exception) {
+    for ($e = $Exception; $e; $e = $e.InnerException) {
+        # WBEM_E_NOT_FOUND, surfaced as an HRESULT or as MI NativeErrorCode NotFound.
+        if ($e.HResult -eq -2147217406 -or $e.Message -match '0x80041002') { return $true }
+        $native = $e.PSObject.Properties['NativeErrorCode']
+        if ($native -and [string]$native.Value -eq 'NotFound') { return $true }
+    }
+    return $false
+}
+# Gone only when the owner query reported not-found (or no error) and no process
+# with the same PID and creation time exists any more.
+function Test-ProcessGone($Process, [Exception]$Exception) {
+    if ($Exception -and -not (Test-CimNotFound $Exception)) { return $false }
+    foreach ($current in @(Get-CimInstance Win32_Process -Filter "ProcessId=$([uint32]$Process.ProcessId)")) {
+        if ($current.CreationDate -eq $Process.CreationDate) { return $false }
+    }
+    return $true
+}
+# Owner SID, or $null for a process that exited after enumeration.
+function Get-ProcessOwnerSid($Process) {
+    try { $owner = Invoke-CimMethod -InputObject $Process -MethodName GetOwnerSid -ErrorAction Stop }
+    catch {
+        if (Test-ProcessGone $Process $_.Exception) { return $null }
+        throw
+    }
+    if ($owner.ReturnValue -ne 0) {
+        if (Test-ProcessGone $Process $null) { return $null }
+        throw "Cannot establish owner of process $($Process.ProcessId): GetOwnerSid returned $($owner.ReturnValue)"
+    }
+    return [string]$owner.Sid
 }
 function Write-ServerDiagnostics {
     foreach ($log in @('Microsoft-Windows-TerminalServices-LocalSessionManager/Operational',
@@ -165,9 +248,8 @@ if ($Mode -eq 'VerifyRemoved') {
     Wait-Condition {
         $children = @(Get-CimInstance Win32_Process -Filter "Name='openabstractions.exe'" | Where-Object {
             if ($_.SessionId -eq $state.Session) {
-                $owner = Invoke-CimMethod -InputObject $_ -MethodName GetOwnerSid
-                if ($owner.ReturnValue -ne 0) { throw 'Cannot verify runtime process owner during removal' }
-                $owner.Sid -eq $state.Sid
+                $owner = Get-ProcessOwnerSid $_
+                $null -ne $owner -and $owner -eq $state.Sid
             }
         })
         $services = @(Get-CimInstance Win32_Service -Filter "Name LIKE 'OpenAbstractionsSupervisor%'")
@@ -269,8 +351,9 @@ try {
             if ($svc.State -ne 'Running' -or $svc.ProcessId -eq 0) { continue }
             $proc = Get-CimInstance Win32_Process -Filter "ProcessId=$($svc.ProcessId)"
             if (-not $proc -or $proc.SessionId -ne $session) { continue }
-            $owner = Invoke-CimMethod -InputObject $proc -MethodName GetOwnerSid
-            if ($owner.ReturnValue -ne 0 -or $owner.Sid -ne $state.Sid) { throw 'Instance has wrong principal' }
+            $owner = Get-ProcessOwnerSid $proc
+            if ($null -eq $owner) { continue }
+            if ($owner -ne $state.Sid) { throw 'Instance has wrong principal' }
             if ($proc.ExecutablePath -ne $expectedImage) { throw 'Instance has wrong executable' }
             return $svc
         }
@@ -282,15 +365,20 @@ try {
         $found = @(Get-CimInstance Win32_Process -Filter "Name='openabstractions.exe'" | Where-Object {
             $_.ParentProcessId -eq $ParentPid -and $_.SessionId -eq $session
         })
+        $live = @()
         foreach ($proc in $found) {
-            $owner = Invoke-CimMethod -InputObject $proc -MethodName GetOwnerSid
-            if ($owner.ReturnValue -ne 0 -or $owner.Sid -ne $state.Sid) { throw 'Runtime child has wrong principal' }
+            $owner = Get-ProcessOwnerSid $proc
+            if ($null -eq $owner) { continue }
+            if ($owner -ne $state.Sid) { throw 'Runtime child has wrong principal' }
             if ($proc.ExecutablePath -ne $runtimeImage) { throw 'Runtime child has wrong executable' }
+            $live += $proc
         }
-        if ($found.Count -gt 1) { throw 'Multiple runtime children for one supervisor' }
-        if ($found.Count -eq 1) { $found[0] }
+        if ($live.Count -gt 1) { throw 'Multiple runtime children for one supervisor' }
+        if ($live.Count -eq 1) { $live[0] }
     }
     $script:lastStatusFailure = $null
+    $script:lastObserved = $null
+    $script:lastStatusJson = $null
     function Test-RuntimeReady {
         $previousEndpoint = $env:ABSTRACTION_RUNTIME_ENDPOINT
         try {
@@ -310,25 +398,43 @@ try {
             $info.LoadUserProfile = $true
             $probe = Invoke-StatusProcess $info
             if ($null -eq $probe.ExitCode) { throw 'Runtime status exit code was not observed' }
+            $script:lastStatusJson = $probe.Output
             if ($probe.ExitCode -ne 0) {
                 $line = Format-StatusFailure $probe.ExitCode $probe.Output $probe.Diagnostics
+                $script:lastObserved = $line
                 if ($line -ne $script:lastStatusFailure) { Write-Diagnostic $line | Out-Null; $script:lastStatusFailure = $line }
                 return $false
             }
-            $result = ConvertFrom-Json -InputObject $probe.Output
-            foreach ($capability in @('abstraction.logging','abstraction.config')) {
-                $matches = @($result.capabilities | Where-Object { $_.capability -eq $capability -and $_.status -eq 'resolved' })
-                if ($matches.Count -ne 1) { throw "Runtime diagnostic omitted ready $capability" }
-            }
-            foreach ($contract in @('abstraction.job/acceptance@1','abstraction.job/operations@1')) {
-                $matches = @($result.capabilities | Where-Object { $_.capability -eq 'abstraction.job' -and $_.contract -eq $contract -and $_.status -eq 'resolved' })
-                if ($matches.Count -ne 1) { throw "Runtime diagnostic omitted ready $contract" }
-            }
-            return $true
+            $readiness = Get-RuntimeReadiness $probe.Output
+            $script:lastObserved = $readiness.Summary
+            if ($readiness.Ready) { return $true }
+            $line = 'runtime not ready: ' + $readiness.Summary
+            if ($line -ne $script:lastStatusFailure) { Write-Diagnostic $line | Out-Null; $script:lastStatusFailure = $line }
+            return $false
         } finally { $env:ABSTRACTION_RUNTIME_ENDPOINT = $previousEndpoint }
     }
+    # service-session.log is the uploaded windows-installer-logs file.
+    function Save-LastRuntimeStatus([string]$Description) {
+        if ($null -eq $script:lastStatusJson) { Write-Diagnostic "last runtime status for ${Description}: none observed" | Out-Null; return }
+        Write-Diagnostic ("last runtime status for ${Description}: " + (Protect-StatusText $script:lastStatusJson)) | Out-Null
+    }
+    function Wait-RuntimeReady([int]$Seconds, [string]$Description) {
+        $script:lastStatusFailure = $null
+        $script:lastObserved = $null
+        $script:lastStatusJson = $null
+        try { Wait-Condition { Test-RuntimeReady } $Seconds $Description | Out-Null }
+        catch {
+            $failure = $_
+            try { Save-LastRuntimeStatus $Description } catch { Write-Warning 'Could not record the last runtime status' }
+            if ($failure.Exception.Message -like 'Timed out after*') {
+                $last = if ($script:lastObserved) { $script:lastObserved } else { 'no status observed' }
+                throw "$($failure.Exception.Message); last status: $last"
+            }
+            throw $failure
+        }
+    }
     $runtime = Wait-Condition { Find-Runtime ([int]$first.ProcessId) } 60 'runtime child in fresh user session'
-    Wait-Condition { Test-RuntimeReady } 60 'logging and config capability readiness' | Out-Null
+    Wait-RuntimeReady 60 'logging and config capability readiness'
     $oldRuntimePid = [int]$runtime.ProcessId
     Stop-Process -Id $oldRuntimePid -Force -ErrorAction Stop
     $recovered = Wait-Condition {
@@ -338,7 +444,7 @@ try {
             if ($child -and $child.ProcessId -ne $oldRuntimePid) { $child }
         }
     } 60 'runtime child replacement after child death'
-    Wait-Condition { Test-RuntimeReady } 60 'capability readiness after runtime child death' | Out-Null
+    Wait-RuntimeReady 60 'capability readiness after runtime child death'
     $first = Find-Instance
     if (-not $first) { throw 'Supervisor disappeared after runtime recovery' }
     $oldRuntimePid = [int]$recovered.ProcessId
@@ -353,7 +459,7 @@ try {
         if (-not (Get-Process -Id $oldRuntimePid -ErrorAction SilentlyContinue)) { $true }
     } 30 'old runtime child exited after supervisor death' | Out-Null
     $finalRuntime = Wait-Condition { Find-Runtime ([int]$replacement.ProcessId) } 60 'runtime child after SCM recovery'
-    Wait-Condition { Test-RuntimeReady } 60 'capability readiness after SCM recovery' | Out-Null
+    Wait-RuntimeReady 60 'capability readiness after SCM recovery'
     $state.Session = $session
     $state.RuntimeVerified = $true
     $state.RuntimePid = [int]$finalRuntime.ProcessId
