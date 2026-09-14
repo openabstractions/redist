@@ -46,7 +46,7 @@ function Invoke-Bounded([string]$Image, [string[]]$Arguments, [int]$Seconds = 90
     $info.FileName = $Image
     $info.Arguments = $Arguments -join ' '
     $result = Invoke-FixtureProcess $info $Seconds
-    if ($result.ExitCode -ne 0) { throw "$([IO.Path]::GetFileName($Image)) exited $($result.ExitCode)" }
+    if ($result.ExitCode -ne 0) { throw "$([IO.Path]::GetFileName($Image)) exited $($result.ExitCode): $(Protect-DiagnosticText ($result.Output + $result.Diagnostics))" }
 }
 function Get-ProfileFolder([Environment+SpecialFolder]$Folder, [scriptblock]$Resolve = {
     param($Name, $Option)
@@ -383,6 +383,8 @@ if ($Mode -eq 'User') {
             Invoke-Bounded msiexec.exe @('/i',"`"$PredecessorMsiPath`"",'/qn','/norestart','ALLUSERS=2','MSIINSTALLPERUSER=1','/l*v','predecessor-install.log')
             Assert-InstalledVersion '0.1.5' (Get-PackageProperty $PredecessorMsiPath ProductCode)
             Assert-RetainedSentinel $sentinel $sentinelValue
+            # 0.1.5 start opens its log before creating the store. Initialize through its own CLI.
+            Invoke-Bounded (Join-Path $tools 'jobd.exe') @('status')
             Start-PredecessorSupervisor $tools
             $previousProcesses = @(Get-RunningFixtureProcesses $tools $ExpectedSid)
         }
