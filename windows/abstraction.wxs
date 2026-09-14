@@ -147,10 +147,20 @@
          no administrator token, and an action that needs one there is the 1603
          the logon schtasks returned. -->
     <!-- Execute incoming shutdown code before the cached old MSI can remove
-         files. The early InstallExecute flushes this deferred action alone. -->
+         files. The early InstallExecute flushes these deferred actions alone. -->
     <Binary Id="UpgradeSupervisorCode" SourceFile="payload/tools/jobd.exe" />
     <CustomAction Id="StopPreviousSupervisor" BinaryRef="UpgradeSupervisorCode" ExeCommand="service stop"
                   Execute="deferred" Impersonate="no" Return="check" />
+    <!-- A per-user predecessor is a process of the installing account, and a
+         0.1.5 supervisor has no Restart Manager shutdown window. The installing
+         user's token ends only its own processes under the upgraded folder.
+         The Target column is Formatted and an EXE action cannot read
+         CustomActionData, so the folder is formatted into the command line when
+         the script is written. The trailing "." keeps the property's final
+         backslash from escaping the closing quote. -->
+    <CustomAction Id="StopPreviousUserSupervisor" BinaryRef="UpgradeSupervisorCode"
+                  ExeCommand="service stop --user &quot;[APPLICATIONFOLDER].&quot;"
+                  Execute="deferred" Impersonate="yes" Return="check" />
     <CustomAction Id="RegisterSupervisor" FileRef="jobd.exe" ExeCommand="service install --runtime"
                   Execute="deferred" Impersonate="no" Return="check" />
     <CustomAction Id="RollbackSupervisor" FileRef="jobd.exe" ExeCommand="service uninstall"
@@ -168,7 +178,9 @@
     <InstallExecuteSequence>
       <Custom Action="StopPreviousSupervisor" After="InstallInitialize"
               Condition="ALLUSERS AND WIX_UPGRADE_DETECTED AND NOT REMOVE" />
-      <InstallExecute After="StopPreviousSupervisor" />
+      <Custom Action="StopPreviousUserSupervisor" After="StopPreviousSupervisor"
+              Condition="NOT ALLUSERS AND WIX_UPGRADE_DETECTED AND NOT REMOVE" />
+      <InstallExecute After="StopPreviousUserSupervisor" />
       <Custom Action="UnregisterSupervisor" Before="RemoveFiles"
               Condition="ALLUSERS AND (REMOVE=&quot;ALL&quot; OR UPGRADINGPRODUCTCODE)" />
       <Custom Action="RollbackSupervisor" After="InstallFiles"

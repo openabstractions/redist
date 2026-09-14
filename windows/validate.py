@@ -51,7 +51,11 @@ def check_upgrade_shutdown(root):
         return next((el for el in root.iter() if untag(el) == tag
                      and (key is None or el.get(key) == value)), None)
 
-    expected = [
+    def broken(rules):
+        return any(el is None or any(el.get(k) != v for k, v in attrs.items()) for el, attrs in rules)
+
+    bad = []
+    machine = [
         (find("MajorUpgrade"), {"Schedule": "afterInstallExecute"}),
         (find("Binary", "Id", "UpgradeSupervisorCode"), {"SourceFile": "payload/tools/jobd.exe"}),
         (find("CustomAction", "Id", "StopPreviousSupervisor"),
@@ -59,11 +63,26 @@ def check_upgrade_shutdown(root):
           "Execute": "deferred", "Impersonate": "no", "Return": "check"}),
         (find("Custom", "Action", "StopPreviousSupervisor"),
          {"After": "InstallInitialize", "Condition": "ALLUSERS AND WIX_UPGRADE_DETECTED AND NOT REMOVE"}),
-        (find("InstallExecute"), {"After": "StopPreviousSupervisor"}),
     ]
-    if any(el is None or any(el.get(k) != v for k, v in attrs.items()) for el, attrs in expected):
-        return ["abstraction.wxs: incoming checked stop must execute before removal of the old product"]
-    return []
+    if broken(machine):
+        bad.append("abstraction.wxs: incoming checked stop must execute before removal of the old product")
+    # Per-user: the installing account's token, the embedded incoming image and
+    # the upgraded folder, flushed in the same early script as the machine stop.
+    user_action = find("CustomAction", "Id", "StopPreviousUserSupervisor")
+    user = [
+        (user_action,
+         {"BinaryRef": "UpgradeSupervisorCode", "ExeCommand": 'service stop --user "[APPLICATIONFOLDER]."',
+          "Execute": "deferred", "Impersonate": "yes", "Return": "check"}),
+        (find("Custom", "Action", "StopPreviousUserSupervisor"),
+         {"After": "StopPreviousSupervisor", "Condition": "NOT ALLUSERS AND WIX_UPGRADE_DETECTED AND NOT REMOVE"}),
+    ]
+    if broken(user) or (user_action is not None and user_action.get("FileRef") is not None):
+        bad.append("abstraction.wxs: incoming checked per-user stop must run impersonated from the embedded "
+                   "jobd Binary against [APPLICATIONFOLDER] before removal of the old product")
+    if broken([(find("InstallExecute"), {"After": "StopPreviousUserSupervisor"})]):
+        bad.append("abstraction.wxs: the early InstallExecute must flush both incoming stops before "
+                   "RemoveExistingProducts")
+    return bad
 
 
 def gated_sources(text):
