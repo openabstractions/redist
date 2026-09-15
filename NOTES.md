@@ -51,6 +51,7 @@ macOS caller-identity limitation still applies to verified service readiness.
 There are six Windows executables and four Linux/macOS programs. `jobd` and `jobdw`
 are two builds of the same source. [`tools.tsv`](tools.tsv) at this release's
 commit names the exact module versions and packages the workflow builds.
+`jobd` and `jobdw` in this release are built from service-jobd v0.3.6.
 Resolving a module through the Go proxy proves it is fetchable; the proxy may
 retain versions after a tag is deleted.
 

@@ -682,6 +682,10 @@ if ($Mode -eq 'User') {
                 try { Invoke-Bounded msiexec.exe @('/x',"`"$PredecessorMsiPath`"",'/qn','/norestart','/l*v','predecessor-cleanup.log') } catch { Write-Warning $_ }
             }
         }
+        # jobd appends each failed installer-invoked command here; MSI discards its stderr.
+        $installerActions = Join-Path (Get-ProfileFolder LocalApplicationData) 'openabstractions\upgrade-v1\installer-actions.txt'
+        try { if (Test-Path -LiteralPath $installerActions) { Copy-Item -LiteralPath $installerActions -Destination 'installer-actions.txt' -Force } }
+        catch { Write-Warning ('Installer action diagnostics failed: ' + (Protect-DiagnosticText $_.Exception.Message)) }
     }
     exit 0
 }
@@ -737,6 +741,11 @@ exit $LASTEXITCODE
         if (Test-Path -LiteralPath $directory) {
             New-Item -ItemType Directory -Force -Path $ResultDirectory | Out-Null
             Get-ChildItem -LiteralPath $directory -File | Where-Object { $_.Extension -in @('.log','.err','.txt','.json') } | Copy-Item -Destination $ResultDirectory
+        }
+        $machineActions = Join-Path $env:ProgramData 'abstraction\upgrade-v1\installer-actions.txt'
+        if (Test-Path -LiteralPath $machineActions) {
+            New-Item -ItemType Directory -Force -Path $ResultDirectory | Out-Null
+            Copy-Item -LiteralPath $machineActions -Destination (Join-Path $ResultDirectory 'machine-installer-actions.txt')
         }
     } catch { Write-Warning "Could not preserve all fixture diagnostics: $_" }
     # Account-owned runtime leftovers are cleanup only; no assertion becomes green here.
