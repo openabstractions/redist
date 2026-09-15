@@ -374,9 +374,11 @@ function Get-MsiSequence($Database, [string]$Condition) {
     } finally { [void]$view.Close(); [void][Runtime.InteropServices.Marshal]::FinalReleaseComObject($view) }
 }
 # A copy of the candidate that fails after its predecessor was removed. An error
-# custom action (type 19) follows InstallFiles, so the early script, the
-# predecessor stop and RemoveExistingProducts have run before it refuses. The
-# copy gets its own package code; the source package is unchanged.
+# custom action (type 19) takes the first free sequence after InstallFiles, so
+# the early script, the predecessor stop, RemoveExistingProducts and the actions
+# scheduled right after InstallFiles (RollbackSupervisor, RegisterSupervisor)
+# have run before it refuses, and machine rollback is exercised. The copy gets
+# its own package code; the source package is unchanged.
 function New-FailingCandidate([string]$Source, [string]$Target) {
     if (Test-Path -LiteralPath $Target) { throw "Forced-failure candidate already exists: $Target" }
     Copy-Item -LiteralPath $Source -Destination $Target
@@ -391,7 +393,8 @@ function New-FailingCandidate([string]$Source, [string]$Target) {
             throw 'Candidate sequence does not place InstallFiles between RemoveExistingProducts and InstallFinalize'
         }
         $at = $files.Sequence + 1
-        if ($null -ne (Get-MsiSequence $database "``Sequence``=$at")) { throw "Candidate sequence $at is already used" }
+        while ($at -lt $finalize.Sequence -and $null -ne (Get-MsiSequence $database "``Sequence``=$at")) { $at++ }
+        if ($at -ge $finalize.Sequence) { throw "Candidate has no free sequence between InstallFiles ($($files.Sequence)) and InstallFinalize ($($finalize.Sequence))" }
         Invoke-MsiSql $database "INSERT INTO ``CustomAction`` (``Action``, ``Type``, ``Target``) VALUES ('ForcedUpgradeFailure', 19, 'Forced upgrade failure after the predecessor was removed')"
         Invoke-MsiSql $database "INSERT INTO ``InstallExecuteSequence`` (``Action``, ``Condition``, ``Sequence``) VALUES ('ForcedUpgradeFailure', 'NOT REMOVE', $at)"
         $summary = $database.SummaryInformation(4)
