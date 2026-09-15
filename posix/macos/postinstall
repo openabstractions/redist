@@ -1,8 +1,8 @@
 #!/bin/sh
-# Runs as root after the payload lands. The payload is rooted at the installing
-# person's home directory, so everything here is about turning home-relative
-# facts into absolute ones and handing the LaunchAgent to that person's own
-# session — never to root's, and never to a LaunchDaemon.
+# Runs after the payload lands in the installing person's home directory, as
+# that person for a home-domain install. Everything here turns home-relative
+# facts into absolute ones and hands the LaunchAgent to that person's own GUI
+# session.
 set -eu
 
 home=${HOME:-}
@@ -15,22 +15,38 @@ home=$(CDPATH= cd -- "$home" && pwd -P)
 share=$home/.local/share/abstraction
 bin=$home/.local/bin
 . "$share/lifecycle.sh"
-plist=$home/Library/LaunchAgents/com.openabstractions.jobd.plist
+# The payload carries the plist as a template in the share directory. Only the
+# finished file ever appears in ~/Library/LaunchAgents: it is written under a
+# temporary name outside that directory, then renamed into place on the same
+# volume, so Background Task Management never reads the @BIN@ placeholder.
+template=$share/com.openabstractions.jobd.plist
+agents=$home/Library/LaunchAgents
+plist=$agents/com.openabstractions.jobd.plist
 
 uid=$(stat -f %u "$home")
 gid=$(stat -f %g "$home")
 
-tmp=$plist.new
+[ -f "$template" ] || { echo "postinstall: LaunchAgent template missing" >&2; exit 1; }
+[ ! -L "$home/Library" ] && [ ! -L "$agents" ] || { echo "postinstall: unsafe payload directory" >&2; exit 1; }
+mkdir -p -- "$agents"
+tmp=$(mktemp "$share/.com.openabstractions.jobd.plist.XXXXXX")
+trap 'rm -f -- "$tmp"' EXIT
 # Escape XML text first, then escape sed replacement metacharacters.
 replacement=$(printf '%s' "$bin" | sed 's/&/\&amp;/g; s/</\&lt;/g; s/>/\&gt;/g' | sed 's/[\\&|]/\\&/g')
-sed "s|@BIN@|$replacement|g" "$plist" > "$tmp"
-mv -- "$tmp" "$plist"
+sed "s|@BIN@|$replacement|g" "$template" > "$tmp"
+if grep -q '@BIN@' "$tmp"; then echo "postinstall: LaunchAgent placeholder left unsubstituted" >&2; exit 1; fi
+chmod 644 "$tmp"
+mv -f -- "$tmp" "$plist"
+trap - EXIT
 
-: > "$share/MANIFEST"
+manifest_tmp=$share/MANIFEST.new
+: > "$manifest_tmp"
 while read -r rel; do
 	[ -n "$rel" ] || continue
-	echo "$home/$rel" >> "$share/MANIFEST"
+	echo "$home/$rel" >> "$manifest_tmp"
 done < "$share/FILES"
+echo "$plist" >> "$manifest_tmp"
+mv -f -- "$manifest_tmp" "$share/MANIFEST"
 
 # Restore ownership and directory access along each installed path. This walks
 # ancestors only; unrelated siblings in ~/.local/bin or Library stay untouched.

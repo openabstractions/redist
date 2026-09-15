@@ -48,7 +48,7 @@ both		.local/share/abstraction/dev/python/download/pyproject.toml	copy		download
 linux		.config/systemd/user/abstraction-jobd.service			authored	posix		linux/abstraction-jobd.service			644
 linux		.config/systemd/user/abstraction-jobd.timer			authored	posix		linux/abstraction-jobd.timer			644
 linux		.local/share/abstraction/uninstall.sh				authored	posix		linux/uninstall.sh				755
-macos		Library/LaunchAgents/com.openabstractions.jobd.plist		authored	posix		macos/com.openabstractions.jobd.plist		644
+macos		.local/share/abstraction/com.openabstractions.jobd.plist	authored	posix		macos/com.openabstractions.jobd.plist		644
 macos		.local/share/abstraction/FILES					generated	posix		-						644
 macos		.local/share/abstraction/uninstall.sh				authored	posix		macos/uninstall.sh				755
 both	.local/bin/openabstractions	gobuild	charter	serve	755

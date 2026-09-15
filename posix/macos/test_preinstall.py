@@ -25,13 +25,15 @@ class Preinstall(unittest.TestCase):
         (self.scripts / "lifecycle.sh").write_text(self.mac_helper)
 
     def run_preflight(self, **env):
-        return subprocess.run(["sh", str(self.scripts / "preinstall")], env=dict(self.env, **env), text=True, capture_output=True, timeout=5)
+        return subprocess.run(["sh", str(self.scripts / "preinstall")], env=dict(self.env, **env), text=True, capture_output=True, timeout=fixtures.SCRIPT_TIMEOUT)
 
     def test_stop_precedes_replacement_and_retains_work(self):
         result = self.run_preflight()
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertTrue((self.root / "calls.stopped").exists())
         self.assertIn("bootout gui/1000/com.openabstractions.jobd", (self.root / "calls").read_text())
+        self.assertIn("booted out running previous LaunchAgent", result.stdout)
+        self.assertNotIn("no previous LaunchAgent", result.stdout)
         self.assertEqual(self.payload.read_text(), "payload")
         self.assertEqual(self.data.read_text(), "accepted work")
 
@@ -48,16 +50,18 @@ class Preinstall(unittest.TestCase):
         result = self.run_preflight(ABSENT="yes", FAIL="stop")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertNotIn("bootout", (self.root / "calls").read_text())
+        self.assertIn("no previous LaunchAgent registered in gui/1000; nothing booted out", result.stdout)
+        self.assertNotIn("booted out running", result.stdout)
 
     def test_conflicting_user_target_refuses_before_manager(self):
         other = self.root / "other-user"
         other.mkdir()
-        result = subprocess.run(["sh", str(self.scripts / "preinstall"), "package.pkg", str(other)], env=self.env, text=True, capture_output=True, timeout=5)
+        result = subprocess.run(["sh", str(self.scripts / "preinstall"), "package.pkg", str(other)], env=self.env, text=True, capture_output=True, timeout=fixtures.SCRIPT_TIMEOUT)
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("conflicting user-home", result.stderr)
         self.assertFalse((self.root / "calls").exists())
         for target in ("/", str(self.home)):
-            result = subprocess.run(["sh", str(self.scripts / "preinstall"), "package.pkg", target], env=dict(self.env, ABSENT="yes"), text=True, capture_output=True, timeout=5)
+            result = subprocess.run(["sh", str(self.scripts / "preinstall"), "package.pkg", target], env=dict(self.env, ABSENT="yes"), text=True, capture_output=True, timeout=fixtures.SCRIPT_TIMEOUT)
             self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_package_stages_preflight_and_current_helper(self):

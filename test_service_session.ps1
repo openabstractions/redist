@@ -1,6 +1,13 @@
 param(
     [ValidateSet('Verify','VerifyRemoved','Cleanup','ValidateOnly')][string]$Mode = 'ValidateOnly',
-    [string]$StatePath = (Join-Path $env:TEMP 'oa-service-session.json')
+    [string]$StatePath = (Join-Path $env:TEMP 'oa-service-session.json'),
+    # Verify only: once the SCM-created instance serves a ready runtime, run this
+    # application as the session's account from CommandDirectory, which must lie
+    # under RUNNER_TEMP or GITHUB_WORKSPACE. Its exit decides the fixture.
+    [string]$CommandPath,
+    [string[]]$CommandArguments = @(),
+    [string]$CommandDirectory,
+    [ValidateRange(1, 7200)][int]$CommandSeconds = 1800
 )
 $ErrorActionPreference = 'Stop'
 # No mutation in the default mode. Only disposable GitHub-hosted runners may run this fixture.
@@ -49,6 +56,9 @@ public static class OASessions {
   }
 }
 "@ -ReferencedAssemblies System.Windows.Forms
+# Bounded processes, the disposable account and account processes, process
+# owners and runtime pipes come from the module published beside this fixture.
+Import-Module (Join-Path $PSScriptRoot 'OAFixture.psm1') -Force
 if ($Mode -eq 'ValidateOnly') { 'Harness compiled; no account, session, firewall or service changes.'; exit 0 }
 if ($env:GITHUB_ACTIONS -ne 'true' -or $env:RUNNER_ENVIRONMENT -ne 'github-hosted') {
     throw 'This mutating fixture is restricted to disposable GitHub-hosted runners.'
@@ -57,26 +67,10 @@ function Write-Diagnostic([string]$Text) {
     $Text | Write-Output
     $Text | Add-Content -Encoding UTF8 'service-session.log'
 }
-# Process.Start retains the creation handle, including for an already-exited
-# child. Start-Process -PassThru on Windows PowerShell can return a PID-only
-# wrapper whose ExitCode becomes null after redirected child exit.
+# One status probe: a bounded process that keeps its creation handle, so an
+# already-exited child still reports its exit code.
 function Invoke-StatusProcess([Diagnostics.ProcessStartInfo]$StartInfo) {
-    $process = New-Object Diagnostics.Process
-    $process.StartInfo = $StartInfo
-    try {
-        if (-not $process.Start()) { throw 'Runtime status process did not start' }
-        $output = $process.StandardOutput.ReadToEndAsync()
-        $diagnostics = $process.StandardError.ReadToEndAsync()
-        if (-not $process.WaitForExit(10000)) {
-            $process.Kill()
-            if (-not $process.WaitForExit(5000)) { throw 'Runtime status termination was not observed' }
-            throw 'Runtime status exceeded its waiting budget'
-        }
-        if (-not $output.Wait(5000) -or -not $diagnostics.Wait(5000)) { throw 'Runtime status output did not close' }
-        $code = $process.ExitCode
-        if ($null -eq $code) { throw 'Runtime status exit code was not observed' }
-        return [pscustomobject]@{ ExitCode=$code; Output=$output.Result; Diagnostics=$diagnostics.Result }
-    } finally { $process.Dispose() }
+    return Invoke-FixtureProcess $StartInfo 10
 }
 # Only fixed vocabulary reaches the artifact; captured CLI text may contain paths or secrets.
 function Format-StatusFailure([Nullable[int]]$ExitCode, [string]$Json, [string]$Diagnostics) {
@@ -87,7 +81,8 @@ function Format-StatusFailure([Nullable[int]]$ExitCode, [string]$Json, [string]$
     $errorText = $Diagnostics
     try {
         $report = ConvertFrom-Json -InputObject $Json -ErrorAction Stop
-        if ($null -eq $report -or $report -is [array] -or $report -is [string]) { throw 'Expected status object' }
+        # JSON numbers, booleans, strings and arrays are not a status object.
+        if ($null -eq $report -or $report -is [array] -or $report -isnot [Management.Automation.PSCustomObject]) { throw 'Expected status object' }
         $fields += 'json=parsed'
         foreach ($name in @('abstraction.logging','abstraction.config')) {
             $items = @($report.capabilities | Where-Object { $_.capability -ceq $name })
@@ -165,37 +160,6 @@ function Protect-StatusText([string]$Text) {
     $Text = $Text -replace '(?i)Bearer\s+[^\s",}]+', 'Bearer [redacted]'
     return $Text -replace '(https?://)[^/\s@"]+@', '$1[redacted]@'
 }
-function Test-CimNotFound([Exception]$Exception) {
-    for ($e = $Exception; $e; $e = $e.InnerException) {
-        # WBEM_E_NOT_FOUND, surfaced as an HRESULT or as MI NativeErrorCode NotFound.
-        if ($e.HResult -eq -2147217406 -or $e.Message -match '0x80041002') { return $true }
-        $native = $e.PSObject.Properties['NativeErrorCode']
-        if ($native -and [string]$native.Value -eq 'NotFound') { return $true }
-    }
-    return $false
-}
-# Gone only when the owner query reported not-found (or no error) and no process
-# with the same PID and creation time exists any more.
-function Test-ProcessGone($Process, [Exception]$Exception) {
-    if ($Exception -and -not (Test-CimNotFound $Exception)) { return $false }
-    foreach ($current in @(Get-CimInstance Win32_Process -Filter "ProcessId=$([uint32]$Process.ProcessId)")) {
-        if ($current.CreationDate -eq $Process.CreationDate) { return $false }
-    }
-    return $true
-}
-# Owner SID, or $null for a process that exited after enumeration.
-function Get-ProcessOwnerSid($Process) {
-    try { $owner = Invoke-CimMethod -InputObject $Process -MethodName GetOwnerSid -ErrorAction Stop }
-    catch {
-        if (Test-ProcessGone $Process $_.Exception) { return $null }
-        throw
-    }
-    if ($owner.ReturnValue -ne 0) {
-        if (Test-ProcessGone $Process $null) { return $null }
-        throw "Cannot establish owner of process $($Process.ProcessId): GetOwnerSid returned $($owner.ReturnValue)"
-    }
-    return [string]$owner.Sid
-}
 function Write-ServerDiagnostics {
     foreach ($log in @('Microsoft-Windows-TerminalServices-LocalSessionManager/Operational',
         'Microsoft-Windows-TerminalServices-RemoteConnectionManager/Operational',
@@ -239,6 +203,31 @@ function Wait-Condition([scriptblock]$Check, [int]$Seconds, [string]$Description
     Get-CimInstance Win32_Service -Filter "Name LIKE 'OpenAbstractionsSupervisor%'" | Format-Table Name,State,ProcessId | Out-Host
     throw "Timed out after ${Seconds}s: $Description"
 }
+# The command a caller runs as the session's account. Its directory is granted
+# to that account, so it must be a runner-owned directory, never a system one.
+function Resolve-SessionCommand([string]$Path, [string]$Directory) {
+    $command = @(Get-Command -Name $Path -CommandType Application -ErrorAction SilentlyContinue)
+    if ($command.Count -eq 0) { throw "Session command is not an application: $Path" }
+    if (-not $Directory -or -not [IO.Path]::IsPathRooted($Directory) -or -not (Test-Path -LiteralPath $Directory -PathType Container)) {
+        throw 'A session command needs -CommandDirectory, an existing absolute directory'
+    }
+    $folder = (Resolve-Path -LiteralPath $Directory).Path.TrimEnd('\')
+    $roots = @($env:RUNNER_TEMP, $env:GITHUB_WORKSPACE | Where-Object { $_ } | ForEach-Object { [IO.Path]::GetFullPath($_).TrimEnd('\') })
+    if (-not @($roots | Where-Object { $folder -ieq $_ -or $folder.StartsWith($_ + '\', [StringComparison]::OrdinalIgnoreCase) }).Count) {
+        throw "Session command directory must lie under RUNNER_TEMP or GITHUB_WORKSPACE: $folder"
+    }
+    return [pscustomobject]@{ Path = $command[0].Source; Directory = $folder }
+}
+# Runs the command as the account through a credential logon, after writing the
+# session's identity beside it. The command's output stays in its own log.
+function Invoke-SessionCommand($Command, [string[]]$Arguments, [int]$Seconds, $Account, [hashtable]$Context) {
+    Grant-AccountAccess -Path $Command.Directory -Sid $Account.Sid -Access Modify
+    $Context | ConvertTo-Json | Set-Content -Encoding UTF8 -LiteralPath (Join-Path $Command.Directory 'service-session-context.json')
+    $result = Invoke-AccountProcess -Account $Account -FileName $Command.Path -Arguments $Arguments -WorkingDirectory $Command.Directory -Seconds $Seconds
+    @($result.Output, $result.Diagnostics) -join "`n" | Set-Content -Encoding UTF8 'service-session-command.log'
+    Write-Diagnostic "session command exit=$($result.ExitCode)" | Out-Null
+    if ($result.ExitCode -ne 0) { throw "Session command exited $($result.ExitCode)" }
+}
 # Removal is checked before Cleanup logs off the account and can terminate its processes.
 if ($Mode -eq 'VerifyRemoved') {
     $state = Get-Content $StatePath -Raw | ConvertFrom-Json
@@ -253,10 +242,7 @@ if ($Mode -eq 'VerifyRemoved') {
             }
         })
         $services = @(Get-CimInstance Win32_Service -Filter "Name LIKE 'OpenAbstractionsSupervisor%'")
-        $prefix = "openabstractions-user-$($state.Sid)-"
-        $pipes = @([IO.Directory]::GetFiles('\\.\pipe\') | Where-Object {
-            [IO.Path]::GetFileName($_) -in @("${prefix}runtime-v1", "${prefix}logging-v1", "${prefix}config-v1", "${prefix}job-acceptance-v1")
-        })
+        $pipes = @(Get-CapabilityPipes $state.Sid -Runtime)
         if ($children.Count -eq 0 -and $services.Count -eq 0 -and $pipes.Count -eq 0) { $true }
     } 30 'uninstall removed runtime processes, capability endpoints and SCM registrations' | Out-Null
     Write-Diagnostic 'ok: runtime and capability endpoints absent before account cleanup'
@@ -282,13 +268,11 @@ if ($Mode -eq 'Cleanup') {
 }
 if ([Threading.Thread]::CurrentThread.ApartmentState -ne 'STA') { throw 'Use powershell.exe -STA -File for ActiveX hosting' }
 if (Test-Path $StatePath) { throw 'State already exists; clean previous fixture first' }
+if (-not $CommandPath -and ($CommandDirectory -or $CommandArguments.Count)) { throw 'CommandDirectory and CommandArguments need -CommandPath' }
+# Resolved before anything changes, so a bad hook changes nothing.
+$sessionCommand = if ($CommandPath) { Resolve-SessionCommand $CommandPath $CommandDirectory } else { $null }
 $started = Get-Date
 $user = 'oa_ci_' + [Guid]::NewGuid().ToString('N').Substring(0,10)
-$random = New-Object byte[] 30
-$rng = [Security.Cryptography.RandomNumberGenerator]::Create()
-try { $rng.GetBytes($random) } finally { $rng.Dispose() }
-$password = 'Aa1!' + [Convert]::ToBase64String($random)
-Write-Output "::add-mask::$password"
 $state = @{ User=$user; Sid=''; Rule=('OA-CI-RDP-'+[Guid]::NewGuid().ToString('N')); Deny=(Get-ItemProperty $rdpKey).fDenyTSConnections }
 $state | ConvertTo-Json | Set-Content -Encoding UTF8 $StatePath
 # Blocks every non-loopback source before changing RDP availability. Never enable a broad allow rule.
@@ -296,11 +280,12 @@ $remote = @('0.0.0.0-126.255.255.255','128.0.0.0-255.255.255.255','::2-ffff:ffff
 foreach ($protocol in 'TCP','UDP') {
     New-NetFirewallRule -Name "$($state.Rule)-$protocol" -DisplayName "$($state.Rule)-$protocol" -Direction Inbound -Action Block -Protocol $protocol -LocalPort 3389 -RemoteAddress $remote -Profile Any | Out-Null
 }
-$account = New-LocalUser -Name $user -Password (ConvertTo-SecureString $password -AsPlainText -Force) -AccountNeverExpires
-$state.Sid = $account.SID.Value
+# Remote Desktop Users, so the account can sign in over the loopback RDP session.
+# The name is already in the state file, so Cleanup finds a half-created account.
+$account = New-DisposableAccount -Name $user -GroupSid 'S-1-5-32-555'
+$password = $account.Credential.GetNetworkCredential().Password
+$state.Sid = $account.Sid
 $state | ConvertTo-Json | Set-Content -Encoding UTF8 $StatePath
-$group = Get-LocalGroup -SID 'S-1-5-32-555'
-Add-LocalGroupMember -Group $group -Member $account
 Set-ItemProperty $rdpKey -Name fDenyTSConnections -Value 0
 Start-Service TermService
 $settings = Get-CimInstance -Namespace root/cimv2/terminalservices -ClassName Win32_TerminalServiceSetting
@@ -360,7 +345,7 @@ try {
     }
     $first = Wait-Condition { Find-Instance } 60 'SCM-created instance Running in fresh session'
     $runtimeImage = Join-Path $env:ProgramFiles 'OpenAbstractions\tools\openabstractions.exe'
-    $credential = New-Object Management.Automation.PSCredential("$env:COMPUTERNAME\$user", (ConvertTo-SecureString $password -AsPlainText -Force))
+    $credential = $account.Credential
     function Find-Runtime([int]$ParentPid) {
         $found = @(Get-CimInstance Win32_Process -Filter "Name='openabstractions.exe'" | Where-Object {
             $_.ParentProcessId -eq $ParentPid -and $_.SessionId -eq $session
@@ -466,6 +451,13 @@ try {
     $state | ConvertTo-Json | Set-Content -Encoding UTF8 $StatePath
     Write-Diagnostic "ok: runtime child death and supervisor death recovered logging/config readiness"
     Write-Diagnostic "ok: $($first.Name), session $session, PID $oldPid replaced by $($replacement.ProcessId)"
+    if ($sessionCommand) {
+        $context = @{ User=$user; Sid=$state.Sid; Session=$session; Instance=$replacement.Name; SupervisorPid=[int]$replacement.ProcessId; RuntimePid=$state.RuntimePid }
+        Invoke-SessionCommand $sessionCommand $CommandArguments $CommandSeconds $account $context
+        $state.CommandVerified = $true
+        $state | ConvertTo-Json | Set-Content -Encoding UTF8 $StatePath
+        Write-Diagnostic "ok: session command ran as the account against the SCM-created instance $($replacement.Name)"
+    }
     # Disconnect retains the session so MSI uninstall must remove the live clone before Cleanup logs off.
 } catch {
     try {

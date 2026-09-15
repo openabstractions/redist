@@ -42,6 +42,7 @@ jobs:
       DOWNLOAD_SHA: ${{ inputs.download_sha }}
       JOB_SHA: ${{ inputs.job_sha }}
       CANDIDATE_VERSION: ${{ inputs.version }}
+      GOTOOLCHAIN: local
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
       - name: validate immutable inputs
@@ -84,10 +85,20 @@ jobs:
           ref: ${{ inputs.job_sha }}
           path: source-job
           persist-credentials: false
-      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16
+      # The release workflow's Go, so a candidate's programs are the bytes a
+      # release of the same sources builds.
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
-          go-version: '1.26.0'
+          go-version: '1.26.8'
           cache: false
+      - name: record the Go toolchain
+        shell: bash
+        run: go version | tee go-version.txt
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: go-version-windows
+          path: go-version.txt
+          if-no-files-found: error
       - name: verify source and dependency provenance
         shell: python
         run: |
@@ -184,6 +195,335 @@ jobs:
           path: dist/
           if-no-files-found: error
 
+  # Every Windows assertion that needs a hosted runner, against the package the
+  # job above built. One dispatch of this workflow qualifies the candidate:
+  # per-user fresh, upgrade, non-default-folder upgrade, forced failed upgrade,
+  # unscoped non-admin, elevated refusal, machine forced failed upgrade, machine
+  # upgrade, registration, fresh session and removal.
+  windows-qualification:
+    needs: windows
+    runs-on: windows-latest
+    timeout-minutes: 120
+    permissions:
+      contents: read
+      actions: read
+    env:
+      CANDIDATE_VERSION: ${{ inputs.version }}
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
+      - name: fetch the candidate package
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        shell: pwsh
+        run: |
+          gh run download $env:GITHUB_RUN_ID -n abstraction-windows-unsigned -D pkg
+          if ($LASTEXITCODE -ne 0) { throw 'Candidate package download failed' }
+          $checked = @{}
+          foreach ($line in Get-Content pkg/SHA256SUMS.windows) {
+            if ($line -notmatch '^([a-f0-9]{64})\s+\*?(abstraction-(?:x64|arm64)\.msi)$') { throw 'Unexpected checksum entry' }
+            $expected = $Matches[1]; $file = $Matches[2]
+            if ((Get-FileHash "pkg/$file" -Algorithm SHA256).Hash.ToLower() -ne $expected) { throw "Checksum mismatch: $file" }
+            if ($checked.ContainsKey($file)) { throw 'Duplicate checksum entry' }
+            $checked[$file] = $true
+          }
+          if ($checked.Count -ne 2) { throw 'Expected checksums for both Windows packages' }
+          exit 0
+      - name: fetch reviewed predecessor package
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: pwsh
+        run: |
+          gh release download v0.1.5 --repo openabstractions/redist --pattern abstraction-x64.msi --pattern SHA256SUMS --dir predecessor
+          if ($LASTEXITCODE -ne 0) { throw 'Published predecessor download failed' }
+      - name: verify predecessor checksum
+        shell: python
+        run: |
+          import hashlib, json, os, pathlib, re
+          package = pathlib.Path('predecessor/abstraction-x64.msi')
+          if not package.is_file() or package.stat().st_size == 0:
+              raise SystemExit('Published predecessor MSI is missing or empty')
+          entries = []
+          for line in pathlib.Path('predecessor/SHA256SUMS').read_text().splitlines():
+              match = re.fullmatch(r'([0-9a-f]{64}) [ *]abstraction-x64\.msi', line)
+              if match:
+                  entries.append(match[1])
+          actual = hashlib.sha256(package.read_bytes()).hexdigest()
+          if entries != [actual]:
+              raise SystemExit('Published predecessor checksum is absent, duplicated or mismatched')
+          pathlib.Path('predecessor-source.json').write_text(json.dumps({'release': 'v0.1.5', 'repository': 'openabstractions/redist', 'file': package.name, 'sha256': actual}, indent=2))
+          with open(os.environ['GITHUB_ENV'], 'a') as output:
+              output.write('PREDECESSOR_SHA256='+actual+'\n')
+      - name: prepare the forced-failure machine candidate
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force failing | Out-Null
+          & powershell.exe -NoProfile -ExecutionPolicy Bypass -File test_user_runtime.ps1 -Mode FailingCandidate -MsiPath (Resolve-Path pkg/abstraction-x64.msi).Path -Output (Join-Path (Resolve-Path failing).Path 'abstraction-x64.msi')
+          if ($LASTEXITCODE -ne 0) { throw "Forced-failure candidate preparation exited $LASTEXITCODE" }
+      - name: what this runner can show
+        shell: pwsh
+        run: |
+          $me = (Get-Process -Id $PID).SessionId
+          "this job runs in session $me"
+          try { & query.exe session } catch { 'query.exe is not on this runner' }
+          "interactive=$(if ($me -eq 0) { 0 } else { 1 })" >> $env:GITHUB_ENV
+          exit 0
+      - name: configure disposable consumer MSI policy
+        shell: pwsh
+        run: |
+          if ($env:GITHUB_ACTIONS -ne 'true' -or $env:RUNNER_ENVIRONMENT -ne 'github-hosted' -or $env:RUNNER_OS -ne 'Windows') { throw 'MSI policy fixture requires a disposable GitHub Windows runner' }
+          if ((Get-CimInstance Win32_OperatingSystem -ErrorAction Stop).ProductType -ne 3) { throw 'MSI policy fixture requires Windows Server' }
+          $policy = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\Installer'
+          $statePath = Join-Path $env:RUNNER_TEMP 'oa-msi-policy.json'
+          if (Test-Path -LiteralPath $statePath -ErrorAction Stop) { throw 'MSI policy baseline already exists' }
+          $keyExists = Test-Path -LiteralPath $policy -ErrorAction Stop
+          $state = @{ KeyExisted=$keyExists; ValueExisted=$false; Value=$null; Restored=$false }
+          if ($keyExists) {
+              $key = Get-Item -LiteralPath $policy -ErrorAction Stop
+              try {
+                  $state.ValueExisted = $key.GetValueNames() -contains 'DisableMSI'
+                  if ($state.ValueExisted) {
+                      if ($key.GetValueKind('DisableMSI') -ne [Microsoft.Win32.RegistryValueKind]::DWord) { throw 'Unexpected DisableMSI registry type' }
+                      $state.Value = $key.GetValue('DisableMSI')
+                      if ($state.Value -notin @(0,1,2)) { throw 'Unexpected DisableMSI registry value' }
+                  }
+              } finally { $key.Close() }
+          }
+          # Persist the original state before the first mutation, including setup failures.
+          $state | ConvertTo-Json | Set-Content -LiteralPath $statePath -Encoding utf8 -ErrorAction Stop
+          "DisableMSI baseline: key=$keyExists present=$($state.ValueExisted) value=$($state.Value)" | Tee-Object msi-policy.log
+          if (-not $keyExists) { New-Item -Path $policy -Force -ErrorAction Stop | Out-Null }
+          New-ItemProperty -LiteralPath $policy -Name DisableMSI -Value 0 -PropertyType DWord -Force -ErrorAction Stop | Out-Null
+          if ((Get-ItemPropertyValue -LiteralPath $policy -Name DisableMSI -ErrorAction Stop) -ne 0) { throw 'DisableMSI test configuration did not take effect' }
+          'Disposable test environment: DisableMSI=0 permits standard-user unmanaged installation' | Tee-Object -Append msi-policy.log
+          exit 0
+      - name: private non-admin installation and cross-tool compatibility
+        shell: pwsh
+        timeout-minutes: 8
+        run: |
+          & powershell.exe -NoProfile -ExecutionPolicy Bypass -File test_user_runtime.ps1 -Mode Verify -MsiPath (Resolve-Path pkg/abstraction-x64.msi).Path -CheckTools -PythonPath (Get-Command python.exe -ErrorAction Stop).Source -ResultDirectory user-runtime-diagnostics
+          if ($LASTEXITCODE -ne 0) { throw "Per-user verification exited $LASTEXITCODE" }
+      - name: private non-admin predecessor upgrade and reinstall
+        shell: pwsh
+        timeout-minutes: 12
+        run: |
+          & powershell.exe -NoProfile -ExecutionPolicy Bypass -File test_user_runtime.ps1 -Mode Verify -MsiPath (Resolve-Path pkg/abstraction-x64.msi).Path -PredecessorMsiPath (Resolve-Path predecessor/abstraction-x64.msi).Path -PredecessorSHA256 $env:PREDECESSOR_SHA256 -ExpectedVersion $env:CANDIDATE_VERSION -ResultDirectory user-upgrade-diagnostics
+          if ($LASTEXITCODE -ne 0) { throw "Per-user upgrade verification exited $LASTEXITCODE" }
+      - name: private non-admin upgrade of a predecessor in a non-default folder
+        shell: pwsh
+        timeout-minutes: 12
+        run: |
+          & powershell.exe -NoProfile -ExecutionPolicy Bypass -File test_user_runtime.ps1 -Mode Verify -MsiPath (Resolve-Path pkg/abstraction-x64.msi).Path -PredecessorMsiPath (Resolve-Path predecessor/abstraction-x64.msi).Path -PredecessorSHA256 $env:PREDECESSOR_SHA256 -ExpectedVersion $env:CANDIDATE_VERSION -PredecessorElsewhere -ResultDirectory user-elsewhere-diagnostics
+          if ($LASTEXITCODE -ne 0) { throw "Non-default-folder upgrade verification exited $LASTEXITCODE" }
+      - name: private non-admin forced failed upgrade rolls back to the predecessor
+        shell: pwsh
+        timeout-minutes: 12
+        run: |
+          & powershell.exe -NoProfile -ExecutionPolicy Bypass -File test_user_runtime.ps1 -Mode Verify -MsiPath (Resolve-Path pkg/abstraction-x64.msi).Path -PredecessorMsiPath (Resolve-Path predecessor/abstraction-x64.msi).Path -PredecessorSHA256 $env:PREDECESSOR_SHA256 -ExpectedVersion $env:CANDIDATE_VERSION -FailUpgrade -ResultDirectory user-failed-upgrade-diagnostics
+          if ($LASTEXITCODE -ne 0) { throw "Forced failed upgrade verification exited $LASTEXITCODE" }
+      - name: an unscoped non-admin install lands in one scope
+        shell: pwsh
+        timeout-minutes: 8
+        run: |
+          & powershell.exe -NoProfile -ExecutionPolicy Bypass -File test_user_runtime.ps1 -Mode Verify -MsiPath (Resolve-Path pkg/abstraction-x64.msi).Path -Unscoped -ResultDirectory user-unscoped-diagnostics
+          if ($LASTEXITCODE -ne 0) { throw "Unscoped non-admin install verification exited $LASTEXITCODE" }
+      - name: an elevated unscoped install is refused before anything is copied
+        shell: pwsh
+        timeout-minutes: 5
+        run: |
+          $msi = (Resolve-Path pkg\abstraction-x64.msi).Path
+          $p = Start-Process msiexec -Wait -PassThru -ArgumentList @('/i', $msi, '/qn', '/norestart', '/l*v', 'elevated-unscoped.log')
+          $log = Get-Content -LiteralPath elevated-unscoped.log -Raw -Encoding Unicode
+          if ($p.ExitCode -ne 1603) { throw "an elevated install with no scope named exited $($p.ExitCode); the refusal returns 1603" }
+          if ($log -notmatch 'Doing action: RefuseElevatedPerUserInstall\r?\n') { throw 'the elevated per-user refusal did not run' }
+          if ($log -notmatch [regex]::Escape('pass ALLUSERS=1 to install for everyone')) { throw 'the refusal did not name its remedies' }
+          foreach ($action in 'CostInitialize', 'InstallValidate', 'InstallInitialize', 'InstallFiles', 'StartUserRuntime') {
+            if ($log -match "Doing action: $action\r?\n") { throw "the refused install still ran $action" }
+          }
+          foreach ($path in @((Join-Path $env:LOCALAPPDATA 'Programs\OpenAbstractions'), (Join-Path $env:ProgramFiles 'OpenAbstractions'),
+                              'HKCU:\Software\OpenAbstractions', 'HKLM:\Software\OpenAbstractions',
+                              (Join-Path $env:APPDATA 'Microsoft\Windows\Start Menu\Programs\Startup\Abstraction supervisor.lnk'))) {
+            if (Test-Path -LiteralPath $path) { throw "the refused install left $path" }
+          }
+          'ok    an elevated install with no scope named was refused before costing and left nothing behind'
+          exit 0
+      - name: restore disposable consumer MSI policy
+        if: always()
+        shell: pwsh
+        run: |
+          if ($env:GITHUB_ACTIONS -ne 'true' -or $env:RUNNER_ENVIRONMENT -ne 'github-hosted' -or $env:RUNNER_OS -ne 'Windows') { throw 'MSI policy fixture requires a disposable GitHub Windows runner' }
+          if ((Get-CimInstance Win32_OperatingSystem -ErrorAction Stop).ProductType -ne 3) { throw 'MSI policy fixture requires Windows Server' }
+          $policy = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\Installer'
+          $statePath = Join-Path $env:RUNNER_TEMP 'oa-msi-policy.json'
+          if (-not (Test-Path -LiteralPath $statePath -ErrorAction Stop)) { 'No MSI policy mutation was recorded'; exit 0 }
+          $state = Get-Content -LiteralPath $statePath -Raw -ErrorAction Stop | ConvertFrom-Json
+          if ($state.KeyExisted -isnot [bool] -or $state.ValueExisted -isnot [bool] -or ($state.ValueExisted -and (-not $state.KeyExisted -or $state.Value -notin @(0,1,2)))) { throw 'Invalid MSI policy baseline' }
+          if ($state.ValueExisted) {
+              New-ItemProperty -LiteralPath $policy -Name DisableMSI -Value $state.Value -PropertyType DWord -Force -ErrorAction Stop | Out-Null
+          } elseif (Test-Path -LiteralPath $policy -ErrorAction Stop) {
+              $key = Get-Item -LiteralPath $policy -ErrorAction Stop
+              try { $present = $key.GetValueNames() -contains 'DisableMSI' } finally { $key.Close() }
+              if ($present) { Remove-ItemProperty -LiteralPath $policy -Name DisableMSI -ErrorAction Stop }
+          }
+          if (Test-Path -LiteralPath $policy -ErrorAction Stop) {
+              $key = Get-Item -LiteralPath $policy -ErrorAction Stop
+              try {
+                  $present = $key.GetValueNames() -contains 'DisableMSI'
+                  if ($present -ne $state.ValueExisted) { throw 'DisableMSI presence was not restored' }
+                  if ($present -and ($key.GetValueKind('DisableMSI') -ne [Microsoft.Win32.RegistryValueKind]::DWord -or $key.GetValue('DisableMSI') -ne $state.Value)) { throw 'DisableMSI value was not restored' }
+                  $empty = $key.GetValueNames().Count -eq 0 -and $key.GetSubKeyNames().Count -eq 0
+              } finally { $key.Close() }
+              if (-not $state.KeyExisted) {
+                  if (-not $empty) { throw 'Refusing to remove a policy key with unrelated values' }
+                  Remove-Item -LiteralPath $policy -ErrorAction Stop
+              }
+          } elseif ($state.KeyExisted) { throw 'Original MSI policy key disappeared' }
+          $state.Restored = $true
+          $state | ConvertTo-Json | Set-Content -LiteralPath $statePath -Encoding utf8 -ErrorAction Stop
+          'DisableMSI baseline restored and verified' | Tee-Object -Append msi-policy.log
+          exit 0
+      # The machine predecessor is installed, the failing copy removes it and then
+      # refuses, and rollback must leave the predecessor registered with its
+      # service template, release the machine exclusion and run the rollback start.
+      - name: machine forced failed upgrade rolls back to the predecessor
+        id: machine-failed-upgrade
+        shell: pwsh
+        timeout-minutes: 15
+        run: |
+          $predecessor = (Resolve-Path predecessor\abstraction-x64.msi).Path
+          $failing = (Resolve-Path failing\abstraction-x64.msi).Path
+          $installer = New-Object -ComObject WindowsInstaller.Installer
+          $database = $installer.OpenDatabase($predecessor, 0)
+          $view = $database.OpenView("SELECT ``Value`` FROM ``Property`` WHERE ``Property``='ProductCode'")
+          [void]$view.Execute(); $code = $view.Fetch().StringData(1); [void]$view.Close()
+          "predecessor=$code" >> $env:GITHUB_OUTPUT
+          $p = Start-Process msiexec -Wait -PassThru -ArgumentList @('/i', $predecessor, '/qn', '/norestart', 'ALLUSERS=1', 'MSIINSTALLPERUSER=', '/l*v', 'machine-predecessor-install.log')
+          if ($p.ExitCode -ne 0) { throw "machine predecessor install exited $($p.ExitCode)" }
+          $p = Start-Process msiexec -Wait -PassThru -ArgumentList @('/i', $failing, '/qn', '/norestart', 'ALLUSERS=1', 'MSIINSTALLPERUSER=', '/l*v', 'machine-failed-upgrade.log')
+          if ($p.ExitCode -ne 1603) { throw "the forced machine upgrade failure exited $($p.ExitCode); it must end with 1603" }
+          $log = Get-Content -LiteralPath machine-failed-upgrade.log -Raw -Encoding Unicode
+          $removal = [regex]::Match($log, 'Action start [^\r\n]*: RemoveExistingProducts\.')
+          $failure = [regex]::Match($log, 'Action start [^\r\n]*: ForcedUpgradeFailure\.')
+          if (-not $removal.Success -or -not $failure.Success -or $failure.Index -lt $removal.Index) { throw 'the forced failure did not follow the predecessor removal' }
+          if ($log.IndexOf('RestartPreviousSupervisor', $failure.Index) -lt 0) { throw 'rollback did not run the machine restart' }
+          if ($installer.ProductState($code) -ne 5) { throw 'rollback did not leave the machine predecessor installed' }
+          & sc.exe qc OpenAbstractionsSupervisor | Out-Null
+          if ($LASTEXITCODE -ne 0) { throw "rollback did not restore the predecessor service template: sc qc exited $LASTEXITCODE" }
+          if (-not (Test-Path -LiteralPath (Join-Path $env:ProgramFiles 'OpenAbstractions\tools\jobdw.exe'))) { throw 'rollback did not restore the predecessor programs' }
+          $record = Join-Path $env:ProgramData 'abstraction\upgrade-v1\exclusion.json'
+          if (Test-Path -LiteralPath $record) { throw "the machine upgrade exclusion survived rollback: $record" }
+          if ($env:interactive -eq '1') {
+            if (-not @(Get-Service -Name 'OpenAbstractionsSupervisor_*' -ErrorAction SilentlyContinue | Where-Object Status -eq 'Running').Count) { throw 'rollback did not restart the stopped machine supervisor instance' }
+          } else {
+            'UNPROVEN here: session 0 runner, so no stopped instance existed to restart; the rollback start ran and the template is restored'
+          }
+          'ok    a failed machine upgrade left the predecessor installed and registered with no exclusion'
+          exit 0
+      - name: machine upgrade holds the exclusion and stops the predecessor before removal
+        id: machine-install
+        shell: pwsh
+        timeout-minutes: 10
+        run: |
+          $msi = (Resolve-Path pkg\abstraction-x64.msi).Path
+          $p = Start-Process msiexec -Wait -PassThru -ArgumentList @('/i', $msi, '/qn', '/norestart', 'ALLUSERS=1', 'MSIINSTALLPERUSER=', '/l*v', 'machine-install.log')
+          if ($p.ExitCode -ne 0) {
+            Select-String -Path machine-install.log -Pattern 'Return value 3','Error [0-9]+','CustomAction .* returned' -Context 12,4 | Out-String -Width 300 | Write-Output
+            throw "machine upgrade exited $($p.ExitCode)"
+          }
+          $log = Get-Content -LiteralPath machine-install.log -Raw -Encoding Unicode
+          $removal = [regex]::Match($log, 'Action start [^\r\n]*: RemoveExistingProducts\.')
+          if (-not $removal.Success) { throw 'the machine upgrade never removed the predecessor' }
+          $before = $log.Substring(0, $removal.Index)
+          foreach ($action in 'BeginMachineUpgradeExclusion', 'StopPreviousSupervisor', 'InstallExecute') {
+            if ($before -notmatch "Action ended [^\r\n]*: $action\. Return value 1\.") { throw "$action did not succeed before RemoveExistingProducts" }
+          }
+          if ($log -notmatch 'EndMachineUpgradeExclusion') { throw 'the machine exclusion release was not scheduled' }
+          $installer = New-Object -ComObject WindowsInstaller.Installer
+          if ($installer.ProductState('${{ steps.machine-failed-upgrade.outputs.predecessor }}') -eq 5) { throw 'the machine predecessor is still installed after upgrade' }
+          if (Test-Path -LiteralPath (Join-Path $env:ProgramData 'abstraction\upgrade-v1\exclusion.json')) { throw 'the machine upgrade exclusion survived commit' }
+          'ok    the machine upgrade held its exclusion, stopped the predecessor and released the exclusion'
+          exit 0
+      - name: the supervisor is registered, and registered as what it claims
+        shell: pwsh
+        run: |
+          $text = (& sc.exe qc OpenAbstractionsSupervisor) -join "`n"
+          if ($LASTEXITCODE -ne 0) { throw "sc qc exited $LASTEXITCODE" }
+          $text
+          if ($text -notmatch 'TYPE\s*:\s*50\s+USER_OWN_PROCESS\s+TEMPLATE') { throw 'the service is not a SERVICE_USER_OWN_PROCESS template' }
+          if ($text -notmatch 'START_TYPE\s*:\s*2\s+AUTO_START') { throw 'the template is not AUTO_START' }
+          if ($text -notmatch 'jobdw\.exe" service run') { throw 'the registered image is not jobdw.exe with the service verb' }
+          $qf = (& sc.exe qfailure OpenAbstractionsSupervisor) -join "`n"
+          if ($qf -notmatch 'RESET_PERIOD[^:]*:\s*3600') { throw 'the reset period is not 3600' }
+          foreach ($ms in 3000, 10000, 30000) {
+            if ($qf -notmatch "RESTART -- Delay = $ms milliseconds") { throw "the $ms ms restart action is not configured" }
+          }
+          if (((& sc.exe qfailureflag OpenAbstractionsSupervisor) -join "`n") -notmatch 'FAILURE_ACTIONS_ON_NONCRASH_FAILURES\s*:\s*TRUE') { throw 'the non-crash failure flag is not set' }
+          exit 0
+      - name: fresh interactive session and crash recovery
+        shell: pwsh
+        timeout-minutes: 5
+        run: |
+          & powershell.exe -NoProfile -ExecutionPolicy Bypass -STA -File test_service_session.ps1 -Mode Verify -StatePath "$env:RUNNER_TEMP/oa-service-session.json"
+          if ($LASTEXITCODE -ne 0) { throw "Fresh logon/recovery fixture exited $LASTEXITCODE" }
+          exit 0
+      - name: uninstall for everyone
+        if: always() && steps.machine-install.outcome == 'success'
+        shell: pwsh
+        run: |
+          $msi = (Resolve-Path pkg\abstraction-x64.msi).Path
+          $p = Start-Process msiexec -Wait -PassThru -ArgumentList @('/x', $msi, '/qn', '/norestart', '/l*v', 'machine-uninstall.log')
+          if ($p.ExitCode -ne 0) { throw "msiexec /x exited $($p.ExitCode)" }
+          & sc.exe qc OpenAbstractionsSupervisor | Out-Null
+          if ($LASTEXITCODE -ne 1060) { throw "the service template survived uninstall or its absence was not established: exit $LASTEXITCODE" }
+          if (@(Get-Service -Name 'OpenAbstractionsSupervisor_*' -ErrorAction SilentlyContinue).Count) { throw 'a per-session instance survived uninstall' }
+          foreach ($path in @((Join-Path $env:ProgramFiles 'OpenAbstractions'), 'HKLM:\Software\OpenAbstractions', (Join-Path $env:ProgramData 'abstraction'))) {
+            if (Test-Path -LiteralPath $path) { throw "uninstall left $path" }
+          }
+          & powershell.exe -NoProfile -ExecutionPolicy Bypass -STA -File test_service_session.ps1 -Mode VerifyRemoved -StatePath "$env:RUNNER_TEMP/oa-service-session.json"
+          if ($LASTEXITCODE -ne 0) { throw "Runtime removal verification exited $LASTEXITCODE" }
+          exit 0
+      - name: remove the machine predecessor left by a failed step
+        if: always() && steps.machine-failed-upgrade.outputs.predecessor != ''
+        shell: pwsh
+        run: |
+          $installer = New-Object -ComObject WindowsInstaller.Installer
+          if ($installer.ProductState('${{ steps.machine-failed-upgrade.outputs.predecessor }}') -eq 5) {
+            $p = Start-Process msiexec -Wait -PassThru -ArgumentList @('/x', '${{ steps.machine-failed-upgrade.outputs.predecessor }}', '/qn', '/norestart', '/l*v', 'machine-predecessor-cleanup.log')
+            if ($p.ExitCode -ne 0) { throw "machine predecessor cleanup exited $($p.ExitCode)" }
+          }
+          exit 0
+      - name: remove only the disposable test session
+        if: always()
+        shell: pwsh
+        timeout-minutes: 2
+        run: |
+          if (Test-Path test_service_session.ps1) {
+            & powershell.exe -NoProfile -ExecutionPolicy Bypass -STA -File test_service_session.ps1 -Mode Cleanup -StatePath "$env:RUNNER_TEMP/oa-service-session.json" 2>&1 | Tee-Object service-session-cleanup.log
+            if ($LASTEXITCODE -ne 0) { throw "Session cleanup exited $LASTEXITCODE" }
+          }
+          exit 0
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        if: always()
+        with:
+          name: windows-qualification-diagnostics
+          path: |
+            predecessor-source.json
+            msi-policy.log
+            ${{ runner.temp }}/oa-msi-policy.json
+            user-runtime-diagnostics/
+            user-upgrade-diagnostics/
+            user-elsewhere-diagnostics/
+            user-failed-upgrade-diagnostics/
+            user-unscoped-diagnostics/
+            elevated-unscoped.log
+            machine-predecessor-install.log
+            machine-failed-upgrade.log
+            machine-install.log
+            machine-uninstall.log
+            machine-predecessor-cleanup.log
+            service-session.log
+            service-session-cleanup.log
+
   posix:
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 30
@@ -206,6 +546,7 @@ jobs:
       JOB_SHA: ${{ inputs.job_sha }}
       CANDIDATE_VERSION: ${{ inputs.version }}
       PACKAGE_PLATFORM: ${{ matrix.platform }}
+      GOTOOLCHAIN: local
     steps:
     - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
     - name: validate immutable inputs
@@ -248,10 +589,18 @@ jobs:
         ref: ${{ inputs.job_sha }}
         path: source-job
         persist-credentials: false
-    - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16
+    - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
       with:
-        go-version: 1.26.0
+        go-version: '1.26.8'
         cache: false
+    - name: record the Go toolchain
+      shell: bash
+      run: go version | tee go-version.txt
+    - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+      with:
+        name: go-version-${{ matrix.platform }}
+        path: go-version.txt
+        if-no-files-found: error
     - name: verify source and dependency provenance
       shell: python
       run: |

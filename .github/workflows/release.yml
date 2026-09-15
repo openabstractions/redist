@@ -59,19 +59,35 @@ jobs:
     needs: candidate
     env:
       CANDIDATE_VERSION: ${{ needs.candidate.outputs.version }}
+      GOTOOLCHAIN: local
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
         with:
           ref: ${{ needs.candidate.outputs.sha }}
 
+      # One Go for every build job of this release. v0.1.6 built with each
+      # image's own Go, and its Linux tarball reproduced off-runner only with
+      # the go1.26.8 that image happened to carry. GOTOOLCHAIN=local stops a
+      # go.mod toolchain line from fetching another.
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: '1.26.8'
+          cache: false
+
       - name: state
         run: |
           printf 'a hosted runner, %s logical CPUs, %s %s, on mains\n' \
             "$(getconf _NPROCESSORS_ONLN)" "$RUNNER_OS" "$RUNNER_ARCH"
-          go version
+          go version | tee go-version.txt
           dotnet --version
           git rev-parse HEAD
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: go-version-windows
+          path: go-version.txt
+          if-no-files-found: error
 
       # Every version named here must exist before anything is built. This is
       # the whole point of the repository: the package is made of our published
@@ -378,15 +394,42 @@ jobs:
       # Startup shortcut, one per-user registration and readiness, nothing of the
       # machine arm, then remove all of it.
       #
-      # From an elevated administrator the same command installs per-user and
-      # fails 1722/1603, because activation refuses an elevated token. 0.1.6
-      # ships that as a known issue in NOTES.md; the package is unchanged.
+      # From an elevated administrator the same command resolves per-user, and
+      # activation refuses an elevated token. The next step holds that case.
       - name: an unscoped install lands in one scope, not half of each
         shell: pwsh
         timeout-minutes: 8
         run: |
           & powershell.exe -NoProfile -ExecutionPolicy Bypass -File user-fixture/test_user_runtime.ps1 -Mode Verify -MsiPath (Resolve-Path pkg/abstraction-x64.msi).Path -Unscoped -ResultDirectory user-unscoped-diagnostics
           if ($LASTEXITCODE -ne 0) { throw "Unscoped non-admin install verification exited $LASTEXITCODE" }
+
+      # ----- an elevated install with no scope named ------------------------
+      #
+      # This runner's full administrator token runs the same unscoped command.
+      # ALLUSERS=2 with MSIINSTALLPERUSER=1 resolves per-user, and per-user
+      # activation refuses an elevated token. 0.1.6 copied the files and then
+      # failed 1722/1603. The package now refuses before costing and names both
+      # remedies, so nothing is copied, registered or started.
+      - name: an elevated unscoped install is refused before anything is copied
+        shell: pwsh
+        timeout-minutes: 5
+        run: |
+          $msi = (Resolve-Path pkg\abstraction-x64.msi).Path
+          $p = Start-Process msiexec -Wait -PassThru -ArgumentList @('/i', $msi, '/qn', '/norestart', '/l*v', 'elevated-unscoped.log')
+          $log = Get-Content -LiteralPath elevated-unscoped.log -Raw -Encoding Unicode
+          if ($p.ExitCode -ne 1603) { throw "an elevated install with no scope named exited $($p.ExitCode); the refusal returns 1603" }
+          if ($log -notmatch 'Doing action: RefuseElevatedPerUserInstall\r?\n') { throw 'the elevated per-user refusal did not run' }
+          if ($log -notmatch [regex]::Escape('pass ALLUSERS=1 to install for everyone')) { throw 'the refusal did not name its remedies' }
+          foreach ($action in 'CostInitialize', 'InstallValidate', 'InstallInitialize', 'InstallFiles', 'StartUserRuntime') {
+            if ($log -match "Doing action: $action\r?\n") { throw "the refused install still ran $action" }
+          }
+          foreach ($path in @((Join-Path $env:LOCALAPPDATA 'Programs\OpenAbstractions'), (Join-Path $env:ProgramFiles 'OpenAbstractions'),
+                              'HKCU:\Software\OpenAbstractions', 'HKLM:\Software\OpenAbstractions',
+                              (Join-Path $env:APPDATA 'Microsoft\Windows\Start Menu\Programs\Startup\Abstraction supervisor.lnk'))) {
+            if (Test-Path -LiteralPath $path) { throw "the refused install left $path" }
+          }
+          'ok    an elevated install with no scope named was refused before costing and left nothing behind'
+          exit 0
       - name: restore disposable consumer MSI policy
         if: always()
         shell: pwsh
@@ -579,24 +622,38 @@ jobs:
             machine-uninstall.log
             service-session.log
             service-session-cleanup.log
+            elevated-unscoped.log
           if-no-files-found: ignore
 
   linux:
     needs: candidate
     env:
       CANDIDATE_VERSION: ${{ needs.candidate.outputs.version }}
+      GOTOOLCHAIN: local
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
         with:
           ref: ${{ needs.candidate.outputs.sha }}
 
+      # The same Go as the windows and macos jobs; see the windows job.
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: '1.26.8'
+          cache: false
+
       - name: state
         run: |
           printf 'a hosted runner, %s logical CPUs, %s %s, on mains\n' \
             "$(getconf _NPROCESSORS_ONLN)" "$RUNNER_OS" "$RUNNER_ARCH"
-          go version
+          go version | tee go-version.txt
           git rev-parse HEAD
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: go-version-linux
+          path: go-version.txt
+          if-no-files-found: error
 
       # The repository first, the proxy second, for the reason the windows job
       # states: a cache that never forgets cannot say whether a tag exists.
@@ -823,6 +880,7 @@ jobs:
     needs: candidate
     env:
       CANDIDATE_VERSION: ${{ needs.candidate.outputs.version }}
+      GOTOOLCHAIN: local
     runs-on: macos-latest
     outputs:
       state: ${{ steps.material.outputs.state }}
@@ -835,19 +893,24 @@ jobs:
       # This image carries no Go, and `go version` belongs in the state line, so
       # Go is installed before the first number rather than the state line
       # moving after the first build: state printed afterwards is the state of
-      # something else. The version is the one the Linux and Windows images
-      # carry; those two are still whatever their image ships, so this is a pin
-      # on one leg of three.
+      # something else. The version is the one the windows and linux jobs pin.
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
-          go-version: '1.26.0'
+          go-version: '1.26.8'
+          cache: false
 
       - name: state
         run: |
           printf 'a hosted runner, %s logical CPUs, %s %s, on mains\n' \
             "$(getconf _NPROCESSORS_ONLN)" "$RUNNER_OS" "$RUNNER_ARCH"
-          go version
+          go version | tee go-version.txt
           sw_vers
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: go-version-macos
+          path: go-version.txt
+          if-no-files-found: error
 
       # Decided before anything is built, so every later step branches on one
       # answer rather than each re-deciding. Names are printed and values never

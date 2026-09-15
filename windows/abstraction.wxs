@@ -22,6 +22,10 @@
          contained runtime. Keep graceful Restart Manager shutdown enabled. -->
     <Property Id="MSIRESTARTMANAGERCONTROL" Value="0" />
     <Property Id="MSIRMSHUTDOWN" Value="0" />
+    <!-- AdminUser reports the installing token itself. Without this, Windows sets
+         AdminUser wherever Privileged is set, including AlwaysInstallElevated for
+         a standard user, whose per-user activation works. -->
+    <Property Id="MSIUSEREALADMINDETECTION" Value="1" />
     <SetProperty Id="MSIDISABLERMRESTART" Value="1" Before="InstallValidate" Sequence="execute"
                  Condition="NOT ALLUSERS AND REMOVE=&quot;ALL&quot;" />
 
@@ -149,18 +153,52 @@
     <!-- Execute incoming shutdown code before the cached old MSI can remove
          files. The early InstallExecute flushes these deferred actions alone. -->
     <Binary Id="UpgradeSupervisorCode" SourceFile="payload/tools/jobd.exe" />
+    <!-- Upgrade exclusion. Before a stop, the incoming jobd records the folders
+         being replaced and this installer process; every activation path of
+         those folders refuses while the installer lives. The commit action
+         releases it. The rollback action releases it and restarts exactly what
+         the stop recorded. Order in the early script: begin, commit release,
+         rollback restart, stop. Rollback runs in reverse, so the record is
+         released and its processes restarted after the old product is back. -->
+    <CustomAction Id="BeginMachineUpgradeExclusion" BinaryRef="UpgradeSupervisorCode"
+                  ExeCommand="service begin-upgrade --machine &quot;[APPLICATIONFOLDER].&quot; --related &quot;[WIX_UPGRADE_DETECTED]&quot;"
+                  Execute="deferred" Impersonate="no" Return="check" />
+    <CustomAction Id="EndMachineUpgradeExclusion" BinaryRef="UpgradeSupervisorCode"
+                  ExeCommand="service end-upgrade --machine"
+                  Execute="commit" Impersonate="no" Return="check" />
+    <CustomAction Id="RestartPreviousSupervisor" BinaryRef="UpgradeSupervisorCode"
+                  ExeCommand="service start --machine"
+                  Execute="rollback" Impersonate="no" Return="ignore" />
     <CustomAction Id="StopPreviousSupervisor" BinaryRef="UpgradeSupervisorCode" ExeCommand="service stop"
                   Execute="deferred" Impersonate="no" Return="check" />
+    <CustomAction Id="BeginUserUpgradeExclusion" BinaryRef="UpgradeSupervisorCode"
+                  ExeCommand="service begin-upgrade --user &quot;[APPLICATIONFOLDER].&quot; --related &quot;[WIX_UPGRADE_DETECTED]&quot;"
+                  Execute="deferred" Impersonate="yes" Return="check" />
+    <CustomAction Id="EndUserUpgradeExclusion" BinaryRef="UpgradeSupervisorCode"
+                  ExeCommand="service end-upgrade --user"
+                  Execute="commit" Impersonate="yes" Return="check" />
     <!-- A per-user predecessor is a process of the installing account, and a
          0.1.5 supervisor has no Restart Manager shutdown window. The installing
          user's token ends only its own processes under the upgraded folder.
          The Target column is Formatted and an EXE action cannot read
          CustomActionData, so the folder is formatted into the command line when
          the script is written. The trailing "." keeps the property's final
-         backslash from escaping the closing quote. -->
+         backslash from escaping the closing quote. [WIX_UPGRADE_DETECTED] names
+         the related per-user products; jobd reads each one's recorded install
+         location through the MSI API, so a predecessor in a non-default folder
+         is stopped where it lives. -->
     <CustomAction Id="StopPreviousUserSupervisor" BinaryRef="UpgradeSupervisorCode"
-                  ExeCommand="service stop --user &quot;[APPLICATIONFOLDER].&quot;"
+                  ExeCommand="service stop --user &quot;[APPLICATIONFOLDER].&quot; --related &quot;[WIX_UPGRADE_DETECTED]&quot;"
                   Execute="deferred" Impersonate="yes" Return="check" />
+    <!-- A failed upgrade rolls the old product back after its supervisor was
+         stopped. This rollback action runs each related product's own Startup
+         activation from its recorded folder, so the old supervisor answers
+         again before the next sign-in. Scheduled before the stop, the script
+         holds it whenever the stop has run. A restart failure is logged and
+         does not block the rollback. -->
+    <CustomAction Id="RestartPreviousUserSupervisor" BinaryRef="UpgradeSupervisorCode"
+                  ExeCommand="service start --related &quot;[WIX_UPGRADE_DETECTED]&quot;"
+                  Execute="rollback" Impersonate="yes" Return="ignore" />
     <CustomAction Id="RegisterSupervisor" FileRef="jobd.exe" ExeCommand="service install --runtime"
                   Execute="deferred" Impersonate="no" Return="check" />
     <CustomAction Id="RollbackSupervisor" FileRef="jobd.exe" ExeCommand="service uninstall"
@@ -174,11 +212,33 @@
     <CustomAction Id="StartUserRuntime" FileRef="jobdw.exe"
                   ExeCommand="start --runtime --require-unelevated"
                   Execute="immediate" Impersonate="yes" Return="check" />
+    <!-- ALLUSERS=2 with MSIINSTALLPERUSER=1 resolves per-user for every token,
+         including a full administrator or a deployment tool running as SYSTEM.
+         Per-user activation refuses that token after InstallFinalize. This
+         refusal runs under the same condition before costing, so nothing is
+         copied or registered, and names both remedies. Selecting machine scope
+         here instead would be a scope change nobody asked for. -->
+    <CustomAction Id="RefuseElevatedPerUserInstall"
+                  Error="Abstraction cannot install for your account from an elevated administrator session, because its runtime does not start with administrator rights. Run the installer without administrator rights to install for your account, or pass ALLUSERS=1 to install for everyone." />
 
     <InstallExecuteSequence>
-      <Custom Action="StopPreviousSupervisor" After="InstallInitialize"
+      <Custom Action="RefuseElevatedPerUserInstall" Before="CostInitialize"
+              Condition="AdminUser AND NOT ALLUSERS AND NOT (REMOVE=&quot;ALL&quot;) AND NOT UPGRADINGPRODUCTCODE" />
+      <Custom Action="BeginMachineUpgradeExclusion" After="InstallInitialize"
               Condition="ALLUSERS AND WIX_UPGRADE_DETECTED AND NOT REMOVE" />
-      <Custom Action="StopPreviousUserSupervisor" After="StopPreviousSupervisor"
+      <Custom Action="EndMachineUpgradeExclusion" After="BeginMachineUpgradeExclusion"
+              Condition="ALLUSERS AND WIX_UPGRADE_DETECTED AND NOT REMOVE" />
+      <Custom Action="RestartPreviousSupervisor" After="EndMachineUpgradeExclusion"
+              Condition="ALLUSERS AND WIX_UPGRADE_DETECTED AND NOT REMOVE" />
+      <Custom Action="StopPreviousSupervisor" After="RestartPreviousSupervisor"
+              Condition="ALLUSERS AND WIX_UPGRADE_DETECTED AND NOT REMOVE" />
+      <Custom Action="BeginUserUpgradeExclusion" After="StopPreviousSupervisor"
+              Condition="NOT ALLUSERS AND WIX_UPGRADE_DETECTED AND NOT REMOVE" />
+      <Custom Action="EndUserUpgradeExclusion" After="BeginUserUpgradeExclusion"
+              Condition="NOT ALLUSERS AND WIX_UPGRADE_DETECTED AND NOT REMOVE" />
+      <Custom Action="RestartPreviousUserSupervisor" After="EndUserUpgradeExclusion"
+              Condition="NOT ALLUSERS AND WIX_UPGRADE_DETECTED AND NOT REMOVE" />
+      <Custom Action="StopPreviousUserSupervisor" After="RestartPreviousUserSupervisor"
               Condition="NOT ALLUSERS AND WIX_UPGRADE_DETECTED AND NOT REMOVE" />
       <InstallExecute After="StopPreviousUserSupervisor" />
       <Custom Action="UnregisterSupervisor" Before="RemoveFiles"

@@ -2,13 +2,36 @@ The Open Abstractions redistributable packages programs built from published
 module versions. The build appends this release's asset and signing state at
 the end of these notes; those facts apply to this release only.
 
-## Changes in 0.1.6
+## Changes in this release
 
-The installed supervisor starts the shared capability runtime. Application
-clients resolve local services through a common IPC boundary with independently
-selected installation trust. The Panel uses those services for configuration,
-readiness and job activity. Windows per-user installation starts the windowless
-runtime immediately.
+- **Windows upgrades keep one owner.** While an upgrade replaces an
+  installation, its supervisor and runtime cannot start again from the Startup
+  shortcut, the service manager, `jobd start` or `openabstractions start`. The
+  installation activates normally once the upgrade finishes.
+- **A failed Windows upgrade restores what it stopped.** Rollback restarts the
+  supervisors the upgrade stopped, for your account or for everyone, and nothing
+  it did not stop.
+- **Per-user upgrades find an installation in another folder.** An upgrade stops
+  the previous version where it was installed, including a folder chosen at
+  install time.
+- **An elevated per-user install is refused before anything is copied.** See
+  [Installing from an elevated session](#installing-from-an-elevated-session).
+- **The panel shows what the installed runtime owns.** `Abstraction Panel`
+  reads runtime readiness, accepted work, questions, rights and user
+  configuration through the runtime's services. Its `--legacy-local` mode and
+  the delegation, downloads and may-reach screens that read the job store
+  directly are removed. With no runtime it reports the absence.
+- **Rights rules can expire and record their origin.** The runtime's rights
+  service accepts registered action names, rule expiry and rule provenance.
+- **`services.json` is no longer read or reserved.** A store written by an
+  earlier release may still hold one; a download may now use that name.
+- **Every program is built with Go 1.26.8.**
+- **Downgrading after a retry or lost result is refused.** See
+  [Downgrading to an earlier release](#downgrading-to-an-earlier-release).
+
+`dl`, `jobctl`, the job-store provider inside `jobd` and its `supervisor.json`
+heartbeat still ship in this release. They are planned for removal in 0.1.8,
+when service-based download and job commands replace them.
 
 This release packages the runtime and tools. Language SDKs keep their own release
 versions. The architecture roadmap continues beyond this release. The known
@@ -22,7 +45,7 @@ macOS caller-identity limitation still applies to verified service readiness.
 | `jobdw` | the same supervisor built without a console window | Windows |
 | `dl` | fetches URLs resumably and verifies a supplied digest | Windows, Linux, macOS |
 | `jobctl` | operates directly on the job store for scripts and debugging | Windows, Linux, macOS |
-| `Abstraction Panel` | service readiness, configuration and local activity | Windows |
+| `Abstraction Panel` | runtime readiness, accepted work, questions, rights and user configuration | Windows |
 | `openabstractions` | hosts capability services through its `serve` command | Windows, Linux, macOS |
 
 There are six Windows executables and four Linux/macOS programs. `jobd` and `jobdw`
@@ -30,6 +53,10 @@ are two builds of the same source. [`tools.tsv`](tools.tsv) at this release's
 commit names the exact module versions and packages the workflow builds.
 Resolving a module through the Go proxy proves it is fetchable; the proxy may
 retain versions after a tag is deleted.
+
+Every program on every platform is built with Go 1.26.8, with
+`GOTOOLCHAIN=local` so no other toolchain is fetched. Each build job keeps
+its `go version` output as a `go-version-<platform>` workflow artifact.
 
 `jobctl` is a low-level tool, not the download browser: use `dl list` for your
 own downloads. Its store override `JOB_STORE` takes precedence over
@@ -83,15 +110,24 @@ and uninstall checks. Building an architecture does not prove installation on
 that architecture. Do not infer a Windows install result from Linux verification,
 or an installed macOS service from a signed package.
 
-## Known issues
+## Installing from an elevated session
 
-- **Windows: an elevated install with no scope named fails.** Running the MSI
-  with no install scope from an elevated administrator prompt, or from a
-  deployment tool running elevated, installs per-user and then fails with
-  Error 1722 / 1603 because the runtime refuses to start with administrator
-  rights. For a per-user install, run the MSI from a normal (unelevated) prompt
-  or double-click it as a normal user. For a machine install, pass
-  `ALLUSERS=1`.
+A Windows install for your account (*Just me*) started from an elevated
+administrator prompt, or from a deployment tool running elevated, stops before
+any file is copied. Running the MSI with no install scope selects *Just me*, so
+it is refused the same way. The runtime does not start with administrator
+rights, and the message names both remedies: run the installer without
+administrator rights to install for your account, or pass `ALLUSERS=1` to
+install for everyone. Release 0.1.6 copied the files first and then failed
+with Error 1722 / 1603.
+
+## Downgrading to an earlier release
+
+Job providers from release 0.1.6 and earlier cannot open a job store after
+this release has retried a job attempt or recorded a lost result in it.
+Downgrading to such a release then fails the storage preflight with
+`unsupported owner field "Features"`. A store that never retried an attempt or
+lost a result stays compatible with the earlier release.
 
 ## Limitations
 

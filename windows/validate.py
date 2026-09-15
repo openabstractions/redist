@@ -18,7 +18,36 @@ SCOPES = {"for everyone": True, "just for me": False}
 # What starts the supervisor, in each scope. Both arms exist or one scope
 # installs the programs and nothing that ever runs them.
 ARMS = {True: "SupervisorServiceMarker", False: "LogonStartShortcut"}
-SUPERVISOR_ACTIONS = ("RegisterSupervisor", "RollbackSupervisor", "UnregisterSupervisor", "StopPreviousSupervisor")
+SUPERVISOR_ACTIONS = ("RegisterSupervisor", "RollbackSupervisor", "UnregisterSupervisor", "StopPreviousSupervisor",
+                      "BeginMachineUpgradeExclusion", "EndMachineUpgradeExclusion", "RestartPreviousSupervisor")
+UPGRADE_CONDITIONS = {"machine": "ALLUSERS AND WIX_UPGRADE_DETECTED AND NOT REMOVE",
+                      "user": "NOT ALLUSERS AND WIX_UPGRADE_DETECTED AND NOT REMOVE"}
+# The early script, in order. For each scope: hold the upgrade exclusion,
+# register its release on commit, register the rollback restart, then stop the
+# predecessor. InstallExecute flushes all eight before RemoveExistingProducts,
+# and rollback runs them in reverse: release and restart after the old product
+# is restored. (action, scope, ExeCommand, Execute, Impersonate, Return)
+UPGRADE_CHAIN = (
+    ("BeginMachineUpgradeExclusion", "machine",
+     'service begin-upgrade --machine "[APPLICATIONFOLDER]." --related "[WIX_UPGRADE_DETECTED]"', "deferred", "no", "check"),
+    ("EndMachineUpgradeExclusion", "machine", "service end-upgrade --machine", "commit", "no", "check"),
+    ("RestartPreviousSupervisor", "machine", "service start --machine", "rollback", "no", "ignore"),
+    ("StopPreviousSupervisor", "machine", "service stop", "deferred", "no", "check"),
+    ("BeginUserUpgradeExclusion", "user",
+     'service begin-upgrade --user "[APPLICATIONFOLDER]." --related "[WIX_UPGRADE_DETECTED]"', "deferred", "yes", "check"),
+    ("EndUserUpgradeExclusion", "user", "service end-upgrade --user", "commit", "yes", "check"),
+    ("RestartPreviousUserSupervisor", "user", 'service start --related "[WIX_UPGRADE_DETECTED]"', "rollback", "yes", "ignore"),
+    ("StopPreviousUserSupervisor", "user",
+     'service stop --user "[APPLICATIONFOLDER]." --related "[WIX_UPGRADE_DETECTED]"', "deferred", "yes", "check"),
+)
+UPGRADE_MESSAGES = {
+    "StopPreviousSupervisor": "abstraction.wxs: incoming checked stop must execute before removal of the old product",
+    "StopPreviousUserSupervisor": "abstraction.wxs: incoming checked per-user stop must run impersonated from the embedded "
+                                  "jobd Binary against [APPLICATIONFOLDER] and the related products' recorded folders "
+                                  "before removal of the old product",
+    "RestartPreviousUserSupervisor": "abstraction.wxs: a failed per-user upgrade must restart the stopped predecessor from "
+                                     "a rollback action scheduled before StopPreviousUserSupervisor",
+}
 
 
 def rows(name):
@@ -51,37 +80,68 @@ def check_upgrade_shutdown(root):
         return next((el for el in root.iter() if untag(el) == tag
                      and (key is None or el.get(key) == value)), None)
 
-    def broken(rules):
-        return any(el is None or any(el.get(k) != v for k, v in attrs.items()) for el, attrs in rules)
-
     bad = []
-    machine = [
-        (find("MajorUpgrade"), {"Schedule": "afterInstallExecute"}),
-        (find("Binary", "Id", "UpgradeSupervisorCode"), {"SourceFile": "payload/tools/jobd.exe"}),
-        (find("CustomAction", "Id", "StopPreviousSupervisor"),
-         {"BinaryRef": "UpgradeSupervisorCode", "ExeCommand": "service stop",
-          "Execute": "deferred", "Impersonate": "no", "Return": "check"}),
-        (find("Custom", "Action", "StopPreviousSupervisor"),
-         {"After": "InstallInitialize", "Condition": "ALLUSERS AND WIX_UPGRADE_DETECTED AND NOT REMOVE"}),
-    ]
-    if broken(machine):
-        bad.append("abstraction.wxs: incoming checked stop must execute before removal of the old product")
-    # Per-user: the installing account's token, the embedded incoming image and
-    # the upgraded folder, flushed in the same early script as the machine stop.
-    user_action = find("CustomAction", "Id", "StopPreviousUserSupervisor")
-    user = [
-        (user_action,
-         {"BinaryRef": "UpgradeSupervisorCode", "ExeCommand": 'service stop --user "[APPLICATIONFOLDER]."',
-          "Execute": "deferred", "Impersonate": "yes", "Return": "check"}),
-        (find("Custom", "Action", "StopPreviousUserSupervisor"),
-         {"After": "StopPreviousSupervisor", "Condition": "NOT ALLUSERS AND WIX_UPGRADE_DETECTED AND NOT REMOVE"}),
-    ]
-    if broken(user) or (user_action is not None and user_action.get("FileRef") is not None):
-        bad.append("abstraction.wxs: incoming checked per-user stop must run impersonated from the embedded "
-                   "jobd Binary against [APPLICATIONFOLDER] before removal of the old product")
-    if broken([(find("InstallExecute"), {"After": "StopPreviousUserSupervisor"})]):
+    major = find("MajorUpgrade")
+    binary = find("Binary", "Id", "UpgradeSupervisorCode")
+    if (major is None or major.get("Schedule") != "afterInstallExecute"
+            or binary is None or binary.get("SourceFile") != "payload/tools/jobd.exe"):
+        bad.append(UPGRADE_MESSAGES["StopPreviousSupervisor"])
+    previous = "InstallInitialize"
+    for action, scope, command, execute, impersonate, returns in UPGRADE_CHAIN:
+        element = find("CustomAction", "Id", action)
+        row = find("Custom", "Action", action)
+        expected = {"BinaryRef": "UpgradeSupervisorCode", "ExeCommand": command,
+                    "Execute": execute, "Impersonate": impersonate, "Return": returns}
+        ok = (element is not None and element.get("FileRef") is None
+              and all(element.get(k) == v for k, v in expected.items())
+              and row is not None and row.get("After") == previous and row.get("Before") is None
+              and row.get("Condition") == UPGRADE_CONDITIONS[scope])
+        if not ok:
+            token = "the installing user's token" if impersonate == "yes" else "an administrator token"
+            bad.append(UPGRADE_MESSAGES.get(action, (
+                f"abstraction.wxs: {action} must be a {execute} action with {token} and return={returns}, "
+                f"running `{command}` from the embedded incoming jobd after {previous} for {scope} upgrades")))
+        previous = action
+    flush = find("InstallExecute")
+    if flush is None or flush.get("After") != previous:
         bad.append("abstraction.wxs: the early InstallExecute must flush both incoming stops before "
                    "RemoveExistingProducts")
+    return bad
+
+
+# Per-user activation's reviewed condition. The elevated refusal is exactly this
+# condition with AdminUser, so it fires wherever activation would refuse the token.
+START_USER_RUNTIME_CONDITION = 'NOT ALLUSERS AND NOT (REMOVE="ALL") AND NOT UPGRADINGPRODUCTCODE'
+
+
+def check_elevated_scope(root):
+    def find(tag, key, value):
+        return next((el for el in root.iter() if untag(el) == tag and el.get(key) == value), None)
+
+    def scheduled(action):
+        return [(untag(sequence), el) for sequence in root.iter()
+                if untag(sequence) in ("InstallExecuteSequence", "InstallUISequence")
+                for el in sequence if untag(el) == "Custom" and el.get("Action") == action]
+
+    bad = []
+    detection = find("Property", "Id", "MSIUSEREALADMINDETECTION")
+    if detection is None or detection.get("Value") != "1":
+        bad.append("abstraction.wxs: AdminUser must report the installing token (MSIUSEREALADMINDETECTION=1); "
+                   "otherwise a policy-elevated standard user is refused")
+    start = find("CustomAction", "Id", "StartUserRuntime")
+    start_rows = scheduled("StartUserRuntime")
+    if (start is None or "--require-unelevated" not in (start.get("ExeCommand") or "").split()
+            or len(start_rows) != 1 or start_rows[0][1].get("Condition") != START_USER_RUNTIME_CONDITION):
+        bad.append("abstraction.wxs: per-user activation must keep --require-unelevated under its reviewed condition")
+    refusal = find("CustomAction", "Id", "RefuseElevatedPerUserInstall")
+    if refusal is None or set(refusal.attrib) != {"Id", "Error"} or "ALLUSERS=1" not in refusal.get("Error", ""):
+        bad.append("abstraction.wxs: RefuseElevatedPerUserInstall must be an error action naming ALLUSERS=1")
+    rows = scheduled("RefuseElevatedPerUserInstall")
+    expected = "AdminUser AND " + START_USER_RUNTIME_CONDITION
+    if (len(rows) != 1 or rows[0][0] != "InstallExecuteSequence" or rows[0][1].get("Before") != "CostInitialize"
+            or rows[0][1].get("After") is not None or rows[0][1].get("Condition") != expected):
+        bad.append("abstraction.wxs: an elevated per-user install must be refused in InstallExecuteSequence "
+                   f"before CostInitialize under exactly {expected!r}")
     return bad
 
 
@@ -292,6 +352,7 @@ def main():
                  for el in root.iter() if untag(el) == "Custom"}
     bad.extend(check_supervisor_removal(root))
     bad.extend(check_upgrade_shutdown(root))
+    bad.extend(check_elevated_scope(root))
     for action in SUPERVISOR_ACTIONS:
         if action not in sequenced:
             bad.append(f"abstraction.wxs: {action} is sequenced nowhere")

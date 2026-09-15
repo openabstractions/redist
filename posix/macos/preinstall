@@ -48,12 +48,18 @@ agent_state() {
     '
 }
 state=$(agent_state)
+booted=no
 if [ "$state" = present ]; then
     manager bootout "gui/$uid/com.openabstractions.jobd"
+    booted=yes
     state=$(agent_state)
 fi
 [ "$state" = absent ] || {
     echo "preinstall: previous LaunchAgent remains registered; replacement refused" >&2
     exit 1
 }
-echo "ok    previous LaunchAgent absence verified before replacement; graceful exit is not independently established"
+if [ "$booted" = yes ]; then
+    echo "ok    booted out running previous LaunchAgent gui/$uid/com.openabstractions.jobd; absence verified before replacement; graceful exit is not independently established"
+else
+    echo "ok    no previous LaunchAgent registered in gui/$uid; nothing booted out before replacement"
+fi

@@ -103,15 +103,20 @@ destination the installer offers is the current user's home.
 | what | where |
 |---|---|
 | `jobd`, `dl`, `jobctl`, `openabstractions`, universal | `~/.local/bin/` |
-| the LaunchAgent | `~/Library/LaunchAgents/com.openabstractions.jobd.plist` |
+| the LaunchAgent template | `~/.local/share/abstraction/com.openabstractions.jobd.plist` |
+| the LaunchAgent, written by `postinstall` | `~/Library/LaunchAgents/com.openabstractions.jobd.plist` |
 | the Python packages and `USING.txt` | `~/.local/share/abstraction/dev/` |
 | `LICENSE` | `~/.local/share/abstraction/` |
 | the uninstaller and its two lists | `~/.local/share/abstraction/{uninstall.sh,FILES,MANIFEST}` |
 
 **LaunchAgent identifier: `com.openabstractions.jobd`**, at
-`~/Library/LaunchAgents/com.openabstractions.jobd.plist`. `RunAtLoad` is the
-logon task; `StartInterval 300` is the five-minute sweep. `scripts/postinstall`
-substitutes the absolute path of `jobd`, writes `MANIFEST`, changes ownership of
+`~/Library/LaunchAgents/com.openabstractions.jobd.plist`. It runs
+`openabstractions serve runtime` with `RunAtLoad` and `KeepAlive`. The package
+scripts run as the installing user for a home-domain install. The payload
+carries the plist as a template in the share directory. `scripts/postinstall`
+substitutes the absolute path of the programs into a temporary file beside the
+template, renames the finished file into `~/Library/LaunchAgents`, so Background
+Task Management never reads the `@BIN@` placeholder, writes `MANIFEST`, changes ownership of
 listed payload files and their ancestor directories below the verified home, and runs `launchctl bootstrap gui/<uid>`. Manager-query,
 bootout, enable, or bootstrap errors fail installation. Register from the target
 user's graphical login session; the installed plist remains available after an
@@ -132,10 +137,18 @@ ancestors, and preserves unrelated sibling files.
 `ExitTimeOut=10` bounds launchd's cooperative shutdown interval, and
 `AbandonProcessGroup=false` retains launchd's process-group cleanup. This does not
 establish that shutdown was graceful, or impose a verified wall-clock bound on
-launchctl IPC. After stop verification it deletes every path in `MANIFEST`, prunes the empty
-directories, runs `pkgutil --forget com.openabstractions.abstraction`, and
-prints the command for `~/.abstraction` and
-`~/Library/Application Support/abstraction`.
+launchctl IPC. After stop verification it forgets the package receipt with
+`pkgutil --volume "$HOME" --forget com.openabstractions.abstraction`, because a
+home-domain install records its receipt in `~/Library/Receipts`; it falls back
+to `/` only when the receipt is there, and an absent receipt lets a rerun finish.
+It then deletes every other path in `MANIFEST`, prunes the empty directories, and
+removes the runtime's `openabstractions-*-$USER.sock.lock` files in `$TMPDIR`
+whose sockets are gone. `uninstall.sh`, `lifecycle.sh` and `MANIFEST` are deleted
+last. Success and every failure print the retained data:
+`~/.abstraction`, `~/Library/Application Support/abstraction`,
+`~/Library/Application Support/openabstractions/runtime-v1` and
+`~/Library/Caches/openabstractions`. A failure also prints the exact recovery
+command, which is runnable because the uninstaller is still in place.
 
 `openabstractions serve logging`, `openabstractions serve config`, and
 `openabstractions serve router-v1` run the selected capability in the foreground.
@@ -144,8 +157,8 @@ LaunchAgent runs `openabstractions serve runtime`. Current macOS peer proof cann
 the Program identity required by shared runtime clients. This package makes no
 macOS capability-readiness promise. Native macOS lifecycle verification remains
 required. Neither deleting a tarball nor deleting a `.pkg` performs uninstall;
-the installed `uninstall.sh` is the supported removal entry point. Receipt cleanup
-failure is reported even if macOS payload deletion already completed.
+the installed `uninstall.sh` is the supported removal entry point. A receipt
+cleanup failure stops removal with the payload and the uninstaller in place.
 
 ## Build it
 
