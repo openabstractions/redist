@@ -3,6 +3,7 @@ param(
     [string]$MsiPath,
     [string]$ExpectedSid,
     [switch]$CheckTools,
+    [switch]$Unscoped,
     [string]$PythonPath,
     [string]$PredecessorMsiPath,
     [string]$PredecessorSHA256,
@@ -424,6 +425,25 @@ function Invoke-CheckedTool([string]$Image, [string[]]$Arguments) {
     if ($result.ExitCode -ne 0) { throw "Tool exited $($result.ExitCode): $Image" }
     return ($result.Output -split '\r?\n')
 }
+# Unscoped passes neither ALLUSERS nor MSIINSTALLPERUSER; the package's own
+# defaults choose the scope, exactly as `msiexec /i package.msi /qn` does.
+function Get-CandidateInstallArguments([string]$Package, [bool]$Unscoped) {
+    if ($Unscoped) { return @('/i', "`"$Package`"", '/qn', '/norestart', '/l*v', 'unscoped.log') }
+    return @('/i', "`"$Package`"", '/qn', '/norestart', 'ALLUSERS=2', 'MSIINSTALLPERUSER=1', '/l*v', 'user-install.log')
+}
+# An unscoped install chose one scope and did all of it: one per-user product
+# registration for this account and nothing of the machine arm.
+function Assert-SingleUserScope([string]$MachineFolder = (Join-Path $env:ProgramFiles 'OpenAbstractions'), [string]$MachineKey = 'HKLM:\Software\OpenAbstractions') {
+    if (Test-Path -LiteralPath $MachineFolder) { throw "an unscoped install also created the machine folder $MachineFolder" }
+    if (Test-Path -LiteralPath $MachineKey) { throw 'an unscoped install also wrote the machine registry key' }
+    if (@(Get-Service | Where-Object { $_.Name -like 'OpenAbstractionsSupervisor*' }).Count) { throw 'an unscoped install also registered the machine supervisor service' }
+    $sid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+    $products = @(Get-UserProducts | Where-Object { $_.ProductName -eq 'Abstraction' })
+    if ($products.Count -ne 1 -or $products[0].Context -ne 2 -or $products[0].UserSid -ne $sid -or $products[0].State -ne '5') {
+        throw "an unscoped install did not register exactly one per-user product for this account; observed: $($products | ConvertTo-Json -Depth 3 -Compress)"
+    }
+    'ok    an unscoped install chose the per-user scope and nothing of the machine scope'
+}
 function Assert-InstalledUserTools([string]$Tools) {
 $dir = Split-Path -Parent $tools
 if (-not (Test-Path $tools)) { throw "a per-user install did not land in $tools" }
@@ -513,6 +533,7 @@ if ($Mode -eq 'User') {
     if ($identity.User.Value -ne $ExpectedSid -or $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
         throw 'Fixture requires the exact private non-admin account'
     }
+    if ($Unscoped -and $PredecessorMsiPath) { throw 'Unscoped verification installs a fresh package and takes no predecessor' }
     $env:ABSTRACTION_RUNTIME_ENDPOINT = $null
     $env:ABSTRACTION_STORE = $null
     $env:MODELGET_STORE = $null
@@ -544,11 +565,13 @@ if ($Mode -eq 'User') {
         }
         $installAttempted = $true
         Invoke-InstallWithDiagnostics {
-            Invoke-Bounded msiexec.exe @('/i', "`"$MsiPath`"", '/qn', '/norestart', 'ALLUSERS=2', 'MSIINSTALLPERUSER=1', '/l*v', 'user-install.log')
+            Invoke-Bounded msiexec.exe (Get-CandidateInstallArguments $MsiPath $Unscoped.IsPresent)
         } { Save-ActivationFailure $tools }
         $installed = $true
         if ($PredecessorMsiPath) { Assert-PreviousProcessesExited $previousProcesses }
-        if ($CheckTools) { Assert-InstalledUserTools $tools; Assert-ToolStoreCompatibility $tools $PythonPath }
+        if ($CheckTools -or $Unscoped) { Assert-InstalledUserTools $tools }
+        if ($Unscoped) { Assert-SingleUserScope }
+        if ($CheckTools) { Assert-ToolStoreCompatibility $tools $PythonPath }
         $central = Join-Path $tools 'openabstractions.exe'
         Assert-RuntimeReady $central post-install-status
         if ($PredecessorMsiPath) {
@@ -577,7 +600,8 @@ if ($Mode -eq 'User') {
         # These assertions precede outer fixture cleanup and its process termination.
         Assert-NoRuntime $ExpectedSid 'removal-remaining.json' (Split-Path -Parent $tools)
         if ($sentinel) { Assert-RetainedSentinel $sentinel $sentinelValue; Assert-RemovedRegistration }
-        if ($CheckTools) {
+        if ($Unscoped) { Assert-RemovedRegistration }
+        if ($CheckTools -or $Unscoped) {
             if (Test-Path (Split-Path -Parent $tools)) { throw 'Install folder survived removal' }
             if (Test-Path 'HKCU:\Software\OpenAbstractions') { throw 'User registry key survived removal' }
             $userPath = (Get-ItemProperty 'HKCU:\Environment' -Name Path -ErrorAction SilentlyContinue).Path
@@ -606,6 +630,7 @@ if ($Mode -eq 'User') {
 
 $MsiPath = (Resolve-Path -LiteralPath $MsiPath).Path
 if ([IO.Path]::GetExtension($MsiPath) -ne '.msi') { throw 'Expected an MSI package' }
+if ($Unscoped -and $PredecessorMsiPath) { throw 'Unscoped verification installs a fresh package and takes no predecessor' }
 if (@(Get-Service | Where-Object { $_.Name -like 'OpenAbstractionsSupervisor*' }).Count) { throw 'Run per-user verification on a separate clean runner' }
 $user = 'oa_ci_' + [Guid]::NewGuid().ToString('N').Substring(0,10)
 $directory = Join-Path $env:ProgramData ('OA-User-Test-' + [Guid]::NewGuid().ToString('N'))
@@ -641,6 +666,7 @@ exit $LASTEXITCODE
     $credential = New-Object Management.Automation.PSCredential("$env:COMPUTERNAME\$user", (ConvertTo-SecureString $password -AsPlainText -Force))
     $arguments = @('-NoProfile','-ExecutionPolicy','Bypass','-File',"`"$directory\launcher.ps1`"",'-Mode','User','-MsiPath',"`"$directory\package.msi`"",'-ExpectedSid',$account.SID.Value)
     if ($PredecessorMsiPath) { $arguments += @('-PredecessorMsiPath',"`"$directory\predecessor.msi`"",'-PredecessorSHA256',$PredecessorSHA256,'-ExpectedVersion',$ExpectedVersion) }
+    if ($Unscoped) { $arguments += '-Unscoped' }
     if ($CheckTools) {
         if (-not $PythonPath -or -not (Test-Path -LiteralPath $PythonPath -PathType Leaf)) { throw 'Release tools check requires an explicit existing Python executable' }
         $arguments += @('-CheckTools','-PythonPath',"`"$PythonPath`"")

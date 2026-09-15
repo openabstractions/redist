@@ -83,6 +83,16 @@ and uninstall checks. Building an architecture does not prove installation on
 that architecture. Do not infer a Windows install result from Linux verification,
 or an installed macOS service from a signed package.
 
+## Known issues
+
+- **Windows: an elevated install with no scope named fails.** Running the MSI
+  with no install scope from an elevated administrator prompt, or from a
+  deployment tool running elevated, installs per-user and then fails with
+  Error 1722 / 1603 because the runtime refuses to start with administrator
+  rights. For a per-user install, run the MSI from a normal (unelevated) prompt
+  or double-click it as a normal user. For a machine install, pass
+  `ALLUSERS=1`.
+
 ## Limitations
 
 - `JOB_STORE` can point `jobctl` at a different store, as described above.
