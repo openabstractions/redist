@@ -42,8 +42,8 @@
          and a value set Before="InstallValidate" arrives after the shutdown it
          was meant to prevent. Every path that replaces or removes a running
          file therefore has an action of its own below: StopPreviousSupervisor
-         and StopPreviousUserSupervisor for upgrades, UnregisterSupervisor and
-         StopUserSupervisorOnRemoval for uninstalls. -->
+         and StopPreviousUserSupervisor for upgrades, StopSupervisorOnRemoval
+         and StopUserSupervisorOnRemoval for uninstalls. -->
     <Property Id="MSIRESTARTMANAGERCONTROL" Value="Disable" />
     <Property Id="MSIRMSHUTDOWN" Value="0" />
     <!-- AdminUser reports the installing token itself. Without this, Windows sets
@@ -231,6 +231,19 @@
     <CustomAction Id="StopUserSupervisorOnRemoval" BinaryRef="UpgradeSupervisorCode"
                   ExeCommand="service stop --user &quot;[APPLICATIONFOLDER].&quot;"
                   Execute="deferred" Impersonate="yes" Return="check" />
+    <!-- The machine half of the same rule. UnregisterSupervisor runs at 3499,
+         in the script InstallFinalize executes, after the registry, shortcut
+         and environment removals at 2600 to 3300 have already run against a
+         supervisor that is still up. Measured on the hosted runner, run
+         35078760207: with a per-session instance running, that removal
+         exited 1; the same `service uninstall` run beforehand stopped and
+         removed the instance in 50 ms and the MSI removal then succeeded.
+         Until the Restart Manager was disabled, it stopped the instance at
+         InstallValidate and hid this. The stop runs here, in the early script
+         with the elevated token the SCM needs, before any removal. -->
+    <CustomAction Id="StopSupervisorOnRemoval" BinaryRef="UpgradeSupervisorCode"
+                  ExeCommand="service stop"
+                  Execute="deferred" Impersonate="no" Return="check" />
     <!-- A failed upgrade leaves the old product installed and its supervisor
          stopped. This rollback action runs each related product's own Startup
          activation from its recorded folder, so the old supervisor answers
@@ -316,7 +329,9 @@
               Condition="NOT ALLUSERS AND WIX_UPGRADE_DETECTED AND NOT REMOVE" />
       <Custom Action="StopUserSupervisorOnRemoval" After="StopPreviousUserSupervisor"
               Condition="NOT ALLUSERS AND REMOVE=&quot;ALL&quot; AND NOT UPGRADINGPRODUCTCODE" />
-      <InstallExecute After="StopUserSupervisorOnRemoval" />
+      <Custom Action="StopSupervisorOnRemoval" After="StopUserSupervisorOnRemoval"
+              Condition="ALLUSERS AND REMOVE=&quot;ALL&quot; AND NOT UPGRADINGPRODUCTCODE" />
+      <InstallExecute After="StopSupervisorOnRemoval" />
       <Custom Action="UnregisterSupervisor" Before="RemoveFiles"
               Condition="ALLUSERS AND REMOVE=&quot;ALL&quot; AND NOT UPGRADINGPRODUCTCODE" />
       <Custom Action="RollbackSupervisor" After="InstallFiles"

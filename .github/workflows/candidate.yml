@@ -499,13 +499,10 @@ jobs:
         shell: pwsh
         run: |
           $msi = (Resolve-Path pkg\abstraction-x64.msi).Path
-          # TEMPORARY DIAGNOSTIC (revert after one run): the command UnregisterSupervisor
-          # runs, by hand, in the state the MSI meets it, so its refusal names itself.
-          Get-CimInstance Win32_Service -Filter "Name LIKE 'OpenAbstractionsSupervisor%'" | ForEach-Object { "before: service $($_.Name) state=$($_.State) pid=$($_.ProcessId)" }
-          $diag = Join-Path $env:ProgramFiles 'OpenAbstractions\tools\jobd.exe'
-          & $diag service uninstall 2>&1 | ForEach-Object { "diagnostic jobd service uninstall: $_" }
-          "diagnostic jobd service uninstall exit=$LASTEXITCODE"
-          Get-CimInstance Win32_Service -Filter "Name LIKE 'OpenAbstractionsSupervisor%'" | ForEach-Object { "after: service $($_.Name) state=$($_.State) pid=$($_.ProcessId)" }
+          # The uninstall must meet a running instance, the case the Restart
+          # Manager used to hide by stopping it first.
+          $live = @(Get-CimInstance Win32_Service -Filter "Name LIKE 'OpenAbstractionsSupervisor[_]%'" | Where-Object State -eq 'Running' | ForEach-Object Name)
+          "instances running before uninstall: $(if ($live.Count) { $live -join ', ' } else { 'none' })"
           $p = Start-Process msiexec -Wait -PassThru -ArgumentList @('/x', $msi, '/qn', '/norestart', '/l*v', 'machine-uninstall.log')
           if ($p.ExitCode -ne 0) {
             # Windows Installer discards a custom action's output. Run the same
@@ -523,7 +520,15 @@ jobs:
           if ($LASTEXITCODE -ne 1060) { throw "the service template survived uninstall or its absence was not established: exit $LASTEXITCODE" }
           if (@(Get-Service -Name 'OpenAbstractionsSupervisor_*' -ErrorAction SilentlyContinue).Count) { throw 'a per-session instance survived uninstall' }
           foreach ($path in @((Join-Path $env:ProgramFiles 'OpenAbstractions'), 'HKLM:\Software\OpenAbstractions', (Join-Path $env:ProgramData 'abstraction'))) {
-            if (Test-Path -LiteralPath $path) { throw "uninstall left $path" }
+            if (Test-Path -LiteralPath $path) {
+            if (-not $path.StartsWith('HKLM:')) {
+              Get-ChildItem -LiteralPath $path -Recurse -Force | ForEach-Object {
+                "left: $($_.FullName) $($_.Length)"
+                if (-not $_.PSIsContainer -and $_.Length -lt 8192) { Get-Content -LiteralPath $_.FullName | ForEach-Object { "      $_" } }
+              }
+            }
+            throw "uninstall left $path"
+          }
           }
           & powershell.exe -NoProfile -ExecutionPolicy Bypass -STA -File test_service_session.ps1 -Mode VerifyRemoved -StatePath "$env:RUNNER_TEMP/oa-service-session.json"
           if ($LASTEXITCODE -ne 0) { throw "Runtime removal verification exited $LASTEXITCODE" }

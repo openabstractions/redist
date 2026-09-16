@@ -44,9 +44,14 @@ UPGRADE_CHAIN = (
 # follows the upgrade chain in the early script, and InstallExecute flushes it
 # with them, before RemoveFiles.
 # (action, ExeCommand, Execute, Impersonate, Return, After, Condition)
-REMOVAL_STOP = ("StopUserSupervisorOnRemoval", 'service stop --user "[APPLICATIONFOLDER]."',
-                "deferred", "yes", "check", "StopPreviousUserSupervisor",
-                'NOT ALLUSERS AND REMOVE="ALL" AND NOT UPGRADINGPRODUCTCODE')
+REMOVAL_STOPS = (
+    ("StopUserSupervisorOnRemoval", 'service stop --user "[APPLICATIONFOLDER]."',
+     "deferred", "yes", "check", "StopPreviousUserSupervisor",
+     'NOT ALLUSERS AND REMOVE="ALL" AND NOT UPGRADINGPRODUCTCODE'),
+    ("StopSupervisorOnRemoval", "service stop",
+     "deferred", "no", "check", "StopUserSupervisorOnRemoval",
+     'ALLUSERS AND REMOVE="ALL" AND NOT UPGRADINGPRODUCTCODE'),
+)
 # After the new version is committed, and only then, the predecessor is
 # removed. (action, Execute, Return, After, Condition)
 LATE_REMOVAL = (
@@ -131,20 +136,21 @@ def check_upgrade_shutdown(root):
                 f"abstraction.wxs: {action} must be a {execute} action with {token} and return={returns}, "
                 f"running `{command}` from the embedded incoming jobd after {previous} for {scope} upgrades")))
         previous = action
-    action, command, execute, impersonate, returns, after, condition = REMOVAL_STOP
-    element = find("CustomAction", "Id", action)
-    row = find("Custom", "Action", action)
-    if (element is None or element.get("BinaryRef") != "UpgradeSupervisorCode"
-            or element.get("ExeCommand") != command or element.get("Execute") != execute
-            or element.get("Impersonate") != impersonate or element.get("Return") != returns
-            or row is None or row.get("After") != after or row.get("Before") is not None
-            or row.get("Condition") != condition):
-        bad.append(f"abstraction.wxs: {action} must be a {execute} action with the installing user's token "
-                   f"and return={returns}, running `{command}` from the embedded jobd after {after} under "
-                   f"exactly {condition!r}: the Restart Manager is disabled, so nothing else ends the "
-                   "per-user supervisor before its files are deleted")
-    else:
-        previous = action
+    for action, command, execute, impersonate, returns, after, condition in REMOVAL_STOPS:
+        element = find("CustomAction", "Id", action)
+        row = find("Custom", "Action", action)
+        if (element is None or element.get("BinaryRef") != "UpgradeSupervisorCode"
+                or element.get("ExeCommand") != command or element.get("Execute") != execute
+                or element.get("Impersonate") != impersonate or element.get("Return") != returns
+                or row is None or row.get("After") != after or row.get("Before") is not None
+                or row.get("Condition") != condition):
+            token = "the installing user's token" if impersonate == "yes" else "an administrator token"
+            bad.append(f"abstraction.wxs: {action} must be a {execute} action with {token} "
+                       f"and return={returns}, running `{command}` from the embedded jobd after {after} under "
+                       f"exactly {condition!r}: the Restart Manager is disabled, so nothing else ends the "
+                       "supervisor before the removal script runs")
+        else:
+            previous = action
     flush = find("InstallExecute")
     if flush is None or flush.get("After") != previous:
         bad.append("abstraction.wxs: the early InstallExecute must flush every incoming stop, and the "
