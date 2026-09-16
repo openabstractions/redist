@@ -111,7 +111,9 @@
     </StandardDirectory>
 
     <StandardDirectory Id="CommonAppDataFolder">
-      <Directory Id="MachineConfigFolder" Name="abstraction" />
+      <Directory Id="MachineConfigFolder" Name="abstraction">
+        <Directory Id="MachineUpgradeFolder" Name="upgrade-v1" />
+      </Directory>
     </StandardDirectory>
 
     <StandardDirectory Id="StartupFolder" />
@@ -364,6 +366,12 @@
                        Name="folder" Type="string" Value="[MachineConfigFolder]" KeyPath="yes" />
         <RemoveRegistryKey Root="HKLM" Key="Software\OpenAbstractions\Abstraction\MachineConfig"
                            Action="removeOnUninstall" />
+        <!-- A machine upgrade creates upgrade-v1 here for its exclusion record
+             and releases the record at commit, leaving the directory. Nothing
+             else removes it, and while it exists this directory cannot be
+             removed either: hosted run 35084640715 left
+             %ProgramData%\abstraction\upgrade-v1 behind after uninstall. -->
+        <RemoveFolder Id="RemoveMachineUpgradeFolder" Directory="MachineUpgradeFolder" On="uninstall" />
       </Component>
     </ComponentGroup>
 
