@@ -24,9 +24,9 @@ UPGRADE_CONDITIONS = {"machine": "ALLUSERS AND WIX_UPGRADE_DETECTED AND NOT REMO
                       "user": "NOT ALLUSERS AND WIX_UPGRADE_DETECTED AND NOT REMOVE"}
 # The early script, in order. For each scope: hold the upgrade exclusion,
 # register its release on commit, register the rollback restart, then stop the
-# predecessor. InstallExecute flushes all eight before RemoveExistingProducts,
-# and rollback runs them in reverse: release and restart after the old product
-# is restored. (action, scope, ExeCommand, Execute, Impersonate, Return)
+# predecessor. InstallExecute flushes all eight before any file is replaced,
+# and rollback runs them in reverse: release and restart after the files are
+# restored. (action, scope, ExeCommand, Execute, Impersonate, Return)
 UPGRADE_CHAIN = (
     ("BeginMachineUpgradeExclusion", "machine",
      'service begin-upgrade --machine "[APPLICATIONFOLDER]." --related "[WIX_UPGRADE_DETECTED]"', "deferred", "no", "check"),
@@ -40,11 +40,31 @@ UPGRADE_CHAIN = (
     ("StopPreviousUserSupervisor", "user",
      'service stop --user "[APPLICATIONFOLDER]." --related "[WIX_UPGRADE_DETECTED]"', "deferred", "yes", "check"),
 )
+# Nothing else stops this package's processes, so removal stops its own. It
+# follows the upgrade chain in the early script, and InstallExecute flushes it
+# with them, before RemoveFiles.
+# (action, ExeCommand, Execute, Impersonate, Return, After, Condition)
+REMOVAL_STOP = ("StopUserSupervisorOnRemoval", 'service stop --user "[APPLICATIONFOLDER]."',
+                "deferred", "yes", "check", "StopPreviousUserSupervisor",
+                'NOT ALLUSERS AND REMOVE="ALL" AND NOT UPGRADINGPRODUCTCODE')
+# After the new version is committed, and only then, the predecessor is
+# removed. (action, Execute, Return, After, Condition)
+LATE_REMOVAL = (
+    ("RollbackSupervisor", "rollback", "ignore", "InstallFiles",
+     'ALLUSERS AND NOT (REMOVE="ALL") AND NOT WIX_UPGRADE_DETECTED'),
+    ("RegisterSupervisor", "deferred", "check", "RollbackSupervisor",
+     'ALLUSERS AND NOT (REMOVE="ALL") AND NOT WIX_UPGRADE_DETECTED'),
+    ("RegisterSupervisorAfterRemoval", "immediate", "check", "RemoveExistingProducts",
+     "ALLUSERS AND WIX_UPGRADE_DETECTED AND NOT REMOVE"),
+    ("StartUserRuntime", "immediate", "check", "RegisterSupervisorAfterRemoval",
+     'NOT ALLUSERS AND NOT (REMOVE="ALL") AND NOT UPGRADINGPRODUCTCODE'),
+)
 UPGRADE_MESSAGES = {
-    "StopPreviousSupervisor": "abstraction.wxs: incoming checked stop must execute before removal of the old product",
+    "StopPreviousSupervisor": "abstraction.wxs: incoming checked stop must execute before the new files replace the "
+                              "predecessor's, and the old product must be removed only after InstallFinalize",
     "StopPreviousUserSupervisor": "abstraction.wxs: incoming checked per-user stop must run impersonated from the embedded "
                                   "jobd Binary against [APPLICATIONFOLDER] and the related products' recorded folders "
-                                  "before removal of the old product",
+                                  "before the new files replace the predecessor's",
     "RestartPreviousUserSupervisor": "abstraction.wxs: a failed per-user upgrade must restart the stopped predecessor from "
                                      "a rollback action scheduled before StopPreviousUserSupervisor",
 }
@@ -63,6 +83,9 @@ def untag(el):
     return el.tag.split("}")[-1]
 
 
+UNREGISTER_CONDITION = 'ALLUSERS AND REMOVE="ALL" AND NOT UPGRADINGPRODUCTCODE'
+
+
 def check_supervisor_removal(root):
     actions = {el.get("Id"): el for el in root.iter() if untag(el) == "CustomAction"}
     action = actions.get("UnregisterSupervisor")
@@ -72,6 +95,12 @@ def check_supervisor_removal(root):
                      if untag(el) == "Custom" and el.get("Action") == "UnregisterSupervisor"), None)
     if sequence is None or sequence.get("Before") != "RemoveFiles":
         return ["abstraction.wxs: checked supervisor removal must precede RemoveFiles"]
+    # A successor removes this product after it has registered the shared
+    # service name for itself. Deleting the service there is what a shipped
+    # 0.1.5 does to us; this package does it to nobody.
+    if sequence.get("Condition") != UNREGISTER_CONDITION:
+        return ["abstraction.wxs: supervisor removal must run for a real uninstall only, under exactly "
+                f"{UNREGISTER_CONDITION!r}, so a successor's registration survives this product's removal"]
     return []
 
 
@@ -83,7 +112,7 @@ def check_upgrade_shutdown(root):
     bad = []
     major = find("MajorUpgrade")
     binary = find("Binary", "Id", "UpgradeSupervisorCode")
-    if (major is None or major.get("Schedule") != "afterInstallExecute"
+    if (major is None or major.get("Schedule") != "afterInstallFinalize"
             or binary is None or binary.get("SourceFile") != "payload/tools/jobd.exe"):
         bad.append(UPGRADE_MESSAGES["StopPreviousSupervisor"])
     previous = "InstallInitialize"
@@ -102,10 +131,39 @@ def check_upgrade_shutdown(root):
                 f"abstraction.wxs: {action} must be a {execute} action with {token} and return={returns}, "
                 f"running `{command}` from the embedded incoming jobd after {previous} for {scope} upgrades")))
         previous = action
+    action, command, execute, impersonate, returns, after, condition = REMOVAL_STOP
+    element = find("CustomAction", "Id", action)
+    row = find("Custom", "Action", action)
+    if (element is None or element.get("BinaryRef") != "UpgradeSupervisorCode"
+            or element.get("ExeCommand") != command or element.get("Execute") != execute
+            or element.get("Impersonate") != impersonate or element.get("Return") != returns
+            or row is None or row.get("After") != after or row.get("Before") is not None
+            or row.get("Condition") != condition):
+        bad.append(f"abstraction.wxs: {action} must be a {execute} action with the installing user's token "
+                   f"and return={returns}, running `{command}` from the embedded jobd after {after} under "
+                   f"exactly {condition!r}: the Restart Manager is disabled, so nothing else ends the "
+                   "per-user supervisor before its files are deleted")
+    else:
+        previous = action
     flush = find("InstallExecute")
     if flush is None or flush.get("After") != previous:
-        bad.append("abstraction.wxs: the early InstallExecute must flush both incoming stops before "
-                   "RemoveExistingProducts")
+        bad.append("abstraction.wxs: the early InstallExecute must flush every incoming stop, and the "
+                   "removal stop, before RemoveFiles and InstallFiles")
+    manager = find("Property", "Id", "MSIRESTARTMANAGERCONTROL")
+    if manager is None or manager.get("Value") != "Disable":
+        bad.append("abstraction.wxs: MSIRESTARTMANAGERCONTROL must be an authored Property set to Disable. "
+                   "The Restart Manager shuts the supervisor down at InstallValidate, before the action "
+                   "that records what to restart, and its session opens before the first sequenced action, "
+                   "so a SetProperty arrives too late")
+    for action, execute, returns, after, condition in LATE_REMOVAL:
+        element = find("CustomAction", "Id", action)
+        row = find("Custom", "Action", action)
+        if (element is None or element.get("Execute") != execute or element.get("Return") != returns
+                or row is None or row.get("After") != after or row.get("Before") is not None
+                or row.get("Condition") != condition):
+            bad.append(f"abstraction.wxs: {action} must be an {execute} action with return={returns}, "
+                       f"scheduled after {after} under exactly {condition!r}, so the predecessor's own "
+                       "uninstall cannot delete the shared supervisor service this version registered")
     return bad
 
 

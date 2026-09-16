@@ -12,22 +12,44 @@
 
     <SummaryInformation Description="Downloads that survive the program that started them" />
 
-    <MajorUpgrade AllowSameVersionUpgrades="yes" Schedule="afterInstallExecute"
+    <!-- The predecessor is removed after this installation is committed.
+         Inside the transaction, a failure rolls the removal back, and an
+         unelevated per-user rollback is denied the HKLM registration it would
+         have to rewrite: the predecessor came back as files with no product
+         registration, no Apps and features entry and no way to restart it
+         (feedback/windows-per-user-upgrade-rollback-registration.md). After
+         InstallFinalize the predecessor is untouched until this version is
+         committed, so any failure before that leaves the previous version
+         installed, registered and runnable — the owner's ruling of
+         2026-09-16. The price is a second transaction: if the predecessor's
+         own uninstall fails, both products stay installed
+         (https://learn.microsoft.com/en-us/windows/win32/msi/removeexistingproducts-action). -->
+    <MajorUpgrade AllowSameVersionUpgrades="yes" Schedule="afterInstallFinalize"
                   DowngradeErrorMessage="A newer Abstraction is already installed. Remove it from Apps and features before installing this one." />
     <MediaTemplate EmbedCab="yes" />
 
     <Property Id="ARPURLINFOABOUT" Value="https://github.com/openabstractions" />
     <Property Id="ARPNOREPAIR" Value="1" />
-    <!-- Native GUI session handling closes the per-user supervisor and its
-         contained runtime. Keep graceful Restart Manager shutdown enabled. -->
-    <Property Id="MSIRESTARTMANAGERCONTROL" Value="0" />
+    <!-- The package stops its own supervisor, so the Restart Manager must not.
+         It shuts applications down at InstallValidate, 1400, and every action
+         here that records what it stopped runs at 1505 and later. Measured on
+         a v0.1.6 predecessor: the Restart Manager ended the supervisor first,
+         `service stop` found nothing to record, and the rollback restart had
+         nothing to start, so a failed upgrade left no supervisor until the
+         next sign-in (feedback/restart-manager-preempts-the-supervisor-stop.md).
+         This is a package default and not a SetProperty: Windows Installer
+         opens its Restart Manager session before the first sequenced action,
+         and a value set Before="InstallValidate" arrives after the shutdown it
+         was meant to prevent. Every path that replaces or removes a running
+         file therefore has an action of its own below: StopPreviousSupervisor
+         and StopPreviousUserSupervisor for upgrades, UnregisterSupervisor and
+         StopUserSupervisorOnRemoval for uninstalls. -->
+    <Property Id="MSIRESTARTMANAGERCONTROL" Value="Disable" />
     <Property Id="MSIRMSHUTDOWN" Value="0" />
     <!-- AdminUser reports the installing token itself. Without this, Windows sets
          AdminUser wherever Privileged is set, including AlwaysInstallElevated for
          a standard user, whose per-user activation works. -->
     <Property Id="MSIUSEREALADMINDETECTION" Value="1" />
-    <SetProperty Id="MSIDISABLERMRESTART" Value="1" Before="InstallValidate" Sequence="execute"
-                 Condition="NOT ALLUSERS AND REMOVE=&quot;ALL&quot;" />
 
     <!-- A build that was not handed a source drops the files it would have
          carried, and every one of those drops is silent: build.py prints a
@@ -150,8 +172,10 @@
          Every one of these is conditioned on ALLUSERS. A per-user install has
          no administrator token, and an action that needs one there is the 1603
          the logon schtasks returned. -->
-    <!-- Execute incoming shutdown code before the cached old MSI can remove
-         files. The early InstallExecute flushes these deferred actions alone. -->
+    <!-- Execute incoming shutdown code before any file is replaced. The early
+         InstallExecute flushes these deferred actions alone, ahead of
+         RemoveFiles and InstallFiles, so no predecessor process holds a file
+         this package is about to overwrite. -->
     <Binary Id="UpgradeSupervisorCode" SourceFile="payload/tools/jobd.exe" />
     <!-- Upgrade exclusion. Before a stop, the incoming jobd records the folders
          being replaced and this installer process; every activation path of
@@ -159,7 +183,14 @@
          releases it. The rollback action releases it and restarts exactly what
          the stop recorded. Order in the early script: begin, commit release,
          rollback restart, stop. Rollback runs in reverse, so the record is
-         released and its processes restarted after the old product is back. -->
+         released and its processes restarted after the files are back.
+
+         The window now covers the file replacement and ends at commit. The
+         predecessor's own removal runs after that, in its own transaction,
+         with nothing of the predecessor running: its processes were ended by
+         the stop, its per-user activation is a Startup shortcut that runs at
+         sign-in, and its machine service was stopped and is not restarted. -->
+
     <CustomAction Id="BeginMachineUpgradeExclusion" BinaryRef="UpgradeSupervisorCode"
                   ExeCommand="service begin-upgrade --machine &quot;[APPLICATIONFOLDER].&quot; --related &quot;[WIX_UPGRADE_DETECTED]&quot;"
                   Execute="deferred" Impersonate="no" Return="check" />
@@ -190,25 +221,68 @@
     <CustomAction Id="StopPreviousUserSupervisor" BinaryRef="UpgradeSupervisorCode"
                   ExeCommand="service stop --user &quot;[APPLICATIONFOLDER].&quot; --related &quot;[WIX_UPGRADE_DETECTED]&quot;"
                   Execute="deferred" Impersonate="yes" Return="check" />
-    <!-- A failed upgrade rolls the old product back after its supervisor was
+    <!-- Removal has to end the supervisor too, now that the Restart Manager is
+         not there to do it: its files are about to be deleted and it holds its
+         own image. It names no related products, because a removal has no
+         predecessor: the folder being removed is the whole scope. Narrowed to
+         a real uninstall:
+         under UPGRADINGPRODUCTCODE a successor is removing this product, it
+         already stopped this supervisor at 1508, and the folder is its own. -->
+    <CustomAction Id="StopUserSupervisorOnRemoval" BinaryRef="UpgradeSupervisorCode"
+                  ExeCommand="service stop --user &quot;[APPLICATIONFOLDER].&quot;"
+                  Execute="deferred" Impersonate="yes" Return="check" />
+    <!-- A failed upgrade leaves the old product installed and its supervisor
          stopped. This rollback action runs each related product's own Startup
          activation from its recorded folder, so the old supervisor answers
          again before the next sign-in. Scheduled before the stop, the script
          holds it whenever the stop has run. A restart failure is logged and
-         does not block the rollback. -->
+         does not block the rollback. With the removal after InstallFinalize
+         the related product is still registered when this runs, so the start
+         reads its version and install location through the MSI API instead of
+         answering MsiGetProductInfoExW 1608. -->
     <CustomAction Id="RestartPreviousUserSupervisor" BinaryRef="UpgradeSupervisorCode"
                   ExeCommand="service start --related &quot;[WIX_UPGRADE_DETECTED]&quot;"
                   Execute="rollback" Impersonate="yes" Return="ignore" />
+    <!-- Fresh machine installs and repairs register the supervisor inside the
+         transaction, with the elevated token the SCM needs, and undo it on
+         rollback. A machine upgrade does neither: the predecessor's own
+         registration of the same shared service name is still live, and
+         deleting it on rollback would take the previous version's supervisor
+         with it — the thing a failed upgrade must leave working. -->
     <CustomAction Id="RegisterSupervisor" FileRef="jobd.exe" ExeCommand="service install --runtime"
                   Execute="deferred" Impersonate="no" Return="check" />
     <CustomAction Id="RollbackSupervisor" FileRef="jobd.exe" ExeCommand="service uninstall"
                   Execute="rollback" Impersonate="no" Return="ignore" />
-    <!-- Preserve the payload if supervisor shutdown cannot be confirmed. -->
+    <!-- The shared service name is the one thing a late removal cannot leave
+         alone. 0.1.5 and 0.1.6 run their own `service uninstall` while being
+         removed, and that removal now happens after this version would have
+         registered `OpenAbstractionsSupervisor`, so the predecessor deletes
+         the successor's service. Nothing deferred can run after
+         RemoveExistingProducts — the execution script is committed at
+         InstallFinalize — so a machine upgrade registers here instead, in the
+         immediate sequence, after the predecessor's uninstall has finished.
+         `service install` creates or rewrites the registration and its
+         recovery policy, so running it once at the end is the whole
+         registration for an upgrade. It reaches the SCM with the token that
+         started msiexec; Return="check" reports a machine upgrade that could
+         not register its supervisor rather than leaving one that installed
+         the programs and nothing that runs them. -->
+    <CustomAction Id="RegisterSupervisorAfterRemoval" FileRef="jobd.exe" ExeCommand="service install --runtime"
+                  Execute="immediate" Return="check" />
+    <!-- Preserve the payload if supervisor shutdown cannot be confirmed. The
+         removal half is scoped to a real uninstall: under UPGRADINGPRODUCTCODE
+         this product is being removed by a successor that has already stopped
+         this supervisor and owns the shared service name from
+         RegisterSupervisorAfterRemoval onwards. Deleting it there is what
+         0.1.5 does to us. -->
     <CustomAction Id="UnregisterSupervisor" FileRef="jobd.exe" ExeCommand="service uninstall"
                   Execute="deferred" Impersonate="no" Return="check" />
-    <!-- Activation follows the committed install. A failure reports an error
-         with installed files retained; it cannot promise transaction rollback.
-         The executable checks its process token before any start/bus lookup. -->
+    <!-- Activation follows the committed install and the predecessor's removal.
+         A failure reports an error with installed files retained; it cannot
+         promise transaction rollback. Starting before the removal would run
+         the new runtime out of a folder the predecessor's uninstall is still
+         accounting for. The executable checks its process token before any
+         start/bus lookup. -->
     <CustomAction Id="StartUserRuntime" FileRef="jobdw.exe"
                   ExeCommand="start --runtime --require-unelevated"
                   Execute="immediate" Impersonate="yes" Return="check" />
@@ -240,14 +314,18 @@
               Condition="NOT ALLUSERS AND WIX_UPGRADE_DETECTED AND NOT REMOVE" />
       <Custom Action="StopPreviousUserSupervisor" After="RestartPreviousUserSupervisor"
               Condition="NOT ALLUSERS AND WIX_UPGRADE_DETECTED AND NOT REMOVE" />
-      <InstallExecute After="StopPreviousUserSupervisor" />
+      <Custom Action="StopUserSupervisorOnRemoval" After="StopPreviousUserSupervisor"
+              Condition="NOT ALLUSERS AND REMOVE=&quot;ALL&quot; AND NOT UPGRADINGPRODUCTCODE" />
+      <InstallExecute After="StopUserSupervisorOnRemoval" />
       <Custom Action="UnregisterSupervisor" Before="RemoveFiles"
-              Condition="ALLUSERS AND (REMOVE=&quot;ALL&quot; OR UPGRADINGPRODUCTCODE)" />
+              Condition="ALLUSERS AND REMOVE=&quot;ALL&quot; AND NOT UPGRADINGPRODUCTCODE" />
       <Custom Action="RollbackSupervisor" After="InstallFiles"
-              Condition="ALLUSERS AND NOT (REMOVE=&quot;ALL&quot;)" />
+              Condition="ALLUSERS AND NOT (REMOVE=&quot;ALL&quot;) AND NOT WIX_UPGRADE_DETECTED" />
       <Custom Action="RegisterSupervisor" After="RollbackSupervisor"
-              Condition="ALLUSERS AND NOT (REMOVE=&quot;ALL&quot;)" />
-      <Custom Action="StartUserRuntime" After="InstallFinalize"
+              Condition="ALLUSERS AND NOT (REMOVE=&quot;ALL&quot;) AND NOT WIX_UPGRADE_DETECTED" />
+      <Custom Action="RegisterSupervisorAfterRemoval" After="RemoveExistingProducts"
+              Condition="ALLUSERS AND WIX_UPGRADE_DETECTED AND NOT REMOVE" />
+      <Custom Action="StartUserRuntime" After="RegisterSupervisorAfterRemoval"
               Condition="NOT ALLUSERS AND NOT (REMOVE=&quot;ALL&quot;) AND NOT UPGRADINGPRODUCTCODE" />
     </InstallExecuteSequence>
 

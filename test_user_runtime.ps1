@@ -10,6 +10,7 @@ param(
     [string]$PythonPath,
     [string]$PredecessorMsiPath,
     [string]$PredecessorSHA256,
+    [string]$PredecessorVersion,
     [string]$ExpectedVersion,
     [string]$ResultDirectory = (Join-Path (Get-Location) 'user-runtime-diagnostics')
 )
@@ -269,14 +270,24 @@ function Assert-RemovedRegistration {
         throw "Per-user product registration survived removal: $($products | ConvertTo-Json -Depth 3 -Compress)"
     }
 }
-function Start-PredecessorSupervisor([string]$Tools) {
+# The predecessor's Startup shortcut, as that version authored it. Through 0.1.5
+# it ran `start`; from 0.1.6 the windowless supervisor starts the contained
+# runtime and it runs `start --runtime`. The rule reads the version it was given,
+# so moving the qualification's predecessor forward changes nothing here.
+function Get-PredecessorActivation([string]$Version) {
+    if ($Version -notmatch '^\d+\.\d+\.\d+$') { throw "A predecessor version is required to select its activation arguments: '$Version'" }
+    if ([version]$Version -le [version]'0.1.5') { return 'start' }
+    return 'start --runtime'
+}
+function Start-PredecessorSupervisor([string]$Tools, [string]$Version) {
+    $expected = Get-PredecessorActivation $Version
     $shell = New-Object -ComObject WScript.Shell
     $shortcut = $shell.CreateShortcut((Join-Path (Get-ProfileFolder Startup) 'Abstraction supervisor.lnk'))
     try {
         $targets = @('jobd.exe','jobdw.exe' | ForEach-Object { [IO.Path]::GetFullPath((Join-Path $Tools $_)) })
-        if ($shortcut.TargetPath -notin $targets -or $shortcut.Arguments -notin @('start','start --runtime') -or
+        if ($shortcut.TargetPath -notin $targets -or $shortcut.Arguments -ne $expected -or
             $shortcut.WorkingDirectory.TrimEnd([char[]]'\/') -ne $Tools.TrimEnd([char[]]'\/')) {
-            throw 'Predecessor shortcut does not select its installed supervisor'
+            throw "Predecessor $Version shortcut does not select its installed supervisor with '$expected'"
         }
         Push-Location $Tools
         try { Invoke-Bounded $shortcut.TargetPath @($shortcut.Arguments) 30 } finally { Pop-Location }
@@ -328,19 +339,25 @@ function Invoke-CheckedTool([string]$Image, [string[]]$Arguments) {
     return ($result.Output -split '\r?\n')
 }
 # The hosted proof for a per-user upgrade: the incoming stop succeeded, its
-# script flushed before RemoveExistingProducts, and the executed command carried
-# a resolved folder and related ProductCodes. Mirrors check() in
+# script flushed before any file was replaced, the executed command carried a
+# resolved folder and related ProductCodes, and the predecessor was removed only
+# after this installation committed. Mirrors check() in
 # installer/test_upgrade_log.py, which the redist fixture does not carry;
 # test_user_runtime.py holds both to the same accepted and refused logs.
 function Assert-UpgradeStopLog([string]$Text, [string]$Action = 'StopPreviousUserSupervisor') {
-    $removal = [regex]::Match($Text, 'Action start [^\r\n]*: RemoveExistingProducts\.')
-    if (-not $removal.Success) { throw 'upgrade never reached RemoveExistingProducts' }
-    $before = $Text.Substring(0, $removal.Index)
+    $files = [regex]::Match($Text, 'Action start [^\r\n]*: InstallFiles\.')
+    if (-not $files.Success) { throw "upgrade never replaced the predecessor's files" }
+    $before = $Text.Substring(0, $files.Index)
     $stop = [regex]::Match($before, "Action ended [^\r\n]*: $([regex]::Escape($Action))\. Return value 1\.")
-    if (-not $stop.Success) { throw "checked incoming stop $Action did not succeed before removal" }
+    if (-not $stop.Success) { throw "checked incoming stop $Action did not succeed before the new files" }
     $after = $before.Substring($stop.Index + $stop.Length)
     $flush = [regex]::Match($after, 'Action ended [^\r\n]*: InstallExecute\. Return value 1\.')
-    if (-not $flush.Success) { throw 'checked stop execution script was not flushed before removal' }
+    if (-not $flush.Success) { throw 'checked stop execution script was not flushed before the new files' }
+    $removal = [regex]::Match($Text, 'Action start [^\r\n]*: RemoveExistingProducts\.')
+    if (-not $removal.Success) { throw 'upgrade never removed the predecessor' }
+    if (-not [regex]::IsMatch($Text.Substring(0, $removal.Index), 'Action ended [^\r\n]*: InstallFinalize\. Return value 1\.')) {
+        throw 'the predecessor was removed before this installation committed'
+    }
     if ($Action -ceq 'StopPreviousUserSupervisor') {
         $op = [regex]::Match($after.Substring(0, $flush.Index), "Executing op: CustomActionSchedule\(Action=$([regex]::Escape($Action)),ActionType=(\d+),Source=[^,\r\n]*,Target=([^\r\n]*),\)")
         if (-not $op.Success) { throw 'per-user stop was not executed from the early script' }
@@ -373,12 +390,17 @@ function Get-MsiSequence($Database, [string]$Condition) {
         return [pscustomobject]@{ Action = $record.StringData(1); Sequence = $record.IntegerData(2) }
     } finally { [void]$view.Close(); [void][Runtime.InteropServices.Marshal]::FinalReleaseComObject($view) }
 }
-# A copy of the candidate that fails after its predecessor was removed. An error
-# custom action (type 19) takes the first free sequence after InstallFiles, so
-# the early script, the predecessor stop, RemoveExistingProducts and the actions
-# scheduled right after InstallFiles (RollbackSupervisor, RegisterSupervisor)
-# have run before it refuses, and machine rollback is exercised. The copy gets
-# its own package code; the source package is unchanged.
+# A copy of the candidate that fails after the new files are written and before
+# the predecessor is removed. The refusal is a deferred EXE from the package's
+# own jobd Binary, taking the first free sequence after InstallFiles, because
+# only a deferred action runs inside the script InstallFinalize executes: an
+# immediate action there refuses before a single file operation has been
+# applied, and the rollback it provokes has nothing to restore. `jobd service`
+# with no known subcommand prints its usage and exits 2, which Windows
+# Installer reports as 1722 and turns into 1603.
+# RemoveExistingProducts follows InstallFinalize, so the failure precedes it and
+# the predecessor is never touched. The copy gets its own package code; the
+# source package is unchanged.
 function New-FailingCandidate([string]$Source, [string]$Target) {
     if (Test-Path -LiteralPath $Target) { throw "Forced-failure candidate already exists: $Target" }
     Copy-Item -LiteralPath $Source -Destination $Target
@@ -389,13 +411,13 @@ function New-FailingCandidate([string]$Source, [string]$Target) {
         $files = Get-MsiSequence $database "``Action``='InstallFiles'"
         $finalize = Get-MsiSequence $database "``Action``='InstallFinalize'"
         if ($null -eq $removal -or $null -eq $files -or $null -eq $finalize -or
-            -not ($removal.Sequence -lt $files.Sequence -and $files.Sequence + 1 -lt $finalize.Sequence)) {
-            throw 'Candidate sequence does not place InstallFiles between RemoveExistingProducts and InstallFinalize'
+            -not ($files.Sequence + 1 -lt $finalize.Sequence -and $finalize.Sequence -lt $removal.Sequence)) {
+            throw 'Candidate sequence does not place InstallFiles, then InstallFinalize, then RemoveExistingProducts'
         }
         $at = $files.Sequence + 1
         while ($at -lt $finalize.Sequence -and $null -ne (Get-MsiSequence $database "``Sequence``=$at")) { $at++ }
         if ($at -ge $finalize.Sequence) { throw "Candidate has no free sequence between InstallFiles ($($files.Sequence)) and InstallFinalize ($($finalize.Sequence))" }
-        Invoke-MsiSql $database "INSERT INTO ``CustomAction`` (``Action``, ``Type``, ``Target``) VALUES ('ForcedUpgradeFailure', 19, 'Forced upgrade failure after the predecessor was removed')"
+        Invoke-MsiSql $database "INSERT INTO ``CustomAction`` (``Action``, ``Type``, ``Source``, ``Target``) VALUES ('ForcedUpgradeFailure', 1026, 'UpgradeSupervisorCode', 'service forced-qualification-failure')"
         Invoke-MsiSql $database "INSERT INTO ``InstallExecuteSequence`` (``Action``, ``Condition``, ``Sequence``) VALUES ('ForcedUpgradeFailure', 'NOT REMOVE', $at)"
         $summary = $database.SummaryInformation(4)
         try {
@@ -409,18 +431,27 @@ function New-FailingCandidate([string]$Source, [string]$Target) {
         [void][Runtime.InteropServices.Marshal]::FinalReleaseComObject($installer)
     }
 }
-# A failed upgrade restored the predecessor's registration and data, released
-# its exclusion, and restarted the supervisor its stop ended, from its folder.
+# A failed upgrade left the predecessor installed, registered and runnable. The
+# failure happens after the new files are written and before
+# RemoveExistingProducts, so the predecessor's product registration is never
+# removed and never has to be written back by an unelevated rollback: it is still
+# there, with its files, its user data and its supervisor restarted from its own
+# folder by the rollback action.
 function Assert-RolledBackUpgrade([string]$LogText, [string]$PredecessorTools, [string]$Sid, [DateTime]$FailedAt,
-                                  [string]$PredecessorCode, [string]$Sentinel, [string]$Value, [int]$Seconds = 30) {
-    $removal = [regex]::Match($LogText, 'Action start [^\r\n]*: RemoveExistingProducts\.')
-    if (-not $removal.Success) { throw 'The failed upgrade never removed the predecessor' }
+                                  [string]$PredecessorCode, [string]$PredecessorVersion, [string]$Sentinel,
+                                  [string]$Value, [int]$Seconds = 30) {
+    $files = [regex]::Match($LogText, 'Action start [^\r\n]*: InstallFiles\.')
+    if (-not $files.Success) { throw 'The failed upgrade never reached the file replacement it is meant to fail after' }
     $failure = [regex]::Match($LogText, 'Action start [^\r\n]*: ForcedUpgradeFailure\.')
-    if (-not $failure.Success -or $failure.Index -lt $removal.Index) { throw 'The forced failure did not follow the predecessor removal' }
+    if (-not $failure.Success -or $failure.Index -lt $files.Index) { throw 'The forced failure did not follow the new files' }
+    $removal = [regex]::Match($LogText, 'Action start [^\r\n]*: RemoveExistingProducts\.')
+    if ($removal.Success) { throw 'The failed upgrade removed the predecessor; the removal must follow the commit it never reached' }
     if (-not @([regex]::Matches($LogText, 'RestartPreviousUserSupervisor') | Where-Object { $_.Index -gt $failure.Index }).Count) {
         throw 'Rollback did not run the per-user restart'
     }
-    Assert-InstalledVersion '0.1.5' $PredecessorCode
+    # State 5 for this account's SID: installed and registered, not the files-only
+    # remains an in-transaction removal left behind.
+    Assert-InstalledVersion $PredecessorVersion $PredecessorCode
     Assert-RetainedSentinel $Sentinel $Value
     Assert-NoUpgradeExclusion
     $deadline = [DateTime]::UtcNow.AddSeconds($Seconds)
@@ -567,8 +598,9 @@ if ($Mode -eq 'User') {
     try {
         if ($PredecessorMsiPath) {
             Assert-PackageHash $PredecessorMsiPath $PredecessorSHA256
-            if ($ExpectedVersion -notmatch '^\d+\.\d+\.\d+$' -or [version]$ExpectedVersion -le [version]'0.1.5') { throw 'Upgrade requires an explicit candidate version newer than 0.1.5' }
-            if ((Get-PackageProperty $PredecessorMsiPath ProductVersion) -ne '0.1.5' -or (Get-PackageProperty $MsiPath ProductVersion) -ne $ExpectedVersion) { throw 'Unexpected predecessor or candidate MSI version' }
+            if ($PredecessorVersion -notmatch '^\d+\.\d+\.\d+$') { throw 'Upgrade requires an explicit predecessor version' }
+            if ($ExpectedVersion -notmatch '^\d+\.\d+\.\d+$' -or [version]$ExpectedVersion -le [version]$PredecessorVersion) { throw "Upgrade requires an explicit candidate version newer than $PredecessorVersion" }
+            if ((Get-PackageProperty $PredecessorMsiPath ProductVersion) -ne $PredecessorVersion -or (Get-PackageProperty $MsiPath ProductVersion) -ne $ExpectedVersion) { throw 'Unexpected predecessor or candidate MSI version' }
             if ((Get-PackageProperty $PredecessorMsiPath UpgradeCode) -ne (Get-PackageProperty $MsiPath UpgradeCode)) { throw 'Packages do not share the product upgrade identity' }
             $productCode = Get-PackageProperty $MsiPath ProductCode
             $sentinel = Join-Path (Get-ProfileFolder LocalApplicationData) 'openabstractions\runtime-v1\qualification-sentinel.txt'
@@ -585,17 +617,19 @@ if ($Mode -eq 'User') {
             }
             $predecessorAttempted = $true
             Invoke-Bounded msiexec.exe $predecessorArguments
-            Assert-InstalledVersion '0.1.5' (Get-PackageProperty $PredecessorMsiPath ProductCode)
+            Assert-InstalledVersion $PredecessorVersion (Get-PackageProperty $PredecessorMsiPath ProductCode)
             Assert-RetainedSentinel $sentinel $sentinelValue
             if ($PredecessorElsewhere -and (Test-Path -LiteralPath (Join-Path $tools 'jobdw.exe'))) { throw 'The predecessor did not install into its chosen folder' }
-            # 0.1.5 start opens its log before creating the store. Initialize through its own CLI.
+            # A predecessor start opens its log before creating the store. Initialize through its own CLI.
             Invoke-Bounded (Join-Path $predecessorTools 'jobd.exe') @('status')
-            Start-PredecessorSupervisor $predecessorTools
+            Start-PredecessorSupervisor $predecessorTools $PredecessorVersion
             $previousProcesses = @(Get-RunningFixtureProcesses $predecessorTools $ExpectedSid)
         }
         if ($FailUpgrade) {
-            # The candidate copy fails after the predecessor was removed. Rollback must
-            # restore it, release the exclusion and restart what the stop ended.
+            # The candidate copy fails after the new files are written and before the
+            # predecessor is removed. Rollback must restore the files, release the
+            # exclusion and restart what the stop ended, and the predecessor must still
+            # be installed and registered because nothing removed it.
             $failingPackage = Join-Path (Split-Path -Parent $MsiPath) 'failing-upgrade.msi'
             if (-not (Test-Path -LiteralPath $failingPackage -PathType Leaf)) { throw 'Forced-failure candidate was not prepared' }
             $failedAt = Get-Date
@@ -604,8 +638,8 @@ if ($Mode -eq 'User') {
             catch { $failure = $_.Exception.Message }
             if ($failure -notmatch 'msiexec\.exe exited 1603') { throw "The forced upgrade failure did not end with 1603: $failure" }
             Assert-PreviousProcessesExited $previousProcesses
-            Assert-RolledBackUpgrade ([IO.File]::ReadAllText((Join-Path (Get-Location) 'failed-upgrade.log'))) $predecessorTools $ExpectedSid $failedAt (Get-PackageProperty $PredecessorMsiPath ProductCode) $sentinel $sentinelValue
-            'ok: failed upgrade restored the predecessor, released its exclusion and restarted the stopped supervisor' | Set-Content 'failed-upgrade.txt'
+            Assert-RolledBackUpgrade ([IO.File]::ReadAllText((Join-Path (Get-Location) 'failed-upgrade.log'))) $predecessorTools $ExpectedSid $failedAt (Get-PackageProperty $PredecessorMsiPath ProductCode) $PredecessorVersion $sentinel $sentinelValue
+            "ok: failed upgrade left $PredecessorVersion installed, registered and restarted, and released its exclusion" | Set-Content 'failed-upgrade.txt'
             # The restored predecessor's own removal is out of scope; end its restarted processes before cleanup removes it.
             foreach ($process in @(Get-RuntimeProcesses $ExpectedSid | Where-Object { [string]$_.ExecutablePath -like (Join-Path $predecessorTools '*') })) {
                 Stop-Process -Id $process.ProcessId -Force -ErrorAction SilentlyContinue
@@ -620,7 +654,7 @@ if ($Mode -eq 'User') {
             if ($PredecessorMsiPath) {
                 Assert-PreviousProcessesExited $previousProcesses
                 Assert-UpgradeStopLog ([IO.File]::ReadAllText((Join-Path (Get-Location) 'user-install.log')))
-                'ok: incoming per-user stop and its flush preceded RemoveExistingProducts' | Set-Content 'upgrade-stop-log.txt'
+                'ok: the incoming per-user stop and its flush preceded the new files, and the predecessor went after the commit' | Set-Content 'upgrade-stop-log.txt'
                 if ($PredecessorElsewhere) {
                     if (Test-Path -LiteralPath (Join-Path $predecessorTools 'jobdw.exe')) { throw 'The upgrade left the predecessor installed in its chosen folder' }
                     'ok: the upgrade stopped and removed the predecessor installed in a non-default folder' | Set-Content 'upgrade-elsewhere.txt'
@@ -694,6 +728,8 @@ $MsiPath = (Resolve-Path -LiteralPath $MsiPath).Path
 if ([IO.Path]::GetExtension($MsiPath) -ne '.msi') { throw 'Expected an MSI package' }
 if ($Unscoped -and $PredecessorMsiPath) { throw 'Unscoped verification installs a fresh package and takes no predecessor' }
 if (($PredecessorElsewhere -or $FailUpgrade) -and -not $PredecessorMsiPath) { throw 'PredecessorElsewhere and FailUpgrade qualify an upgrade and need -PredecessorMsiPath' }
+# The predecessor release is the caller's choice, not a constant of this fixture.
+if ($PredecessorMsiPath -and $PredecessorVersion -notmatch '^\d+\.\d+\.\d+$') { throw 'An upgrade needs -PredecessorVersion naming the predecessor release' }
 if (@(Get-Service | Where-Object { $_.Name -like 'OpenAbstractionsSupervisor*' }).Count) { throw 'Run per-user verification on a separate clean runner' }
 $directory = Join-Path $env:ProgramData ('OA-User-Test-' + [Guid]::NewGuid().ToString('N'))
 $account = $null
@@ -722,7 +758,7 @@ exit $LASTEXITCODE
 '@
     Set-Content -LiteralPath (Join-Path $directory 'launcher.ps1') -Value $launcher -Encoding UTF8
     $arguments = @('-NoProfile','-ExecutionPolicy','Bypass','-File',"`"$directory\launcher.ps1`"",'-Mode','User','-MsiPath',"`"$directory\package.msi`"",'-ExpectedSid',$account.Sid)
-    if ($PredecessorMsiPath) { $arguments += @('-PredecessorMsiPath',"`"$directory\predecessor.msi`"",'-PredecessorSHA256',$PredecessorSHA256,'-ExpectedVersion',$ExpectedVersion) }
+    if ($PredecessorMsiPath) { $arguments += @('-PredecessorMsiPath',"`"$directory\predecessor.msi`"",'-PredecessorSHA256',$PredecessorSHA256,'-PredecessorVersion',$PredecessorVersion,'-ExpectedVersion',$ExpectedVersion) }
     if ($Unscoped) { $arguments += '-Unscoped' }
     if ($PredecessorElsewhere) { $arguments += '-PredecessorElsewhere' }
     if ($FailUpgrade) { $arguments += '-FailUpgrade' }

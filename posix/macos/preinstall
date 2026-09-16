@@ -30,7 +30,8 @@ case "$target" in
 esac
 uid=$(stat -f %u "$home")
 case "$uid" in ''|*[!0-9]*|0) echo "preinstall: non-root target owner required" >&2; exit 1;; esac
-# Select and verify the target user's GUI bootstrap even when Installer is root.
+# Select and verify the target user's GUI bootstrap. A home-domain install runs
+# this script as that user; asuser names the target domain explicitly.
 manager print "gui/$uid" >/dev/null
 manager_uid=$(manager asuser "$uid" /bin/launchctl manageruid)
 manager_name=$(manager asuser "$uid" /bin/launchctl managername)

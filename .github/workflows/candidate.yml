@@ -209,6 +209,13 @@ jobs:
       actions: read
     env:
       CANDIDATE_VERSION: ${{ inputs.version }}
+      # The published release an upgrade is qualified from, in one place: the
+      # download, the recorded provenance and the version the fixture asserts
+      # all read it. v0.1.5 is withdrawn, and its Startup shortcut runs `start`
+      # where v0.1.6 runs `start --runtime`; the fixture picks the activation
+      # from the version it is given.
+      PREDECESSOR_RELEASE: v0.1.6
+      PREDECESSOR_VERSION: 0.1.6
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
       - name: fetch the candidate package
@@ -234,7 +241,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         shell: pwsh
         run: |
-          gh release download v0.1.5 --repo openabstractions/redist --pattern abstraction-x64.msi --pattern SHA256SUMS --dir predecessor
+          gh release download $env:PREDECESSOR_RELEASE --repo openabstractions/redist --pattern abstraction-x64.msi --pattern SHA256SUMS --dir predecessor
           if ($LASTEXITCODE -ne 0) { throw 'Published predecessor download failed' }
       - name: verify predecessor checksum
         shell: python
@@ -251,7 +258,10 @@ jobs:
           actual = hashlib.sha256(package.read_bytes()).hexdigest()
           if entries != [actual]:
               raise SystemExit('Published predecessor checksum is absent, duplicated or mismatched')
-          pathlib.Path('predecessor-source.json').write_text(json.dumps({'release': 'v0.1.5', 'repository': 'openabstractions/redist', 'file': package.name, 'sha256': actual}, indent=2))
+          release = os.environ['PREDECESSOR_RELEASE']
+          if release != 'v'+os.environ['PREDECESSOR_VERSION']:
+              raise SystemExit('The predecessor release and the version the fixture asserts name different versions')
+          pathlib.Path('predecessor-source.json').write_text(json.dumps({'release': release, 'repository': 'openabstractions/redist', 'file': package.name, 'sha256': actual}, indent=2))
           with open(os.environ['GITHUB_ENV'], 'a') as output:
               output.write('PREDECESSOR_SHA256='+actual+'\n')
       - name: prepare the forced-failure machine candidate
@@ -307,19 +317,19 @@ jobs:
         shell: pwsh
         timeout-minutes: 12
         run: |
-          & powershell.exe -NoProfile -ExecutionPolicy Bypass -File test_user_runtime.ps1 -Mode Verify -MsiPath (Resolve-Path pkg/abstraction-x64.msi).Path -PredecessorMsiPath (Resolve-Path predecessor/abstraction-x64.msi).Path -PredecessorSHA256 $env:PREDECESSOR_SHA256 -ExpectedVersion $env:CANDIDATE_VERSION -ResultDirectory user-upgrade-diagnostics
+          & powershell.exe -NoProfile -ExecutionPolicy Bypass -File test_user_runtime.ps1 -Mode Verify -MsiPath (Resolve-Path pkg/abstraction-x64.msi).Path -PredecessorMsiPath (Resolve-Path predecessor/abstraction-x64.msi).Path -PredecessorSHA256 $env:PREDECESSOR_SHA256 -PredecessorVersion $env:PREDECESSOR_VERSION -ExpectedVersion $env:CANDIDATE_VERSION -ResultDirectory user-upgrade-diagnostics
           if ($LASTEXITCODE -ne 0) { throw "Per-user upgrade verification exited $LASTEXITCODE" }
       - name: private non-admin upgrade of a predecessor in a non-default folder
         shell: pwsh
         timeout-minutes: 12
         run: |
-          & powershell.exe -NoProfile -ExecutionPolicy Bypass -File test_user_runtime.ps1 -Mode Verify -MsiPath (Resolve-Path pkg/abstraction-x64.msi).Path -PredecessorMsiPath (Resolve-Path predecessor/abstraction-x64.msi).Path -PredecessorSHA256 $env:PREDECESSOR_SHA256 -ExpectedVersion $env:CANDIDATE_VERSION -PredecessorElsewhere -ResultDirectory user-elsewhere-diagnostics
+          & powershell.exe -NoProfile -ExecutionPolicy Bypass -File test_user_runtime.ps1 -Mode Verify -MsiPath (Resolve-Path pkg/abstraction-x64.msi).Path -PredecessorMsiPath (Resolve-Path predecessor/abstraction-x64.msi).Path -PredecessorSHA256 $env:PREDECESSOR_SHA256 -PredecessorVersion $env:PREDECESSOR_VERSION -ExpectedVersion $env:CANDIDATE_VERSION -PredecessorElsewhere -ResultDirectory user-elsewhere-diagnostics
           if ($LASTEXITCODE -ne 0) { throw "Non-default-folder upgrade verification exited $LASTEXITCODE" }
       - name: private non-admin forced failed upgrade rolls back to the predecessor
         shell: pwsh
         timeout-minutes: 12
         run: |
-          & powershell.exe -NoProfile -ExecutionPolicy Bypass -File test_user_runtime.ps1 -Mode Verify -MsiPath (Resolve-Path pkg/abstraction-x64.msi).Path -PredecessorMsiPath (Resolve-Path predecessor/abstraction-x64.msi).Path -PredecessorSHA256 $env:PREDECESSOR_SHA256 -ExpectedVersion $env:CANDIDATE_VERSION -FailUpgrade -ResultDirectory user-failed-upgrade-diagnostics
+          & powershell.exe -NoProfile -ExecutionPolicy Bypass -File test_user_runtime.ps1 -Mode Verify -MsiPath (Resolve-Path pkg/abstraction-x64.msi).Path -PredecessorMsiPath (Resolve-Path predecessor/abstraction-x64.msi).Path -PredecessorSHA256 $env:PREDECESSOR_SHA256 -PredecessorVersion $env:PREDECESSOR_VERSION -ExpectedVersion $env:CANDIDATE_VERSION -FailUpgrade -ResultDirectory user-failed-upgrade-diagnostics
           if ($LASTEXITCODE -ne 0) { throw "Forced failed upgrade verification exited $LASTEXITCODE" }
       - name: an unscoped non-admin install lands in one scope
         shell: pwsh

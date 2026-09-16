@@ -100,6 +100,18 @@ One `productbuild` archive around one `pkgbuild` component, identifier
 `<domains enable_currentUserHome="true" enable_localSystem="false"/>` so the only
 destination the installer offers is the current user's home.
 
+Observed on macOS 26.6.2 (25G83), 2026-09-15, by double-clicking the package in
+Finder ([evidence](../../research/lifecycle/macos-2026-09-15/README.md)):
+Installer logs `Set authorization level to none for session` and asks for no
+password. It starts a per-user `installd` and `package_script_service` as the
+installing user (uid 501), so `preinstall` and `postinstall` run as that user.
+`PKInstallRequest` names `destination=/Users/<user>`, the payload lands under the
+home directory, and the receipt is written to `~/Library/Receipts`
+(`pkgutil --volume "$HOME" --pkg-info com.openabstractions.abstraction`). The
+system receipt database holds nothing for this package. Installing over a
+running earlier version worked the same way: `preinstall` booted out the old
+LaunchAgent, and `postinstall` registered the new one.
+
 | what | where |
 |---|---|
 | `jobd`, `dl`, `jobctl`, `openabstractions`, universal | `~/.local/bin/` |
@@ -181,6 +193,8 @@ not claimed to be; `pkgbuild` writes a bom and a payload archive of its own.
 `--platform macos` needs `lipo`, `pkgbuild` and `productbuild`, and refuses by
 name on a machine that has none of them rather than skipping the package.
 
+`sh scripts/wsl_posix_tests.sh --run` runs this directory's `python3 -m unittest` fixtures inside WSL.
+
 ## Signing
 
 The local packager emits unsigned packages. The redist workflow can sign and
@@ -198,11 +212,17 @@ team identifier. It is kept in the private tree.
   builds the macOS package and conditionally signs/notarizes it. This does not
   establish that its postinstall, LaunchAgent or uninstall behavior was tested
   on an actual user installation.
-- **The `enable_currentUserHome` install location is the least-travelled part.**
-  A component built with `--install-location /` and installed into the home
-  domain lands relative to the home directory; if that turns out to be wrong on
-  a current macOS the payload lands at the filesystem root instead, and the
-  first CI run is what will say so.
+- **macOS removal leaves the receipt and fails.** The receipt lives on the home
+  volume, and `uninstall.sh` runs `pkgutil --forget` without
+  `--volume "$HOME"`. On 2026-09-15 that call printed `No receipt … found at '/'`
+  and the script exited 1 after deleting the payload, including `uninstall.sh`
+  itself. `MANIFEST` and the receipt remained, and the printed retry has no
+  script left to run. Manual cleanup:
+  `pkgutil --volume "$HOME" --forget com.openabstractions.abstraction`, then
+  delete `~/.local/share/abstraction/MANIFEST`.
+- **The home-domain install location works.** A component built with
+  `--install-location /` and installed into the home domain landed under the
+  home directory on macOS 26.6.2.
 - **`jobd install` prints `schtasks` lines on every platform.** Run it on Linux
   or macOS and it tells you to type Windows commands. These packages therefore
   register the timer and the agent themselves, and now three places own the

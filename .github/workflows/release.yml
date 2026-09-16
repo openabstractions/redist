@@ -276,6 +276,13 @@ jobs:
       actions: read
     outputs:
       machine-service: ${{ steps.instance.outputs.state }}
+    env:
+      # The published release an upgrade is qualified from, in one place, as in
+      # redist-candidate.yml. v0.1.5 is withdrawn, and its Startup shortcut runs
+      # `start` where v0.1.6 runs `start --runtime`; the fixture picks the
+      # activation from the version it is given.
+      PREDECESSOR_RELEASE: v0.1.6
+      PREDECESSOR_VERSION: 0.1.6
     steps:
       - name: fetch the package
         env:
@@ -318,7 +325,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         shell: pwsh
         run: |
-          gh release download v0.1.5 --repo openabstractions/redist --pattern abstraction-x64.msi --pattern SHA256SUMS --dir predecessor
+          gh release download $env:PREDECESSOR_RELEASE --repo openabstractions/redist --pattern abstraction-x64.msi --pattern SHA256SUMS --dir predecessor
           if ($LASTEXITCODE -ne 0) { throw 'Published predecessor download failed' }
       - name: verify predecessor checksum
         shell: python
@@ -335,7 +342,10 @@ jobs:
           actual = hashlib.sha256(package.read_bytes()).hexdigest()
           if entries != [actual]:
               raise SystemExit('Published predecessor checksum is absent, duplicated or mismatched')
-          pathlib.Path('predecessor-source.json').write_text(json.dumps({'release': 'v0.1.5', 'repository': 'openabstractions/redist', 'file': package.name, 'sha256': actual}, indent=2))
+          release = os.environ['PREDECESSOR_RELEASE']
+          if release != 'v'+os.environ['PREDECESSOR_VERSION']:
+              raise SystemExit('The predecessor release and the version the fixture asserts name different versions')
+          pathlib.Path('predecessor-source.json').write_text(json.dumps({'release': release, 'repository': 'openabstractions/redist', 'file': package.name, 'sha256': actual}, indent=2))
           with open(os.environ['GITHUB_ENV'], 'a') as output:
               output.write('PREDECESSOR_SHA256='+actual+'\n')
       - name: configure disposable consumer MSI policy
@@ -378,7 +388,7 @@ jobs:
         timeout-minutes: 12
         run: |
           $version = '${{ inputs.version }}'.Substring(1)
-          & powershell.exe -NoProfile -ExecutionPolicy Bypass -File user-fixture/test_user_runtime.ps1 -Mode Verify -MsiPath (Resolve-Path pkg/abstraction-x64.msi).Path -PredecessorMsiPath (Resolve-Path predecessor/abstraction-x64.msi).Path -PredecessorSHA256 $env:PREDECESSOR_SHA256 -ExpectedVersion $version -ResultDirectory user-upgrade-diagnostics
+          & powershell.exe -NoProfile -ExecutionPolicy Bypass -File user-fixture/test_user_runtime.ps1 -Mode Verify -MsiPath (Resolve-Path pkg/abstraction-x64.msi).Path -PredecessorMsiPath (Resolve-Path predecessor/abstraction-x64.msi).Path -PredecessorSHA256 $env:PREDECESSOR_SHA256 -PredecessorVersion $env:PREDECESSOR_VERSION -ExpectedVersion $version -ResultDirectory user-upgrade-diagnostics
           if ($LASTEXITCODE -ne 0) { throw "Per-user upgrade verification exited $LASTEXITCODE" }
 
       # ----- the command nobody names a scope on -----------------------------

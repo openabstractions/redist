@@ -53,11 +53,21 @@ express it.
 
 Machine removal checks shutdown before deleting payload files. Machine upgrades
 run the incoming binary's `service stop` from the MSI Binary table first. An early
-`InstallExecute` runs that checked action before `RemoveExistingProducts` invokes
-the cached predecessor MSI. Stop preserves registrations; removal deletes them
-only after confirmed shutdown. A failed check aborts before replacing the payload.
-The stop command shares one 60-second polling budget across all instances; native
-SCM calls retain their operating-system RPC behavior.
+`InstallExecute` runs that checked action before any file is replaced. A failed
+check aborts before replacing the payload. The stop command shares one 60-second
+polling budget across all instances; native SCM calls retain their
+operating-system RPC behavior.
+
+`RemoveExistingProducts` runs after `InstallFinalize`: the predecessor is removed
+once this version is committed, so a failure at any earlier point leaves the
+previous version installed, registered and restartable. The predecessor's own
+uninstall then runs in its own transaction, after this package registered the
+shared supervisor service, and a shipped 0.1.5 or 0.1.6 deletes that service on
+its way out. Nothing deferred can run after `InstallFinalize`, so a machine
+upgrade registers the supervisor from `RegisterSupervisorAfterRemoval`, an
+immediate checked action scheduled after the removal, and the in-transaction
+`RegisterSupervisor`/`RollbackSupervisor` pair is limited to installs with no
+predecessor. Per-user activation follows that action.
 This confirms the enumerated instances at that point. Preserved registrations
 can activate on a later logon or external start; transaction-wide activation
 exclusion and installed rollback verification remain open release requirements.
@@ -158,17 +168,26 @@ cannot gate away.
   instance also requires a suitable session. Read the run result and any
   explicit preview limitation; source tables alone do not prove installation.
 - **Per-user verification uses a fresh non-administrator account.** The release
-  workflow checks immediate readiness, removal, upgrade from 0.1.5 and same-version
-  reinstall in that account. The release run records their actual outcomes.
+  workflow checks immediate readiness, removal, an upgrade from the predecessor
+  release the caller names with `-PredecessorVersion`, and same-version reinstall
+  in that account. The release run records their actual outcomes.
 - **`jobd install` prints `schtasks` lines this package no longer registers.**
   Its sweep and logon lines are a second, hand-driven answer to the question the
   Startup shortcut now answers, and nothing compares them.
 - **`sources.tsv` is behind the published tags.** Both pins resolve, neither is a
   tag any more.
 - **The checked-shutdown upgrade sequence needs an installed test.** WiX linking
-  and MSI table inspection verify that incoming shutdown executes before old
-  product removal. Simulated SCM tests cover refusal and process exit. Actual
-  installed upgrade and rollback behavior remain unverified for this change.
+  and MSI table inspection verify that incoming shutdown executes before the new
+  files and that the predecessor goes after the commit. Simulated SCM tests cover
+  refusal and process exit. Actual installed upgrade and rollback behavior remain
+  unverified for this change.
+- **The machine-scope post-removal registration is unmeasured.**
+  `RegisterSupervisorAfterRemoval` runs in the immediate sequence, so it reaches
+  the SCM with the token that started msiexec. A machine upgrade driven from an
+  elevated session has it; whether an upgrade started from Explorer's
+  "for everyone" path does has not been measured. Its failure is checked, not
+  ignored: the upgrade reports the error and re-running the installer registers
+  the supervisor through `RegisterSupervisor`.
 - **The paths in `signpath.artifact-configuration.xml` are how we think SignPath
   addresses a file inside an MSI, and nobody has submitted one.**
   the element vocabulary is as written

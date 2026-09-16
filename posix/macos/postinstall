@@ -1,8 +1,10 @@
 #!/bin/sh
-# Runs after the payload lands in the installing person's home directory, as
-# that person for a home-domain install. Everything here turns home-relative
-# facts into absolute ones and hands the LaunchAgent to that person's own GUI
-# session.
+# Runs after the payload lands. A home-domain install uses authorization level
+# none: Installer starts a per-user installd and package_script_service, and
+# this script runs as the installing user with no password (observed on macOS
+# 26.6.2 25G83, 2026-09-15). The payload is rooted at that person's home
+# directory. This script turns home-relative facts into absolute ones and
+# registers the LaunchAgent in that person's gui/<uid> domain.
 set -eu
 
 home=${HOME:-}
