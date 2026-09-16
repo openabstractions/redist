@@ -410,6 +410,12 @@ jobs:
           "predecessor=$code" >> $env:GITHUB_OUTPUT
           $p = Start-Process msiexec -Wait -PassThru -ArgumentList @('/i', $predecessor, '/qn', '/norestart', 'ALLUSERS=1', 'MSIINSTALLPERUSER=', '/l*v', 'machine-predecessor-install.log')
           if ($p.ExitCode -ne 0) { throw "machine predecessor install exited $($p.ExitCode)" }
+          # SCM creates a template instance when a session signs in. The runner's
+          # session signed in before the template existed, so it may have none;
+          # the restart is judged against what was actually running here.
+          Start-Sleep -Seconds 10
+          $running = @(Get-Service -Name 'OpenAbstractionsSupervisor_*' -ErrorAction SilentlyContinue | Where-Object Status -eq 'Running' | ForEach-Object Name)
+          "instances running before the failing upgrade: $(if ($running.Count) { $running -join ', ' } else { 'none' })"
           $p = Start-Process msiexec -Wait -PassThru -ArgumentList @('/i', $failing, '/qn', '/norestart', 'ALLUSERS=1', 'MSIINSTALLPERUSER=', '/l*v', 'machine-failed-upgrade.log')
           if ($p.ExitCode -ne 1603) { throw "the forced machine upgrade failure exited $($p.ExitCode); it must end with 1603" }
           $log = Get-Content -LiteralPath machine-failed-upgrade.log -Raw -Encoding Unicode
@@ -424,10 +430,15 @@ jobs:
           if (-not (Test-Path -LiteralPath (Join-Path $env:ProgramFiles 'OpenAbstractions\tools\jobdw.exe'))) { throw 'rollback did not restore the predecessor programs' }
           $record = Join-Path $env:ProgramData 'abstraction\upgrade-v1\exclusion.json'
           if (Test-Path -LiteralPath $record) { throw "the machine upgrade exclusion survived rollback: $record" }
-          if ($env:interactive -eq '1') {
-            if (-not @(Get-Service -Name 'OpenAbstractionsSupervisor_*' -ErrorAction SilentlyContinue | Where-Object Status -eq 'Running').Count) { throw 'rollback did not restart the stopped machine supervisor instance' }
+          if ($running.Count) {
+            foreach ($name in $running) {
+              $deadline = (Get-Date).AddSeconds(30)
+              while ((Get-Service -Name $name -ErrorAction SilentlyContinue).Status -ne 'Running' -and (Get-Date) -lt $deadline) { Start-Sleep -Milliseconds 500 }
+              if ((Get-Service -Name $name -ErrorAction SilentlyContinue).Status -ne 'Running') { throw "rollback did not restart the stopped machine supervisor instance $name" }
+            }
+            "ok    rollback restarted $($running -join ', ')"
           } else {
-            'UNPROVEN here: session 0 runner, so no stopped instance existed to restart; the rollback start ran and the template is restored'
+            'UNPROVEN here: no supervisor instance was running before the failing upgrade (instances start at sign-in, and this session signed in before the template existed), so there was nothing to restart; the rollback start ran and the template is restored. The fresh-session step below proves an instance'
           }
           'ok    a failed machine upgrade left the predecessor installed and registered with no exclusion'
           exit 0
