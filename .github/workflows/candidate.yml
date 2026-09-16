@@ -511,6 +511,15 @@ jobs:
             Get-CimInstance Win32_Service -Filter "Name LIKE 'OpenAbstractionsSupervisor%'" | ForEach-Object { "service $($_.Name) state=$($_.State) pid=$($_.ProcessId) start=$($_.StartMode)" }
             $jobd = Join-Path $env:ProgramFiles 'OpenAbstractions\tools\jobd.exe'
             if (Test-Path -LiteralPath $jobd) {
+              # Windows Installer runs these as LocalSystem, where they fail and
+              # the runner's administrator does not. Run the stop as SYSTEM first.
+              $capture = Join-Path $env:RUNNER_TEMP 'system-service-stop.txt'
+              $action = New-ScheduledTaskAction -Execute 'cmd.exe' -Argument "/c `"`"$jobd`" service stop > `"$capture`" 2>&1 & echo exit=%ERRORLEVEL% >> `"$capture`"`""
+              Register-ScheduledTask -TaskName 'OA-SystemServiceStop' -Action $action -User 'SYSTEM' -RunLevel Highest -Force | Out-Null
+              Start-ScheduledTask -TaskName 'OA-SystemServiceStop'
+              for ($i = 0; $i -lt 60 -and -not ((Test-Path -LiteralPath $capture) -and (Get-Content -LiteralPath $capture -Raw) -match 'exit='); $i++) { Start-Sleep -Milliseconds 500 }
+              if (Test-Path -LiteralPath $capture) { Get-Content -LiteralPath $capture | ForEach-Object { "as SYSTEM, jobd service stop: $_" } } else { 'as SYSTEM, jobd service stop: no output within 30 s' }
+              Unregister-ScheduledTask -TaskName 'OA-SystemServiceStop' -Confirm:$false
               & $jobd service uninstall 2>&1 | ForEach-Object { "jobd service uninstall: $_" }
               "jobd service uninstall exit=$LASTEXITCODE"
             }
