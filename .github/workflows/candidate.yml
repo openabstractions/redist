@@ -392,9 +392,10 @@ jobs:
           $state | ConvertTo-Json | Set-Content -LiteralPath $statePath -Encoding utf8 -ErrorAction Stop
           'DisableMSI baseline restored and verified' | Tee-Object -Append msi-policy.log
           exit 0
-      # The machine predecessor is installed, the failing copy removes it and then
-      # refuses, and rollback must leave the predecessor registered with its
-      # service template, release the machine exclusion and run the rollback start.
+      # The machine predecessor is installed, the failing copy stops it, replaces
+      # its files and refuses before the commit, so RemoveExistingProducts never
+      # runs. Rollback must leave the predecessor registered with its service
+      # template, release the machine exclusion and run the rollback start.
       - name: machine forced failed upgrade rolls back to the predecessor
         id: machine-failed-upgrade
         shell: pwsh
@@ -412,9 +413,10 @@ jobs:
           $p = Start-Process msiexec -Wait -PassThru -ArgumentList @('/i', $failing, '/qn', '/norestart', 'ALLUSERS=1', 'MSIINSTALLPERUSER=', '/l*v', 'machine-failed-upgrade.log')
           if ($p.ExitCode -ne 1603) { throw "the forced machine upgrade failure exited $($p.ExitCode); it must end with 1603" }
           $log = Get-Content -LiteralPath machine-failed-upgrade.log -Raw -Encoding Unicode
-          $removal = [regex]::Match($log, 'Action start [^\r\n]*: RemoveExistingProducts\.')
+          $files = [regex]::Match($log, 'Action start [^\r\n]*: InstallFiles\.')
           $failure = [regex]::Match($log, 'Action start [^\r\n]*: ForcedUpgradeFailure\.')
-          if (-not $removal.Success -or -not $failure.Success -or $failure.Index -lt $removal.Index) { throw 'the forced failure did not follow the predecessor removal' }
+          if (-not $files.Success -or -not $failure.Success -or $failure.Index -lt $files.Index) { throw 'the forced failure did not follow the new files' }
+          if ([regex]::IsMatch($log, 'Action start [^\r\n]*: RemoveExistingProducts\.')) { throw 'the failed machine upgrade removed the predecessor; the removal must follow the commit it never reached' }
           if ($log.IndexOf('RestartPreviousSupervisor', $failure.Index) -lt 0) { throw 'rollback did not run the machine restart' }
           if ($installer.ProductState($code) -ne 5) { throw 'rollback did not leave the machine predecessor installed' }
           & sc.exe qc OpenAbstractionsSupervisor | Out-Null
@@ -448,6 +450,11 @@ jobs:
             if ($before -notmatch "Action ended [^\r\n]*: $action\. Return value 1\.") { throw "$action did not succeed before RemoveExistingProducts" }
           }
           if ($log -notmatch 'EndMachineUpgradeExclusion') { throw 'the machine exclusion release was not scheduled' }
+          # The removal follows the commit, and the predecessor's own uninstall
+          # deletes the shared service name, so registration must come after it.
+          $finalize = [regex]::Match($log, 'Action start [^\r\n]*: InstallFinalize\.')
+          if (-not $finalize.Success -or $removal.Index -lt $finalize.Index) { throw 'the machine upgrade removed the predecessor before its own commit' }
+          if ($log.Substring($removal.Index) -notmatch "Action ended [^\r\n]*: RegisterSupervisorAfterRemoval\. Return value 1\.") { throw 'the machine supervisor was not registered after the predecessor removal' }
           $installer = New-Object -ComObject WindowsInstaller.Installer
           if ($installer.ProductState('${{ steps.machine-failed-upgrade.outputs.predecessor }}') -eq 5) { throw 'the machine predecessor is still installed after upgrade' }
           if (Test-Path -LiteralPath (Join-Path $env:ProgramData 'abstraction\upgrade-v1\exclusion.json')) { throw 'the machine upgrade exclusion survived commit' }
