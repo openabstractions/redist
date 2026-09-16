@@ -499,6 +499,13 @@ jobs:
         shell: pwsh
         run: |
           $msi = (Resolve-Path pkg\abstraction-x64.msi).Path
+          # TEMPORARY DIAGNOSTIC (revert after one run): the command UnregisterSupervisor
+          # runs, by hand, in the state the MSI meets it, so its refusal names itself.
+          Get-CimInstance Win32_Service -Filter "Name LIKE 'OpenAbstractionsSupervisor%'" | ForEach-Object { "before: service $($_.Name) state=$($_.State) pid=$($_.ProcessId)" }
+          $diag = Join-Path $env:ProgramFiles 'OpenAbstractions\tools\jobd.exe'
+          & $diag service uninstall 2>&1 | ForEach-Object { "diagnostic jobd service uninstall: $_" }
+          "diagnostic jobd service uninstall exit=$LASTEXITCODE"
+          Get-CimInstance Win32_Service -Filter "Name LIKE 'OpenAbstractionsSupervisor%'" | ForEach-Object { "after: service $($_.Name) state=$($_.State) pid=$($_.ProcessId)" }
           $p = Start-Process msiexec -Wait -PassThru -ArgumentList @('/x', $msi, '/qn', '/norestart', '/l*v', 'machine-uninstall.log')
           if ($p.ExitCode -ne 0) {
             # Windows Installer discards a custom action's output. Run the same
