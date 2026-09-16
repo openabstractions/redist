@@ -499,50 +499,8 @@ jobs:
         shell: pwsh
         run: |
           $msi = (Resolve-Path pkg\abstraction-x64.msi).Path
-          # The uninstall must meet a running instance, the case the Restart
-          # Manager used to hide by stopping it first.
-          $live = @(Get-CimInstance Win32_Service -Filter "Name LIKE 'OpenAbstractionsSupervisor[_]%'" | Where-Object State -eq 'Running' | ForEach-Object Name)
-          "instances running before uninstall: $(if ($live.Count) { $live -join ', ' } else { 'none' })"
-          # TEMPORARY DIAGNOSTIC (revert after one run). StopSupervisorOnRemoval
-          # exits 1 only inside Windows Installer, which discards its output; as
-          # SYSTEM from a scheduled task the same stop succeeds. The cached package
-          # the removal reads is rewritten so the action runs through cmd.exe and
-          # keeps what jobd prints.
-          $capture = Join-Path $env:ProgramData 'oa-diag-stop.txt'
-          $wi = New-Object -ComObject WindowsInstaller.Installer
-          $pkgdb = $wi.OpenDatabase($msi, 0)
-          $pv = $pkgdb.OpenView("SELECT ``Value`` FROM ``Property`` WHERE ``Property``='ProductCode'"); [void]$pv.Execute(); $productCode = $pv.Fetch().StringData(1); [void]$pv.Close()
-          $cached = $wi.ProductInfo($productCode, 'LocalPackage')
-          "cached package: $cached"
-          $cdb = $wi.OpenDatabase($cached, 1)
-          $target = '"[SystemFolder]cmd.exe" /c ""[ToolsFolder]jobd.exe" service stop > "' + $capture + '" 2>&1"'
-          $uv = $cdb.OpenView("UPDATE ``CustomAction`` SET ``Type``=3106, ``Source``='SystemFolder', ``Target``='" + $target.Replace("'", "''") + "' WHERE ``Action``='StopSupervisorOnRemoval'")
-          [void]$uv.Execute(); [void]$uv.Close(); [void]$cdb.Commit()
-          [void][Runtime.InteropServices.Marshal]::FinalReleaseComObject($cdb)
-          # By product code, so the removal reads the rewritten cached package.
-          $p = Start-Process msiexec -Wait -PassThru -ArgumentList @('/x', $productCode, '/qn', '/norestart', '/l*v', 'machine-uninstall.log')
-          if (Test-Path -LiteralPath $capture) { Get-Content -LiteralPath $capture | ForEach-Object { "inside Windows Installer, jobd service stop: $_" } } else { "inside Windows Installer: no capture at $capture" }
-          if ($p.ExitCode -ne 0) {
-            # Windows Installer discards a custom action's output. Run the same
-            # command UnregisterSupervisor runs, with this elevated token, so the
-            # failure names itself; the step fails either way.
-            Get-CimInstance Win32_Service -Filter "Name LIKE 'OpenAbstractionsSupervisor%'" | ForEach-Object { "service $($_.Name) state=$($_.State) pid=$($_.ProcessId) start=$($_.StartMode)" }
-            $jobd = Join-Path $env:ProgramFiles 'OpenAbstractions\tools\jobd.exe'
-            if (Test-Path -LiteralPath $jobd) {
-              # Windows Installer runs these as LocalSystem, where they fail and
-              # the runner's administrator does not. Run the stop as SYSTEM first.
-              $capture = Join-Path $env:RUNNER_TEMP 'system-service-stop.txt'
-              $action = New-ScheduledTaskAction -Execute 'cmd.exe' -Argument "/c `"`"$jobd`" service stop > `"$capture`" 2>&1 & echo exit=%ERRORLEVEL% >> `"$capture`"`""
-              Register-ScheduledTask -TaskName 'OA-SystemServiceStop' -Action $action -User 'SYSTEM' -RunLevel Highest -Force | Out-Null
-              Start-ScheduledTask -TaskName 'OA-SystemServiceStop'
-              for ($i = 0; $i -lt 60 -and -not ((Test-Path -LiteralPath $capture) -and (Get-Content -LiteralPath $capture -Raw) -match 'exit='); $i++) { Start-Sleep -Milliseconds 500 }
-              if (Test-Path -LiteralPath $capture) { Get-Content -LiteralPath $capture | ForEach-Object { "as SYSTEM, jobd service stop: $_" } } else { 'as SYSTEM, jobd service stop: no output within 30 s' }
-              Unregister-ScheduledTask -TaskName 'OA-SystemServiceStop' -Confirm:$false
-              & $jobd service uninstall 2>&1 | ForEach-Object { "jobd service uninstall: $_" }
-              "jobd service uninstall exit=$LASTEXITCODE"
-            }
-            throw "msiexec /x exited $($p.ExitCode)"
-          }
+          $p = Start-Process msiexec -Wait -PassThru -ArgumentList @('/x', $msi, '/qn', '/norestart', '/l*v', 'machine-uninstall.log')
+          if ($p.ExitCode -ne 0) { throw "msiexec /x exited $($p.ExitCode)" }
           & sc.exe qc OpenAbstractionsSupervisor | Out-Null
           if ($LASTEXITCODE -ne 1060) { throw "the service template survived uninstall or its absence was not established: exit $LASTEXITCODE" }
           if (@(Get-Service -Name 'OpenAbstractionsSupervisor_*' -ErrorAction SilentlyContinue).Count) { throw 'a per-session instance survived uninstall' }

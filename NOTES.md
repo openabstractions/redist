@@ -8,9 +8,11 @@ the end of these notes; those facts apply to this release only.
   installation, its supervisor and runtime cannot start again from the Startup
   shortcut, the service manager, `jobd start` or `openabstractions start`. The
   installation activates normally once the upgrade finishes.
-- **A failed Windows upgrade restores what it stopped.** Rollback restarts the
-  supervisors the upgrade stopped, for your account or for everyone, and nothing
-  it did not stop.
+- **A failed Windows upgrade leaves the previous version installed.** The
+  previous version is removed only after the new one is fully installed, so an
+  upgrade that fails keeps the earlier installation registered in Apps and
+  features with its programs and your data. See
+  [Limitations](#limitations) for when its supervisor runs again.
 - **Per-user upgrades find an installation in another folder.** An upgrade stops
   the previous version where it was installed, including a folder chosen at
   install time.
@@ -136,6 +138,10 @@ lost a result stays compatible with the earlier release.
 - Cross-tool compatibility checks cover particular scenarios, not every operation.
 - Removal preserves user data. Resume across upgrades depends on the job and provider;
   retained-data checks alone do not establish transfer recovery.
+- After a failed Windows upgrade, the previous version's supervisor is not
+  running until you next sign in, or until you run `jobdw start --runtime` from
+  its `tools` folder. The upgrade stops it before replacing files, and the
+  rollback does not start it again.
 - CI runner checks do not establish behavior on every user's machine.
 
 ## Source

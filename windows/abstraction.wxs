@@ -30,26 +30,16 @@
 
     <Property Id="ARPURLINFOABOUT" Value="https://github.com/openabstractions" />
     <Property Id="ARPNOREPAIR" Value="1" />
-    <!-- The package stops its own supervisor, so the Restart Manager must not.
-         It shuts applications down at InstallValidate, 1400, and every action
-         here that records what it stopped runs at 1505 and later. Measured on
-         a v0.1.6 predecessor: the Restart Manager ended the supervisor first,
-         `service stop` found nothing to record, and the rollback restart had
-         nothing to start, so a failed upgrade left no supervisor until the
-         next sign-in (feedback/restart-manager-preempts-the-supervisor-stop.md).
-         This is a package default and not a SetProperty: Windows Installer
-         opens its Restart Manager session before the first sequenced action,
-         and a value set Before="InstallValidate" arrives after the shutdown it
-         was meant to prevent. Every path that replaces or removes a running
-         file therefore has an action of its own below: StopPreviousSupervisor
-         and StopPreviousUserSupervisor for upgrades, StopSupervisorOnRemoval
-         and StopUserSupervisorOnRemoval for uninstalls. -->
-    <Property Id="MSIRESTARTMANAGERCONTROL" Value="Disable" />
+    <!-- Native GUI session handling closes the per-user supervisor and its
+         contained runtime. Keep graceful Restart Manager shutdown enabled. -->
+    <Property Id="MSIRESTARTMANAGERCONTROL" Value="0" />
     <Property Id="MSIRMSHUTDOWN" Value="0" />
     <!-- AdminUser reports the installing token itself. Without this, Windows sets
          AdminUser wherever Privileged is set, including AlwaysInstallElevated for
          a standard user, whose per-user activation works. -->
     <Property Id="MSIUSEREALADMINDETECTION" Value="1" />
+    <SetProperty Id="MSIDISABLERMRESTART" Value="1" Before="InstallValidate" Sequence="execute"
+                 Condition="NOT ALLUSERS AND REMOVE=&quot;ALL&quot;" />
 
     <!-- A build that was not handed a source drops the files it would have
          carried, and every one of those drops is silent: build.py prints a
@@ -221,29 +211,6 @@
     <CustomAction Id="StopPreviousUserSupervisor" BinaryRef="UpgradeSupervisorCode"
                   ExeCommand="service stop --user &quot;[APPLICATIONFOLDER].&quot; --related &quot;[WIX_UPGRADE_DETECTED]&quot;"
                   Execute="deferred" Impersonate="yes" Return="check" />
-    <!-- Removal has to end the supervisor too, now that the Restart Manager is
-         not there to do it: its files are about to be deleted and it holds its
-         own image. It names no related products, because a removal has no
-         predecessor: the folder being removed is the whole scope. Narrowed to
-         a real uninstall:
-         under UPGRADINGPRODUCTCODE a successor is removing this product, it
-         already stopped this supervisor at 1508, and the folder is its own. -->
-    <CustomAction Id="StopUserSupervisorOnRemoval" BinaryRef="UpgradeSupervisorCode"
-                  ExeCommand="service stop --user &quot;[APPLICATIONFOLDER].&quot;"
-                  Execute="deferred" Impersonate="yes" Return="check" />
-    <!-- The machine half of the same rule. UnregisterSupervisor runs at 3499,
-         in the script InstallFinalize executes, after the registry, shortcut
-         and environment removals at 2600 to 3300 have already run against a
-         supervisor that is still up. Measured on the hosted runner, run
-         35078760207: with a per-session instance running, that removal
-         exited 1; the same `service uninstall` run beforehand stopped and
-         removed the instance in 50 ms and the MSI removal then succeeded.
-         Until the Restart Manager was disabled, it stopped the instance at
-         InstallValidate and hid this. The stop runs here, in the early script
-         with the elevated token the SCM needs, before any removal. -->
-    <CustomAction Id="StopSupervisorOnRemoval" BinaryRef="UpgradeSupervisorCode"
-                  ExeCommand="service stop"
-                  Execute="deferred" Impersonate="no" Return="check" />
     <!-- A failed upgrade leaves the old product installed and its supervisor
          stopped. This rollback action runs each related product's own Startup
          activation from its recorded folder, so the old supervisor answers
@@ -327,11 +294,7 @@
               Condition="NOT ALLUSERS AND WIX_UPGRADE_DETECTED AND NOT REMOVE" />
       <Custom Action="StopPreviousUserSupervisor" After="RestartPreviousUserSupervisor"
               Condition="NOT ALLUSERS AND WIX_UPGRADE_DETECTED AND NOT REMOVE" />
-      <Custom Action="StopUserSupervisorOnRemoval" After="StopPreviousUserSupervisor"
-              Condition="NOT ALLUSERS AND REMOVE=&quot;ALL&quot; AND NOT UPGRADINGPRODUCTCODE" />
-      <Custom Action="StopSupervisorOnRemoval" After="StopUserSupervisorOnRemoval"
-              Condition="ALLUSERS AND REMOVE=&quot;ALL&quot; AND NOT UPGRADINGPRODUCTCODE" />
-      <InstallExecute After="StopSupervisorOnRemoval" />
+      <InstallExecute After="StopPreviousUserSupervisor" />
       <Custom Action="UnregisterSupervisor" Before="RemoveFiles"
               Condition="ALLUSERS AND REMOVE=&quot;ALL&quot; AND NOT UPGRADINGPRODUCTCODE" />
       <Custom Action="RollbackSupervisor" After="InstallFiles"
