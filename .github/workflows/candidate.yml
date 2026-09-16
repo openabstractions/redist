@@ -503,7 +503,24 @@ jobs:
           # Manager used to hide by stopping it first.
           $live = @(Get-CimInstance Win32_Service -Filter "Name LIKE 'OpenAbstractionsSupervisor[_]%'" | Where-Object State -eq 'Running' | ForEach-Object Name)
           "instances running before uninstall: $(if ($live.Count) { $live -join ', ' } else { 'none' })"
+          # TEMPORARY DIAGNOSTIC (revert after one run). StopSupervisorOnRemoval
+          # exits 1 only inside Windows Installer, which discards its output; as
+          # SYSTEM from a scheduled task the same stop succeeds. The cached package
+          # the removal reads is rewritten so the action runs through cmd.exe and
+          # keeps what jobd prints.
+          $capture = Join-Path $env:ProgramData 'oa-diag-stop.txt'
+          $wi = New-Object -ComObject WindowsInstaller.Installer
+          $pkgdb = $wi.OpenDatabase($msi, 0)
+          $pv = $pkgdb.OpenView("SELECT ``Value`` FROM ``Property`` WHERE ``Property``='ProductCode'"); [void]$pv.Execute(); $productCode = $pv.Fetch().StringData(1); [void]$pv.Close()
+          $cached = $wi.ProductInfo($productCode, 'LocalPackage')
+          "cached package: $cached"
+          $cdb = $wi.OpenDatabase($cached, 1)
+          $target = '"[SystemFolder]cmd.exe" /c ""[ToolsFolder]jobd.exe" service stop > "' + $capture + '" 2>&1"'
+          $uv = $cdb.OpenView("UPDATE ``CustomAction`` SET ``Type``=3106, ``Source``='SystemFolder', ``Target``='" + $target.Replace("'", "''") + "' WHERE ``Action``='StopSupervisorOnRemoval'")
+          [void]$uv.Execute(); [void]$uv.Close(); [void]$cdb.Commit()
+          [void][Runtime.InteropServices.Marshal]::FinalReleaseComObject($cdb)
           $p = Start-Process msiexec -Wait -PassThru -ArgumentList @('/x', $msi, '/qn', '/norestart', '/l*v', 'machine-uninstall.log')
+          if (Test-Path -LiteralPath $capture) { Get-Content -LiteralPath $capture | ForEach-Object { "inside Windows Installer, jobd service stop: $_" } } else { "inside Windows Installer: no capture at $capture" }
           if ($p.ExitCode -ne 0) {
             # Windows Installer discards a custom action's output. Run the same
             # command UnregisterSupervisor runs, with this elevated token, so the
