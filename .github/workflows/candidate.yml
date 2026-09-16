@@ -519,7 +519,8 @@ jobs:
           $uv = $cdb.OpenView("UPDATE ``CustomAction`` SET ``Type``=3106, ``Source``='SystemFolder', ``Target``='" + $target.Replace("'", "''") + "' WHERE ``Action``='StopSupervisorOnRemoval'")
           [void]$uv.Execute(); [void]$uv.Close(); [void]$cdb.Commit()
           [void][Runtime.InteropServices.Marshal]::FinalReleaseComObject($cdb)
-          $p = Start-Process msiexec -Wait -PassThru -ArgumentList @('/x', $msi, '/qn', '/norestart', '/l*v', 'machine-uninstall.log')
+          # By product code, so the removal reads the rewritten cached package.
+          $p = Start-Process msiexec -Wait -PassThru -ArgumentList @('/x', $productCode, '/qn', '/norestart', '/l*v', 'machine-uninstall.log')
           if (Test-Path -LiteralPath $capture) { Get-Content -LiteralPath $capture | ForEach-Object { "inside Windows Installer, jobd service stop: $_" } } else { "inside Windows Installer: no capture at $capture" }
           if ($p.ExitCode -ne 0) {
             # Windows Installer discards a custom action's output. Run the same
