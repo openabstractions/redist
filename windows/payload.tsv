@@ -21,8 +21,12 @@
 > and still left out of a --bin one. sources.tsv says which sources those are.
 > A row the --bin route cannot fill must be gated in abstraction.wxs, because a
 > gate is what turns a missing file into a smaller package instead of a red
-> build. jobd.exe and jobdw.exe are separate console/windowless links of the
-> same supervisor source and both have required rows below.
+> build. openabstractions.exe and openabstractionsw.exe are the console and
+> windowless links of the one serve source, and both rows are required: the
+> windowless image is what the service template, the Startup shortcut and the
+> installer's activation run. jobd,
+> jobdw, dl, jobctl and the Python file-store packages leave the payload in
+> 0.2.0 (docs/REMOVED.md).
 >
 > over_curl.hpp has a declared abstraction-download-over-curl repository rule,
 > but no public refs were present at the 2026-09-12 check. Until a public commit
@@ -36,29 +40,14 @@
 > release build could never obtain it, and its absence turned the whole Panel
 > feature off and took the program with it. monitor/README.md documents the
 > manual copy for anyone who wants the button styling in a local build.
->
-> The four Python rows are gated on Dev for a different reason: they have a
-> publishable source and no way to reach it from a package assembled out of
-> published module versions, which is what the release builds. Those two
-> packages publish on their own registry, and a redistributable carrying a
-> second copy of them would be one file with two homes — the same answer
-> posix/payload.tsv gives. A build handed --src job and --src download carries
-> them; the release is not, and says so.
 
 feature		path						kind		source		from						sign	subsystem
-service		tools/jobd.exe					gobuild		self		.						yes	console
-service		tools/jobdw.exe					gobuild		self		.						yes	windows
-tools		tools/dl.exe					gobuild		download	go/cmd/dl					yes	console
-tools		tools/jobctl.exe				gobuild		job		go/cmd/jobctl					yes	console
 tools		tools/Abstraction Panel.exe			gobuild		panel		monitor						yes	windows
 tools		examples/README.txt					authored	installer	examples/README.txt				no	-
 tools		examples/what-this-machine-does/run.cmd		authored	installer	examples/what-this-machine-does/run.cmd		no	-
 tools		examples/job-lifecycle/run.cmd			authored	installer	examples/job-lifecycle/run.cmd			no	-
 tools		examples/download-a-file/run.cmd		authored	installer	examples/download-a-file/run.cmd		no	-
 developer	dev/USING.txt					authored	installer	dev/USING.txt					no	-
-developer	dev/python/job/abstraction_job.py		copy		job		python/abstraction_job.py			no	-
-developer	dev/python/job/pyproject.toml			copy		job		python/pyproject.toml				no	-
-developer	dev/python/download/abstraction_download.py	copy		download	python/abstraction_download.py			no	-
-developer	dev/python/download/pyproject.toml		copy		download	python/pyproject.toml				no	-
 developer	dev/include/abstraction/download/over_curl.hpp	copy		UNRESOLVED	include/abstraction/download/over_curl.hpp	no	-
 service	tools/openabstractions.exe	gobuild	charter	serve	yes	console
+service	tools/openabstractionsw.exe	gobuild	charter	serve	yes	windows

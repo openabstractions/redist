@@ -1,13 +1,13 @@
 @echo off
 setlocal
-set TOOLS=%~dp0..\..\tools
+set OA=%~dp0..\..\tools\openabstractions.exe
 
-echo == where a download would run on this machine ==
-"%TOOLS%\dl.exe" tiers
+echo == whether the runtime is ready, one capability at a time ==
+"%OA%" status
 echo.
 
-echo == what is in the store, and whether anything is watching it ==
-"%TOOLS%\jobd.exe" status
+echo == what this program has asked the runtime to do ==
+"%OA%" jobs list
 echo.
 
 echo == how this install starts the supervisor ==

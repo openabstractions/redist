@@ -15,7 +15,10 @@ fi
 valid_path() (
     f=$1
     case "$f" in
-        "$HOME/.local/bin/jobd"|"$HOME/.local/bin/jobctl"|"$HOME/.local/bin/dl"|"$HOME/.local/bin/openabstractions"|"$HOME/.config/systemd/user/abstraction-jobd.service"|"$HOME/.config/systemd/user/abstraction-jobd.timer"|"$HOME/.config/systemd/user/abstraction-runtime.service"|"$HOME/.local/share/abstraction/"*) ;;
+        "$HOME/.local/bin/openabstractions"|"$HOME/.config/systemd/user/abstraction-runtime.service"|"$HOME/.local/share/abstraction/"*) ;;
+        # Retired by 0.2.0 (docs/REMOVED.md). A predecessor's ledger still names
+        # them, and they are removed only when their recorded bytes match.
+        "$HOME/.local/bin/jobd"|"$HOME/.local/bin/jobctl"|"$HOME/.local/bin/dl"|"$HOME/.config/systemd/user/abstraction-jobd.service"|"$HOME/.config/systemd/user/abstraction-jobd.timer") ;;
         *) echo "unsafe installation path; payload retained" >&2; exit 1;;
     esac
     case "$f" in */../*|*/./*|*//*|*/..|*/.|*/MANIFEST|*/MANIFEST.*) echo "noncanonical installation path" >&2; exit 1;; esac
@@ -76,7 +79,7 @@ systemd=no
 if command -v systemctl >/dev/null 2>&1 && manager show-environment >/dev/null 2>&1; then
     systemd=yes
     stop_installed
-    manager disable abstraction-jobd.timer
+    disable_retired
     load=$(manager show abstraction-runtime.service --property=LoadState --value)
     if [ "$load" != not-found ]; then manager disable abstraction-runtime.service; fi
 elif grep -q '^timer yes$' "$manifest"; then

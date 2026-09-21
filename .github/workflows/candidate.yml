@@ -10,16 +10,12 @@ on:
         description: Published abstractions commit containing the central runtime and status command
         required: true
         type: string
-      service_jobd_sha:
-        description: Published service-jobd commit containing runtime supervision registration
-        required: true
-        type: string
       download_sha:
-        description: Published abstraction-download commit required by both parent and central command
+        description: Published abstraction-download commit the central command's download module must resolve to
         required: true
         type: string
       job_sha:
-        description: Published abstraction-job commit containing jobctl and the selected job module
+        description: Published abstraction-job commit the central command's job module must resolve to
         required: true
         type: string
       version:
@@ -38,7 +34,6 @@ jobs:
       CGO_ENABLED: '0'
       REDIST_SHA: ${{ inputs.redist_sha }}
       CHARTER_SHA: ${{ inputs.charter_sha }}
-      SERVICE_JOBD_SHA: ${{ inputs.service_jobd_sha }}
       DOWNLOAD_SHA: ${{ inputs.download_sha }}
       JOB_SHA: ${{ inputs.job_sha }}
       CANDIDATE_VERSION: ${{ inputs.version }}
@@ -49,7 +44,7 @@ jobs:
         shell: python
         run: |
           import os, re, subprocess
-          for key in ('REDIST_SHA', 'CHARTER_SHA', 'SERVICE_JOBD_SHA', 'DOWNLOAD_SHA', 'JOB_SHA'):
+          for key in ('REDIST_SHA', 'CHARTER_SHA', 'DOWNLOAD_SHA', 'JOB_SHA'):
               if not re.fullmatch('[0-9a-f]{40}', os.environ[key]):
                   raise SystemExit(f'{key} must be a full lowercase public commit SHA')
           if os.environ['REDIST_SHA'] != os.environ['GITHUB_SHA']:
@@ -66,12 +61,6 @@ jobs:
           repository: openabstractions/abstractions
           ref: ${{ inputs.charter_sha }}
           path: source-charter
-          persist-credentials: false
-      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
-        with:
-          repository: openabstractions/service-jobd
-          ref: ${{ inputs.service_jobd_sha }}
-          path: source-jobd
           persist-credentials: false
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
         with:
@@ -103,7 +92,7 @@ jobs:
         shell: python
         run: |
           import json, os, pathlib, subprocess
-          sources = {'source-charter': 'CHARTER_SHA', 'source-jobd': 'SERVICE_JOBD_SHA', 'source-download': 'DOWNLOAD_SHA', 'source-job': 'JOB_SHA'}
+          sources = {'source-charter': 'CHARTER_SHA', 'source-download': 'DOWNLOAD_SHA', 'source-job': 'JOB_SHA'}
           evidence = {'redist': os.environ['REDIST_SHA'], 'sources': {}, 'dependencies': {}}
           for directory, key in sources.items():
               actual = subprocess.check_output(['git', '-C', directory, 'rev-parse', 'HEAD'], text=True).strip()
@@ -118,11 +107,11 @@ jobs:
                   raw = raw.lstrip()[end:]
           expected = {'github.com/openabstractions/abstraction-download/go': os.environ['DOWNLOAD_SHA'],
                       'github.com/openabstractions/abstraction-job/go': os.environ['JOB_SHA']}
-          for directory in ('source-charter/serve', 'source-charter/monitor', 'source-jobd', 'source-download/go', 'source-job/go'):
+          for directory in ('source-charter/serve', 'source-charter/monitor', 'source-download/go', 'source-job/go'):
               selected = list(modules(subprocess.check_output(['go', 'list', '-m', '-json', 'all'], cwd=directory, text=True)))
               if not selected or sum(bool(item.get('Main')) for item in selected) != 1:
                   raise SystemExit(f'{directory} must select one main module')
-              if directory in ('source-charter/serve', 'source-jobd') and 'github.com/openabstractions/abstraction-download/go' not in {item.get('Path') for item in selected}:
+              if directory == 'source-charter/serve' and 'github.com/openabstractions/abstraction-download/go' not in {item.get('Path') for item in selected}:
                   raise SystemExit(f'{directory} is missing its required download dependency')
               closure = []
               for item in selected:
@@ -149,7 +138,7 @@ jobs:
           import json, os, pathlib, subprocess
           # The Panel filename contains spaces; columns are separated by tabs.
           rows = [[part.strip() for part in line.split('\t') if part.strip()] for line in pathlib.Path('tools.tsv').read_text().splitlines() if line.strip() and not line.startswith('>')][1:]
-          overrides = {'jobd.exe': ('source-jobd', '.'), 'jobdw.exe': ('source-jobd', '.'), 'openabstractions.exe': ('source-charter/serve', '.'), 'dl.exe': ('source-download/go', './cmd/dl'), 'jobctl.exe': ('source-job/go', './cmd/jobctl'), 'Abstraction Panel.exe': ('source-charter/monitor', '.')}
+          overrides = {'openabstractions.exe': ('source-charter/serve', '.'), 'openabstractionsw.exe': ('source-charter/serve', '.'), 'Abstraction Panel.exe': ('source-charter/monitor', '.')}
           names = [row[0] for row in rows]
           if len(names) != len(set(names)) or set(names) != set(overrides):
               raise SystemExit('tools.tsv must contain each required runtime program exactly once')
@@ -197,9 +186,11 @@ jobs:
 
   # Every Windows assertion that needs a hosted runner, against the package the
   # job above built. One dispatch of this workflow qualifies the candidate:
-  # per-user fresh, upgrade, non-default-folder upgrade, forced failed upgrade,
-  # unscoped non-admin, elevated refusal, machine forced failed upgrade, machine
-  # upgrade, registration, fresh session and removal.
+  # per-user fresh, upgrade, non-default-folder upgrade, forced failed upgrade
+  # with the predecessor running again, same-version forced failure restarted by
+  # Restart Manager, unscoped non-admin, elevated refusal, machine forced failed
+  # upgrade with an instance in a second session, machine upgrade, registration,
+  # fresh session and removal.
   windows-qualification:
     needs: windows
     runs-on: windows-latest
@@ -211,11 +202,11 @@ jobs:
       CANDIDATE_VERSION: ${{ inputs.version }}
       # The published release an upgrade is qualified from, in one place: the
       # download, the recorded provenance and the version the fixture asserts
-      # all read it. v0.1.5 is withdrawn, and its Startup shortcut runs `start`
-      # where v0.1.6 runs `start --runtime`; the fixture picks the activation
-      # from the version it is given.
-      PREDECESSOR_RELEASE: v0.1.6
-      PREDECESSOR_VERSION: 0.1.6
+      # all read it. v0.1.7's Startup shortcut runs `jobdw start --runtime`, and
+      # from 0.1.8 it runs `openabstractionsw serve host`; the fixture picks the
+      # activation from the version it is given.
+      PREDECESSOR_RELEASE: v0.1.7
+      PREDECESSOR_VERSION: 0.1.7
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
       - name: fetch the candidate package
@@ -325,18 +316,40 @@ jobs:
         run: |
           & powershell.exe -NoProfile -ExecutionPolicy Bypass -File test_user_runtime.ps1 -Mode Verify -MsiPath (Resolve-Path pkg/abstraction-x64.msi).Path -PredecessorMsiPath (Resolve-Path predecessor/abstraction-x64.msi).Path -PredecessorSHA256 $env:PREDECESSOR_SHA256 -PredecessorVersion $env:PREDECESSOR_VERSION -ExpectedVersion $env:CANDIDATE_VERSION -PredecessorElsewhere -ResultDirectory user-elsewhere-diagnostics
           if ($LASTEXITCODE -ne 0) { throw "Non-default-folder upgrade verification exited $LASTEXITCODE" }
-      - name: private non-admin forced failed upgrade rolls back to the predecessor
+      # The rollback activation must leave the predecessor's supervisor running
+      # again before msiexec returns: the 0.1.7 known issue this release fixes.
+      - name: private non-admin forced failed upgrade rolls back to the running predecessor
         shell: pwsh
         timeout-minutes: 12
         run: |
           & powershell.exe -NoProfile -ExecutionPolicy Bypass -File test_user_runtime.ps1 -Mode Verify -MsiPath (Resolve-Path pkg/abstraction-x64.msi).Path -PredecessorMsiPath (Resolve-Path predecessor/abstraction-x64.msi).Path -PredecessorSHA256 $env:PREDECESSOR_SHA256 -PredecessorVersion $env:PREDECESSOR_VERSION -ExpectedVersion $env:CANDIDATE_VERSION -FailUpgrade -ResultDirectory user-failed-upgrade-diagnostics
           if ($LASTEXITCODE -ne 0) { throw "Forced failed upgrade verification exited $LASTEXITCODE" }
+      # The candidate as its own predecessor: a registered host that ran 60
+      # seconds is restarted by Restart Manager when the failed transaction ends.
+      - name: private non-admin same-version forced failure restarts the host
+        shell: pwsh
+        timeout-minutes: 12
+        run: |
+          & powershell.exe -NoProfile -ExecutionPolicy Bypass -File test_user_runtime.ps1 -Mode Verify -MsiPath (Resolve-Path pkg/abstraction-x64.msi).Path -FailSameVersion -ResultDirectory user-same-version-diagnostics
+          if ($LASTEXITCODE -ne 0) { throw "Same-version forced failure verification exited $LASTEXITCODE" }
       - name: an unscoped non-admin install lands in one scope
         shell: pwsh
         timeout-minutes: 8
         run: |
           & powershell.exe -NoProfile -ExecutionPolicy Bypass -File test_user_runtime.ps1 -Mode Verify -MsiPath (Resolve-Path pkg/abstraction-x64.msi).Path -Unscoped -ResultDirectory user-unscoped-diagnostics
           if ($LASTEXITCODE -ne 0) { throw "Unscoped non-admin install verification exited $LASTEXITCODE" }
+      # Each fixture run checked its own logs inside the disposable account.
+      # This step reads the logs the runner collected from those accounts and
+      # refuses mutated copies of each, so the checks are shown to bite on the
+      # hosted log format: the upgrade exclusion order and its formatted folder,
+      # and removals that finished with no reboot pending.
+      - name: the collected per-user logs prove the upgrade order, the formatted folder and a finished removal
+        shell: pwsh
+        run: |
+          $upgrade = 'user-upgrade-diagnostics/user-install.log|user-elsewhere-diagnostics/user-install.log'
+          $removal = 'user-runtime-diagnostics/user-uninstall.log|user-upgrade-diagnostics/user-uninstall.log|user-elsewhere-diagnostics/user-uninstall.log|user-same-version-diagnostics/same-version-uninstall.log|user-unscoped-diagnostics/user-uninstall.log'
+          & powershell.exe -NoProfile -ExecutionPolicy Bypass -File test_user_runtime.ps1 -Mode CheckLogs -UpgradeLogs $upgrade -RemovalLogs $removal | Tee-Object hosted-log-checks.txt
+          if ($LASTEXITCODE -ne 0) { throw "Collected per-user log checks exited $LASTEXITCODE" }
       - name: an elevated unscoped install is refused before anything is copied
         shell: pwsh
         timeout-minutes: 5
@@ -392,14 +405,17 @@ jobs:
           $state | ConvertTo-Json | Set-Content -LiteralPath $statePath -Encoding utf8 -ErrorAction Stop
           'DisableMSI baseline restored and verified' | Tee-Object -Append msi-policy.log
           exit 0
-      # The machine predecessor is installed, the failing copy stops it, replaces
-      # its files and refuses before the commit, so RemoveExistingProducts never
-      # runs. Rollback must leave the predecessor registered with its service
-      # template, release the machine exclusion and run the rollback start.
+      # The machine predecessor is installed and a fresh account signs in over
+      # RDP, so the SCM creates a per-session instance in a second session. The
+      # failing copy replaces the files and refuses before the commit, so
+      # RemoveExistingProducts never runs. The package stops nothing: Restart
+      # Manager stops the instance through the SCM. Rollback must leave the
+      # predecessor registered with its service template, release the machine
+      # exclusion and leave that instance running.
       - name: machine forced failed upgrade rolls back to the predecessor
         id: machine-failed-upgrade
         shell: pwsh
-        timeout-minutes: 15
+        timeout-minutes: 20
         run: |
           $predecessor = (Resolve-Path predecessor\abstraction-x64.msi).Path
           $failing = (Resolve-Path failing\abstraction-x64.msi).Path
@@ -410,39 +426,58 @@ jobs:
           "predecessor=$code" >> $env:GITHUB_OUTPUT
           $p = Start-Process msiexec -Wait -PassThru -ArgumentList @('/i', $predecessor, '/qn', '/norestart', 'ALLUSERS=1', 'MSIINSTALLPERUSER=', '/l*v', 'machine-predecessor-install.log')
           if ($p.ExitCode -ne 0) { throw "machine predecessor install exited $($p.ExitCode)" }
-          # SCM creates a template instance when a session signs in. The runner's
-          # session signed in before the template existed, so it may have none;
-          # the restart is judged against what was actually running here.
-          Start-Sleep -Seconds 10
-          $running = @(Get-Service -Name 'OpenAbstractionsSupervisor_*' -ErrorAction SilentlyContinue | Where-Object Status -eq 'Running' | ForEach-Object Name)
-          "instances running before the failing upgrade: $(if ($running.Count) { $running -join ', ' } else { 'none' })"
+          $statePath = "$env:RUNNER_TEMP/oa-predecessor-session.json"
+          & powershell.exe -NoProfile -ExecutionPolicy Bypass -STA -File test_service_session.ps1 -Mode Verify -StatePath $statePath -ExpectedImage jobdw.exe
+          if ($LASTEXITCODE -ne 0) { throw "Predecessor session fixture exited $LASTEXITCODE" }
+          $state = Get-Content -LiteralPath $statePath -Raw | ConvertFrom-Json
+          function Get-SessionInstances {
+            @(Get-CimInstance Win32_Service -Filter "Name LIKE 'OpenAbstractionsSupervisor_%'" | Where-Object {
+              $_.State -eq 'Running' -and $_.ProcessId -ne 0 -and
+              @(Get-CimInstance Win32_Process -Filter "ProcessId=$($_.ProcessId)" | Where-Object SessionId -eq $state.Session).Count
+            })
+          }
+          $before = @(Get-SessionInstances)
+          if ($before.Count -ne 1) { throw "expected one running instance in the second session $($state.Session) before the failing upgrade; observed $($before.Count)" }
+          "instance before the failing upgrade: $($before[0].Name) pid $($before[0].ProcessId) in session $($state.Session)"
           $p = Start-Process msiexec -Wait -PassThru -ArgumentList @('/i', $failing, '/qn', '/norestart', 'ALLUSERS=1', 'MSIINSTALLPERUSER=', '/l*v', 'machine-failed-upgrade.log')
           if ($p.ExitCode -ne 1603) { throw "the forced machine upgrade failure exited $($p.ExitCode); it must end with 1603" }
           $log = Get-Content -LiteralPath machine-failed-upgrade.log -Raw -Encoding Unicode
           $files = [regex]::Match($log, 'Action start [^\r\n]*: InstallFiles\.')
           $failure = [regex]::Match($log, 'Action start [^\r\n]*: ForcedUpgradeFailure\.')
           if (-not $files.Success -or -not $failure.Success -or $failure.Index -lt $files.Index) { throw 'the forced failure did not follow the new files' }
+          if ([regex]::IsMatch($log, 'StopPrevious(User)?Supervisor')) { throw 'the package ran a stop action; it stops nothing' }
           if ([regex]::IsMatch($log, 'Action start [^\r\n]*: RemoveExistingProducts\.')) { throw 'the failed machine upgrade removed the predecessor; the removal must follow the commit it never reached' }
-          if ($log.IndexOf('RestartPreviousSupervisor', $failure.Index) -lt 0) { throw 'rollback did not run the machine restart' }
+          if ($log.IndexOf('RestartPreviousSupervisor', $failure.Index) -lt 0) { throw 'rollback did not run the machine activation' }
+          Select-String -LiteralPath machine-failed-upgrade.log -Encoding Unicode -Pattern 'RESTART MANAGER' | ForEach-Object Line
           if ($installer.ProductState($code) -ne 5) { throw 'rollback did not leave the machine predecessor installed' }
           & sc.exe qc OpenAbstractionsSupervisor | Out-Null
           if ($LASTEXITCODE -ne 0) { throw "rollback did not restore the predecessor service template: sc qc exited $LASTEXITCODE" }
           if (-not (Test-Path -LiteralPath (Join-Path $env:ProgramFiles 'OpenAbstractions\tools\jobdw.exe'))) { throw 'rollback did not restore the predecessor programs' }
           $record = Join-Path $env:ProgramData 'abstraction\upgrade-v1\exclusion.json'
           if (Test-Path -LiteralPath $record) { throw "the machine upgrade exclusion survived rollback: $record" }
-          if ($running.Count) {
-            foreach ($name in $running) {
-              $deadline = (Get-Date).AddSeconds(30)
-              while ((Get-Service -Name $name -ErrorAction SilentlyContinue).Status -ne 'Running' -and (Get-Date) -lt $deadline) { Start-Sleep -Milliseconds 500 }
-              if ((Get-Service -Name $name -ErrorAction SilentlyContinue).Status -ne 'Running') { throw "rollback did not restart the stopped machine supervisor instance $name" }
-            }
-            "ok    rollback restarted $($running -join ', ')"
-          } else {
-            'UNPROVEN here: no supervisor instance was running before the failing upgrade (instances start at sign-in, and this session signed in before the template existed), so there was nothing to restart; the rollback start ran and the template is restored. The fresh-session step below proves an instance'
-          }
-          'ok    a failed machine upgrade left the predecessor installed and registered with no exclusion'
+          $deadline = (Get-Date).AddSeconds(60)
+          do {
+            $after = @(Get-SessionInstances | Where-Object Name -eq $before[0].Name)
+            if ($after.Count -eq 1) { break }
+            Start-Sleep -Milliseconds 500
+          } while ((Get-Date) -lt $deadline)
+          if ($after.Count -ne 1) { throw "the predecessor instance $($before[0].Name) in session $($state.Session) is not running after rollback" }
+          $restarted = [int]$after[0].ProcessId -ne [int]$before[0].ProcessId
+          "instance after rollback: $($after[0].Name) pid $($after[0].ProcessId) ($(if ($restarted) { 'restarted' } else { 'the same process: Restart Manager did not stop it' }))"
+          "machine-instance-restarted=$restarted" >> $env:GITHUB_STEP_SUMMARY
+          'ok    a failed machine upgrade left the predecessor installed, registered, with no exclusion and its session instance running'
           exit 0
-      - name: machine upgrade holds the exclusion and stops the predecessor before removal
+      - name: remove the predecessor test session
+        if: always()
+        shell: pwsh
+        timeout-minutes: 2
+        run: |
+          if (Test-Path test_service_session.ps1) {
+            & powershell.exe -NoProfile -ExecutionPolicy Bypass -STA -File test_service_session.ps1 -Mode Cleanup -StatePath "$env:RUNNER_TEMP/oa-predecessor-session.json" 2>&1 | Tee-Object predecessor-session-cleanup.log
+            if ($LASTEXITCODE -ne 0) { throw "Predecessor session cleanup exited $LASTEXITCODE" }
+          }
+          exit 0
+      - name: machine upgrade holds the exclusion, stops nothing, and removes the predecessor after the commit
         id: machine-install
         shell: pwsh
         timeout-minutes: 10
@@ -457,9 +492,10 @@ jobs:
           $removal = [regex]::Match($log, 'Action start [^\r\n]*: RemoveExistingProducts\.')
           if (-not $removal.Success) { throw 'the machine upgrade never removed the predecessor' }
           $before = $log.Substring(0, $removal.Index)
-          foreach ($action in 'BeginMachineUpgradeExclusion', 'StopPreviousSupervisor', 'InstallExecute') {
+          foreach ($action in 'BeginMachineUpgradeExclusion', 'InstallExecute') {
             if ($before -notmatch "Action ended [^\r\n]*: $action\. Return value 1\.") { throw "$action did not succeed before RemoveExistingProducts" }
           }
+          if ([regex]::IsMatch($log, 'StopPrevious(User)?Supervisor')) { throw 'the package ran a stop action; it stops nothing' }
           if ($log -notmatch 'EndMachineUpgradeExclusion') { throw 'the machine exclusion release was not scheduled' }
           # The removal follows the commit, and the predecessor's own uninstall
           # deletes the shared service name, so registration must come after it.
@@ -469,7 +505,7 @@ jobs:
           $installer = New-Object -ComObject WindowsInstaller.Installer
           if ($installer.ProductState('${{ steps.machine-failed-upgrade.outputs.predecessor }}') -eq 5) { throw 'the machine predecessor is still installed after upgrade' }
           if (Test-Path -LiteralPath (Join-Path $env:ProgramData 'abstraction\upgrade-v1\exclusion.json')) { throw 'the machine upgrade exclusion survived commit' }
-          'ok    the machine upgrade held its exclusion, stopped the predecessor and released the exclusion'
+          'ok    the machine upgrade held its exclusion, stopped nothing itself, released the exclusion and registered the host after the removal'
           exit 0
       - name: the supervisor is registered, and registered as what it claims
         shell: pwsh
@@ -479,7 +515,7 @@ jobs:
           $text
           if ($text -notmatch 'TYPE\s*:\s*50\s+USER_OWN_PROCESS\s+TEMPLATE') { throw 'the service is not a SERVICE_USER_OWN_PROCESS template' }
           if ($text -notmatch 'START_TYPE\s*:\s*2\s+AUTO_START') { throw 'the template is not AUTO_START' }
-          if ($text -notmatch 'jobdw\.exe" service run') { throw 'the registered image is not jobdw.exe with the service verb' }
+          if ($text -notmatch 'openabstractionsw\.exe" serve host --service') { throw 'the registered image is not openabstractionsw.exe serve host --service' }
           $qf = (& sc.exe qfailure OpenAbstractionsSupervisor) -join "`n"
           if ($qf -notmatch 'RESET_PERIOD[^:]*:\s*3600') { throw 'the reset period is not 3600' }
           foreach ($ms in 3000, 10000, 30000) {
@@ -494,6 +530,22 @@ jobs:
           & powershell.exe -NoProfile -ExecutionPolicy Bypass -STA -File test_service_session.ps1 -Mode Verify -StatePath "$env:RUNNER_TEMP/oa-service-session.json"
           if ($LASTEXITCODE -ne 0) { throw "Fresh logon/recovery fixture exited $LASTEXITCODE" }
           exit 0
+      # The host records its token's TokenElevation and TokenElevationType at
+      # start. Kept as evidence of what token a per-user service instance runs
+      # with; it decides nothing here.
+      - name: the session host's startup diagnostics
+        if: always()
+        shell: pwsh
+        run: |
+          $statePath = "$env:RUNNER_TEMP/oa-service-session.json"
+          if (-not (Test-Path -LiteralPath $statePath)) { 'no session was created'; exit 0 }
+          $state = Get-Content -LiteralPath $statePath -Raw | ConvertFrom-Json
+          $profile = @(Get-CimInstance Win32_UserProfile | Where-Object { $_.SID -eq $state.Sid } | ForEach-Object LocalPath)
+          $log = if ($profile.Count -eq 1) { Join-Path $profile[0] 'AppData\Local\openabstractions\host\host.log' } else { $null }
+          if (-not $log -or -not (Test-Path -LiteralPath $log)) { "host.log absent for the session account"; exit 0 }
+          Copy-Item -LiteralPath $log -Destination machine-host.log
+          Select-String -LiteralPath $log -Pattern 'serve host start' | ForEach-Object Line
+          exit 0
       - name: uninstall for everyone
         if: always() && steps.machine-install.outcome == 'success'
         shell: pwsh
@@ -501,6 +553,10 @@ jobs:
           $msi = (Resolve-Path pkg\abstraction-x64.msi).Path
           $p = Start-Process msiexec -Wait -PassThru -ArgumentList @('/x', $msi, '/qn', '/norestart', '/l*v', 'machine-uninstall.log')
           if ($p.ExitCode -ne 0) { throw "msiexec /x exited $($p.ExitCode)" }
+          # A zero exit is not an honest removal: refuse a log in which the Restart Manager
+          # could not stop a process or a reboot operation was left pending.
+          & powershell.exe -NoProfile -ExecutionPolicy Bypass -File test_user_runtime.ps1 -Mode CheckLogs -RemovalLogs machine-uninstall.log
+          if ($LASTEXITCODE -ne 0) { throw "the machine removal log is not an honest removal: exit $LASTEXITCODE" }
           & sc.exe qc OpenAbstractionsSupervisor | Out-Null
           if ($LASTEXITCODE -ne 1060) { throw "the service template survived uninstall or its absence was not established: exit $LASTEXITCODE" }
           if (@(Get-Service -Name 'OpenAbstractionsSupervisor_*' -ErrorAction SilentlyContinue).Count) { throw 'a per-session instance survived uninstall' }
@@ -550,11 +606,15 @@ jobs:
             user-upgrade-diagnostics/
             user-elsewhere-diagnostics/
             user-failed-upgrade-diagnostics/
+            user-same-version-diagnostics/
             user-unscoped-diagnostics/
+            hosted-log-checks.txt
             elevated-unscoped.log
             machine-predecessor-install.log
             machine-failed-upgrade.log
             machine-install.log
+            machine-host.log
+            predecessor-session-cleanup.log
             machine-uninstall.log
             machine-predecessor-cleanup.log
             service-session.log
@@ -577,7 +637,6 @@ jobs:
       CGO_ENABLED: '0'
       REDIST_SHA: ${{ inputs.redist_sha }}
       CHARTER_SHA: ${{ inputs.charter_sha }}
-      SERVICE_JOBD_SHA: ${{ inputs.service_jobd_sha }}
       DOWNLOAD_SHA: ${{ inputs.download_sha }}
       JOB_SHA: ${{ inputs.job_sha }}
       CANDIDATE_VERSION: ${{ inputs.version }}
@@ -589,7 +648,7 @@ jobs:
       shell: python
       run: |
         import os, re, subprocess
-        for key in ('REDIST_SHA', 'CHARTER_SHA', 'SERVICE_JOBD_SHA', 'DOWNLOAD_SHA', 'JOB_SHA'):
+        for key in ('REDIST_SHA', 'CHARTER_SHA', 'DOWNLOAD_SHA', 'JOB_SHA'):
             if not re.fullmatch('[0-9a-f]{40}', os.environ[key]):
                 raise SystemExit(f'{key} must be a full lowercase public commit SHA')
         if os.environ['REDIST_SHA'] != os.environ['GITHUB_SHA']:
@@ -606,12 +665,6 @@ jobs:
         repository: openabstractions/abstractions
         ref: ${{ inputs.charter_sha }}
         path: source-charter
-        persist-credentials: false
-    - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
-      with:
-        repository: openabstractions/service-jobd
-        ref: ${{ inputs.service_jobd_sha }}
-        path: source-jobd
         persist-credentials: false
     - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
       with:
@@ -641,7 +694,7 @@ jobs:
       shell: python
       run: |
         import json, os, pathlib, subprocess
-        sources = {'source-charter': 'CHARTER_SHA', 'source-jobd': 'SERVICE_JOBD_SHA', 'source-download': 'DOWNLOAD_SHA', 'source-job': 'JOB_SHA'}
+        sources = {'source-charter': 'CHARTER_SHA', 'source-download': 'DOWNLOAD_SHA', 'source-job': 'JOB_SHA'}
         evidence = {'redist': os.environ['REDIST_SHA'], 'sources': {}, 'dependencies': {}}
         for directory, key in sources.items():
             actual = subprocess.check_output(['git', '-C', directory, 'rev-parse', 'HEAD'], text=True).strip()
@@ -656,11 +709,11 @@ jobs:
                 raw = raw.lstrip()[end:]
         expected = {'github.com/openabstractions/abstraction-download/go': os.environ['DOWNLOAD_SHA'],
                     'github.com/openabstractions/abstraction-job/go': os.environ['JOB_SHA']}
-        for directory in ('source-charter/serve', 'source-charter/monitor', 'source-jobd', 'source-download/go', 'source-job/go'):
+        for directory in ('source-charter/serve', 'source-charter/monitor', 'source-download/go', 'source-job/go'):
             selected = list(modules(subprocess.check_output(['go', 'list', '-m', '-json', 'all'], cwd=directory, text=True)))
             if not selected or sum(bool(item.get('Main')) for item in selected) != 1:
                 raise SystemExit(f'{directory} must select one main module')
-            if directory in ('source-charter/serve', 'source-jobd') and 'github.com/openabstractions/abstraction-download/go' not in {item.get('Path') for item in selected}:
+            if directory == 'source-charter/serve' and 'github.com/openabstractions/abstraction-download/go' not in {item.get('Path') for item in selected}:
                 raise SystemExit(f'{directory} is missing its required download dependency')
             closure = []
             for item in selected:
@@ -697,13 +750,13 @@ jobs:
             raise SystemExit('Unsupported POSIX package platform')
         items = packager.payload(platform)
         names = [pathlib.PurePosixPath(path).name for path, kind, *_ in items if kind == 'gobuild']
-        if len(names) != len(set(names)) or not {'jobd', 'dl', 'openabstractions'}.issubset(names):
+        if len(names) != len(set(names)) or 'openabstractions' not in names:
             raise SystemExit('Required POSIX runtime payload is missing or duplicated')
         rows = [[part.strip() for part in line.split('\t') if part.strip()] for line in pathlib.Path('tools.tsv').read_text().splitlines() if line.strip() and not line.startswith('>')][1:]
         if any(len(row) != 5 for row in rows) or len({row[0] for row in rows}) != len(rows):
             raise SystemExit('Invalid or duplicate tools.tsv rows')
         tools = {row[0]: row for row in rows}
-        overrides = {'jobd': ('source-jobd', '.'), 'openabstractions': ('source-charter/serve', '.'), 'dl': ('source-download/go', './cmd/dl'), 'jobctl': ('source-job/go', './cmd/jobctl')}
+        overrides = {'openabstractions': ('source-charter/serve', '.')}
         plan, pins = {}, {}
         for name in names:
             if name+'.exe' not in tools or tools[name+'.exe'][4] != 'console':
@@ -711,7 +764,7 @@ jobs:
             plan[name] = overrides[name]
             directory, target = plan[name]
             source = directory.split('/')[0]
-            source_key = {'source-jobd': 'SERVICE_JOBD_SHA', 'source-charter': 'CHARTER_SHA', 'source-download': 'DOWNLOAD_SHA', 'source-job': 'JOB_SHA'}[source]
+            source_key = {'source-charter': 'CHARTER_SHA'}[source]
             pins[name] = {'directory': directory, 'package': target, 'sha': os.environ[source_key]}
         goos = 'linux' if platform == 'linux' else 'darwin'
         hashes = {}
@@ -752,13 +805,13 @@ jobs:
                 raise SystemExit('Packager did not produce the expected artifact')
             if platform == 'linux':
                 with tarfile.open(artifact) as archive:
-                    for program in ('jobd', 'dl', 'jobctl', 'openabstractions'):
+                    for program in ('openabstractions',):
                         member = archive.getmember(f'abstraction-{version}-linux-{arch}/payload/.local/bin/'+program)
                         if not member.isfile() or member.mode & 0o111 != 0o111 or archive.extractfile(member).read() != pathlib.Path('binaries', arch, program).read_bytes():
                             raise SystemExit('Linux package executable differs from verified input')
             else:
                 subprocess.run(['pkgutil', '--expand-full', str(artifact), 'package-inspect'], check=True)
-                for program in ('jobd', 'dl', 'jobctl', 'openabstractions'):
+                for program in ('openabstractions',):
                     matches = list(pathlib.Path('package-inspect').glob('*/Payload/.local/bin/'+program))
                     if len(matches) != 1 or matches[0].read_bytes() != pathlib.Path('binaries/universal', program).read_bytes():
                         raise SystemExit('macOS package executable differs from verified universal input')
@@ -803,13 +856,28 @@ jobs:
           user mkdir -p "$home/.abstraction"
           user sh -c 'printf preserved > "$HOME/.abstraction/candidate-data"'
           user sh "$home/package/abstraction-$CANDIDATE_VERSION-linux-amd64/install.sh"
-          for program in jobd dl jobctl openabstractions; do user test -x "$home/.local/bin/$program"; done
+          user test -x "$home/.local/bin/openabstractions"
+          for program in jobd dl jobctl; do user test ! -e "$home/.local/bin/$program"; done
           user "$home/.local/bin/openabstractions" status --timeout 5s
+          # A download through the runtime, with no store named: the runtime
+          # fetches and verifies, the command copies the result out, and jobs
+          # show observes the same operation.
+          user mkdir -p "$home/download-origin" "$home/download-out"
+          user sh -c 'printf "bytes through the runtime" > "$HOME/download-origin/thing.bin"'
+          user python3 -m http.server 8099 --bind 127.0.0.1 --directory "$home/download-origin" >/dev/null 2>&1 &
+          origin=$!
+          for _ in $(seq 50); do curl -fsS -o /dev/null http://127.0.0.1:8099/thing.bin && break; sleep 0.2; done
+          user "$home/.local/bin/openabstractions" download http://127.0.0.1:8099/thing.bin --out "$home/download-out" --json --timeout 60s > "$RUNNER_TEMP/download.json"
+          kill "$origin" || true
+          user cmp "$home/download-out/thing.bin" "$home/download-origin/thing.bin"
+          operation=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["receipt"]["operation_id"])' "$RUNNER_TEMP/download.json")
+          [ -n "$operation" ]
+          user "$home/.local/bin/openabstractions" jobs show "$operation" --json | python3 -c 'import json,sys; s=json.load(sys.stdin)["snapshot"]; sys.exit(0 if s["state"] == "complete" and s["receipt"]["operation_id"] == sys.argv[1] else 1)' "$operation"
           user sh "$home/.local/share/abstraction/uninstall.sh"
-          for program in jobd dl jobctl openabstractions; do user test ! -e "$home/.local/bin/$program"; done
-          for unit in abstraction-jobd.timer abstraction-jobd.service abstraction-runtime.service; do user test ! -e "$home/.config/systemd/user/$unit"; done
+          user test ! -e "$home/.local/bin/openabstractions"
+          user test ! -e "$home/.config/systemd/user/abstraction-runtime.service"
           [ "$(user cat "$home/.abstraction/candidate-data")" = preserved ]
-          echo 'PASS Linux installed runtime readiness, native stop/removal and user-data preservation'
+          echo 'PASS Linux installed runtime readiness, a download through the runtime, native stop/removal and user-data preservation'
         } 2>&1 | tee dist/linux-installed-lifecycle.log
         python3 - <<'PY'
         import json, pathlib
@@ -840,7 +908,7 @@ jobs:
           # status returns nonzero for stopped/failed units; retain that diagnostic
           # without changing the preceding install step's failure conclusion.
           sudo -u "$account" env HOME="/home/$account" XDG_RUNTIME_DIR="/run/user/$uid" DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$uid/bus" \
-            timeout --kill-after=2s 10s systemctl --user status abstraction-runtime.service abstraction-jobd.service --no-pager --full || true
+            timeout --kill-after=2s 10s systemctl --user status abstraction-runtime.service --no-pager --full || true
           sudo timeout --kill-after=2s 10s journalctl --no-pager -n 60 "_UID=$uid" _SYSTEMD_USER_UNIT=abstraction-runtime.service
         } 2>&1 | tee dist/linux-runtime-diagnostics.log
     - name: remove only the disposable Linux account

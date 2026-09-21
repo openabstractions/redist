@@ -9,11 +9,19 @@ Three assets, built by the release workflow in `openabstractions/redist`:
 | `abstraction-<version>-macos-universal.pkg` | one `pkg`, x86_64 and arm64 in one binary |
 
 All three are **per-user**. They install into the home directory, ask for no
-root and no administrator password, and the background sweep each registers
+root and no administrator password, and the background runtime each registers
 belongs to the person who installed it — a systemd **user** unit on Linux, a
 **LaunchAgent** on macOS. Neither is a system service, for the same reason the
-Windows package is per-user: a supervisor that finishes your downloads runs as
-you, and registering one for another account needs that account's password.
+Windows package is per-user: the runtime that finishes your accepted work runs
+as you, and registering one for another account needs that account's password.
+
+Each package installs one program, `openabstractions`. It hosts the runtime
+(`openabstractions serve runtime`), submits and observes downloads through it
+(`openabstractions download`, `openabstractions jobs list|show|wait|cancel|result`)
+and reports readiness (`openabstractions status`). None of these names a store.
+`jobd`, `dl`, `jobctl`, the `abstraction-jobd` sweep units and the Python
+file-store packages leave the packages in 0.2.0
+([docs/REMOVED.md](https://github.com/openabstractions/abstractions/blob/main/docs/REMOVED.md)).
 
 ## Why a tarball on Linux and not `.deb` and `.rpm`
 
@@ -32,7 +40,7 @@ including the ones with no packaging story, and is the format `rustup`, `go`,
 Node and every Go single-binary tool already ship.
 
 What we give up: no `apt upgrade`, no dependency solving (there are no
-dependencies — the binaries are static, `CGO_ENABLED=0`), and no distribution
+dependencies — the binary is static, `CGO_ENABLED=0`), and no distribution
 review. Reinstalling over an existing install is how you upgrade, and
 `uninstall.sh` then `install.sh` is how you are sure.
 
@@ -44,52 +52,62 @@ review. Reinstalling over an existing install is how you upgrade, and
 
 | what | where |
 |---|---|
-| `jobd`, `dl`, `jobctl`, `openabstractions` | `~/.local/bin/` |
+| `openabstractions` | `~/.local/bin/` |
 | shared runtime | `~/.config/systemd/user/abstraction-runtime.service` |
-| the sweep unit and its timer | `~/.config/systemd/user/abstraction-jobd.{service,timer}` |
-| the Python packages and `USING.txt` | `~/.local/share/abstraction/dev/` |
+| `USING.txt` | `~/.local/share/abstraction/dev/` |
 | `LICENSE` | `~/.local/share/abstraction/` |
-| the uninstaller and the list it works from | `~/.local/share/abstraction/{uninstall.sh,MANIFEST}` |
+| the uninstaller, its lifecycle helper and the list it works from | `~/.local/share/abstraction/{uninstall.sh,lifecycle.sh,MANIFEST}` |
 
-`install.sh` enables the timer and `abstraction-runtime.service` through the
-systemd user manager. The runtime executes `openabstractions serve runtime` and
-restarts on failure. Installation polls the installed read-only `status` command
-within 15 seconds and reports failure if any default runtime contract is unavailable.
-The runtime owns managed durable jobs alongside logging and configuration.
-The existing jobd timer continues to own its legacy download sweep.
-The timer fires 30 seconds after the user manager starts — which is your login —
-and every 5 minutes after that, which is the same shape as the two Windows
-scheduled tasks, `jobd-logon` and `jobd`.
+`install.sh` enables `abstraction-runtime.service` through the systemd user
+manager. The runtime executes `openabstractions serve runtime` and restarts on
+failure. Installation polls the installed read-only `status` command within 15
+seconds and reports failure if any default runtime contract is unavailable. The
+runtime owns durable jobs, logging and configuration; `openabstractions start`
+starts it on demand and is idempotent with a running one.
 
 It does **not** edit any shell profile. If `~/.local/bin` is not on `PATH` it
 prints the one line to add and says why it will not add it for you.
 
 It does **not** fail when there is no systemd user manager — a container, WSL
-without systemd, a machine with no user bus. It installs the four programs,
-prints that automatic background services are unavailable and what to run instead, and
-records `timer no` in the manifest. Absence is reported, never passed.
+without systemd, a machine with no user bus. It installs the program, prints
+that nothing starts the runtime in the background and the command that runs it
+in a terminal, and records `timer no` in the manifest. The key keeps its 0.1.7
+name so an older ledger stays readable; it records whether a user manager owns
+registration. Absence is reported, never passed.
+
+**Upgrading from 0.1.7 or earlier.** The candidate's `lifecycle.sh` stops
+`abstraction-jobd.timer`, then `abstraction-jobd.service`, then the runtime,
+before any file is replaced, and `install.sh` disables the timer before it
+enables the runtime. The predecessor's `jobd`, `dl`, `jobctl` and sweep unit
+files become `retired` entries in the new `MANIFEST` with the hashes the
+predecessor recorded; `uninstall.sh` deletes each one whose bytes still match and
+reports the ones a person changed. Downloads the predecessor's `dl` or `jobd`
+left unfinished in `~/.abstraction` are abandoned: nothing reads or finishes
+them, and removal keeps them as user data.
 
 Removal, exactly:
 
     ~/.local/share/abstraction/uninstall.sh
 
-It stops the timer, sweep service, and runtime before disabling registration.
-Each service has `TimeoutStopSec=10s` and `KillMode=control-group`: systemd sends
-SIGTERM, then can force remaining cgroup members to exit. The uninstaller records
-the service result; a forced stop is reported separately from graceful completion.
-Manager commands have a 20-second external bound (plus a two-second kill margin).
-`timeout` from coreutils is required. A failed stop, active service, or unavailable
-previously registered manager retains the payload and returns failure. Upgrade
-also stops existing units before replacing files. The candidate executable then
-runs `storage check` against the retained runtime state before the installer
-changes any payload file or the removal manifest. An incompatible store or busy
-participating host refuses the upgrade and preserves those files; the previously
-stopped services remain stopped for the operator to inspect. This check performs
-no migration. The runtime checks compatibility again when it takes ownership.
-After verified stops, removal
-deletes every path in `MANIFEST` and nothing else, removes every directory that is then empty up to your home directory, and
-prints the command for the two things it deliberately leaves: `~/.abstraction`,
-your job store, and `~/.config/abstraction`, what `jobd setup` recorded.
+It stops a retired sweep timer and service if a predecessor left them loaded,
+then the runtime, before disabling registration. Each service has
+`TimeoutStopSec=10s` and `KillMode=control-group`: systemd sends SIGTERM, then
+can force remaining cgroup members to exit. The uninstaller records the service
+result; a forced stop is reported separately from graceful completion. Manager
+commands have a 20-second external bound (plus a two-second kill margin).
+`timeout` from coreutils is required. A failed stop, active service, or
+unavailable previously registered manager retains the payload and returns
+failure. Upgrade also stops existing units before replacing files. The candidate
+executable then runs `storage check` against the retained runtime state before
+the installer changes any payload file or the removal manifest. An incompatible
+store or busy participating host refuses the upgrade and preserves those files;
+the previously stopped services remain stopped for the operator to inspect. This
+check performs no migration. The runtime checks compatibility again when it takes
+ownership. After verified stops, removal deletes every path in `MANIFEST` and
+nothing else, removes every directory that is then empty up to your home
+directory, and prints what it deliberately leaves: the runtime state and cache,
+`~/.abstraction`, a legacy job store an earlier release wrote, and
+`~/.config/abstraction`, the configuration.
 
 ## macOS — what it places, and what removes it
 
@@ -100,8 +118,8 @@ One `productbuild` archive around one `pkgbuild` component, identifier
 `<domains enable_currentUserHome="true" enable_localSystem="false"/>` so the only
 destination the installer offers is the current user's home.
 
-Observed on macOS 26.6.2 (25G83), 2026-09-15, by double-clicking the package in
-Finder ([evidence](../../research/lifecycle/macos-2026-09-15/README.md)):
+Observed on macOS 26.6.2 (25G83), 2026-09-15, by double-clicking the 0.1.7
+package in Finder:
 Installer logs `Set authorization level to none for session` and asks for no
 password. It starts a per-user `installd` and `package_script_service` as the
 installing user (uid 501), so `preinstall` and `postinstall` run as that user.
@@ -114,25 +132,35 @@ LaunchAgent, and `postinstall` registered the new one.
 
 | what | where |
 |---|---|
-| `jobd`, `dl`, `jobctl`, `openabstractions`, universal | `~/.local/bin/` |
-| the LaunchAgent template | `~/.local/share/abstraction/com.openabstractions.jobd.plist` |
-| the LaunchAgent, written by `postinstall` | `~/Library/LaunchAgents/com.openabstractions.jobd.plist` |
-| the Python packages and `USING.txt` | `~/.local/share/abstraction/dev/` |
+| `openabstractions`, universal | `~/.local/bin/` |
+| the LaunchAgent template | `~/.local/share/abstraction/com.openabstractions.runtime.plist` |
+| the LaunchAgent, written by `postinstall` | `~/Library/LaunchAgents/com.openabstractions.runtime.plist` |
+| `USING.txt` | `~/.local/share/abstraction/dev/` |
 | `LICENSE` | `~/.local/share/abstraction/` |
-| the uninstaller and its two lists | `~/.local/share/abstraction/{uninstall.sh,FILES,MANIFEST}` |
+| the uninstaller, its lifecycle helper and its two lists | `~/.local/share/abstraction/{uninstall.sh,lifecycle.sh,FILES,MANIFEST}` |
 
-**LaunchAgent identifier: `com.openabstractions.jobd`**, at
-`~/Library/LaunchAgents/com.openabstractions.jobd.plist`. It runs
+**LaunchAgent identifier: `com.openabstractions.runtime`**, at
+`~/Library/LaunchAgents/com.openabstractions.runtime.plist`. It runs
 `openabstractions serve runtime` with `RunAtLoad` and `KeepAlive`. The package
 scripts run as the installing user for a home-domain install. The payload
 carries the plist as a template in the share directory. `scripts/postinstall`
-substitutes the absolute path of the programs into a temporary file beside the
+substitutes the absolute path of the program into a temporary file beside the
 template, renames the finished file into `~/Library/LaunchAgents`, so Background
-Task Management never reads the `@BIN@` placeholder, writes `MANIFEST`, changes ownership of
-listed payload files and their ancestor directories below the verified home, and runs `launchctl bootstrap gui/<uid>`. Manager-query,
+Task Management never reads the `@BIN@` placeholder, writes `MANIFEST`, changes
+ownership of listed payload files and their ancestor directories below the
+verified home, and runs `launchctl bootstrap gui/<uid>`. Manager-query,
 bootout, enable, or bootstrap errors fail installation. Register from the target
 user's graphical login session; the installed plist remains available after an
 activation failure.
+
+**Upgrading from 0.1.7 or earlier.** Those releases registered the same runtime
+under the label `com.openabstractions.jobd`. `preinstall` boots out both
+`com.openabstractions.jobd` and `com.openabstractions.runtime` and verifies each
+absent before any file is replaced. `postinstall` then removes the retired
+LaunchAgent plist, the retired template and `jobd`, `dl` and `jobctl`, each only
+when the predecessor's `MANIFEST` lists it, because that plist would otherwise
+start a second runtime at the next login. Downloads the predecessor left
+unfinished in `~/.abstraction` are abandoned and kept as user data.
 
 Removal, exactly the same command as on Linux:
 
@@ -164,13 +192,12 @@ command, which is runnable because the uninstaller is still in place.
 
 `openabstractions serve logging`, `openabstractions serve config`, and
 `openabstractions serve router-v1` run the selected capability in the foreground.
-Linux and macOS register the shared runtime described above. The macOS
-LaunchAgent runs `openabstractions serve runtime`. Current macOS peer proof cannot establish
-the Program identity required by shared runtime clients. This package makes no
-macOS capability-readiness promise. Native macOS lifecycle verification remains
-required. Neither deleting a tarball nor deleting a `.pkg` performs uninstall;
-the installed `uninstall.sh` is the supported removal entry point. A receipt
-cleanup failure stops removal with the payload and the uninstaller in place.
+Current macOS peer proof cannot establish the Program identity required by shared
+runtime clients. This package makes no macOS capability-readiness promise.
+Native macOS lifecycle verification remains required. Neither deleting a tarball
+nor deleting a `.pkg` performs uninstall; the installed `uninstall.sh` is the
+supported removal entry point. A receipt cleanup failure stops removal with the
+payload and the uninstaller in place.
 
 ## Build it
 
@@ -179,12 +206,13 @@ pins, never from a working tree. `build.py` re-reads `git rev-parse HEAD` in
 each checkout and refuses a build where it does not match.
 
     py -3 installer/posix/build.py --platform linux --arch amd64 --version 0.3.0 \
-      --out dist --src jobd=<service-jobd> --src download=<abstraction-download> \
-      --src job=<abstraction-job> --src charter=<abstractions>
+      --out dist --src charter=<abstractions>
 
     python3 installer/posix/build.py --platform macos --version 0.3.0 \
-      --out dist --src jobd=<service-jobd> --src download=<abstraction-download> \
-      --src job=<abstraction-job> --src charter=<abstractions>
+      --out dist --src charter=<abstractions>
+
+The release route passes `--bin DIR` with `openabstractions` built from the
+module version in redist's `tools.tsv` instead of a checkout.
 
 The Linux tarball is deterministic: fixed mtimes, uid 0, sorted names, gzip with
 no timestamp. Two builds of one commit are byte-identical. The macOS package is
@@ -193,12 +221,15 @@ not claimed to be; `pkgbuild` writes a bom and a payload archive of its own.
 `--platform macos` needs `lipo`, `pkgbuild` and `productbuild`, and refuses by
 name on a machine that has none of them rather than skipping the package.
 
-`sh scripts/wsl_posix_tests.sh --run` runs this directory's `python3 -m unittest` fixtures inside WSL.
+`sh scripts/wsl_posix_tests.sh --run` runs this directory's `python3 -m unittest`
+fixtures inside WSL. `qualify_linux.py --run` qualifies a tarball against a real
+systemd user manager in a temporary account, including a download through the
+runtime with no store named.
 
 ## Signing
 
 The local packager emits unsigned packages. The redist workflow can sign and
-notarize the macOS package and its programs; it attaches a macOS asset only
+notarize the macOS package and its program; it attaches a macOS asset only
 after those gates pass. Linux tarballs remain unsigned. Consult the selected
 release for its actual signing and installation evidence.
 
@@ -212,35 +243,36 @@ team identifier. It is kept in the private tree.
   builds the macOS package and conditionally signs/notarizes it. This does not
   establish that its postinstall, LaunchAgent or uninstall behavior was tested
   on an actual user installation.
-- **macOS removal leaves the receipt and fails.** The receipt lives on the home
-  volume, and `uninstall.sh` runs `pkgutil --forget` without
-  `--volume "$HOME"`. On 2026-09-15 that call printed `No receipt … found at '/'`
-  and the script exited 1 after deleting the payload, including `uninstall.sh`
-  itself. `MANIFEST` and the receipt remained, and the printed retry has no
-  script left to run. Manual cleanup:
-  `pkgutil --volume "$HOME" --forget com.openabstractions.abstraction`, then
-  delete `~/.local/share/abstraction/MANIFEST`.
+- **The macOS label rename is unmeasured on a Mac.** The fixtures prove that
+  `preinstall` boots out both labels and `postinstall` removes the retired plist
+  the predecessor listed. An installed upgrade from 0.1.7 on a Mac has not run.
+- **An older macOS uninstaller leaves the receipt and fails.** The receipt lives
+  on the home volume, and `uninstall.sh` as of commit 114eb78e ran
+  `pkgutil --forget` without `--volume "$HOME"`
+  (`test_fixture_macos_uninstall_114eb78e.sh` keeps that script as a control). On 2026-09-15 that call printed
+  `No receipt … found at '/'` and the script exited 1 after deleting the
+  payload, including `uninstall.sh` itself. `MANIFEST` and the receipt remained.
+  Manual cleanup: `pkgutil --volume "$HOME" --forget
+  com.openabstractions.abstraction`, then delete
+  `~/.local/share/abstraction/MANIFEST`.
 - **The home-domain install location works.** A component built with
   `--install-location /` and installed into the home domain landed under the
   home directory on macOS 26.6.2.
-- **`jobd install` prints `schtasks` lines on every platform.** Run it on Linux
-  or macOS and it tells you to type Windows commands. These packages therefore
-  register the timer and the agent themselves, and now three places own the
-  shape of that schedule instead of two.
 - **Source-build pins and release module versions differ.** `sources.tsv`
-  describes explicit checkout builds; redist builds programs from its
-  `tools.tsv` module versions and passes them with `--bin`. A historical `-`
+  describes explicit checkout builds; redist builds `openabstractions` from its
+  `tools.tsv` module version and passes it with `--bin`. A historical `-`
   tag field is not a statement about all tags now in that repository.
 - **`~/.local/bin` is on `PATH` by default on most Linux distributions and on no
   macOS.** Both installers print the line; neither writes it.
-- **The Windows package offers three features and these offer none.** A tarball
+- **The Windows package offers four features and these offer none.** A tarball
   and a `pkg` with `customize="never"` install everything they contain,
   developer files included. That is a deliberate divergence from
   `abstraction.wxs`, which makes Developer opt-in.
 - **The Windows package ships runnable examples and these ship none.** Both
-  packages agree on the tools — all four programs in one directory on `PATH`,
-  `~/.local/bin` here and `OpenAbstractions\tools\` there — and `installer/examples/`
-  has no counterpart on either platform. Its three `.cmd` files are Windows
-  shells; a person on Linux or macOS is given `USING.txt` and nothing to run.
-- **Upgrading is reinstalling.** Neither format removes a file that a previous
-  version installed and this one does not.
+  packages agree on the program — `openabstractions` in one directory on `PATH`,
+  `~/.local/bin` here and `OpenAbstractions\tools\` there — and
+  `installer/examples/` has no counterpart on either platform. Its three `.cmd`
+  files are Windows shells; a person on Linux or macOS is given `USING.txt` and
+  nothing to run.
+- **Large results move through 64 KiB exchanges.** `download` and `jobs result`
+  copy a result through the runtime's `ReadResult`.

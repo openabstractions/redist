@@ -278,11 +278,11 @@ jobs:
       machine-service: ${{ steps.instance.outputs.state }}
     env:
       # The published release an upgrade is qualified from, in one place, as in
-      # redist-candidate.yml. v0.1.5 is withdrawn, and its Startup shortcut runs
-      # `start` where v0.1.6 runs `start --runtime`; the fixture picks the
-      # activation from the version it is given.
-      PREDECESSOR_RELEASE: v0.1.6
-      PREDECESSOR_VERSION: 0.1.6
+      # redist-candidate.yml. v0.1.7's Startup shortcut runs `jobdw start
+      # --runtime`, and from 0.1.8 it runs `openabstractionsw serve host`; the
+      # fixture picks the activation from the version it is given.
+      PREDECESSOR_RELEASE: v0.1.7
+      PREDECESSOR_VERSION: 0.1.7
     steps:
       - name: fetch the package
         env:
@@ -510,7 +510,7 @@ jobs:
           $dir = Join-Path $env:ProgramFiles 'OpenAbstractions'
           $tools = Join-Path $dir 'tools'
           if (-not (Test-Path $tools)) { throw "a per-machine install did not land in $tools" }
-          foreach ($f in 'jobd.exe','jobdw.exe','dl.exe','jobctl.exe','openabstractions.exe','Abstraction Panel.exe') {
+          foreach ($f in 'openabstractions.exe','openabstractionsw.exe','Abstraction Panel.exe') {
             if (-not (Test-Path (Join-Path $tools $f))) { throw "$f was not installed" }
           }
           $key = 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Environment'
@@ -548,8 +548,8 @@ jobs:
             throw 'the service is not a SERVICE_USER_OWN_PROCESS template. Any other type is a service running as someone, and this design stores no password because it runs as whoever signs in.'
           }
           if ($text -notmatch 'START_TYPE\s*:\s*2\s+AUTO_START') { throw 'the template is not AUTO_START, so nothing clones it at sign-in' }
-          if ($text -notmatch 'jobdw\.exe" service run') {
-            throw 'the registered image is not jobdw.exe with the service verb. jobd.exe is the console image, and the loader gives a console image a window in the session it runs in — a window at every sign-in is what this whole mechanism removed.'
+          if ($text -notmatch 'openabstractionsw\.exe" serve host --service') {
+            throw 'the registered image is not openabstractionsw.exe serve host --service. openabstractions.exe is the console image, and the loader gives a console image a window in the session it runs in — a window at every sign-in is what this whole mechanism removed.'
           }
 
           # The restart is the entire reason this is a service and not a
@@ -566,7 +566,7 @@ jobs:
           if ($qff -notmatch 'FAILURE_ACTIONS_ON_NONCRASH_FAILURES\s*:\s*TRUE') {
             throw 'recovery fires only on a process that died without reporting SERVICE_STOPPED. A supervisor that reports a tidy stop after failing to open its store is the case we most want restarted.'
           }
-          'ok    a USER_OWN_PROCESS template, auto-start, pointing at jobdw.exe, with three restarts and the non-crash flag'
+          'ok    a USER_OWN_PROCESS template, auto-start, pointing at openabstractionsw.exe serve host --service, with three restarts and the non-crash flag'
 
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
         with:
@@ -580,6 +580,23 @@ jobs:
           & powershell.exe -NoProfile -ExecutionPolicy Bypass -STA -File session-fixture/test_service_session.ps1 -Mode Verify -StatePath "$env:RUNNER_TEMP/oa-service-session.json"
           if ($LASTEXITCODE -ne 0) { throw "Fresh logon/recovery fixture exited $LASTEXITCODE" }
           "state=proven" >> $env:GITHUB_OUTPUT
+          exit 0
+
+      # The host records its token's TokenElevation and TokenElevationType at
+      # start. Kept as evidence of what token a per-user service instance runs
+      # with; it decides nothing here.
+      - name: the session host's startup diagnostics
+        if: always()
+        shell: pwsh
+        run: |
+          $statePath = "$env:RUNNER_TEMP/oa-service-session.json"
+          if (-not (Test-Path -LiteralPath $statePath)) { 'no session was created'; exit 0 }
+          $state = Get-Content -LiteralPath $statePath -Raw | ConvertFrom-Json
+          $profile = @(Get-CimInstance Win32_UserProfile | Where-Object { $_.SID -eq $state.Sid } | ForEach-Object LocalPath)
+          $log = if ($profile.Count -eq 1) { Join-Path $profile[0] 'AppData\Local\openabstractions\host\host.log' } else { $null }
+          if (-not $log -or -not (Test-Path -LiteralPath $log)) { "host.log absent for the session account"; exit 0 }
+          Copy-Item -LiteralPath $log -Destination machine-host.log
+          Select-String -LiteralPath $log -Pattern 'serve host start' | ForEach-Object Line
           exit 0
 
       - name: uninstall for everyone
@@ -629,6 +646,7 @@ jobs:
             user-install.log
             user-uninstall.log
             machine-install.log
+            machine-host.log
             machine-uninstall.log
             service-session.log
             service-session-cleanup.log
@@ -823,59 +841,23 @@ jobs:
 
       - name: what it installed
         run: |
-          for f in jobd dl jobctl openabstractions; do
-            [ -x "$HOME/.local/bin/$f" ] || { printf 'FAIL  %s was not installed\n' "$f"; exit 1; }
+          [ -x "$HOME/.local/bin/openabstractions" ] || { printf 'FAIL  openabstractions was not installed\n'; exit 1; }
+          for f in jobd dl jobctl; do
+            [ -e "$HOME/.local/bin/$f" ] && { printf 'FAIL  %s was removed in 0.2.0 and was installed\n' "$f"; exit 1; }
           done
           [ -f "$HOME/.local/share/abstraction/MANIFEST" ] || { printf 'FAIL  no MANIFEST, so uninstall.sh cannot know what to remove\n'; exit 1; }
           [ -x "$HOME/.local/share/abstraction/uninstall.sh" ] || { printf 'FAIL  no uninstall.sh\n'; exit 1; }
           [ -f "$HOME/.local/share/abstraction/LICENSE" ] || { printf 'FAIL  no LICENSE in the package\n'; exit 1; }
-          printf 'ok    four programs, a MANIFEST, an uninstaller and a licence\n'
+          printf 'ok    openabstractions, a MANIFEST, an uninstaller and a licence\n'
           cat "$HOME/.local/share/abstraction/MANIFEST"
-
-      - name: the three programs agree about the store
-        run: |
-          work=$(mktemp -d)
-          mkdir -p "$work/serve" "$work/out" "$work/store"
-          export ABSTRACTION_STORE="$work/store"
-          printf 'three modules, one store format' > "$work/serve/thing.bin"
-          python3 -m http.server 8099 --bind 127.0.0.1 --directory "$work/serve" &
-          srv=$!
-          trap 'kill "$srv"' EXIT
-          # 200 ms of backoff, at most ten seconds of it: http.server has no
-          # readiness signal, so the first successful request is the only one
-          # there is to wait for.
-          for _ in $(seq 50); do
-            curl -fsS -o /dev/null http://127.0.0.1:8099/thing.bin && break
-            sleep 0.2
-          done
-          "$HOME/.local/bin/dl" http://127.0.0.1:8099/thing.bin -o "$work/out" | tee "$work/dl.out"
-          [ -f "$work/out/thing.bin" ] || { printf 'FAIL  dl reported success and delivered nothing\n'; exit 1; }
-          id=$(sed -n 's/^[[:space:]]*job[[:space:]]\{1,\}\([^[:space:]]*\).*/\1/p' "$work/dl.out" | head -1)
-          [ -n "$id" ] || { printf 'FAIL  dl did not name the job it created\n'; exit 1; }
-          "$HOME/.local/bin/jobd" status | tee "$work/jobd.out"
-          grep -q 'thing.bin' "$work/jobd.out" || { printf 'FAIL  jobd could not see the download dl completed in the store they share\n'; exit 1; }
-          if ! "$HOME/.local/bin/jobctl" show "$id" | tee "$work/jobctl.out"; then
-            printf 'FAIL  jobctl would not resolve the store dl wrote to and jobd read.\n'
-            printf 'FAIL  ABSTRACTION_STORE=%s was set for all three; two took it and\n' "$ABSTRACTION_STORE"
-            printf 'FAIL  jobctl asked for a name of its own. Three programs in one package, and\n'
-            printf 'FAIL  they do not agree on how a store is found. Setting the name jobctl wants\n'
-            printf 'FAIL  would make this step green and change nothing a person installs, so it is\n'
-            printf 'FAIL  not done here. Check first that tools.tsv names the newest published\n'
-            printf 'FAIL  versions: a fix can be tagged and unused.\n'
-            exit 1
-          fi
-          grep -q "$id" "$work/jobctl.out" || { printf 'FAIL  jobctl read the store and did not find the record dl wrote there\n'; exit 1; }
-          printf 'ok    dl wrote it, jobd saw it, jobctl read the record back\n'
 
       - name: uninstall
         run: |
           "$HOME/.local/share/abstraction/uninstall.sh"
           left=0
-          for f in jobd dl jobctl openabstractions; do
-            [ -e "$HOME/.local/bin/$f" ] && { printf 'FAIL  %s survived uninstall\n' "$f"; left=1; }
-          done
+          [ -e "$HOME/.local/bin/openabstractions" ] && { printf 'FAIL  openabstractions survived uninstall\n'; left=1; }
           [ -e "$HOME/.local/share/abstraction" ] && { printf 'FAIL  the share directory survived uninstall\n'; ls -la "$HOME/.local/share/abstraction"; left=1; }
-          [ -e "$HOME/.config/systemd/user/abstraction-jobd.timer" ] && { printf 'FAIL  the timer unit survived uninstall\n'; left=1; }
+          [ -e "$HOME/.config/systemd/user/abstraction-runtime.service" ] && { printf 'FAIL  the runtime unit survived uninstall\n'; left=1; }
           [ "$left" = 0 ] || exit 1
           printf 'ok    uninstall reversed it: no program, no unit, no share directory\n'
 
@@ -1113,7 +1095,7 @@ jobs:
         run: |
           pkg=$(ls dist/*.pkg)
           pkgutil --expand-full "$pkg" "$RUNNER_TEMP/expanded"
-          for name in jobd dl jobctl openabstractions; do
+          for name in openabstractions; do
             f=$(find "$RUNNER_TEMP/expanded" -type f -name "$name" | head -1)
             [ -n "$f" ] || { printf 'FAIL  %s is not in the package\n' "$name"; exit 1; }
             codesign --verify --strict --verbose=2 "$f"
@@ -1130,8 +1112,8 @@ jobs:
           {
             if [ "$STATE" = signed ]; then
               printf '\n### macOS — signed and notarised\n\n'
-              printf 'The universal `.pkg` is **attached to the release**. Its four programs\n'
-              printf 'are signed with a Developer ID Application certificate with the hardened\n'
+              printf 'The universal `.pkg` is **attached to the release**. Its program is\n'
+              printf 'signed with a Developer ID Application certificate with the hardened\n'
               printf 'runtime enabled; the package is signed with a Developer ID Installer\n'
               printf 'certificate, notarised by Apple and stapled. `spctl -a -vv -t install`\n'
               printf 'accepted it on this runner.\n\n'
@@ -1269,13 +1251,12 @@ jobs:
             printf '\n## Signatures\n\n'
             printf -- '- **Windows** — `abstraction-x64.msi` and `abstraction-arm64.msi` are\n'
             printf -- '  **not signed**. SmartScreen will warn you and the publisher will show\n'
-            printf -- '  as unknown; that warning is correct. `jobd` installed from an unsigned\n'
-            printf -- '  package does not pass our own strict-mode check.\n'
+            printf -- '  as unknown; that warning is correct.\n'
             printf -- '- **Linux** — the tarballs are **not signed**. There is no signature\n'
             printf -- '  scheme for them here.\n'
             if [ "$MACOS_STATE" = signed ]; then
               printf -- '- **macOS** — the `.pkg` **is signed**: a Developer ID Installer\n'
-              printf -- '  certificate, notarised by Apple and stapled, and the four programs\n'
+              printf -- '  certificate, notarised by Apple and stapled, and `openabstractions`\n'
               printf -- '  inside it signed with a Developer ID Application certificate with the\n'
               printf -- '  hardened runtime enabled. It has still never been installed on a Mac.\n'
               printf -- '  Gatekeeper opening a package is not the claim that the package works.\n'
@@ -1309,12 +1290,15 @@ jobs:
                 printf -- '  says it has no package. `go install` is the route on macOS.\n' ;;
             esac
             printf -- '- **C++ development libraries** are not bundled in this redistributable.\n'
-            printf -- '  Standalone CMake packages are available from the layer repositories, including\n'
-            printf -- '  [abstraction-cas](https://github.com/openabstractions/abstraction-cas).\n'
-            printf -- '- **The Python packages**: published on their own registry, so no package\n'
-            printf -- '  here carries a second copy of them.\n'
-            printf -- '- **A container**: `jobd` for a NAS is a separate image,\n'
-            printf -- '  [docker-jobd](https://github.com/openabstractions/docker-jobd).\n'
+            printf -- '  CMake package source is available at the corresponding layer repository\n'
+            printf -- '  revision, including [abstraction-cas](https://github.com/openabstractions/abstraction-cas).\n'
+            printf -- '- **Language SDK packages** are not bundled in this redistributable. Python\n'
+            printf -- '  wheels, Rust crates and npm packages keep independent versions and release\n'
+            printf -- '  status; this release makes no registry-publication claim for them. Their\n'
+            printf -- '  source is available at the corresponding layer repository revisions.\n'
+            printf -- '- **`jobd`, `dl` and `jobctl`** are removed in 0.2.0 with the file-store\n'
+            printf -- '  provider. `openabstractions download` and `openabstractions jobs` replace\n'
+            printf -- '  them. Downloads still in flight through the old file store are abandoned.\n'
           } > "$RUNNER_TEMP/state.md"
           cat NOTES.md "$RUNNER_TEMP/state.md" > "$RUNNER_TEMP/NOTES.md"
           cat "$RUNNER_TEMP/state.md" >> "$GITHUB_STEP_SUMMARY"

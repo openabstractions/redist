@@ -23,32 +23,23 @@
 > publishes from nowhere. The Windows package gates both away and says so; these
 > two do not carry the rows at all, and the release notes name both.
 >
-> @BIN@ in an authored file is the absolute directory the three programs land in.
+> @BIN@ in an authored file is the absolute directory openabstractions lands in.
 > install.sh on Linux and scripts/postinstall on macOS substitute it. Nothing
 > else is substituted at install time anywhere.
 >
 > A source with no --src has its rows left out of the package and each one named,
 > the way the Windows build gates the UNRESOLVED rows. A program is never left
 > out that way: a gobuild row with neither --src nor --bin stops the build. That
-> is what lets a package built only from published module versions ship the three
-> programs without checking out the repositories the Python files come from -
-> those are published on their own registry, and a redistributable carrying a
-> second copy of them would be one file with two homes.
+> is what lets a package built only from published module versions ship
+> openabstractions without checking out any repository. jobd, dl, jobctl, the
+> jobd sweep units and the Python file-store packages leave the payload in 0.2.0
+> (docs/REMOVED.md).
 
 platform	path								kind		source		from						mode
-both		.local/bin/jobd							gobuild		jobd		.						755
-both		.local/bin/dl							gobuild		download	go/cmd/dl					755
-both		.local/bin/jobctl						gobuild		job		go/cmd/jobctl					755
 both		.local/share/abstraction/LICENSE				license		posix		-						644
 both		.local/share/abstraction/dev/USING.txt				authored	posix		dev/USING.txt					644
-both		.local/share/abstraction/dev/python/job/abstraction_job.py	copy		job		python/abstraction_job.py			644
-both		.local/share/abstraction/dev/python/job/pyproject.toml		copy		job		python/pyproject.toml				644
-both		.local/share/abstraction/dev/python/download/abstraction_download.py	copy	download	python/abstraction_download.py			644
-both		.local/share/abstraction/dev/python/download/pyproject.toml	copy		download	python/pyproject.toml				644
-linux		.config/systemd/user/abstraction-jobd.service			authored	posix		linux/abstraction-jobd.service			644
-linux		.config/systemd/user/abstraction-jobd.timer			authored	posix		linux/abstraction-jobd.timer			644
 linux		.local/share/abstraction/uninstall.sh				authored	posix		linux/uninstall.sh				755
-macos		.local/share/abstraction/com.openabstractions.jobd.plist	authored	posix		macos/com.openabstractions.jobd.plist		644
+macos		.local/share/abstraction/com.openabstractions.runtime.plist	authored	posix		macos/com.openabstractions.runtime.plist		644
 macos		.local/share/abstraction/FILES					generated	posix		-						644
 macos		.local/share/abstraction/uninstall.sh				authored	posix		macos/uninstall.sh				755
 both	.local/bin/openabstractions	gobuild	charter	serve	755

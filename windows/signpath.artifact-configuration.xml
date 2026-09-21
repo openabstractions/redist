@@ -2,20 +2,14 @@
 <artifact-configuration xmlns="http://signpath.io/artifact-configuration/v1">
   <zip-file>
     <msi-file path="abstraction-x64.msi">
-      <pe-file path="tools/jobd.exe"><authenticode-sign /></pe-file>
-      <pe-file path="tools/jobdw.exe"><authenticode-sign /></pe-file>
-      <pe-file path="tools/dl.exe"><authenticode-sign /></pe-file>
-      <pe-file path="tools/jobctl.exe"><authenticode-sign /></pe-file>
       <pe-file path="tools/openabstractions.exe"><authenticode-sign /></pe-file>
+      <pe-file path="tools/openabstractionsw.exe"><authenticode-sign /></pe-file>
       <pe-file path="tools/Abstraction Panel.exe"><authenticode-sign /></pe-file>
       <authenticode-sign />
     </msi-file>
     <msi-file path="abstraction-arm64.msi">
-      <pe-file path="tools/jobd.exe"><authenticode-sign /></pe-file>
-      <pe-file path="tools/jobdw.exe"><authenticode-sign /></pe-file>
-      <pe-file path="tools/dl.exe"><authenticode-sign /></pe-file>
-      <pe-file path="tools/jobctl.exe"><authenticode-sign /></pe-file>
       <pe-file path="tools/openabstractions.exe"><authenticode-sign /></pe-file>
+      <pe-file path="tools/openabstractionsw.exe"><authenticode-sign /></pe-file>
       <pe-file path="tools/Abstraction Panel.exe"><authenticode-sign /></pe-file>
       <authenticode-sign />
     </msi-file>

@@ -30,15 +30,13 @@
 > A program with no published module has no row. It is named as absent in the
 > release notes instead; there is no placeholder here to be filled in silently.
 > C++ development libraries are distributed separately by their layers. The panel
-> and jobdw.exe were absent until 2026-09-10, when abstractions/monitor and
-> service-jobd got their first tags; jobd.exe and jobdw.exe are two links of one
-> source and share a tag, because two images on two tags are two programs
-> wearing a pair's name.
+> was absent until 2026-09-10, when abstractions/monitor got its first tag.
+> openabstractions.exe and openabstractionsw.exe are two links of one source and
+> share the abstractions/serve tag, because two images on two tags are two
+> programs wearing a pair's name. jobd.exe, jobdw.exe, dl.exe and jobctl.exe
+> leave in 0.2.0 (docs/REMOVED.md).
 
 path		module							package		feature		subsystem
-jobd.exe	github.com/openabstractions/service-jobd@v0.3.6		.		service		console
-jobdw.exe	github.com/openabstractions/service-jobd@v0.3.6		.		service		windows
-dl.exe		github.com/openabstractions/abstraction-download/go@v0.4.4	cmd/dl		tools		console
-jobctl.exe	github.com/openabstractions/abstraction-job/go@v0.4.4	cmd/jobctl	tools		console
-Abstraction Panel.exe	github.com/openabstractions/abstractions/monitor@v0.1.3	.		tools		windows
-openabstractions.exe	github.com/openabstractions/abstractions/serve@v0.1.2	.	service	console
+Abstraction Panel.exe	github.com/openabstractions/abstractions/monitor@v0.2.0	.		tools		windows
+openabstractions.exe	github.com/openabstractions/abstractions/serve@v0.2.0	.	service	console
+openabstractionsw.exe	github.com/openabstractions/abstractions/serve@v0.2.0	.	service	windows

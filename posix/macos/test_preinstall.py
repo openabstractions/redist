@@ -31,11 +31,20 @@ class Preinstall(unittest.TestCase):
         result = self.run_preflight()
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertTrue((self.root / "calls.stopped").exists())
-        self.assertIn("bootout gui/1000/com.openabstractions.jobd", (self.root / "calls").read_text())
+        self.assertIn("bootout gui/1000/com.openabstractions.runtime", (self.root / "calls").read_text())
         self.assertIn("booted out running previous LaunchAgent", result.stdout)
-        self.assertNotIn("no previous LaunchAgent", result.stdout)
+        self.assertNotIn("no previous LaunchAgent com.openabstractions.runtime", result.stdout)
         self.assertEqual(self.payload.read_text(), "payload")
         self.assertEqual(self.data.read_text(), "accepted work")
+
+    def test_a_retired_label_is_booted_out_before_replacement(self):
+        result = self.run_preflight(AGENT_LABEL="com.openabstractions.jobd")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        calls = (self.root / "calls").read_text()
+        self.assertIn("bootout gui/1000/com.openabstractions.jobd", calls)
+        self.assertNotIn("bootout gui/1000/com.openabstractions.runtime", calls)
+        self.assertIn("no previous LaunchAgent com.openabstractions.runtime", result.stdout)
+        self.assertEqual(self.payload.read_text(), "payload")
 
     def test_stop_failure_or_unverifiable_absence_blocks_replacement(self):
         for env in ({"FAIL":"stop"}, {"ACTIVE":"active"}, {"FAIL":"after"}, {"FAIL":"format"}, {"FAIL":"manager_query"}, {"MANAGER_UID":"0"}, {"MANAGER_NAME":"Background"}, {"TARGET_UID":"0"}):
@@ -50,7 +59,7 @@ class Preinstall(unittest.TestCase):
         result = self.run_preflight(ABSENT="yes", FAIL="stop")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertNotIn("bootout", (self.root / "calls").read_text())
-        self.assertIn("no previous LaunchAgent registered in gui/1000; nothing booted out", result.stdout)
+        self.assertIn("no previous LaunchAgent com.openabstractions.runtime registered in gui/1000; nothing booted out", result.stdout)
         self.assertNotIn("booted out running", result.stdout)
 
     def test_conflicting_user_target_refuses_before_manager(self):

@@ -1,8 +1,8 @@
 #!/bin/sh
 # Abstraction, per user, no root. Installs into your home directory and
-# registers a systemd *user* timer, matching the Windows package, which is
-# per-user with no elevation for the same reason: a supervisor that finishes
-# your downloads runs as you, and nothing here needs to outlive your account.
+# registers a systemd *user* service for the shared runtime, matching the
+# Windows package, which is per-user with no elevation for the same reason: the
+# runtime that finishes your accepted work runs as you.
 set -eu
 
 here=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
@@ -25,7 +25,10 @@ fi
 valid_path() (
     f=$1
     case "$f" in
-        "$HOME/.local/bin/jobd"|"$HOME/.local/bin/jobctl"|"$HOME/.local/bin/dl"|"$HOME/.local/bin/openabstractions"|"$HOME/.config/systemd/user/abstraction-jobd.service"|"$HOME/.config/systemd/user/abstraction-jobd.timer"|"$HOME/.config/systemd/user/abstraction-runtime.service"|"$HOME/.local/share/abstraction/"*) ;;
+        "$HOME/.local/bin/openabstractions"|"$HOME/.config/systemd/user/abstraction-runtime.service"|"$HOME/.local/share/abstraction/"*) ;;
+        # Retired by 0.2.0 (docs/REMOVED.md). A predecessor's ledger still names
+        # them, and they are removed only when their recorded bytes match.
+        "$HOME/.local/bin/jobd"|"$HOME/.local/bin/jobctl"|"$HOME/.local/bin/dl"|"$HOME/.config/systemd/user/abstraction-jobd.service"|"$HOME/.config/systemd/user/abstraction-jobd.timer") ;;
         *) echo "unsafe installation path; payload retained" >&2; exit 1;;
     esac
     case "$f" in */../*|*/./*|*//*|*/..|*/.|*/MANIFEST|*/MANIFEST.*) echo "noncanonical installation path" >&2; exit 1;; esac
@@ -183,7 +186,8 @@ if [ "$managed" = yes ]; then
 	manager daemon-reload
 	# Record manager ownership before a partial registration can fail.
     # Manager ownership was committed with the candidate ledger.
-    manager enable --now abstraction-jobd.timer abstraction-runtime.service
+    disable_retired
+    manager enable --now abstraction-runtime.service
     manager is-active --quiet abstraction-runtime.service
     # Startup includes listener initialization; poll read-only readiness within one budget.
     timeout --kill-after=2s 15s sh -c '
@@ -191,11 +195,10 @@ if [ "$managed" = yes ]; then
     ' sh "$bin/openabstractions"
     echo "ok    user runtime started; status probe completed"
 	timer=yes
-	echo "ok    abstraction-jobd.timer enabled: once 30s after login, then every 5 minutes"
 else
-	echo "note  no systemd user manager on this machine, so nothing sweeps unfinished"
-	echo "note  transfers in the background. dl and jobctl work without it; a transfer"
-	echo "note  interrupted after dl exits stays unfinished until you run: jobd once"
+	echo "note  no systemd user manager on this machine, so nothing starts the runtime"
+	echo "note  in the background. Run it in a terminal you keep open:"
+	echo "note      $bin/openabstractions serve runtime"
 fi
 
 

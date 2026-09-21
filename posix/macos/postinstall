@@ -21,9 +21,9 @@ bin=$home/.local/bin
 # finished file ever appears in ~/Library/LaunchAgents: it is written under a
 # temporary name outside that directory, then renamed into place on the same
 # volume, so Background Task Management never reads the @BIN@ placeholder.
-template=$share/com.openabstractions.jobd.plist
+template=$share/com.openabstractions.runtime.plist
 agents=$home/Library/LaunchAgents
-plist=$agents/com.openabstractions.jobd.plist
+plist=$agents/com.openabstractions.runtime.plist
 
 uid=$(stat -f %u "$home")
 gid=$(stat -f %g "$home")
@@ -31,7 +31,7 @@ gid=$(stat -f %g "$home")
 [ -f "$template" ] || { echo "postinstall: LaunchAgent template missing" >&2; exit 1; }
 [ ! -L "$home/Library" ] && [ ! -L "$agents" ] || { echo "postinstall: unsafe payload directory" >&2; exit 1; }
 mkdir -p -- "$agents"
-tmp=$(mktemp "$share/.com.openabstractions.jobd.plist.XXXXXX")
+tmp=$(mktemp "$share/.com.openabstractions.runtime.plist.XXXXXX")
 trap 'rm -f -- "$tmp"' EXIT
 # Escape XML text first, then escape sed replacement metacharacters.
 replacement=$(printf '%s' "$bin" | sed 's/&/\&amp;/g; s/</\&lt;/g; s/>/\&gt;/g' | sed 's/[\\&|]/\\&/g')
@@ -40,6 +40,20 @@ if grep -q '@BIN@' "$tmp"; then echo "postinstall: LaunchAgent placeholder left 
 chmod 644 "$tmp"
 mv -f -- "$tmp" "$plist"
 trap - EXIT
+
+# 0.1.7 and earlier installed jobd, dl and jobctl and registered the runtime as
+# com.openabstractions.jobd (docs/REMOVED.md). preinstall booted that label out.
+# Its plist would start a second runtime at the next login, so each retired
+# file the predecessor's MANIFEST lists is removed before the new ledger exists.
+if [ -f "$share/MANIFEST" ]; then
+    for retired in "$agents/com.openabstractions.jobd.plist" "$share/com.openabstractions.jobd.plist" \
+        "$bin/jobd" "$bin/dl" "$bin/jobctl"; do
+        if grep -F -x -- "$retired" "$share/MANIFEST" >/dev/null && [ -f "$retired" ] && [ ! -L "$retired" ]; then
+            rm -f -- "$retired"
+            echo "ok    removed retired $retired"
+        fi
+    done
+fi
 
 manifest_tmp=$share/MANIFEST.new
 : > "$manifest_tmp"
@@ -74,7 +88,7 @@ while IFS= read -r installed; do own_path "$installed"; done < "$share/MANIFEST"
 own_path "$share/MANIFEST"
 
 domain=gui/$uid
-service=$domain/com.openabstractions.jobd
+service=$domain/com.openabstractions.runtime
 # A failed manager query/registration is an installation error. The plist remains
 # available for the user to register later in a graphical login session.
 manager print "$domain" >/dev/null

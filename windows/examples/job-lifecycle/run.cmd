@@ -1,54 +1,58 @@
 @echo off
 setlocal
-set TOOLS=%~dp0..\..\tools
-set STORE=%TEMP%\openabstractions-example-store
-set ABSTRACTION_STORE=%STORE%
-set JOB_STORE=%STORE%
-set CTL="%TOOLS%\jobctl.exe"
+set OA="%~dp0..\..\tools\openabstractions.exe"
+set KEY=example-lifecycle-%RANDOM%%RANDOM%
+set URL=http://127.0.0.1:9/never
 
-echo A throwaway store, so this touches nothing you rely on:
-echo   %STORE%
+echo A job from submitted to ended, one command per step, through the runtime
+echo this install runs. The source is a port on this machine that nothing
+echo answers, so the work stays unfinished until it is cancelled. Nothing is
+echo downloaded and no internet is needed.
 echo.
 
-echo == submit ==  an application says what it wants done
-%CTL% submit --kind download --spec "{\"url\":\"https://example.com/big.iso\"}" --total 1000 > "%STORE%.id"
-set ID=
-set /p ID=<"%STORE%.id"
-del "%STORE%.id"
-if not defined ID goto :failed
-echo   job %ID%
-%CTL% list
+echo == submit ==  the request identity %KEY% is chosen before anything is sent
+%OA% download %URL% --key %KEY% --no-wait
+if errorlevel 1 goto :failed
 echo.
 
-echo == claim ==  one worker takes it, for 60 seconds, and gets an epoch
-%CTL% claim --owner example --ttl 60 %ID%
-echo.
-echo   The epoch is the point. A second worker that claims this job gets epoch
-echo   2, and every write the first one still tries is refused. That is how one
-echo   job survives two programs without a lock.
+echo == observe ==  pending or running: the runtime keeps trying the port
+%OA% jobs show --key %KEY%
 echo.
 
-echo == progress ==  reported against the epoch you hold
-%CTL% progress --epoch 1 --done 400 %ID%
-%CTL% progress --epoch 1 --done 1000 %ID%
+echo == cancel ==  records the intent to cancel, which is not proof it stopped
+%OA% jobs cancel --key %KEY%
 echo.
 
-echo == a stale epoch is refused ==
-%CTL% progress --epoch 0 --done 7 %ID%
-echo   ^(that failure is the example working^)
+echo == wait ==  follows the job until it ends
+%OA% jobs wait --key %KEY% --timeout 60s
+echo   ^(exit 5, cancelled: that is the example working^)
 echo.
 
-echo == finish ==
-%CTL% finish --epoch 1 --state complete %ID%
-%CTL% show %ID%
+echo == cancel again ==  nothing is left to cancel, and no work is created
+%OA% jobs cancel --key %KEY%
 echo.
 
-echo Delete %STORE% when you are done with it.
+echo == submit the same request again ==  the same job comes back
+%OA% download %URL% --key %KEY% --no-wait
+echo.
+
+echo == retry ==  a new attempt is accepted only after the last one failed
+%OA% download %URL% --key %KEY% --no-wait --retry
+echo   ^(exit 3, invalid: a cancelled job is not retried^)
+echo.
+
+echo == a request the runtime cannot perform ==  refused before anything is sent
+%OA% download ftp://127.0.0.1/never
+echo   ^(exit 2^)
+echo.
+
+echo The job stays in this program's list: openabstractions jobs list
 echo.
 if /i "%~1"=="--no-pause" goto :eof
 pause
 goto :eof
 
 :failed
-echo   jobctl submit produced no job id. Nothing else here can run.
+echo   The runtime did not accept the job. openabstractions status says whether
+echo   it is running.
 exit /b 1

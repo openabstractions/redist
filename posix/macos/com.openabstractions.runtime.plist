@@ -3,7 +3,7 @@
 <plist version="1.0">
 <dict>
 	<key>Label</key>
-	<string>com.openabstractions.jobd</string>
+	<string>com.openabstractions.runtime</string>
 	<key>ProgramArguments</key>
 	<array>
 		<string>@BIN@/openabstractions</string>

@@ -148,7 +148,7 @@ function Get-ProcessOwnerSid($Process) {
 }
 
 # Stops the account's processes and deletes the account after checking its SID.
-# -RuntimeProcessesOnly stops only its jobd, jobdw and openabstractions
+# -RuntimeProcessesOnly stops only its jobd, jobdw, openabstractions and openabstractionsw
 # processes, whose owners must be established; otherwise every process whose
 # owner is readable is considered. -RequirePresent treats a missing account as
 # a changed identity.
@@ -175,9 +175,9 @@ function Remove-DisposableAccount {
     Remove-LocalUser -Name $Account.Name
 }
 
-# jobd, jobdw and openabstractions processes owned by the SID.
+# jobd, jobdw, openabstractions and openabstractionsw processes owned by the SID.
 function Get-RuntimeProcesses([string]$Sid) {
-    foreach ($candidate in @(Get-CimInstance Win32_Process -Filter "Name='jobd.exe' OR Name='jobdw.exe' OR Name='openabstractions.exe'")) {
+    foreach ($candidate in @(Get-CimInstance Win32_Process -Filter "Name='jobd.exe' OR Name='jobdw.exe' OR Name='openabstractions.exe' OR Name='openabstractionsw.exe'")) {
         $owner = Get-ProcessOwnerSid $candidate
         if ($null -ne $owner -and $owner -eq $Sid) { $candidate }
     }
@@ -250,7 +250,44 @@ function Test-PathNames {
     return $false
 }
 
+# How this process sees the profile folders: 'real', or
+# 'virtualized(<package family>)' when it descends from an MSIX packaged app
+# whose new AppData files land in the package's private copy. The probe
+# creates one empty file directly in Root (%LOCALAPPDATA%), looks for it under
+# Packages\*\LocalCache\Local, and removes every copy. Create makes the file;
+# tests replace it to simulate a redirected create.
+function Get-ProfileView {
+    param([string]$Root = $env:LOCALAPPDATA,
+          [scriptblock]$Create = { param($Path) [IO.File]::Open($Path, [IO.FileMode]::CreateNew).Dispose() })
+    if (-not $Root) { throw 'Get-ProfileView: LOCALAPPDATA is not set.' }
+    $name = '.oa-profile-{0}-{1}' -f $PID, [guid]::NewGuid().ToString('N')
+    $probe = Join-Path $Root $name
+    & $Create $probe
+    try {
+        $copies = @(Get-ChildItem -LiteralPath (Join-Path $Root 'Packages') -Directory -ErrorAction SilentlyContinue |
+            Where-Object { Test-Path -LiteralPath (Join-Path $_.FullName "LocalCache\Local\$name") })
+    } finally {
+        Remove-Item -LiteralPath $probe -Force -ErrorAction SilentlyContinue
+    }
+    foreach ($copy in $copies) { Remove-Item -LiteralPath (Join-Path $copy.FullName "LocalCache\Local\$name") -Force -ErrorAction SilentlyContinue }
+    if ($copies.Count -gt 1) { throw "Get-ProfileView: the probe appears in $($copies.Count) package copies." }
+    if ($copies.Count -eq 1) { return "virtualized($($copies[0].Name))" }
+    return 'real'
+}
+
+# Refuses to go on from a shell inside a packaged app, such as an agent's shell
+# under Claude Desktop: product processes started from it would read and write
+# that package's private copy of AppData, and a qualification run there proves
+# nothing about the person's installation. Start the fixture through Explorer or
+# WMI instead.
+function Assert-RealProfileView {
+    $view = Get-ProfileView
+    if ($view -ne 'real') {
+        throw "This fixture runs product processes, and this shell's profile view is $view. Start it from a shell outside the packaged app, through Explorer or WMI."
+    }
+}
+
 Export-ModuleMember -Function Assert-DisposableRunner, Invoke-FixtureProcess, Invoke-Bounded, Protect-DiagnosticText,
     New-DisposableAccount, Grant-AccountAccess, Invoke-AccountProcess, Test-CimNotFound, Test-ProcessGone,
     Get-ProcessOwnerSid, Remove-DisposableAccount, Get-RuntimeProcesses, Get-PipeNames, Get-CapabilityPipes,
-    Assert-NoRuntime, Get-InstalledProducts, Test-PathNames
+    Assert-NoRuntime, Get-InstalledProducts, Test-PathNames, Get-ProfileView, Assert-RealProfileView

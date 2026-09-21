@@ -15,51 +15,55 @@ WIDTH = 7
 
 MACHINE, USER = "ALLUSERS", "NOT ALLUSERS"
 SCOPES = {"for everyone": True, "just for me": False}
-# What starts the supervisor, in each scope. Both arms exist or one scope
+# What starts the runtime host, in each scope. Both arms exist or one scope
 # installs the programs and nothing that ever runs them.
 ARMS = {True: "SupervisorServiceMarker", False: "LogonStartShortcut"}
-SUPERVISOR_ACTIONS = ("RegisterSupervisor", "RollbackSupervisor", "UnregisterSupervisor", "StopPreviousSupervisor",
+SUPERVISOR_ACTIONS = ("RegisterSupervisor", "RollbackSupervisor", "UnregisterSupervisor",
                       "BeginMachineUpgradeExclusion", "EndMachineUpgradeExclusion", "RestartPreviousSupervisor")
 UPGRADE_CONDITIONS = {"machine": "ALLUSERS AND WIX_UPGRADE_DETECTED AND NOT REMOVE",
                       "user": "NOT ALLUSERS AND WIX_UPGRADE_DETECTED AND NOT REMOVE"}
 # The early script, in order. For each scope: hold the upgrade exclusion,
-# register its release on commit, register the rollback restart, then stop the
-# predecessor. InstallExecute flushes all eight before any file is replaced,
-# and rollback runs them in reverse: release and restart after the files are
-# restored. (action, scope, ExeCommand, Execute, Impersonate, Return)
+# register its release on commit, then register the rollback activation.
+# InstallExecute flushes all six before any file is replaced, and rollback runs
+# them in reverse: release and activate after the files are restored. The
+# package stops nothing: Restart Manager ends the running host at
+# InstallValidate. (action, scope, ExeCommand, Execute, Impersonate, Return)
 UPGRADE_CHAIN = (
     ("BeginMachineUpgradeExclusion", "machine",
      'service begin-upgrade --machine "[APPLICATIONFOLDER]." --related "[WIX_UPGRADE_DETECTED]"', "deferred", "no", "check"),
     ("EndMachineUpgradeExclusion", "machine", "service end-upgrade --machine", "commit", "no", "check"),
     ("RestartPreviousSupervisor", "machine", "service start --machine", "rollback", "no", "ignore"),
-    ("StopPreviousSupervisor", "machine", "service stop", "deferred", "no", "check"),
     ("BeginUserUpgradeExclusion", "user",
      'service begin-upgrade --user "[APPLICATIONFOLDER]." --related "[WIX_UPGRADE_DETECTED]"', "deferred", "yes", "check"),
     ("EndUserUpgradeExclusion", "user", "service end-upgrade --user", "commit", "yes", "check"),
     ("RestartPreviousUserSupervisor", "user", 'service start --related "[WIX_UPGRADE_DETECTED]"', "rollback", "yes", "ignore"),
-    ("StopPreviousUserSupervisor", "user",
-     'service stop --user "[APPLICATIONFOLDER]." --related "[WIX_UPGRADE_DETECTED]"', "deferred", "yes", "check"),
 )
+UPGRADE_BINARY = "payload/tools/openabstractions.exe"
 # After the new version is committed, and only then, the predecessor is
-# removed. (action, Execute, Return, After, Condition)
+# removed. (action, Execute, Return, After, Condition, FileRef, ExeCommand)
 LATE_REMOVAL = (
     ("RollbackSupervisor", "rollback", "ignore", "InstallFiles",
-     'ALLUSERS AND NOT (REMOVE="ALL") AND NOT WIX_UPGRADE_DETECTED'),
+     'ALLUSERS AND NOT (REMOVE="ALL") AND NOT WIX_UPGRADE_DETECTED', "openabstractions.exe", "host unregister"),
     ("RegisterSupervisor", "deferred", "check", "RollbackSupervisor",
-     'ALLUSERS AND NOT (REMOVE="ALL") AND NOT WIX_UPGRADE_DETECTED'),
+     'ALLUSERS AND NOT (REMOVE="ALL") AND NOT WIX_UPGRADE_DETECTED', "openabstractions.exe", "host register"),
     ("RegisterSupervisorAfterRemoval", "immediate", "check", "RemoveExistingProducts",
-     "ALLUSERS AND WIX_UPGRADE_DETECTED AND NOT REMOVE"),
+     "ALLUSERS AND WIX_UPGRADE_DETECTED AND NOT REMOVE", "openabstractions.exe", "host register"),
     ("StartUserRuntime", "immediate", "check", "RegisterSupervisorAfterRemoval",
-     'NOT ALLUSERS AND NOT (REMOVE="ALL") AND NOT UPGRADINGPRODUCTCODE'),
+     'NOT ALLUSERS AND NOT (REMOVE="ALL") AND NOT UPGRADINGPRODUCTCODE', "openabstractionsw.exe",
+     "start --require-unelevated"),
 )
+# The per-user Startup shortcut runs the windowless host.
+LOGON_SHORTCUT = {"Target": "[#openabstractionsw.exe]", "Arguments": "serve host"}
 UPGRADE_MESSAGES = {
-    "StopPreviousSupervisor": "abstraction.wxs: incoming checked stop must execute before the new files replace the "
-                              "predecessor's, and the old product must be removed only after InstallFinalize",
-    "StopPreviousUserSupervisor": "abstraction.wxs: incoming checked per-user stop must run impersonated from the embedded "
-                                  "jobd Binary against [APPLICATIONFOLDER] and the related products' recorded folders "
-                                  "before the new files replace the predecessor's",
-    "RestartPreviousUserSupervisor": "abstraction.wxs: a failed per-user upgrade must restart the stopped predecessor from "
-                                     "a rollback action scheduled before StopPreviousUserSupervisor",
+    "binary": "abstraction.wxs: the upgrade actions must run the embedded incoming openabstractions.exe "
+              f"(Binary UpgradeSupervisorCode = {UPGRADE_BINARY}), and the old product must be removed only "
+              "after InstallFinalize",
+    "flush": "abstraction.wxs: the early InstallExecute must follow the last exclusion action, "
+             "RestartPreviousUserSupervisor, so the exclusion is held before RemoveFiles and InstallFiles",
+    "stop": "abstraction.wxs: the package stops nothing; Restart Manager ends the running host at "
+            "InstallValidate and every restart path is an idempotent activation",
+    "RestartPreviousUserSupervisor": "abstraction.wxs: a failed per-user upgrade must activate the previous runtime "
+                                     "from an impersonated rollback action in the early script",
 }
 
 
@@ -106,8 +110,13 @@ def check_upgrade_shutdown(root):
     major = find("MajorUpgrade")
     binary = find("Binary", "Id", "UpgradeSupervisorCode")
     if (major is None or major.get("Schedule") != "afterInstallFinalize"
-            or binary is None or binary.get("SourceFile") != "payload/tools/jobd.exe"):
-        bad.append(UPGRADE_MESSAGES["StopPreviousSupervisor"])
+            or binary is None or binary.get("SourceFile") != UPGRADE_BINARY):
+        bad.append(UPGRADE_MESSAGES["binary"])
+    # No custom action ends a process: not by name, not by command.
+    for element in (el for el in root.iter() if untag(el) == "CustomAction"):
+        words = (element.get("ExeCommand") or "").split()
+        if element.get("Id", "").startswith("Stop") or "stop" in words[:2] or "taskkill" in (element.get("ExeCommand") or ""):
+            bad.append(f"{UPGRADE_MESSAGES['stop']} ({element.get('Id')} runs {element.get('ExeCommand')!r})")
     previous = "InstallInitialize"
     for action, scope, command, execute, impersonate, returns in UPGRADE_CHAIN:
         element = find("CustomAction", "Id", action)
@@ -122,21 +131,25 @@ def check_upgrade_shutdown(root):
             token = "the installing user's token" if impersonate == "yes" else "an administrator token"
             bad.append(UPGRADE_MESSAGES.get(action, (
                 f"abstraction.wxs: {action} must be a {execute} action with {token} and return={returns}, "
-                f"running `{command}` from the embedded incoming jobd after {previous} for {scope} upgrades")))
+                f"running `{command}` from the embedded incoming openabstractions after {previous} for {scope} upgrades")))
         previous = action
     flush = find("InstallExecute")
-    if flush is None or flush.get("After") != previous:
-        bad.append("abstraction.wxs: the early InstallExecute must flush both incoming stops before "
-                   "RemoveFiles and InstallFiles")
-    for action, execute, returns, after, condition in LATE_REMOVAL:
+    if flush is None or flush.get("After") != previous or flush.get("Before") is not None:
+        bad.append(UPGRADE_MESSAGES["flush"])
+    for action, execute, returns, after, condition, file, command in LATE_REMOVAL:
         element = find("CustomAction", "Id", action)
         row = find("Custom", "Action", action)
         if (element is None or element.get("Execute") != execute or element.get("Return") != returns
+                or element.get("FileRef") != file or element.get("ExeCommand") != command
                 or row is None or row.get("After") != after or row.get("Before") is not None
                 or row.get("Condition") != condition):
-            bad.append(f"abstraction.wxs: {action} must be an {execute} action with return={returns}, "
-                       f"scheduled after {after} under exactly {condition!r}, so the predecessor's own "
-                       "uninstall cannot delete the shared supervisor service this version registered")
+            bad.append(f"abstraction.wxs: {action} must be an {execute} action running installed {file} "
+                       f"`{command}` with return={returns}, scheduled after {after} under exactly {condition!r}, "
+                       "so the predecessor's own uninstall cannot delete the shared host service this version registered")
+    shortcut = find("Shortcut", "Id", "LogonStartFile")
+    if shortcut is None or any(shortcut.get(k) != v for k, v in LOGON_SHORTCUT.items()):
+        bad.append("abstraction.wxs: the per-user Startup shortcut must run "
+                   f"{LOGON_SHORTCUT['Target']} {LOGON_SHORTCUT['Arguments']}")
     return bad
 
 

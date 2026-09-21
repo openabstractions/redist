@@ -16,8 +16,7 @@
          Inside the transaction, a failure rolls the removal back, and an
          unelevated per-user rollback is denied the HKLM registration it would
          have to rewrite: the predecessor came back as files with no product
-         registration, no Apps and features entry and no way to restart it
-         (feedback/windows-per-user-upgrade-rollback-registration.md). After
+         registration, no Apps and features entry and no way to restart it. After
          InstallFinalize the predecessor is untouched until this version is
          committed, so any failure before that leaves the previous version
          installed, registered and runnable — the owner's ruling of
@@ -51,11 +50,9 @@
          one that does not say it is incomplete may not. -->
     <?if $(var.Panel) = yes ?><?define NoPanel = "" ?>
     <?else?><?define NoPanel = " The Abstraction Panel, the graphical front end, is not in it." ?><?endif?>
-    <?if $(var.Dev) = yes ?><?define NoDev = "" ?>
-    <?else?><?define NoDev = " The Python packages are not in it; they are on their own registry." ?><?endif?>
     <?if $(var.Cpp) = yes ?><?define NoCpp = "" ?>
     <?else?><?define NoCpp = " The C++ header is not in it; no module carries it." ?><?endif?>
-    <?define Absent = "$(var.NoPanel)$(var.NoDev)$(var.NoCpp)" ?>
+    <?define Absent = "$(var.NoPanel)$(var.NoCpp)" ?>
     <?if $(var.Absent) = "" ?>
     <Property Id="ARPCOMMENTS" Value="Downloads that survive the program that started them." />
     <?else?>
@@ -92,10 +89,6 @@
             <Directory Id="ExampleDownload" Name="download-a-file" />
           </Directory>
           <Directory Id="DevFolder" Name="dev">
-            <Directory Id="DevPython" Name="python">
-              <Directory Id="DevPythonJob" Name="job" />
-              <Directory Id="DevPythonDownload" Name="download" />
-            </Directory>
             <Directory Id="DevInclude" Name="include">
               <Directory Id="DevIncludeAbstraction" Name="abstraction">
                 <Directory Id="DevIncludeDownload" Name="download" />
@@ -118,25 +111,37 @@
 
     <StandardDirectory Id="StartupFolder" />
 
-    <!-- jobd.exe is in tools\ with dl and jobctl, and on PATH with them, because
-         its own package comment calls it "the console program a person types
-         at": `jobd status` is what the what-this-machine-does example runs and
-         `jobd start` is what a person runs. The posix package has put all three
-         in ~/.local/bin since it existed, and two packages disagreeing about
-         where a tool lives is the same defect as one of them being wrong.
+    <!-- openabstractions.exe is the console command a person types and the
+         runtime the host supervises; openabstractionsw.exe is the same serve
+         source linked -H=windowsgui, the image the service template, the
+         Startup shortcut and the post-install activation run, because a
+         console image started at sign-in opens a console window.
 
          Nothing about the registration depends on the folder: the custom
-         actions below reach the file through the File table by Id, and the
-         service's ImagePath is written by jobd from its own os.Executable(). -->
+         actions reach the files through the File table by Id, and the
+         service's ImagePath is written by `host register` from its own
+         os.Executable(). -->
     <ComponentGroup Id="ServiceFiles">
       <Component Directory="ToolsFolder">
         <File Id="openabstractions.exe" Source="payload/tools/openabstractions.exe" KeyPath="yes" />
+        <!-- Restart Manager ends only the processes holding a file this
+             transaction replaces or removes. A 0.1.5-0.1.7 predecessor runs its
+             runtime under jobdw.exe (or jobd.exe), which this package no longer
+             carries, so without these rows Restart Manager sees only the
+             runtime child openabstractions.exe. It cannot shut down that
+             console-type process (RmShutdown returns ERROR_FAIL_SHUTDOWN after
+             30 s), the replacement of openabstractions.exe fails with 1310 and
+             the upgrade ends 1603. Removing the predecessor's supervisor image
+             in this transaction registers it: Restart Manager sends its hidden
+             window WM_QUERYENDSESSION, and the supervisor ends its contained
+             runtime. A rollback
+             restores the files, and the predecessor's own late removal finds
+             them already gone. -->
+        <RemoveFile Id="RemovePredecessorJobdw" Directory="ToolsFolder" Name="jobdw.exe" On="install" />
+        <RemoveFile Id="RemovePredecessorJobd" Directory="ToolsFolder" Name="jobd.exe" On="install" />
       </Component>
       <Component Directory="ToolsFolder">
-        <File Id="jobd.exe" Source="payload/tools/jobd.exe" KeyPath="yes" />
-      </Component>
-      <Component Directory="ToolsFolder">
-        <File Id="jobdw.exe" Source="payload/tools/jobdw.exe" KeyPath="yes" />
+        <File Id="openabstractionsw.exe" Source="payload/tools/openabstractionsw.exe" KeyPath="yes" />
       </Component>
       <Component Id="RegistryRoot" Directory="APPLICATIONFOLDER"
                  Guid="8821E881-5E73-465E-904E-EF7FC1223A5C">
@@ -146,42 +151,34 @@
       </Component>
     </ComponentGroup>
 
-    <!-- Registering the supervisor is a machine-scope act, because the only
-         thing that supervises a process on Windows is the SCM and reaching it
-         needs an administrator token. `sc create ... type= userown` gives a
-         template the operating system clones into every interactive session as
-         `<name>_<luid>`, running as that person with no password stored, and
-         restarts when it dies — measured on Windows 11, and
-         settled by the owner's own run of it, VISION.md 2026-09-10 "Host S is
-         unnecessary".
-
-         WiX cannot say it. ServiceInstall/@Type takes 'ownProcess,shareProcess'
-         and nothing else, so the registration is a deferred custom action
-         running the installed jobd.exe, which knows its own path, its own
-         recovery policy and — the part sc.exe cannot express — how to find and
-         delete the per-session instances that outlive the template.
+    <!-- Registering the host is a machine-scope act: the SCM is what
+         supervises a process on Windows and reaching it needs an administrator
+         token. A SERVICE_USER_OWN_PROCESS template is cloned into every
+         interactive session as `<name>_<luid>`, running as that person with no
+         password stored, and restarted when it fails (VISION.md 2026-09-10
+         "Host S is unnecessary"). WiX's ServiceInstall cannot express that
+         type, so `openabstractions host register` writes it from a deferred
+         custom action, and `host unregister` deletes the template and the
+         per-session instances that outlive it.
 
          Every one of these is conditioned on ALLUSERS. A per-user install has
-         no administrator token, and an action that needs one there is the 1603
-         the logon schtasks returned. -->
-    <!-- Execute incoming shutdown code before any file is replaced. The early
-         InstallExecute flushes these deferred actions alone, ahead of
-         RemoveFiles and InstallFiles, so no predecessor process holds a file
-         this package is about to overwrite. -->
-    <Binary Id="UpgradeSupervisorCode" SourceFile="payload/tools/jobd.exe" />
-    <!-- Upgrade exclusion. Before a stop, the incoming jobd records the folders
-         being replaced and this installer process; every activation path of
-         those folders refuses while the installer lives. The commit action
-         releases it. The rollback action releases it and restarts exactly what
-         the stop recorded. Order in the early script: begin, commit release,
-         rollback restart, stop. Rollback runs in reverse, so the record is
-         released and its processes restarted after the files are back.
+         no administrator token.
 
-         The window now covers the file replacement and ends at commit. The
-         predecessor's own removal runs after that, in its own transaction,
-         with nothing of the predecessor running: its processes were ended by
-         the stop, its per-user activation is a Startup shortcut that runs at
-         sign-in, and its machine service was stopped and is not restarted. -->
+         The package stops nothing.
+         Restart Manager ends the running host at InstallValidate: per-user
+         through its session window, machine scope through the SCM. The host
+         registers for restart, and every restart path below is an idempotent
+         activation, correct whether or not anything was running. -->
+    <Binary Id="UpgradeSupervisorCode" SourceFile="payload/tools/openabstractions.exe" />
+    <!-- Upgrade exclusion. The incoming openabstractions records the folders
+         being replaced and this installer process; every activation path of
+         those folders (start, serve host, SDK activation) exits 3 while the
+         installer lives. The commit action releases it. The rollback action
+         releases it and runs the previous version's own activation. Order in
+         the early script, per scope: begin, commit release, rollback
+         activation. Rollback runs in reverse, so the record is released and
+         the previous runtime activated after the files are back. The early
+         InstallExecute flushes the chain before any file is replaced. -->
 
     <CustomAction Id="BeginMachineUpgradeExclusion" BinaryRef="UpgradeSupervisorCode"
                   ExeCommand="service begin-upgrade --machine &quot;[APPLICATIONFOLDER].&quot; --related &quot;[WIX_UPGRADE_DETECTED]&quot;"
@@ -189,84 +186,67 @@
     <CustomAction Id="EndMachineUpgradeExclusion" BinaryRef="UpgradeSupervisorCode"
                   ExeCommand="service end-upgrade --machine"
                   Execute="commit" Impersonate="no" Return="check" />
+    <!-- Machine rollback: release the record and start every per-session
+         instance of the restored registration that is not running. -->
     <CustomAction Id="RestartPreviousSupervisor" BinaryRef="UpgradeSupervisorCode"
                   ExeCommand="service start --machine"
                   Execute="rollback" Impersonate="no" Return="ignore" />
-    <CustomAction Id="StopPreviousSupervisor" BinaryRef="UpgradeSupervisorCode" ExeCommand="service stop"
-                  Execute="deferred" Impersonate="no" Return="check" />
+    <!-- The Target column is Formatted and an EXE action cannot read
+         CustomActionData, so the folder is formatted into the command line when
+         the script is written. The trailing "." keeps the property's final
+         backslash from escaping the closing quote. [WIX_UPGRADE_DETECTED] names
+         the related per-user products; each one's recorded install location is
+         read through the MSI API, so a predecessor in a non-default folder is
+         covered where it lives. -->
     <CustomAction Id="BeginUserUpgradeExclusion" BinaryRef="UpgradeSupervisorCode"
                   ExeCommand="service begin-upgrade --user &quot;[APPLICATIONFOLDER].&quot; --related &quot;[WIX_UPGRADE_DETECTED]&quot;"
                   Execute="deferred" Impersonate="yes" Return="check" />
     <CustomAction Id="EndUserUpgradeExclusion" BinaryRef="UpgradeSupervisorCode"
                   ExeCommand="service end-upgrade --user"
                   Execute="commit" Impersonate="yes" Return="check" />
-    <!-- A per-user predecessor is a process of the installing account, and a
-         0.1.5 supervisor has no Restart Manager shutdown window. The installing
-         user's token ends only its own processes under the upgraded folder.
-         The Target column is Formatted and an EXE action cannot read
-         CustomActionData, so the folder is formatted into the command line when
-         the script is written. The trailing "." keeps the property's final
-         backslash from escaping the closing quote. [WIX_UPGRADE_DETECTED] names
-         the related per-user products; jobd reads each one's recorded install
-         location through the MSI API, so a predecessor in a non-default folder
-         is stopped where it lives. -->
-    <CustomAction Id="StopPreviousUserSupervisor" BinaryRef="UpgradeSupervisorCode"
-                  ExeCommand="service stop --user &quot;[APPLICATIONFOLDER].&quot; --related &quot;[WIX_UPGRADE_DETECTED]&quot;"
-                  Execute="deferred" Impersonate="yes" Return="check" />
-    <!-- A failed upgrade leaves the old product installed and its supervisor
-         stopped. This rollback action runs each related product's own Startup
-         activation from its recorded folder, so the old supervisor answers
-         again before the next sign-in. Scheduled before the stop, the script
-         holds it whenever the stop has run. A restart failure is logged and
-         does not block the rollback. With the removal after InstallFinalize
-         the related product is still registered when this runs, so the start
-         reads its version and install location through the MSI API instead of
-         answering MsiGetProductInfoExW 1608. -->
+    <!-- Per-user rollback: release the record and run each related product's
+         own activation from its recorded folder, so the previous runtime
+         answers again before the next sign-in: jobdw.exe with the runtime
+         flag for 0.1.6 and 0.1.7, openabstractionsw.exe from 0.1.8. A failure is
+         logged to installer-actions.txt and does not block the rollback. The
+         related product is still registered when this runs, because the
+         predecessor is removed only after InstallFinalize. -->
     <CustomAction Id="RestartPreviousUserSupervisor" BinaryRef="UpgradeSupervisorCode"
                   ExeCommand="service start --related &quot;[WIX_UPGRADE_DETECTED]&quot;"
                   Execute="rollback" Impersonate="yes" Return="ignore" />
-    <!-- Fresh machine installs and repairs register the supervisor inside the
+    <!-- Fresh machine installs and repairs register the host inside the
          transaction, with the elevated token the SCM needs, and undo it on
          rollback. A machine upgrade does neither: the predecessor's own
          registration of the same shared service name is still live, and
-         deleting it on rollback would take the previous version's supervisor
-         with it — the thing a failed upgrade must leave working. -->
-    <CustomAction Id="RegisterSupervisor" FileRef="jobd.exe" ExeCommand="service install --runtime"
+         deleting it on rollback would take the previous version's host with
+         it. -->
+    <CustomAction Id="RegisterSupervisor" FileRef="openabstractions.exe" ExeCommand="host register"
                   Execute="deferred" Impersonate="no" Return="check" />
-    <CustomAction Id="RollbackSupervisor" FileRef="jobd.exe" ExeCommand="service uninstall"
+    <CustomAction Id="RollbackSupervisor" FileRef="openabstractions.exe" ExeCommand="host unregister"
                   Execute="rollback" Impersonate="no" Return="ignore" />
-    <!-- The shared service name is the one thing a late removal cannot leave
-         alone. 0.1.5 and 0.1.6 run their own `service uninstall` while being
-         removed, and that removal now happens after this version would have
-         registered `OpenAbstractionsSupervisor`, so the predecessor deletes
-         the successor's service. Nothing deferred can run after
-         RemoveExistingProducts — the execution script is committed at
-         InstallFinalize — so a machine upgrade registers here instead, in the
+    <!-- 0.1.5 and 0.1.6 run their own `service uninstall` while being removed,
+         and that removal happens after this version registered
+         `OpenAbstractionsSupervisor`. Nothing deferred can run after
+         RemoveExistingProducts, so a machine upgrade registers here, in the
          immediate sequence, after the predecessor's uninstall has finished.
-         `service install` creates or rewrites the registration and its
-         recovery policy, so running it once at the end is the whole
-         registration for an upgrade. It reaches the SCM with the token that
-         started msiexec; Return="check" reports a machine upgrade that could
-         not register its supervisor rather than leaving one that installed
-         the programs and nothing that runs them. -->
-    <CustomAction Id="RegisterSupervisorAfterRemoval" FileRef="jobd.exe" ExeCommand="service install --runtime"
+         `host register` creates or rewrites the registration and its recovery
+         policy. It reaches the SCM with the token that started msiexec;
+         Return="check" reports a machine upgrade that could not register its
+         host. -->
+    <CustomAction Id="RegisterSupervisorAfterRemoval" FileRef="openabstractions.exe" ExeCommand="host register"
                   Execute="immediate" Return="check" />
-    <!-- Preserve the payload if supervisor shutdown cannot be confirmed. The
-         removal half is scoped to a real uninstall: under UPGRADINGPRODUCTCODE
-         this product is being removed by a successor that has already stopped
-         this supervisor and owns the shared service name from
-         RegisterSupervisorAfterRemoval onwards. Deleting it there is what
-         0.1.5 does to us. -->
-    <CustomAction Id="UnregisterSupervisor" FileRef="jobd.exe" ExeCommand="service uninstall"
+    <!-- Delete the registration and its instances before the payload goes, for
+         a real uninstall only: under UPGRADINGPRODUCTCODE a successor owns the
+         shared service name from RegisterSupervisorAfterRemoval onwards. -->
+    <CustomAction Id="UnregisterSupervisor" FileRef="openabstractions.exe" ExeCommand="host unregister"
                   Execute="deferred" Impersonate="no" Return="check" />
     <!-- Activation follows the committed install and the predecessor's removal.
-         A failure reports an error with installed files retained; it cannot
-         promise transaction rollback. Starting before the removal would run
-         the new runtime out of a folder the predecessor's uninstall is still
-         accounting for. The executable checks its process token before any
-         start/bus lookup. -->
-    <CustomAction Id="StartUserRuntime" FileRef="jobdw.exe"
-                  ExeCommand="start --runtime --require-unelevated"
+         `start` refuses an elevated token before anything else, launches the
+         windowless host detached and waits for readiness. When Restart Manager
+         also restarts a registered host after the transaction, one of the two
+         owns the endpoint and the other exits. -->
+    <CustomAction Id="StartUserRuntime" FileRef="openabstractionsw.exe"
+                  ExeCommand="start --require-unelevated"
                   Execute="immediate" Impersonate="yes" Return="check" />
     <!-- ALLUSERS=2 with MSIINSTALLPERUSER=1 resolves per-user for every token,
          including a full administrator or a deployment tool running as SYSTEM.
@@ -286,17 +266,13 @@
               Condition="ALLUSERS AND WIX_UPGRADE_DETECTED AND NOT REMOVE" />
       <Custom Action="RestartPreviousSupervisor" After="EndMachineUpgradeExclusion"
               Condition="ALLUSERS AND WIX_UPGRADE_DETECTED AND NOT REMOVE" />
-      <Custom Action="StopPreviousSupervisor" After="RestartPreviousSupervisor"
-              Condition="ALLUSERS AND WIX_UPGRADE_DETECTED AND NOT REMOVE" />
-      <Custom Action="BeginUserUpgradeExclusion" After="StopPreviousSupervisor"
+      <Custom Action="BeginUserUpgradeExclusion" After="RestartPreviousSupervisor"
               Condition="NOT ALLUSERS AND WIX_UPGRADE_DETECTED AND NOT REMOVE" />
       <Custom Action="EndUserUpgradeExclusion" After="BeginUserUpgradeExclusion"
               Condition="NOT ALLUSERS AND WIX_UPGRADE_DETECTED AND NOT REMOVE" />
       <Custom Action="RestartPreviousUserSupervisor" After="EndUserUpgradeExclusion"
               Condition="NOT ALLUSERS AND WIX_UPGRADE_DETECTED AND NOT REMOVE" />
-      <Custom Action="StopPreviousUserSupervisor" After="RestartPreviousUserSupervisor"
-              Condition="NOT ALLUSERS AND WIX_UPGRADE_DETECTED AND NOT REMOVE" />
-      <InstallExecute After="StopPreviousUserSupervisor" />
+      <InstallExecute After="RestartPreviousUserSupervisor" />
       <Custom Action="UnregisterSupervisor" Before="RemoveFiles"
               Condition="ALLUSERS AND REMOVE=&quot;ALL&quot; AND NOT UPGRADINGPRODUCTCODE" />
       <Custom Action="RollbackSupervisor" After="InstallFiles"
@@ -319,16 +295,17 @@
       </Component>
     </ComponentGroup>
 
-    <!-- Per-user activation runs at sign-in. The windowless supervisor starts
-         the contained sibling runtime and retains its download worker. Start
-         checks logging/config availability even when a supervisor already
-         answers. The shortcut supplies no recovery after the supervisor dies. -->
+    <!-- Per-user activation at sign-in. The windowless host starts the
+         contained runtime, restarts it after failure, and registers for
+         restart so an upgrade that ends it gets it back. A host that exits is
+         started again by the next `openabstractions start`, SDK activation or
+         sign-in. -->
     <ComponentGroup Id="LogonStart" Directory="StartupFolder">
       <Component Id="LogonStartShortcut" Guid="C84BB684-4B58-4B42-9B05-8F12DAFAABDE"
                  Condition="NOT ALLUSERS">
         <Shortcut Id="LogonStartFile" Name="Abstraction supervisor"
-                  Description="Starts the download supervisor and shared runtime"
-                  Target="[#jobdw.exe]" Arguments="start --runtime"
+                  Description="Starts the OpenAbstractions runtime host"
+                  Target="[#openabstractionsw.exe]" Arguments="serve host"
                   WorkingDirectory="ToolsFolder" />
         <RegistryValue Root="HKCU" Key="Software\OpenAbstractions\Abstraction\Supervisor"
                        Name="atLogon" Type="integer" Value="1" KeyPath="yes" />
@@ -372,15 +349,6 @@
              removed either: hosted run 35084640715 left
              %ProgramData%\abstraction\upgrade-v1 behind after uninstall. -->
         <RemoveFolder Id="RemoveMachineUpgradeFolder" Directory="MachineUpgradeFolder" On="uninstall" />
-      </Component>
-    </ComponentGroup>
-
-    <ComponentGroup Id="ToolFiles" Directory="ToolsFolder">
-      <Component>
-        <File Id="dl.exe" Source="payload/tools/dl.exe" KeyPath="yes" />
-      </Component>
-      <Component>
-        <File Id="jobctl.exe" Source="payload/tools/jobctl.exe" KeyPath="yes" />
       </Component>
     </ComponentGroup>
 
@@ -451,20 +419,6 @@
       <Component Directory="DevFolder">
         <File Id="using.txt" Source="payload/dev/USING.txt" KeyPath="yes" />
       </Component>
-      <?if $(var.Dev) = yes ?>
-      <Component Directory="DevPythonJob">
-        <File Id="abstraction_job.py" Source="payload/dev/python/job/abstraction_job.py" KeyPath="yes" />
-      </Component>
-      <Component Directory="DevPythonJob">
-        <File Id="job.pyproject.toml" Name="pyproject.toml" Source="payload/dev/python/job/pyproject.toml" KeyPath="yes" />
-      </Component>
-      <Component Directory="DevPythonDownload">
-        <File Id="abstraction_download.py" Source="payload/dev/python/download/abstraction_download.py" KeyPath="yes" />
-      </Component>
-      <Component Directory="DevPythonDownload">
-        <File Id="download.pyproject.toml" Name="pyproject.toml" Source="payload/dev/python/download/pyproject.toml" KeyPath="yes" />
-      </Component>
-      <?endif?>
       <?if $(var.Cpp) = yes ?>
       <Component Directory="DevIncludeDownload">
         <File Id="over_curl.hpp" Source="payload/dev/include/abstraction/download/over_curl.hpp" KeyPath="yes" />
@@ -474,7 +428,7 @@
 
     <Feature Id="Service" Level="1" AllowAbsent="no" AllowAdvertise="no"
              Title="Background supervisor"
-             Description="Finishes transfers after the calling program closes. For everyone, Windows starts the supervisor in each user's session at sign-in and restarts it after failure. For your account, installation starts the runtime and supervisor, and a Startup shortcut starts them at sign-in. A per-user supervisor that exits starts again at the next sign-in.">
+             Description="Runs the OpenAbstractions runtime for applications, and keeps accepted work going after the calling program closes. For everyone, Windows starts the runtime host in each user's session at sign-in and restarts it after failure. For your account, installation starts the runtime host, a Startup shortcut starts it at sign-in, and the next command or application that needs it starts it again. The host restarts a runtime that fails, and upgrades restart it.">
       <ComponentGroupRef Id="ServiceFiles" />
       <ComponentGroupRef Id="SupervisorService" />
       <ComponentGroupRef Id="LogonStart" />
@@ -482,9 +436,8 @@
     </Feature>
 
     <Feature Id="Tools" Level="1" AllowAdvertise="no"
-             Title="Command-line tools and examples"
-             Description="dl resumes a download from what it proved and refuses corruption that curl -C - accepts. jobctl drives the job store from a shell. examples\ holds three that run against this install and need no checkout.">
-      <ComponentGroupRef Id="ToolFiles" />
+             Title="Examples and the panel"
+             Description="examples\ holds three that run openabstractions download, jobs and status against this install and need no checkout. The Abstraction Panel shows what the runtime serves.">
       <ComponentGroupRef Id="ExampleFiles" />
       <?if $(var.Panel) = yes ?>
       <ComponentGroupRef Id="PanelFiles" />
@@ -493,7 +446,7 @@
 
       <Feature Id="Path" Level="1" AllowAdvertise="no"
                Title="Add to PATH"
-               Description="Puts the tools folder inside the install folder on PATH, so dl, jobctl and jobd run in any shell. For everyone that is the machine PATH; just for you, your own. Untick this and they are still installed; you type the whole path.">
+               Description="Puts the tools folder inside the install folder on PATH, so openabstractions runs in any shell. For everyone that is the machine PATH; just for you, your own. Untick this and they are still installed; you type the whole path.">
         <ComponentGroupRef Id="PathEntry" />
       </Feature>
     </Feature>
@@ -502,8 +455,8 @@
          the feature is not: a release build assembled out of published module
          versions carries USING.txt alone, under text promising headers and
          Python packages. -->
-    <?if "$(var.NoDev)$(var.NoCpp)" = "" ?><?define DeveloperText = "Headers, the Python packages and the Go module paths, for building an application against these layers. Not needed to use the tools." ?>
-    <?else?><?define DeveloperText = "USING.txt, which names the Go module paths and the package names to install, for building an application against these layers.$(var.NoDev)$(var.NoCpp) Not needed to use the tools." ?><?endif?>
+    <?if "$(var.NoCpp)" = "" ?><?define DeveloperText = "Headers and USING.txt, which names the Go module paths and the generated client packages, for building an application against these layers. Not needed to use the tools." ?>
+    <?else?><?define DeveloperText = "USING.txt, which names the Go module paths and the generated client packages to install, for building an application against these layers.$(var.NoCpp) Not needed to use the tools." ?><?endif?>
     <Feature Id="Developer" Level="1000" AllowAdvertise="no"
              Title="Developer files"
              Description="$(var.DeveloperText)">

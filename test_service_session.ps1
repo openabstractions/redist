@@ -7,7 +7,10 @@ param(
     [string]$CommandPath,
     [string[]]$CommandArguments = @(),
     [string]$CommandDirectory,
-    [ValidateRange(1, 7200)][int]$CommandSeconds = 1800
+    [ValidateRange(1, 7200)][int]$CommandSeconds = 1800,
+    # Verify only: the image the SCM-created instance runs. 0.1.8 and later run
+    # the windowless host; a 0.1.7 predecessor installed for a rollback test runs jobdw.
+    [ValidateSet('openabstractionsw.exe','jobdw.exe')][string]$ExpectedImage = 'openabstractionsw.exe'
 )
 $ErrorActionPreference = 'Stop'
 # No mutation in the default mode. Only disposable GitHub-hosted runners may run this fixture.
@@ -330,7 +333,8 @@ try {
     } 90 'fresh RDP account session'
     $form.WindowState = 'Minimized'
     if ($session -eq (Get-Process -Id $PID).SessionId) { throw 'Fresh account reused runner session' }
-    $expectedImage = Join-Path $env:ProgramFiles 'OpenAbstractions\tools\jobdw.exe'
+    # The service template runs the windowless host, `openabstractionsw.exe serve host --service`.
+    $expectedImage = Join-Path $env:ProgramFiles ('OpenAbstractions\tools\' + $ExpectedImage)
     function Find-Instance {
         foreach ($svc in @(Get-CimInstance Win32_Service -Filter "Name LIKE 'OpenAbstractionsSupervisor_%'")) {
             if ($svc.State -ne 'Running' -or $svc.ProcessId -eq 0) { continue }

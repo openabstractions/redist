@@ -14,7 +14,7 @@ self=$share/uninstall.sh
 home=${HOME:-/}
 receipt=com.openabstractions.abstraction
 uid=$(id -u)
-service=gui/$uid/com.openabstractions.jobd
+service=gui/$uid/com.openabstractions.runtime
 
 # Single-quotes a value for a command line the person can paste.
 quote() { printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"; }
@@ -79,7 +79,7 @@ agent_state() {
     printf '%s\n' "$jobs" | awk '
         NR == 1 { if (NF != 3 || $1 != "PID" || $2 != "Status" || $3 != "Label") bad=1; next }
         NF < 3 || $1 !~ /^(-|[0-9]+)$/ || $2 !~ /^-?[0-9]+$/ { bad=1 }
-        NF == 3 && $3 == "com.openabstractions.jobd" { found=1 }
+        NF == 3 && $3 == "com.openabstractions.runtime" { found=1 }
         END { if (bad || NR == 0) exit 2; print found ? "present" : "absent" }
     '
 }

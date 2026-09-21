@@ -5,7 +5,7 @@ if desired. The installer leaves shell profiles unchanged.
 
     ~/.local/bin/openabstractions start
     ~/.local/bin/openabstractions status
-    launchctl print gui/$(id -u)/com.openabstractions.jobd
+    launchctl print gui/$(id -u)/com.openabstractions.runtime
 
 Start activates the installed runtime and requires capability readiness. The
 closed macOS Program-proof limitation remains; registration alone cannot make

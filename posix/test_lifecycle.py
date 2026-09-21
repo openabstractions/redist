@@ -54,11 +54,11 @@ list)
     printf 'PID\tStatus\tLabel\n'
     if [ "${UNRELATED:-}" = yes ]; then printf '%s\n' '- 0 unrelated label with spaces'; fi
     if [ "${ABSENT:-}" != yes ] && { [ ! -f "$LOG.stopped" ] || [ "${ACTIVE:-}" = active ]; }; then
-        printf '%s\n' '- 0 com.openabstractions.jobd'
+        printf -- '- 0 %s\n' "${AGENT_LABEL:-com.openabstractions.runtime}"
     fi;;
 bootout) [ "${FAIL:-}" != stop ] || exit 5; touch "$LOG.stopped";;
 bootstrap) [ "${FAIL:-}" != bootstrap ];;
-print) case "$2" in */com.openabstractions.jobd) [ "${ACTIVE:-}" = active ];; *) [ "${FAIL:-}" != verify ];; esac;;
+print) case "$2" in */"${AGENT_LABEL:-com.openabstractions.runtime}") [ "${ACTIVE:-}" = active ];; *) [ "${FAIL:-}" != verify ];; esac;;
 *) exit 0;;
 esac''')
         # A receipt lives on one volume, recorded in $LOG.receipt. pkgutil with
@@ -290,7 +290,7 @@ exit 1''')
         calls = (self.root/"calls").read_text().splitlines()
         forget = [c for c in calls if c.startswith("pkgutil --forget")]
         self.assertEqual(forget, ["pkgutil --forget volume=%s receipt=present payload=present uninstaller=present" % self.home])
-        self.assertLess(calls.index("bootout gui/1000/com.openabstractions.jobd"), calls.index(forget[0]))
+        self.assertLess(calls.index("bootout gui/1000/com.openabstractions.runtime"), calls.index(forget[0]))
         self.assertFalse((self.root/"calls.receipt").exists())
         for gone in (self.payload, self.share/"MANIFEST", self.share/"uninstall.sh", self.share/"lifecycle.sh", self.share):
             self.assertFalse(gone.exists(), gone)
@@ -431,7 +431,10 @@ exit 1''')
         result = subprocess.run(["sh", str(package/"install.sh")], env=self.env, text=True, capture_output=True, timeout=10)
         self.assertEqual(result.returncode, 0, result.stderr)
         calls = (self.root/"calls").read_text()
-        self.assertIn("enable --now abstraction-jobd.timer abstraction-runtime.service", calls)
+        self.assertIn("enable --now abstraction-runtime.service", calls)
+        self.assertNotIn("abstraction-jobd.timer abstraction-runtime.service", calls)
+        # A 0.1.7 predecessor's sweep timer is disabled before the runtime is enabled.
+        self.assertLess(calls.index("disable abstraction-jobd.timer"), calls.index("enable --now abstraction-runtime.service"))
         self.assertIn("cli status --timeout 1s", calls)
         self.assertLess(calls.index("stop abstraction-runtime.service"), calls.index("cli storage check"))
         self.assertLess(calls.index("cli storage check"), calls.index("enable --now"))
@@ -471,13 +474,15 @@ exit 1''')
         self.assertNotIn("enable --now", calls)
 
     def template(self):
-        shutil.copyfile(HERE/"macos/com.openabstractions.jobd.plist", self.share/"com.openabstractions.jobd.plist")
-        return self.home/"Library/LaunchAgents/com.openabstractions.jobd.plist"
+        shutil.copyfile(HERE/"macos/com.openabstractions.runtime.plist", self.share/"com.openabstractions.runtime.plist")
+        return self.home/"Library/LaunchAgents/com.openabstractions.runtime.plist"
 
     def test_macos_bootstrap_failure_is_installation_failure(self):
         self.command("stat", "echo 1000")
         self.command("chown", "exit 0")
         self.template()
+        # A fresh install: no predecessor ledger names a retired file to remove.
+        (self.share/"MANIFEST").unlink()
         (self.share/"FILES").write_text(".local/bin/jobd\n")
         result = subprocess.run(["sh", str(HERE/"macos/postinstall")], env=dict(self.env, FAIL="bootstrap", ACTIVE="active"), text=True, capture_output=True, timeout=SCRIPT_TIMEOUT)
         self.assertNotEqual(result.returncode, 0)
@@ -496,7 +501,7 @@ exec /bin/mv "$@"''')
         plist = self.template()
         other = self.payload.parent/"other-tool"
         other.write_text("unrelated")
-        (self.share/"FILES").write_text(".local/bin/jobd\n.local/share/abstraction/com.openabstractions.jobd.plist\n")
+        (self.share/"FILES").write_text(".local/bin/jobd\n.local/share/abstraction/com.openabstractions.runtime.plist\n")
         result = subprocess.run(["sh", str(HERE/"macos/postinstall")], env=dict(self.env, ACTIVE="active"), text=True, capture_output=True, timeout=SCRIPT_TIMEOUT)
         self.assertEqual(result.returncode, 0, result.stderr)
         import plistlib
@@ -508,7 +513,7 @@ exec /bin/mv "$@"''')
         calls = (self.root/"calls").read_text().splitlines()
         renames = [c for c in calls if c.startswith("mv:") and str(plist.parent) in c]
         self.assertEqual(len(renames), 1, calls)
-        self.assertTrue(renames[0].startswith("mv:" + str(self.share) + "/.com.openabstractions.jobd.plist."), renames[0])
+        self.assertTrue(renames[0].startswith("mv:" + str(self.share) + "/.com.openabstractions.runtime.plist."), renames[0])
         self.assertTrue(renames[0].endswith(" -> %s bin=0" % plist), renames[0])
         self.assertLess(next(i for i, c in enumerate(calls) if c.startswith("mv:") and str(plist) in c),
                         calls.index("bootstrap gui/1000 " + str(plist)))
@@ -518,6 +523,30 @@ exec /bin/mv "$@"''')
         self.assertNotIn("chown:1000:1000 " + str(self.home), calls)
         self.assertFalse(any(str(other) in line or "chown:-R" in line for line in calls))
         self.assertEqual(other.read_text(), "unrelated")
+
+    def test_macos_upgrade_removes_the_retired_label_and_programs_the_predecessor_listed(self):
+        self.command("stat", "echo 1000")
+        self.command("chown", "exit 0")
+        self.template()
+        retired_plist = self.home/"Library/LaunchAgents/com.openabstractions.jobd.plist"
+        retired_plist.parent.mkdir(parents=True)
+        retired_plist.write_text("previous LaunchAgent")
+        dl = self.home/".local/bin/dl"
+        dl.write_text("previous dl")
+        unlisted = self.home/".local/bin/jobctl"
+        unlisted.write_text("a jobctl the predecessor did not install")
+        (self.share/"MANIFEST").write_text(str(retired_plist) + "\n" + str(dl) + "\n" + str(self.payload) + "\n")
+        (self.share/"FILES").write_text(".local/bin/openabstractions\n")
+        (self.home/".local/bin/openabstractions").write_text("candidate")
+        result = subprocess.run(["sh", str(HERE/"macos/postinstall")], env=dict(self.env, ACTIVE="active"), text=True, capture_output=True, timeout=SCRIPT_TIMEOUT)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(retired_plist.exists())
+        self.assertFalse(dl.exists())
+        self.assertEqual(unlisted.read_text(), "a jobctl the predecessor did not install")
+        self.assertIn("removed retired " + str(retired_plist), result.stdout)
+        manifest = (self.share/"MANIFEST").read_text().splitlines()
+        self.assertNotIn(str(retired_plist), manifest)
+        self.assertIn(str(self.home/"Library/LaunchAgents/com.openabstractions.runtime.plist"), manifest)
 
     def test_macos_refuses_symlink_ancestor_before_ownership_change(self):
         self.command("stat", "echo 1000")
@@ -538,11 +567,11 @@ exec /bin/mv "$@"''')
         runtime = (HERE/"linux/abstraction-runtime.service").read_text()
         self.assertIn('ExecStart="%h/.local/bin/openabstractions" serve runtime\n', runtime)
         self.assertNotIn("--jobs-", runtime)
-        for unit in [runtime, (HERE/"linux/abstraction-jobd.service").read_text()]:
-            self.assertIn("KillMode=control-group", unit)
-            self.assertIn("TimeoutStopSec=10s", unit)
+        self.assertIn("KillMode=control-group", runtime)
+        self.assertIn("TimeoutStopSec=10s", runtime)
         import plistlib
-        plist = plistlib.loads((HERE/"macos/com.openabstractions.jobd.plist").read_bytes())
+        plist = plistlib.loads((HERE/"macos/com.openabstractions.runtime.plist").read_bytes())
+        self.assertEqual(plist["Label"], "com.openabstractions.runtime")
         self.assertEqual(plist["ExitTimeOut"], 10)
         self.assertFalse(plist["AbandonProcessGroup"])
         self.assertEqual(plist["ProgramArguments"], ["@BIN@/openabstractions", "serve", "runtime"])
@@ -551,7 +580,10 @@ exec /bin/mv "$@"''')
         # The payload carries only a template; postinstall places the plist.
         payload = (HERE/"payload.tsv").read_text()
         self.assertNotIn("Library/LaunchAgents", payload)
-        self.assertIn(".local/share/abstraction/com.openabstractions.jobd.plist\tauthored\tposix\t\tmacos/com.openabstractions.jobd.plist", payload)
+        self.assertIn(".local/share/abstraction/com.openabstractions.runtime.plist\tauthored\tposix\t\tmacos/com.openabstractions.runtime.plist", payload)
+        rows = "\n".join(line for line in payload.splitlines() if not line.startswith(">"))
+        for retired in (".local/bin/jobd", ".local/bin/dl", ".local/bin/jobctl", "abstraction-jobd", "com.openabstractions.jobd", "abstraction_job.py", "abstraction_download.py"):
+            self.assertNotIn(retired, rows)
 
     def test_macos_manager_watchdog_bounds_only_its_child(self):
         self.command("launchctl", 'trap "" TERM; exec sleep 5')

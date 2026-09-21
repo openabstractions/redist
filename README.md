@@ -1,11 +1,13 @@
 # redist
 
 The Open Abstractions redistributable packages programs built from published
-module versions: `jobd`, `dl`, `jobctl` and the `openabstractions` service host.
-Windows also includes the windowless `jobdw` supervisor and Abstraction Panel.
+module versions: the `openabstractions` service host and command.
+Windows also includes `openabstractionsw`, the windowless runtime host, and
+Abstraction Panel.
 
 See [Releases](https://github.com/openabstractions/redist/releases) for available
 downloads and their release-specific verification. Draft builds are not releases.
+Each release lists its included capabilities, platform verification and signing state.
 
 ## Installing
 
@@ -29,17 +31,23 @@ Compare downloads against the release's `SHA256SUMS`:
 assets are unsigned in the current workflow; macOS assets are attached only
 after its signing and notarization gates. A checksum is not a signature.
 
-The central CLI is available on PATH, for example:
+The current source candidate's central CLI provides:
 
-    openabstractions serve logging
-    openabstractions serve config
-    openabstractions serve router-v1
+    openabstractions status --json
+    openabstractions probe --json
+    openabstractions applications list
 
-These commands run individual capabilities in the foreground. Current source
-installers register the shared runtime, which supervises configured capabilities.
+`status` reports service readiness. `probe` performs bounded reads and prints
+typed outcomes. `applications list` shows the caller's permission-filtered local
+application directory. Current source installers register the shared runtime,
+which supervises configured capabilities.
 Windows per-user installation starts it immediately and registers a windowless
 Startup launcher. Check `openabstractions status --json` for readiness. Consult
 the selected release notes for the behavior qualified in that release.
+
+Developers can also run individual hosts in the foreground with
+`openabstractions serve logging`, `serve config` and `serve router-v1`. These
+commands do not install or register a service.
 
 ## Without an installer
 
@@ -68,7 +76,7 @@ has cached for good — including one whose tag was deleted. So that check canno
 see a deleted tag; `git ls-remote --tags` on the repository is what does.
 
 Start the release workflow manually from the reviewed branch commit with a new
-`version` such as `v0.1.5`. It pins that commit, builds the published modules and
+`version` such as `v0.2.0`. It pins that commit, builds the published modules and
 packages, and runs the existing installer and signing gates before creating any
 version tag. A build failure leaves the proposed tag absent. Existing tags are
 refused and never moved, including tags left by older failed release workflows.

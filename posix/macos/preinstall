@@ -41,26 +41,30 @@ manager_name=$(manager asuser "$uid" /bin/launchctl managername)
 }
 agent_state() {
     jobs=$(manager asuser "$uid" /bin/launchctl list) || return 1
-    printf '%s\n' "$jobs" | awk '
+    printf '%s\n' "$jobs" | awk -v label="$1" '
         NR == 1 { if (NF != 3 || $1 != "PID" || $2 != "Status" || $3 != "Label") bad=1; next }
         NF < 3 || $1 !~ /^(-|[0-9]+)$/ || $2 !~ /^-?[0-9]+$/ { bad=1 }
-        NF == 3 && $3 == "com.openabstractions.jobd" { found=1 }
+        NF == 3 && $3 == label { found=1 }
         END { if (bad || NR == 0) exit 2; print found ? "present" : "absent" }
     '
 }
-state=$(agent_state)
-booted=no
-if [ "$state" = present ]; then
-    manager bootout "gui/$uid/com.openabstractions.jobd"
-    booted=yes
-    state=$(agent_state)
-fi
-[ "$state" = absent ] || {
-    echo "preinstall: previous LaunchAgent remains registered; replacement refused" >&2
-    exit 1
-}
-if [ "$booted" = yes ]; then
-    echo "ok    booted out running previous LaunchAgent gui/$uid/com.openabstractions.jobd; absence verified before replacement; graceful exit is not independently established"
-else
-    echo "ok    no previous LaunchAgent registered in gui/$uid; nothing booted out before replacement"
-fi
+# 0.1.7 and earlier registered the same runtime as com.openabstractions.jobd.
+# Both labels are booted out and verified absent before any file is replaced.
+for label in com.openabstractions.jobd com.openabstractions.runtime; do
+    state=$(agent_state "$label")
+    booted=no
+    if [ "$state" = present ]; then
+        manager bootout "gui/$uid/$label"
+        booted=yes
+        state=$(agent_state "$label")
+    fi
+    [ "$state" = absent ] || {
+        echo "preinstall: previous LaunchAgent $label remains registered; replacement refused" >&2
+        exit 1
+    }
+    if [ "$booted" = yes ]; then
+        echo "ok    booted out running previous LaunchAgent gui/$uid/$label; absence verified before replacement; graceful exit is not independently established"
+    else
+        echo "ok    no previous LaunchAgent $label registered in gui/$uid; nothing booted out before replacement"
+    fi
+done

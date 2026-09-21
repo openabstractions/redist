@@ -4,16 +4,17 @@ Each folder holds one runnable thing and the source it runs. Double-click the
 .cmd, or run it from a shell. Nothing here needs a checkout, a compiler or an
 internet connection, except where the folder says so.
 
-  what-this-machine-does\   where a download would run on this machine, whether
-                            a supervisor is alive, and how this install starts
-                            one. Reads; changes nothing.
+  what-this-machine-does\   whether the runtime is ready, what this program
+                            has asked it to do, and how this install starts
+                            the supervisor. Reads; changes nothing.
 
-  job-lifecycle\            a job from submitted to finished, one command per
-                            step, against a throwaway store in %TEMP%. This is
-                            what an application does through the library, shown
-                            one call at a time.
+  job-lifecycle\            a job from submitted to cancelled, one command per
+                            step: observe, cancel, wait, submit again, retry.
+                            This is what an application does through the
+                            library, shown one call at a time.
 
-  download-a-file\          dl fetching a real file and proving its digest.
+  download-a-file\          openabstractions download fetching a real file
+                            through the runtime and proving its digest.
                             Needs the internet. Writes into %TEMP%.
 
 The tools these call live in ..\tools\, and are on PATH if you ticked "Add to

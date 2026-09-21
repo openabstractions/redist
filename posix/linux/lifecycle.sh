@@ -16,9 +16,16 @@ stop_unit() {
         *) echo "note  $unit stopped; manager result=$result (graceful completion not established)" >&2;; esac
     esac
 }
+# abstraction-jobd.timer and its sweep service were registered by 0.1.7 and
+# earlier for the removed jobd (docs/REMOVED.md). An upgrade or a removal stops
+# them first, because a sweep that fires after the runtime stopped would start
+# the retired program again; stop_unit skips a unit the manager does not know.
 stop_installed() {
-    # Stop triggers before workers, then prevent registration from restarting.
     stop_unit abstraction-jobd.timer &&
     stop_unit abstraction-jobd.service &&
     stop_unit abstraction-runtime.service
+}
+disable_retired() {
+    load=$(manager show abstraction-jobd.timer --property=LoadState --value) || return 1
+    [ "$load" = not-found ] || manager disable abstraction-jobd.timer
 }

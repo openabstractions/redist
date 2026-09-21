@@ -1,12 +1,13 @@
 OpenAbstractions user runtime
 
 This package installs programs into ~/.local/bin and registers a LaunchAgent in
-your graphical login session. The existing com.openabstractions.jobd label is
-retained for upgrades; its command now hosts openabstractions serve runtime.
-launchd restarts it after exit and removes its process group during shutdown.
+your graphical login session. Its label is com.openabstractions.runtime and it
+runs openabstractions serve runtime. launchd restarts it after exit and removes
+its process group during shutdown. An upgrade from 0.1.7 or earlier boots out
+the retired com.openabstractions.jobd label and removes jobd, dl and jobctl.
 
-The package includes openabstractions, jobd, dl and jobctl, Python packages and
-~/.local/share/abstraction/uninstall.sh. It preserves application data.
+The package includes openabstractions and ~/.local/share/abstraction/uninstall.sh.
+It preserves application data.
 
 Registration and process startup do not establish usable capability access.
 The existing macOS Program identity-proof limitation still causes protected

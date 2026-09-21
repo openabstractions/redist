@@ -31,8 +31,8 @@ import time
 import uuid
 from pathlib import Path
 
-UNITS = ("abstraction-runtime.service", "abstraction-jobd.service", "abstraction-jobd.timer")
-PROGRAMS = ("openabstractions", "jobd", "dl", "jobctl")
+UNITS = ("abstraction-runtime.service",)
+PROGRAMS = ("openabstractions",)
 
 PROBE = r'''
 import json, sys
@@ -42,6 +42,8 @@ NAMES = ["OK", "TIMEOUT", "DISCONNECTED", "IO_ERROR", "INVALID_ARGUMENT", "NO_ME
          "INTERNAL_ERROR", "CANCELLED", "UNTRUSTED", "PROOF_UNAVAILABLE"]
 mode = sys.argv[2]
 out = {"mode": mode}
+def frame_status(error):
+    return NAMES[error.status] if 0 <= error.status < len(NAMES) else str(error.status)
 try:
     library = Library()
     if mode == "select":
@@ -50,11 +52,11 @@ try:
                    principal=selected.principal, program=selected.program)
     elif mode == "trusted":
         from abstraction.facade.client import Machine
-        from abstraction.config import rec as config
-        from abstraction.logging import rec as logging
+        import abstraction.config as config
+        import abstraction.logging as logging
         machine = Machine(library=library, timeout=5)
-        snapshot = machine.resolve_config(scope="local").Read(config.RunOverrides())
-        machine.resolve_log(scope="local").Write(logging.Record(
+        snapshot = machine.resolve_config(scope="local").read(config.RunOverrides())
+        machine.resolve_log(scope="local").write(logging.Record(
             schema=1, time="2026-09-15T12:00:00.000000Z", level=2,
             msg="linux qualification", attrs={"fixture": "qualify_linux"}))
         out.update(status="OK", config_stamp=snapshot.stamp, endpoint=library.runtime_endpoint())
@@ -67,9 +69,14 @@ try:
     else:
         out.update(status="EXCEPTION", detail="unknown probe mode")
 except FrameError as error:
-    out.update(status=NAMES[error.status] if 0 <= error.status < len(NAMES) else str(error.status), detail=str(error))
+    out.update(status=frame_status(error), detail=str(error))
 except Exception as error:
-    out.update(status="EXCEPTION", detail=f"{type(error).__name__}: {error}")
+    # A resolve refusal chains the transport failure as __cause__.
+    if isinstance(error.__cause__, FrameError):
+        out.update(status=frame_status(error.__cause__), resolution=getattr(error, "status", None),
+                   detail=f"{error}: {error.__cause__}")
+    else:
+        out.update(status="EXCEPTION", detail=f"{type(error).__name__}: {error}")
 print(json.dumps(out))
 '''
 
@@ -295,9 +302,6 @@ class Qualification:
                          "Restart", "RestartUSec", "TimeoutStopUSec", "KillMode", "FragmentPath")
         self.record("install: runtime user unit is loaded and active", unit.get("LoadState") == "loaded"
                     and unit.get("ActiveState") == "active" and unit.get("MainPID", "0") != "0", **unit)
-        timer = self.show("abstraction-jobd.timer", "LoadState", "ActiveState", "UnitFileState")
-        self.record("install: sweep timer is loaded and enabled", timer.get("LoadState") == "loaded"
-                    and timer.get("UnitFileState") == "enabled", **timer)
         pid = unit["MainPID"]
         image = os.readlink(f"/proc/{pid}/exe")
         self.record("install: runtime process image is the installed executable",
@@ -307,6 +311,34 @@ class Qualification:
         self.record("install: start is idempotent for a running runtime",
                     started.returncode == 0 and self.runtime()["MainPID"] == pid,
                     rc=started.returncode, main_pid_after=self.runtime()["MainPID"])
+
+        # A download through the runtime, with no store named.
+        served = work / "served"
+        served.mkdir()
+        payload = uuid.uuid4().hex.encode()
+        (served / "thing.bin").write_bytes(payload)
+        out = work / "downloaded"
+        self.user(["mkdir", "-p", out])
+        origin = subprocess.Popen([sys.executable, "-u", "-m", "http.server", "0", "--bind", "127.0.0.1", "--directory", str(served)],
+                                  stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
+        try:
+            port = int(origin.stdout.readline().split("port ")[1].split(" ")[0])
+            fetched = self.user(["openabstractions", "download", f"http://127.0.0.1:{port}/thing.bin",
+                                 "--out", out, "--json", "--timeout", "60s"], timeout=90, check=False)
+        finally:
+            origin.kill()
+            origin.wait(10)
+        report = json.loads(fetched.stdout) if fetched.returncode == 0 else {}
+        operation = (report.get("receipt") or {}).get("operation_id", "-")
+        self.record("download: the runtime fetches it and the command delivers the bytes",
+                    fetched.returncode == 0 and (report.get("snapshot") or {}).get("state") == "complete"
+                    and (out / "thing.bin").is_file() and (out / "thing.bin").read_bytes() == payload,
+                    rc=fetched.returncode, output=tail(fetched, 800))
+        shown = self.user(["openabstractions", "jobs", "show", operation, "--json"], timeout=30, check=False)
+        observed = json.loads(shown.stdout) if shown.returncode == 0 else {}
+        self.record("download: jobs show observes the same operation as complete",
+                    shown.returncode == 0 and ((observed.get("snapshot") or {}).get("receipt") or {}).get("operation_id") == operation
+                    and (observed.get("snapshot") or {}).get("state") == "complete", rc=shown.returncode, output=tail(shown, 600))
 
         # Identity
         selected = self.probe("select")
