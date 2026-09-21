@@ -255,7 +255,7 @@ jobs:
   # install did rather than what the package promised. A manifest is checked by
   # windows/validate.py, before anything is built; nothing below reads one.
   verify:
-    needs: windows
+    needs: [candidate, windows]
     runs-on: windows-latest
     permissions:
       contents: read
@@ -267,6 +267,7 @@ jobs:
       # redist-candidate.yml. v0.1.7's Startup shortcut runs `jobdw start
       # --runtime`, and from 0.1.8 it runs `openabstractionsw serve host`; the
       # fixture picks the activation from the version it is given.
+      CANDIDATE_VERSION: ${{ needs.candidate.outputs.version }}
       PREDECESSOR_RELEASE: v0.1.7
       PREDECESSOR_VERSION: 0.1.7
     steps:
@@ -595,49 +596,6 @@ jobs:
           }
           exit 0
 
-      - name: install for everyone
-        id: machine-install
-        shell: pwsh
-        run: |
-          $msi = (Resolve-Path pkg\abstraction-x64.msi).Path
-          $p = Start-Process msiexec -Wait -PassThru -ArgumentList @('/i', $msi, '/qn', '/norestart', 'ALLUSERS=1', 'MSIINSTALLPERUSER=', '/l*v', 'machine-install.log')
-          if ($p.ExitCode -ne 0) {
-            Select-String -Path machine-install.log -Pattern 'Return value 3','Error [0-9]+','CustomAction .* returned' -Context 12,4 | Out-String -Width 300 | Write-Output
-            Get-Content machine-install.log -Tail 120
-            throw "msiexec /i ALLUSERS=1 exited $($p.ExitCode). RegisterSupervisor is Return=check, so a supervisor that could not be registered fails and rolls back the install rather than leaving a package that installed the programs and nothing that runs them."
-          }
-
-      - name: what a per-machine install did, and what it must not have done
-        shell: pwsh
-        run: |
-          $dir = Join-Path $env:ProgramFiles 'OpenAbstractions'
-          $tools = Join-Path $dir 'tools'
-          if (-not (Test-Path $tools)) { throw "a per-machine install did not land in $tools" }
-          foreach ($f in 'openabstractions.exe','openabstractionsw.exe','Abstraction Panel.exe') {
-            if (-not (Test-Path (Join-Path $tools $f))) { throw "$f was not installed" }
-          }
-          $key = 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Environment'
-          if ((Get-ItemProperty $key -Name Path).Path -notlike "*$tools*") { throw "the machine PATH does not carry $tools" }
-          if (-not (Test-Path 'HKLM:\Software\OpenAbstractions\Abstraction')) { throw 'the machine registry key was not written' }
-
-          # %ProgramData% grants BUILTIN\Users create-file by inheritance, and
-          # config refuses a machine file no administrator owns. The component
-          # replaces the inherited ACL; if it stops doing so, the machine rung
-          # becomes squattable and nothing else says so.
-          $cfg = Join-Path $env:ProgramData 'abstraction'
-          if (-not (Test-Path $cfg)) { throw 'the machine config folder was not created' }
-          $bad = (Get-Acl $cfg).Access | Where-Object {
-            $_.IdentityReference -like '*\Users' -and $_.FileSystemRights -match 'CreateFiles|Write|FullControl|Modify'
-          }
-          if ($bad) { $bad | Format-List; throw 'Users can write into the machine config folder, so the machine rung can be squatted' }
-
-          # The per-user arm must not also have fired. Both arms installing is
-          # the same defect as neither: the scope stopped meaning anything.
-          if (Test-Path (Join-Path $env:APPDATA 'Microsoft\Windows\Start Menu\Programs\Startup\Abstraction supervisor.lnk')) {
-            throw 'a per-machine install also created the Startup shortcut, which is the per-user arm. Both arms fired, so ALLUSERS is not deciding between them.'
-          }
-          'ok    programs in Program Files, a machine PATH entry, a protected config folder, and no Startup shortcut'
-
       - name: machine upgrade holds the exclusion, stops nothing, and removes the predecessor after the commit
         id: machine-install
         shell: pwsh
@@ -673,6 +631,37 @@ jobs:
           if (Test-Path -LiteralPath (Join-Path $env:ProgramData 'abstraction\upgrade-v1\exclusion.json')) { throw 'the machine upgrade exclusion survived commit' }
           'ok    the machine upgrade held its exclusion, stopped nothing itself, released the exclusion and registered the host after the removal'
           exit 0
+
+      - name: what a per-machine install did, and what it must not have done
+        shell: pwsh
+        run: |
+          $dir = Join-Path $env:ProgramFiles 'OpenAbstractions'
+          $tools = Join-Path $dir 'tools'
+          if (-not (Test-Path $tools)) { throw "a per-machine install did not land in $tools" }
+          foreach ($f in 'openabstractions.exe','openabstractionsw.exe','Abstraction Panel.exe') {
+            if (-not (Test-Path (Join-Path $tools $f))) { throw "$f was not installed" }
+          }
+          $key = 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Environment'
+          if ((Get-ItemProperty $key -Name Path).Path -notlike "*$tools*") { throw "the machine PATH does not carry $tools" }
+          if (-not (Test-Path 'HKLM:\Software\OpenAbstractions\Abstraction')) { throw 'the machine registry key was not written' }
+
+          # %ProgramData% grants BUILTIN\Users create-file by inheritance, and
+          # config refuses a machine file no administrator owns. The component
+          # replaces the inherited ACL; if it stops doing so, the machine rung
+          # becomes squattable and nothing else says so.
+          $cfg = Join-Path $env:ProgramData 'abstraction'
+          if (-not (Test-Path $cfg)) { throw 'the machine config folder was not created' }
+          $bad = (Get-Acl $cfg).Access | Where-Object {
+            $_.IdentityReference -like '*\Users' -and $_.FileSystemRights -match 'CreateFiles|Write|FullControl|Modify'
+          }
+          if ($bad) { $bad | Format-List; throw 'Users can write into the machine config folder, so the machine rung can be squatted' }
+
+          # The per-user arm must not also have fired. Both arms installing is
+          # the same defect as neither: the scope stopped meaning anything.
+          if (Test-Path (Join-Path $env:APPDATA 'Microsoft\Windows\Start Menu\Programs\Startup\Abstraction supervisor.lnk')) {
+            throw 'a per-machine install also created the Startup shortcut, which is the per-user arm. Both arms fired, so ALLUSERS is not deciding between them.'
+          }
+          'ok    programs in Program Files, a machine PATH entry, a protected config folder, and no Startup shortcut'
 
       - name: the supervisor is registered, and registered as what it claims
         shell: pwsh
@@ -943,12 +932,17 @@ jobs:
           if-no-files-found: error
 
   linux-verify:
-    needs: linux
+    needs: [candidate, linux]
+    env:
+      CANDIDATE_VERSION: ${{ needs.candidate.outputs.version }}
     runs-on: ubuntu-latest
     permissions:
       contents: read
       actions: read
     steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+        with:
+          ref: ${{ needs.candidate.outputs.sha }}
       - name: fetch the package
         env:
           GH_TOKEN: ${{ github.token }}
@@ -1209,7 +1203,7 @@ jobs:
           done
           present=${present# }; missing=${missing# }
           if [ -z "$missing" ]; then state=signed
-          elif [ -z "$present" ]; then state=absent
+          elif [ -z "$present" ]; then state=unsigned
           else state=partial
           fi
           printf 'state=%s\n' "$state" >> "$GITHUB_OUTPUT"
