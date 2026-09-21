@@ -334,7 +334,7 @@ try {
     $form.WindowState = 'Minimized'
     if ($session -eq (Get-Process -Id $PID).SessionId) { throw 'Fresh account reused runner session' }
     # The service template runs the windowless host, `openabstractionsw.exe serve host --service`.
-    $expectedImage = Join-Path $env:ProgramFiles ('OpenAbstractions\tools\' + $ExpectedImage)
+    $expectedImagePath = Join-Path $env:ProgramFiles ('OpenAbstractions\tools\' + $ExpectedImage)
     function Find-Instance {
         foreach ($svc in @(Get-CimInstance Win32_Service -Filter "Name LIKE 'OpenAbstractionsSupervisor_%'")) {
             if ($svc.State -ne 'Running' -or $svc.ProcessId -eq 0) { continue }
@@ -343,7 +343,7 @@ try {
             $owner = Get-ProcessOwnerSid $proc
             if ($null -eq $owner) { continue }
             if ($owner -ne $state.Sid) { throw 'Instance has wrong principal' }
-            if ($proc.ExecutablePath -ne $expectedImage) { throw 'Instance has wrong executable' }
+            if ($proc.ExecutablePath -ne $expectedImagePath) { throw 'Instance has wrong executable' }
             return $svc
         }
     }

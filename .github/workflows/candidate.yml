@@ -925,6 +925,21 @@ jobs:
           # Cleanup after a failed assertion is explicit containment, not lifecycle PASS.
           sudo loginctl disable-linger "$account"
           sudo systemctl stop "user@$uid.service"
+          # Stopping the user manager may leave its session scope exiting for a
+          # short time. Terminate only this verified disposable login, then wait
+          # for the kernel's UID process inventory to drain before userdel.
+          # An earlier lifecycle failure may leave no registered login; the UID
+          # inventory below remains the authoritative cleanup condition.
+          sudo loginctl terminate-user "$account" || true
+          for _ in $(seq 1 50); do
+            if ! sudo pgrep -u "$uid" >/dev/null; then break; fi
+            sleep 0.2
+          done
+          if sudo pgrep -u "$uid" >/dev/null; then
+            echo "Disposable account still owns processes after bounded shutdown:"
+            sudo ps -o user:24,pid,ppid,stat,etimes,comm,args -u "$uid"
+            exit 1
+          fi
           sudo userdel --remove "$account"
           if getent passwd "$account" >/dev/null; then echo 'Disposable account survived cleanup'; exit 1; fi
           rm "$state"
