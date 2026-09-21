@@ -90,19 +90,31 @@ It resolves them through `proxy.golang.org`, and the proxy serves a version it
 has cached for good — including one whose tag was deleted. So that check cannot
 see a deleted tag; `git ls-remote --tags` on the repository is what does.
 
-Start the release workflow manually from the reviewed branch commit with a new
-`version` such as `v0.2.0`. It pins that commit, builds the published modules and
-packages, and runs the existing installer and signing gates before creating any
-version tag. A build failure leaves the proposed tag absent. Existing tags are
-refused and never moved, including tags left by older failed release workflows.
+## Preparing a release
 
-After verification, it creates the tag at the exact tested commit and drafts a
-release using that run's already checked artifacts, without rebuilding. An
-explicit `preview` retains the existing machine-scope evidence exception; it
-does not bypass compilation, packaging or installer checks. The workflow never
-publishes the draft. Publishing is a person's decision. If drafting fails after
-tag creation, inspect that run's artifacts and recover explicitly; rerunning
-with the existing version will refuse it rather than replace it.
+Run `candidate.yml` from the reviewed `release/X.Y.Z` branch with
+`version=vX.Y.Z`. It builds from the published versions in `tools.tsv`, records
+the selected module graph and tag commits, and runs packaging, installer,
+reproducibility and signing checks. Its `verified-release-N` artifact contains
+the checked packages, checksums, release notes and exact source/run metadata.
+Artifacts are retained for 30 days. No release tag is created at this stage.
+
+Inspect the failed step if a job fails. Retry failed jobs on that run;
+successful build artifacts remain available. A source change requires a new
+candidate. Preserve the run URL when handing work to another maintainer.
+
+After the candidate passes, fast-forward `main` to its exact commit through
+the publication tool. Run `release.yml` from that same release branch with the
+same `version` and its `candidate_run` ID. Promotion verifies the run, artifact
+digest and every package checksum, then creates the version tag and a draft
+release from those bytes. It invokes no builds or installation tests.
+Review the draft and publish it as a separate action.
+
+An explicit candidate `preview=true` records the existing machine-scope
+evidence exception. Compilation and installer checks remain required.
+If promotion stops after creating the tag or draft, inspect that run and use
+`resume=true` with the same candidate. Recovery accepts only the exact tag,
+notes and asset bytes already verified. Existing assets are never replaced.
 
 ## What is not here
 

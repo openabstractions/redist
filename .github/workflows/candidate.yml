@@ -1,232 +1,312 @@
-name: Windows runtime candidate
+name: verified release candidate
+
 on:
   workflow_dispatch:
     inputs:
-      redist_sha:
-        description: Exact redist commit containing this workflow and the installer fixture
-        required: true
-        type: string
-      charter_sha:
-        description: Published abstractions commit containing the central runtime and status command
-        required: true
-        type: string
-      download_sha:
-        description: Published abstraction-download commit the central command's download module must resolve to
-        required: true
-        type: string
-      job_sha:
-        description: Published abstraction-job commit the central command's job module must resolve to
-        required: true
-        type: string
       version:
-        description: MSI test version in MAJOR.MINOR.PATCH form; no tag or release is created
-        required: true
+        description: Candidate version (vMAJOR.MINOR.PATCH); no tag or release is created
         type: string
+        required: true
+      preview:
+        description: >-
+          Retain a verified preview artifact when the machine scope was not proven
+          on this run. An incomplete candidate is something a person asked for by
+          name and never something a run decided.
+        type: boolean
+        default: false
+
+concurrency:
+  group: redist-candidate-${{ inputs.version }}
+  cancel-in-progress: false
+
 permissions:
   contents: read
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  WIX_VERSION: '5.0.2'
+
 jobs:
-  windows:
-    runs-on: windows-latest
-    timeout-minutes: 30
-    env:
-      GOWORK: 'off'
-      GOFLAGS: '-mod=readonly -trimpath'
-      CGO_ENABLED: '0'
-      REDIST_SHA: ${{ inputs.redist_sha }}
-      CHARTER_SHA: ${{ inputs.charter_sha }}
-      DOWNLOAD_SHA: ${{ inputs.download_sha }}
-      JOB_SHA: ${{ inputs.job_sha }}
-      CANDIDATE_VERSION: ${{ inputs.version }}
-      GOTOOLCHAIN: local
+  candidate:
+    runs-on: ubuntu-latest
+    outputs:
+      sha: ${{ steps.candidate.outputs.sha }}
+      version: ${{ steps.candidate.outputs.version }}
     steps:
-      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
-      - name: validate immutable inputs
-        shell: python
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+        with:
+          ref: ${{ github.sha }}
+      - name: validate an untagged candidate
+        id: candidate
+        env:
+          RELEASE_VERSION: ${{ inputs.version }}
         run: |
-          import os, re, subprocess
-          for key in ('REDIST_SHA', 'CHARTER_SHA', 'DOWNLOAD_SHA', 'JOB_SHA'):
-              if not re.fullmatch('[0-9a-f]{40}', os.environ[key]):
-                  raise SystemExit(f'{key} must be a full lowercase public commit SHA')
-          if os.environ['REDIST_SHA'] != os.environ['GITHUB_SHA']:
-              raise SystemExit('Dispatched redist commit differs from redist_sha')
-          if subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip() != os.environ['REDIST_SHA']:
-              raise SystemExit('Redist checkout differs from requested commit')
-          version = os.environ['CANDIDATE_VERSION']
-          if not re.fullmatch(r'(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)', version):
-              raise SystemExit('MSI version must be MAJOR.MINOR.PATCH')
-          if any(int(n) > bound for n, bound in zip(version.split('.'), (255, 255, 65535))):
-              raise SystemExit('MSI version exceeds Windows Installer limits')
-      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
+          [[ "$RELEASE_VERSION" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]] || {
+            echo 'FAIL version must be vMAJOR.MINOR.PATCH'; exit 1;
+          }
+          [[ "$GITHUB_SHA" =~ ^[0-9a-f]{40}$ ]] || {
+            echo 'FAIL source must be a full lowercase public commit SHA'; exit 1;
+          }
+          IFS=. read -r major minor patch <<< "${RELEASE_VERSION#v}"
+          [ "$major" -le 255 ] && [ "$minor" -le 255 ] && [ "$patch" -le 65535 ] || {
+            echo 'FAIL version exceeds Windows Installer limits'; exit 1;
+          }
+          [ "$GITHUB_REF_TYPE" != tag ] || { echo 'FAIL dispatch from a branch, not an existing tag'; exit 1; }
+          sha=$(git rev-parse HEAD)
+          [ "$sha" = "$GITHUB_SHA" ] || { echo 'FAIL checkout differs from dispatch commit'; exit 1; }
+          # A failed lookup must not be confused with an absent tag.
+          refs=$(git ls-remote --tags origin "refs/tags/$RELEASE_VERSION")
+          [ -z "$refs" ] || { echo 'FAIL release tag already exists; choose a new version'; exit 1; }
+          printf 'sha=%s\nversion=%s\n' "$sha" "${RELEASE_VERSION#v}" >> "$GITHUB_OUTPUT"
+
+  windows:
+    needs: candidate
+    outputs:
+      package-artifact: ${{ steps.artifact-names.outputs.package }}
+    env:
+      CANDIDATE_VERSION: ${{ needs.candidate.outputs.version }}
+      GOTOOLCHAIN: local
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
         with:
-          repository: openabstractions/abstractions
-          ref: ${{ inputs.charter_sha }}
-          path: source-charter
-          persist-credentials: false
-      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
-        with:
-          repository: openabstractions/abstraction-download
-          ref: ${{ inputs.download_sha }}
-          path: source-download
-          persist-credentials: false
-      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
-        with:
-          repository: openabstractions/abstraction-job
-          ref: ${{ inputs.job_sha }}
-          path: source-job
-          persist-credentials: false
-      # The release workflow's Go, so a candidate's programs are the bytes a
-      # release of the same sources builds.
+          ref: ${{ needs.candidate.outputs.sha }}
+
+      - name: name this attempt's package artifact
+        id: artifact-names
+        run: printf 'package=abstraction-windows-unsigned-%s\n' "$GITHUB_RUN_ATTEMPT" >> "$GITHUB_OUTPUT"
+
+      # One Go for every build job of this release. v0.1.6 built with each
+      # image's own Go, and its Linux tarball reproduced off-runner only with
+      # the go1.26.8 that image happened to carry. GOTOOLCHAIN=local stops a
+      # go.mod toolchain line from fetching another.
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version: '1.26.8'
           cache: false
-      - name: record the Go toolchain
-        shell: bash
-        run: go version | tee go-version.txt
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+
+      - name: state
+        run: |
+          printf 'a hosted runner, %s logical CPUs, %s %s, on mains\n' \
+            "$(getconf _NPROCESSORS_ONLN)" "$RUNNER_OS" "$RUNNER_ARCH"
+          go version | tee go-version.txt
+          dotnet --version
+          git rev-parse HEAD
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: go-version-windows
+          name: go-version-windows-${{ github.run_attempt }}
           path: go-version.txt
           if-no-files-found: error
-      - name: verify source and dependency provenance
-        shell: python
-        run: |
-          import json, os, pathlib, subprocess
-          sources = {'source-charter': 'CHARTER_SHA', 'source-download': 'DOWNLOAD_SHA', 'source-job': 'JOB_SHA'}
-          evidence = {'redist': os.environ['REDIST_SHA'], 'sources': {}, 'dependencies': {}}
-          for directory, key in sources.items():
-              actual = subprocess.check_output(['git', '-C', directory, 'rev-parse', 'HEAD'], text=True).strip()
-              if actual != os.environ[key]:
-                  raise SystemExit(f'{directory} checkout differs from requested commit')
-              evidence['sources'][directory] = actual
-          def modules(raw):
-              decoder = json.JSONDecoder()
-              while raw.strip():
-                  value, end = decoder.raw_decode(raw.lstrip())
-                  yield value
-                  raw = raw.lstrip()[end:]
-          expected = {'github.com/openabstractions/abstraction-download/go': os.environ['DOWNLOAD_SHA'],
-                      'github.com/openabstractions/abstraction-job/go': os.environ['JOB_SHA']}
-          for directory in ('source-charter/serve', 'source-charter/monitor', 'source-download/go', 'source-job/go'):
-              selected = list(modules(subprocess.check_output(['go', 'list', '-m', '-json', 'all'], cwd=directory, text=True)))
-              if not selected or sum(bool(item.get('Main')) for item in selected) != 1:
-                  raise SystemExit(f'{directory} must select one main module')
-              if directory == 'source-charter/serve' and 'github.com/openabstractions/abstraction-download/go' not in {item.get('Path') for item in selected}:
-                  raise SystemExit(f'{directory} is missing its required download dependency')
-              closure = []
-              for item in selected:
-                  if item.get('Replace') or item.get('Error'):
-                      raise SystemExit(f'{directory} has a replaced or unresolved module: {item.get("Path")}')
-                  if item.get('Main'):
-                      closure.append(item)
-                      continue
-                  if not item.get('Path') or not item.get('Version'):
-                      raise SystemExit(f'{directory} dependency lacks an immutable module version')
-                  downloaded = json.loads(subprocess.check_output(['go', 'mod', 'download', '-json', item['Path']+'@'+item['Version']], cwd=directory, text=True))
-                  if downloaded.get('Replace') or downloaded.get('Error') or not downloaded.get('Sum') or not downloaded.get('GoModSum'):
-                      raise SystemExit(f'{directory} dependency lacks verified downloaded content: {item["Path"]}')
-                  if item['Path'] in expected and downloaded.get('Origin', {}).get('Hash') != expected[item['Path']]:
-                      raise SystemExit(f'{directory} dependency does not identify the requested source SHA: {item["Path"]}')
-                  closure.append({'selected': item, 'download': downloaded})
-              evidence['dependencies'][directory] = closure
-          pathlib.Path('dist').mkdir()
-          pathlib.Path('dist/source-provenance.json').write_text(json.dumps(evidence, indent=2))
-          pathlib.Path('dist/tools.tsv').write_bytes(pathlib.Path('tools.tsv').read_bytes())
-      - name: build Windows programs from pinned public sources
-        shell: python
-        run: |
-          import json, os, pathlib, subprocess
-          # The Panel filename contains spaces; columns are separated by tabs.
-          rows = [[part.strip() for part in line.split('\t') if part.strip()] for line in pathlib.Path('tools.tsv').read_text().splitlines() if line.strip() and not line.startswith('>')][1:]
-          overrides = {'openabstractions.exe': ('source-charter/serve', '.'), 'openabstractionsw.exe': ('source-charter/serve', '.'), 'Abstraction Panel.exe': ('source-charter/monitor', '.')}
-          names = [row[0] for row in rows]
-          if len(names) != len(set(names)) or set(names) != set(overrides):
-              raise SystemExit('tools.tsv must contain each required runtime program exactly once')
-          for arch in ('amd64', 'arm64'):
-              output = pathlib.Path('binaries', arch).resolve()
-              output.mkdir(parents=True)
-              env = dict(os.environ, GOOS='windows', GOARCH=arch)
-              for name, module_version, package, feature, subsystem in rows:
-                  if pathlib.PureWindowsPath(name).name != name or subsystem not in ('console', 'windows'):
-                      raise SystemExit('Invalid program filename or subsystem')
-                  flags = '-s -w -buildid=' + (' -H=windowsgui' if subsystem == 'windows' else '')
-                  directory, target = overrides[name]
-                  subprocess.run(['go', 'build', '-ldflags='+flags, '-o', str(output/name), target], cwd=directory, env=env, check=True)
-          evidence_path = pathlib.Path('dist/source-provenance.json')
-          evidence = json.loads(evidence_path.read_text())
-          evidence['programs'] = {name: {'directory': directory, 'package': target} for name, (directory, target) in overrides.items()}
-          evidence_path.write_text(json.dumps(evidence, indent=2))
-      - name: assemble unsigned Windows packages
-        shell: pwsh
-        run: |
-          dotnet tool install --global wix --version 5.0.2
-          if ($LASTEXITCODE -ne 0) { throw 'WiX installation failed' }
-          $env:PATH += ";$env:USERPROFILE\.dotnet\tools"
-          wix extension add -g WixToolset.UI.wixext/5.0.2
-          if ($LASTEXITCODE -ne 0) { throw 'WiX extension failed' }
-          foreach ($arch in @('x64','arm64')) {
-            $goarch = if ($arch -eq 'x64') { 'amd64' } else { 'arm64' }
-            python windows/build.py --arch $arch --version $env:CANDIDATE_VERSION --out "package-$arch" --bin "binaries/$goarch" --license LICENSE
-            if ($LASTEXITCODE -ne 0) { throw "Package $arch failed" }
-            python windows/validate.py "package-$arch/abstraction-$arch.msi"
-            if ($LASTEXITCODE -ne 0) { throw "Package $arch validation failed" }
-            Copy-Item "package-$arch/abstraction-$arch.msi" dist/
-          }
-          $lines = foreach ($arch in @('x64','arm64')) {
-            $name = "abstraction-$arch.msi"
-            $hash = (Get-FileHash "dist/$name" -Algorithm SHA256).Hash.ToLowerInvariant()
-            "$hash  $name"
-          }
-          $lines | Set-Content -Encoding ascii dist/SHA256SUMS.windows
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+
+      # candidate.json source is this exact redist commit. Program inputs come from
+      # the immutable published module versions in tools.tsv; their repository tags
+      # and public proxy resolution are checked below rather than represented as
+      # source commits of this redist repository.
+      #
+      # Every version named here must exist before anything is built. This is
+      # the whole point of the repository: the package is made of our published
+      # artifacts, so a tag we deleted or never pushed stops the release here,
+      # by name, instead of shipping.
+      #
+      # The repository is asked first and it is the authority: proxy.golang.org
+      # serves a deleted tag forever, and it served service-jobd v0.2.0 for a
+      # repository that has never had a tag â€” a release built on that answer is
+      # built out of a cache. The proxy is asked second, and answers a different
+      # question: whether `go install` can reach the version a stranger is told
+      # to install.
+      - name: verify and record published module provenance
+        run: python3 scripts/module_provenance.py --tools tools.tsv --output module-provenance.json
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: abstraction-windows-unsigned
+          name: module-provenance-${{ runner.os }}-${{ github.run_attempt }}
+          path: module-provenance.json
+          if-no-files-found: error
+
+      - name: build from the published modules
+        env:
+          CGO_ENABLED: '0'
+          GOOS: windows
+          GOFLAGS: -trimpath
+        run: |
+          rows() { grep -v '^>' "$1" | sed '/^[[:space:]]*$/d' | tail -n +2 | tr -s '\t'; }
+          root=$PWD
+          for arch in amd64 arm64; do
+            while IFS=$'\t' read -r path module package feature subsystem; do
+              mod=${module%@*}
+              version=${module##*@}
+              case "$package" in
+                .) target="$mod@$version" ;;
+                *) target="$mod/$package@$version" ;;
+              esac
+              ld='-s -w -buildid='
+              case "$subsystem" in
+                windows) ld="$ld -H=windowsgui" ;;
+                console) ;;
+                *) printf 'FAIL  %s has subsystem %s, which is console or windows\n' \
+                     "$path" "$subsystem"; exit 1 ;;
+              esac
+              # GOBIN refuses a cross-compiled install, so these land in
+              # GOPATH/bin under a name go chooses â€” at the root for the
+              # runner's own arch, in windows_arm64/ for the other. Emptying it
+              # first is what makes "the one file in there" a safe way to find
+              # what this install just produced.
+              gobin="$(go env GOPATH)/bin"
+              for pass in a b; do
+                mkdir -p "$root/$pass/$arch"
+                rm -rf "$gobin"
+                GOARCH="$arch" go install -ldflags "$ld" "$target"
+                built=$(find "$gobin" -type f -name '*.exe')
+                n=$(printf '%s\n' "$built" | sed '/^$/d' | wc -l)
+                if [ "$n" -ne 1 ]; then
+                  printf 'FAIL  %s produced %s binaries, expected 1\n' "$target" "$n"
+                  exit 1
+                fi
+                mv "$built" "$root/$pass/$arch/$path"
+              done
+              printf 'built %s %s from %s\n' "$arch" "$path" "$target"
+            done < <(rows tools.tsv)
+          done
+
+      - name: reproducible
+        run: |
+          rc=0
+          n=0
+          for f in a/*/*; do
+            n=$((n + 1))
+            if cmp -s "$f" "b/${f#a/}"; then
+              printf 'ok    %s is byte-identical across two builds of one module version\n' "${f#a/}"
+            else
+              printf 'FAIL  %s differs between two builds of one module version\n' "${f#a/}"
+              rc=1
+            fi
+          done
+          if [ "$n" -lt 2 ]; then
+            printf 'FAIL  binaries â€” %s inputs, and this rule cannot fail on fewer than 2\n' "$n"
+            exit 1
+          fi
+          exit $rc
+
+      - name: wix
+        run: |
+          dotnet tool install --global wix --version "$WIX_VERSION"
+          echo "$HOME/.dotnet/tools" >> "$GITHUB_PATH"
+
+      # windows/build.py is the packager on a workstation and it is the packager
+      # here, because two assemblers cannot be kept agreeing about what the
+      # package contains and abstraction.wxs installs more than tools.tsv names.
+      # --bin is what lets one packager serve both routes: the programs come
+      # from the published module versions installed above rather than from
+      # checkouts, and a row with no source here is named and gated out, the way
+      # posix/build.py does it.
+      - name: package
+        env:
+          CANDIDATE_VERSION: ${{ needs.candidate.outputs.version }}
+        run: |
+          version=$CANDIDATE_VERSION
+
+          wix extension add -g "WixToolset.UI.wixext/$WIX_VERSION"
+
+          mkdir -p dist
+          for arch in x64 arm64; do
+            case $arch in x64) goarch=amd64 ;; *) goarch=arm64 ;; esac
+            for pass in a b; do
+              python3 windows/build.py --arch "$arch" --version "$version" \
+                --out "pkg-$pass/$arch" --bin "a/$goarch" --license LICENSE
+            done
+            cp "pkg-a/$arch/abstraction-$arch.msi" "dist/abstraction-$arch.msi"
+            if cmp -s "pkg-a/$arch/abstraction-$arch.msi" "pkg-b/$arch/abstraction-$arch.msi"; then
+              printf 'ok    abstraction-%s.msi is byte-identical across two builds\n' "$arch"
+            else
+              printf 'note  abstraction-%s.msi differs between two builds; its inputs do not\n' "$arch"
+            fi
+          done
+
+      # sha256sum's own format, so `sha256sum -c SHA256SUMS` is the verification
+      # command and we are not asking anyone to learn ours. One file per build
+      # job, joined by `draft`: a digest is computed by the job that made the
+      # bytes, or it describes a different build.
+      - name: digests
+        run: |
+          n=$(ls dist/*.msi | wc -l)
+          if [ "$n" -lt 2 ]; then
+            printf 'FAIL  packages â€” %s inputs, and this rule cannot fail on fewer than 2\n' "$n"
+            exit 1
+          fi
+          (cd dist && sha256sum ./*.msi | sed 's#\./##' | tee SHA256SUMS.windows)
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ${{ steps.artifact-names.outputs.package }}
           path: dist/
           if-no-files-found: error
 
-  # Every Windows assertion that needs a hosted runner, against the package the
-  # job above built. One dispatch of this workflow qualifies the candidate:
-  # per-user fresh, upgrade, non-default-folder upgrade, forced failed upgrade
-  # with the predecessor running again, same-version forced failure restarted by
-  # Restart Manager, unscoped non-admin, elevated refusal, machine forced failed
-  # upgrade with an instance in a second session, machine upgrade, registration,
-  # fresh session and removal.
-  windows-qualification:
+  # This package has two scopes and, until today, this job exercised one of
+  # them: `msiexec /i /qn` with no scope named, on a runner that is an
+  # administrator. That green never reached the custom action that registers
+  # the supervisor, so the machine scope shipped for days calling a `jobd` verb
+  # no `jobd` had. The cheap half passing is not the package passing.
+  #
+  # So: each leg names its scope on the command line, and asserts what the
+  # install did rather than what the package promised. A manifest is checked by
+  # windows/validate.py, before anything is built; nothing below reads one.
+  verify:
     needs: windows
     runs-on: windows-latest
-    timeout-minutes: 120
     permissions:
       contents: read
       actions: read
+    outputs:
+      machine-service: ${{ steps.instance.outputs.state }}
     env:
-      CANDIDATE_VERSION: ${{ inputs.version }}
-      # The published release an upgrade is qualified from, in one place: the
-      # download, the recorded provenance and the version the fixture asserts
-      # all read it. v0.1.7's Startup shortcut runs `jobdw start --runtime`, and
-      # from 0.1.8 it runs `openabstractionsw serve host`; the fixture picks the
-      # activation from the version it is given.
+      # The published release an upgrade is qualified from, in one place, as in
+      # redist-candidate.yml. v0.1.7's Startup shortcut runs `jobdw start
+      # --runtime`, and from 0.1.8 it runs `openabstractionsw serve host`; the
+      # fixture picks the activation from the version it is given.
       PREDECESSOR_RELEASE: v0.1.7
       PREDECESSOR_VERSION: 0.1.7
     steps:
-      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
-      - name: fetch the candidate package
+      - name: fetch the package
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
+          PACKAGE_ARTIFACT: ${{ needs.windows.outputs.package-artifact }}
+        run: gh run download "$GITHUB_RUN_ID" -n "$PACKAGE_ARTIFACT" -D pkg
+
+      # The checksum file ships to strangers as the way to check a download, so
+      # it is checked here first. A SHA256SUMS nobody validated is decoration.
+      - name: the checksum file is true
+        run: (cd pkg && sha256sum -c SHA256SUMS.windows)
+
+      # A per-user service instance is created at logon, so whether one can
+      # appear here at all is a property of the runner and not of the package.
+      # It is measured before anything is installed, because it decides what the
+      # machine leg is allowed to conclude from an absence.
+      - name: what this runner can show
         shell: pwsh
         run: |
-          gh run download $env:GITHUB_RUN_ID -n abstraction-windows-unsigned -D pkg
-          if ($LASTEXITCODE -ne 0) { throw 'Candidate package download failed' }
-          $checked = @{}
-          foreach ($line in Get-Content pkg/SHA256SUMS.windows) {
-            if ($line -notmatch '^([a-f0-9]{64})\s+\*?(abstraction-(?:x64|arm64)\.msi)$') { throw 'Unexpected checksum entry' }
-            $expected = $Matches[1]; $file = $Matches[2]
-            if ((Get-FileHash "pkg/$file" -Algorithm SHA256).Hash.ToLower() -ne $expected) { throw "Checksum mismatch: $file" }
-            if ($checked.ContainsKey($file)) { throw 'Duplicate checksum entry' }
-            $checked[$file] = $true
+          $me = (Get-Process -Id $PID).SessionId
+          "this job runs in session $me"
+          try { & query.exe session } catch { 'query.exe is not on this runner' }
+          $interactive = if ($me -eq 0) { 0 } else { 1 }
+          if ($interactive -eq 0) {
+            'UNPROVEN here: this job runs in session 0. The service manager clones a per-user service into a session at logon, and there is no session for it to clone into. The template, its configuration and its recovery policy are provable on this runner; a running instance is not.'
+          } else {
+            "an interactive session exists, so a clone of the template must appear and this job holds the machine scope to it"
           }
-          if ($checked.Count -ne 2) { throw 'Expected checksums for both Windows packages' }
+          "interactive=$interactive" >> $env:GITHUB_ENV
+          # query.exe is diagnostic; do not propagate its stale native exit code.
           exit 0
+
+      # Per-user assertions run with the fresh standard-user token.
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
+        with:
+          ref: ${{ github.sha }}
+          path: user-fixture
       - name: fetch reviewed predecessor package
         env:
           GH_TOKEN: ${{ github.token }}
@@ -259,16 +339,9 @@ jobs:
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force failing | Out-Null
-          & powershell.exe -NoProfile -ExecutionPolicy Bypass -File test_user_runtime.ps1 -Mode FailingCandidate -MsiPath (Resolve-Path pkg/abstraction-x64.msi).Path -Output (Join-Path (Resolve-Path failing).Path 'abstraction-x64.msi')
+          & powershell.exe -NoProfile -ExecutionPolicy Bypass -File user-fixture/test_user_runtime.ps1 -Mode FailingCandidate -MsiPath (Resolve-Path pkg/abstraction-x64.msi).Path -Output (Join-Path (Resolve-Path failing).Path 'abstraction-x64.msi')
           if ($LASTEXITCODE -ne 0) { throw "Forced-failure candidate preparation exited $LASTEXITCODE" }
-      - name: what this runner can show
-        shell: pwsh
-        run: |
-          $me = (Get-Process -Id $PID).SessionId
-          "this job runs in session $me"
-          try { & query.exe session } catch { 'query.exe is not on this runner' }
-          "interactive=$(if ($me -eq 0) { 0 } else { 1 })" >> $env:GITHUB_ENV
-          exit 0
+
       - name: configure disposable consumer MSI policy
         shell: pwsh
         run: |
@@ -302,54 +375,78 @@ jobs:
         shell: pwsh
         timeout-minutes: 8
         run: |
-          & powershell.exe -NoProfile -ExecutionPolicy Bypass -File test_user_runtime.ps1 -Mode Verify -MsiPath (Resolve-Path pkg/abstraction-x64.msi).Path -CheckTools -PythonPath (Get-Command python.exe -ErrorAction Stop).Source -ResultDirectory user-runtime-diagnostics
-          if ($LASTEXITCODE -ne 0) { throw "Per-user verification exited $LASTEXITCODE" }
+          & powershell.exe -NoProfile -ExecutionPolicy Bypass -File user-fixture/test_user_runtime.ps1 -Mode Verify -MsiPath (Resolve-Path pkg/abstraction-x64.msi).Path -CheckTools -PythonPath (Get-Command python.exe -ErrorAction Stop).Source -ResultDirectory user-runtime-diagnostics
+          if ($LASTEXITCODE -ne 0) { throw "Per-user release verification exited $LASTEXITCODE" }
       - name: private non-admin predecessor upgrade and reinstall
         shell: pwsh
         timeout-minutes: 12
         run: |
-          & powershell.exe -NoProfile -ExecutionPolicy Bypass -File test_user_runtime.ps1 -Mode Verify -MsiPath (Resolve-Path pkg/abstraction-x64.msi).Path -PredecessorMsiPath (Resolve-Path predecessor/abstraction-x64.msi).Path -PredecessorSHA256 $env:PREDECESSOR_SHA256 -PredecessorVersion $env:PREDECESSOR_VERSION -ExpectedVersion $env:CANDIDATE_VERSION -ResultDirectory user-upgrade-diagnostics
+          $version = '${{ inputs.version }}'.Substring(1)
+          & powershell.exe -NoProfile -ExecutionPolicy Bypass -File user-fixture/test_user_runtime.ps1 -Mode Verify -MsiPath (Resolve-Path pkg/abstraction-x64.msi).Path -PredecessorMsiPath (Resolve-Path predecessor/abstraction-x64.msi).Path -PredecessorSHA256 $env:PREDECESSOR_SHA256 -PredecessorVersion $env:PREDECESSOR_VERSION -ExpectedVersion $version -ResultDirectory user-upgrade-diagnostics
           if ($LASTEXITCODE -ne 0) { throw "Per-user upgrade verification exited $LASTEXITCODE" }
+
+      # ----- the command nobody names a scope on -----------------------------
+      #
+      # `msiexec /i /qn` with no ALLUSERS or MSIINSTALLPERUSER is what a script
+      # writes. The Property table carries ALLUSERS=2, and the install folder and
+      # the components resolve their scope separately; if they disagree the
+      # package lands half in each scope. This leg asks that of a real install.
+      #
+      # It runs as the disposable standard account, like the per-user checks
+      # above and while their consumer MSI policy is in effect. From that account
+      # the package must choose one scope and do all of it: per-user files, PATH,
+      # Startup shortcut, one per-user registration and readiness, nothing of the
+      # machine arm, then remove all of it.
+      #
+      # From an elevated administrator the same command resolves per-user, and
+      # activation refuses an elevated token. The next step holds that case.
       - name: private non-admin upgrade of a predecessor in a non-default folder
         shell: pwsh
         timeout-minutes: 12
         run: |
-          & powershell.exe -NoProfile -ExecutionPolicy Bypass -File test_user_runtime.ps1 -Mode Verify -MsiPath (Resolve-Path pkg/abstraction-x64.msi).Path -PredecessorMsiPath (Resolve-Path predecessor/abstraction-x64.msi).Path -PredecessorSHA256 $env:PREDECESSOR_SHA256 -PredecessorVersion $env:PREDECESSOR_VERSION -ExpectedVersion $env:CANDIDATE_VERSION -PredecessorElsewhere -ResultDirectory user-elsewhere-diagnostics
+          & powershell.exe -NoProfile -ExecutionPolicy Bypass -File user-fixture/test_user_runtime.ps1 -Mode Verify -MsiPath (Resolve-Path pkg/abstraction-x64.msi).Path -PredecessorMsiPath (Resolve-Path predecessor/abstraction-x64.msi).Path -PredecessorSHA256 $env:PREDECESSOR_SHA256 -PredecessorVersion $env:PREDECESSOR_VERSION -ExpectedVersion $env:CANDIDATE_VERSION -PredecessorElsewhere -ResultDirectory user-elsewhere-diagnostics
           if ($LASTEXITCODE -ne 0) { throw "Non-default-folder upgrade verification exited $LASTEXITCODE" }
       # The rollback activation must leave the predecessor's supervisor running
       # again before msiexec returns: the 0.1.7 known issue this release fixes.
+
       - name: private non-admin forced failed upgrade rolls back to the running predecessor
         shell: pwsh
         timeout-minutes: 12
         run: |
-          & powershell.exe -NoProfile -ExecutionPolicy Bypass -File test_user_runtime.ps1 -Mode Verify -MsiPath (Resolve-Path pkg/abstraction-x64.msi).Path -PredecessorMsiPath (Resolve-Path predecessor/abstraction-x64.msi).Path -PredecessorSHA256 $env:PREDECESSOR_SHA256 -PredecessorVersion $env:PREDECESSOR_VERSION -ExpectedVersion $env:CANDIDATE_VERSION -FailUpgrade -ResultDirectory user-failed-upgrade-diagnostics
+          & powershell.exe -NoProfile -ExecutionPolicy Bypass -File user-fixture/test_user_runtime.ps1 -Mode Verify -MsiPath (Resolve-Path pkg/abstraction-x64.msi).Path -PredecessorMsiPath (Resolve-Path predecessor/abstraction-x64.msi).Path -PredecessorSHA256 $env:PREDECESSOR_SHA256 -PredecessorVersion $env:PREDECESSOR_VERSION -ExpectedVersion $env:CANDIDATE_VERSION -FailUpgrade -ResultDirectory user-failed-upgrade-diagnostics
           if ($LASTEXITCODE -ne 0) { throw "Forced failed upgrade verification exited $LASTEXITCODE" }
       # The candidate as its own predecessor: a registered host that ran 60
       # seconds is restarted by Restart Manager when the failed transaction ends.
+
       - name: private non-admin same-version forced failure restarts the host
         shell: pwsh
         timeout-minutes: 12
         run: |
-          & powershell.exe -NoProfile -ExecutionPolicy Bypass -File test_user_runtime.ps1 -Mode Verify -MsiPath (Resolve-Path pkg/abstraction-x64.msi).Path -FailSameVersion -ResultDirectory user-same-version-diagnostics
+          & powershell.exe -NoProfile -ExecutionPolicy Bypass -File user-fixture/test_user_runtime.ps1 -Mode Verify -MsiPath (Resolve-Path pkg/abstraction-x64.msi).Path -FailSameVersion -ResultDirectory user-same-version-diagnostics
           if ($LASTEXITCODE -ne 0) { throw "Same-version forced failure verification exited $LASTEXITCODE" }
-      - name: an unscoped non-admin install lands in one scope
+
+      - name: an unscoped install lands in one scope, not half of each
         shell: pwsh
         timeout-minutes: 8
         run: |
-          & powershell.exe -NoProfile -ExecutionPolicy Bypass -File test_user_runtime.ps1 -Mode Verify -MsiPath (Resolve-Path pkg/abstraction-x64.msi).Path -Unscoped -ResultDirectory user-unscoped-diagnostics
+          & powershell.exe -NoProfile -ExecutionPolicy Bypass -File user-fixture/test_user_runtime.ps1 -Mode Verify -MsiPath (Resolve-Path pkg/abstraction-x64.msi).Path -Unscoped -ResultDirectory user-unscoped-diagnostics
           if ($LASTEXITCODE -ne 0) { throw "Unscoped non-admin install verification exited $LASTEXITCODE" }
-      # Each fixture run checked its own logs inside the disposable account.
-      # This step reads the logs the runner collected from those accounts and
-      # refuses mutated copies of each, so the checks are shown to bite on the
-      # hosted log format: the upgrade exclusion order and its formatted folder,
-      # and removals that finished with no reboot pending.
+
+      # ----- an elevated install with no scope named ------------------------
+      #
+      # This runner's full administrator token runs the same unscoped command.
+      # ALLUSERS=2 with MSIINSTALLPERUSER=1 resolves per-user, and per-user
+      # activation refuses an elevated token. 0.1.6 copied the files and then
+      # failed 1722/1603. The package now refuses before costing and names both
+      # remedies, so nothing is copied, registered or started.
       - name: the collected per-user logs prove the upgrade order, the formatted folder and a finished removal
         shell: pwsh
         run: |
           $upgrade = 'user-upgrade-diagnostics/user-install.log|user-elsewhere-diagnostics/user-install.log'
           $removal = 'user-runtime-diagnostics/user-uninstall.log|user-upgrade-diagnostics/user-uninstall.log|user-elsewhere-diagnostics/user-uninstall.log|user-same-version-diagnostics/same-version-uninstall.log|user-unscoped-diagnostics/user-uninstall.log'
-          & powershell.exe -NoProfile -ExecutionPolicy Bypass -File test_user_runtime.ps1 -Mode CheckLogs -UpgradeLogs $upgrade -RemovalLogs $removal | Tee-Object hosted-log-checks.txt
+          & powershell.exe -NoProfile -ExecutionPolicy Bypass -File user-fixture/test_user_runtime.ps1 -Mode CheckLogs -UpgradeLogs $upgrade -RemovalLogs $removal | Tee-Object hosted-log-checks.txt
           if ($LASTEXITCODE -ne 0) { throw "Collected per-user log checks exited $LASTEXITCODE" }
+
       - name: an elevated unscoped install is refused before anything is copied
         shell: pwsh
         timeout-minutes: 5
@@ -405,13 +502,32 @@ jobs:
           $state | ConvertTo-Json | Set-Content -LiteralPath $statePath -Encoding utf8 -ErrorAction Stop
           'DisableMSI baseline restored and verified' | Tee-Object -Append msi-policy.log
           exit 0
-      # The machine predecessor is installed and a fresh account signs in over
-      # RDP, so the SCM creates a per-session instance in a second session. The
-      # failing copy replaces the files and refuses before the commit, so
-      # RemoveExistingProducts never runs. The package stops nothing: Restart
-      # Manager stops the instance through the SCM. Rollback must leave the
-      # predecessor registered with its service template, release the machine
-      # exclusion and leave that instance running.
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        if: always()
+        with:
+          name: release-per-user-diagnostics-${{ github.run_attempt }}
+          path: |
+            user-runtime-diagnostics/
+            user-upgrade-diagnostics/
+            user-elsewhere-diagnostics/
+            user-failed-upgrade-diagnostics/
+            user-same-version-diagnostics/
+            user-unscoped-diagnostics/
+            hosted-log-checks.txt
+            predecessor-source.json
+            msi-policy.log
+            ${{ runner.temp }}/oa-msi-policy.json
+
+      # ----- for everyone ----------------------------------------------------
+      #
+      # This is the leg that never ran. A GitHub runner is an administrator and
+      # a workstation is not, which is exactly why this belongs here: the
+      # machine scope cannot be proved on the machine the package is written on.
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+        with:
+          ref: ${{ github.sha }}
+          path: session-fixture
+
       - name: machine forced failed upgrade rolls back to the predecessor
         id: machine-failed-upgrade
         shell: pwsh
@@ -427,7 +543,7 @@ jobs:
           $p = Start-Process msiexec -Wait -PassThru -ArgumentList @('/i', $predecessor, '/qn', '/norestart', 'ALLUSERS=1', 'MSIINSTALLPERUSER=', '/l*v', 'machine-predecessor-install.log')
           if ($p.ExitCode -ne 0) { throw "machine predecessor install exited $($p.ExitCode)" }
           $statePath = "$env:RUNNER_TEMP/oa-predecessor-session.json"
-          & powershell.exe -NoProfile -ExecutionPolicy Bypass -STA -File test_service_session.ps1 -Mode Verify -StatePath $statePath -ExpectedImage jobdw.exe
+          & powershell.exe -NoProfile -ExecutionPolicy Bypass -STA -File session-fixture/test_service_session.ps1 -Mode Verify -StatePath $statePath -ExpectedImage jobdw.exe
           if ($LASTEXITCODE -ne 0) { throw "Predecessor session fixture exited $LASTEXITCODE" }
           $state = Get-Content -LiteralPath $statePath -Raw | ConvertFrom-Json
           function Get-SessionInstances {
@@ -467,16 +583,61 @@ jobs:
           "machine-instance-restarted=$restarted" >> $env:GITHUB_STEP_SUMMARY
           'ok    a failed machine upgrade left the predecessor installed, registered, with no exclusion and its session instance running'
           exit 0
+
       - name: remove the predecessor test session
         if: always()
         shell: pwsh
         timeout-minutes: 2
         run: |
-          if (Test-Path test_service_session.ps1) {
-            & powershell.exe -NoProfile -ExecutionPolicy Bypass -STA -File test_service_session.ps1 -Mode Cleanup -StatePath "$env:RUNNER_TEMP/oa-predecessor-session.json" 2>&1 | Tee-Object predecessor-session-cleanup.log
+          if (Test-Path session-fixture/test_service_session.ps1) {
+            & powershell.exe -NoProfile -ExecutionPolicy Bypass -STA -File session-fixture/test_service_session.ps1 -Mode Cleanup -StatePath "$env:RUNNER_TEMP/oa-predecessor-session.json" 2>&1 | Tee-Object predecessor-session-cleanup.log
             if ($LASTEXITCODE -ne 0) { throw "Predecessor session cleanup exited $LASTEXITCODE" }
           }
           exit 0
+
+      - name: install for everyone
+        id: machine-install
+        shell: pwsh
+        run: |
+          $msi = (Resolve-Path pkg\abstraction-x64.msi).Path
+          $p = Start-Process msiexec -Wait -PassThru -ArgumentList @('/i', $msi, '/qn', '/norestart', 'ALLUSERS=1', 'MSIINSTALLPERUSER=', '/l*v', 'machine-install.log')
+          if ($p.ExitCode -ne 0) {
+            Select-String -Path machine-install.log -Pattern 'Return value 3','Error [0-9]+','CustomAction .* returned' -Context 12,4 | Out-String -Width 300 | Write-Output
+            Get-Content machine-install.log -Tail 120
+            throw "msiexec /i ALLUSERS=1 exited $($p.ExitCode). RegisterSupervisor is Return=check, so a supervisor that could not be registered fails and rolls back the install rather than leaving a package that installed the programs and nothing that runs them."
+          }
+
+      - name: what a per-machine install did, and what it must not have done
+        shell: pwsh
+        run: |
+          $dir = Join-Path $env:ProgramFiles 'OpenAbstractions'
+          $tools = Join-Path $dir 'tools'
+          if (-not (Test-Path $tools)) { throw "a per-machine install did not land in $tools" }
+          foreach ($f in 'openabstractions.exe','openabstractionsw.exe','Abstraction Panel.exe') {
+            if (-not (Test-Path (Join-Path $tools $f))) { throw "$f was not installed" }
+          }
+          $key = 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Environment'
+          if ((Get-ItemProperty $key -Name Path).Path -notlike "*$tools*") { throw "the machine PATH does not carry $tools" }
+          if (-not (Test-Path 'HKLM:\Software\OpenAbstractions\Abstraction')) { throw 'the machine registry key was not written' }
+
+          # %ProgramData% grants BUILTIN\Users create-file by inheritance, and
+          # config refuses a machine file no administrator owns. The component
+          # replaces the inherited ACL; if it stops doing so, the machine rung
+          # becomes squattable and nothing else says so.
+          $cfg = Join-Path $env:ProgramData 'abstraction'
+          if (-not (Test-Path $cfg)) { throw 'the machine config folder was not created' }
+          $bad = (Get-Acl $cfg).Access | Where-Object {
+            $_.IdentityReference -like '*\Users' -and $_.FileSystemRights -match 'CreateFiles|Write|FullControl|Modify'
+          }
+          if ($bad) { $bad | Format-List; throw 'Users can write into the machine config folder, so the machine rung can be squatted' }
+
+          # The per-user arm must not also have fired. Both arms installing is
+          # the same defect as neither: the scope stopped meaning anything.
+          if (Test-Path (Join-Path $env:APPDATA 'Microsoft\Windows\Start Menu\Programs\Startup\Abstraction supervisor.lnk')) {
+            throw 'a per-machine install also created the Startup shortcut, which is the per-user arm. Both arms fired, so ALLUSERS is not deciding between them.'
+          }
+          'ok    programs in Program Files, a machine PATH entry, a protected config folder, and no Startup shortcut'
+
       - name: machine upgrade holds the exclusion, stops nothing, and removes the predecessor after the commit
         id: machine-install
         shell: pwsh
@@ -512,29 +673,50 @@ jobs:
           if (Test-Path -LiteralPath (Join-Path $env:ProgramData 'abstraction\upgrade-v1\exclusion.json')) { throw 'the machine upgrade exclusion survived commit' }
           'ok    the machine upgrade held its exclusion, stopped nothing itself, released the exclusion and registered the host after the removal'
           exit 0
+
       - name: the supervisor is registered, and registered as what it claims
         shell: pwsh
         run: |
-          $text = (& sc.exe qc OpenAbstractionsSupervisor) -join "`n"
-          if ($LASTEXITCODE -ne 0) { throw "sc qc exited $LASTEXITCODE" }
-          $text
-          if ($text -notmatch 'TYPE\s*:\s*50\s+USER_OWN_PROCESS\s+TEMPLATE') { throw 'the service is not a SERVICE_USER_OWN_PROCESS template' }
-          if ($text -notmatch 'START_TYPE\s*:\s*2\s+AUTO_START') { throw 'the template is not AUTO_START' }
-          if ($text -notmatch 'openabstractionsw\.exe" serve host --service') { throw 'the registered image is not openabstractionsw.exe serve host --service' }
+          $qc = & sc.exe qc OpenAbstractionsSupervisor
+          $qc
+          if ($LASTEXITCODE -ne 0) {
+            throw "sc qc exited $LASTEXITCODE. The install reported success and registered no supervisor: the Background supervisor feature promises a service for everyone, and there is none."
+          }
+          $text = $qc -join "`n"
+          if ($text -notmatch 'TYPE\s*:\s*50\s+USER_OWN_PROCESS\s+TEMPLATE') {
+            throw 'the service is not a SERVICE_USER_OWN_PROCESS template. Any other type is a service running as someone, and this design stores no password because it runs as whoever signs in.'
+          }
+          if ($text -notmatch 'START_TYPE\s*:\s*2\s+AUTO_START') { throw 'the template is not AUTO_START, so nothing clones it at sign-in' }
+          if ($text -notmatch 'openabstractionsw\.exe" serve host --service') {
+            throw 'the registered image is not openabstractionsw.exe serve host --service. openabstractions.exe is the console image, and the loader gives a console image a window in the session it runs in â€” a window at every sign-in is what this whole mechanism removed.'
+          }
+
+          # The restart is the entire reason this is a service and not a
+          # shortcut. A template with no recovery policy is the Startup shortcut
+          # with extra steps.
           $qf = (& sc.exe qfailure OpenAbstractionsSupervisor) -join "`n"
-          if ($qf -notmatch 'RESET_PERIOD[^:]*:\s*3600') { throw 'the reset period is not 3600' }
+          $qf
+          if ($qf -notmatch 'RESET_PERIOD[^:]*:\s*3600') { throw 'the reset period is not 3600, so three restarts are a budget for the life of the machine rather than a crash-loop brake' }
           foreach ($ms in 3000, 10000, 30000) {
             if ($qf -notmatch "RESTART -- Delay = $ms milliseconds") { throw "the $ms ms restart action is not configured" }
           }
-          if (((& sc.exe qfailureflag OpenAbstractionsSupervisor) -join "`n") -notmatch 'FAILURE_ACTIONS_ON_NONCRASH_FAILURES\s*:\s*TRUE') { throw 'the non-crash failure flag is not set' }
-          exit 0
+          $qff = (& sc.exe qfailureflag OpenAbstractionsSupervisor) -join "`n"
+          $qff
+          if ($qff -notmatch 'FAILURE_ACTIONS_ON_NONCRASH_FAILURES\s*:\s*TRUE') {
+            throw 'recovery fires only on a process that died without reporting SERVICE_STOPPED. A supervisor that reports a tidy stop after failing to open its store is the case we most want restarted.'
+          }
+          'ok    a USER_OWN_PROCESS template, auto-start, pointing at openabstractionsw.exe serve host --service, with three restarts and the non-crash flag'
+
       - name: fresh interactive session and crash recovery
+        id: instance
         shell: pwsh
         timeout-minutes: 5
         run: |
-          & powershell.exe -NoProfile -ExecutionPolicy Bypass -STA -File test_service_session.ps1 -Mode Verify -StatePath "$env:RUNNER_TEMP/oa-service-session.json"
+          & powershell.exe -NoProfile -ExecutionPolicy Bypass -STA -File session-fixture/test_service_session.ps1 -Mode Verify -StatePath "$env:RUNNER_TEMP/oa-service-session.json"
           if ($LASTEXITCODE -ne 0) { throw "Fresh logon/recovery fixture exited $LASTEXITCODE" }
+          "state=proven" >> $env:GITHUB_OUTPUT
           exit 0
+
       # The host records its token's TokenElevation and TokenElevationType at
       # start. Kept as evidence of what token a per-user service instance runs
       # with; it decides nothing here.
@@ -551,34 +733,34 @@ jobs:
           Copy-Item -LiteralPath $log -Destination machine-host.log
           Select-String -LiteralPath $log -Pattern 'serve host start' | ForEach-Object Line
           exit 0
+
       - name: uninstall for everyone
         if: always() && steps.machine-install.outcome == 'success'
         shell: pwsh
         run: |
           $msi = (Resolve-Path pkg\abstraction-x64.msi).Path
           $p = Start-Process msiexec -Wait -PassThru -ArgumentList @('/x', $msi, '/qn', '/norestart', '/l*v', 'machine-uninstall.log')
-          if ($p.ExitCode -ne 0) { throw "msiexec /x exited $($p.ExitCode)" }
-          # A zero exit is not an honest removal: refuse a log in which the Restart Manager
-          # could not stop a process or a reboot operation was left pending.
-          & powershell.exe -NoProfile -ExecutionPolicy Bypass -File test_user_runtime.ps1 -Mode CheckLogs -RemovalLogs machine-uninstall.log
-          if ($LASTEXITCODE -ne 0) { throw "the machine removal log is not an honest removal: exit $LASTEXITCODE" }
+          if ($p.ExitCode -ne 0) { Get-Content machine-uninstall.log -Tail 60; throw "msiexec /x exited $($p.ExitCode)" }
           & sc.exe qc OpenAbstractionsSupervisor | Out-Null
-          if ($LASTEXITCODE -ne 1060) { throw "the service template survived uninstall or its absence was not established: exit $LASTEXITCODE" }
-          if (@(Get-Service -Name 'OpenAbstractionsSupervisor_*' -ErrorAction SilentlyContinue).Count) { throw 'a per-session instance survived uninstall' }
-          foreach ($path in @((Join-Path $env:ProgramFiles 'OpenAbstractions'), 'HKLM:\Software\OpenAbstractions', (Join-Path $env:ProgramData 'abstraction'))) {
-            if (Test-Path -LiteralPath $path) {
-            if (-not $path.StartsWith('HKLM:')) {
-              Get-ChildItem -LiteralPath $path -Recurse -Force | ForEach-Object {
-                "left: $($_.FullName) $($_.Length)"
-                if (-not $_.PSIsContainer -and $_.Length -lt 8192) { Get-Content -LiteralPath $_.FullName | ForEach-Object { "      $_" } }
-              }
-            }
-            throw "uninstall left $path"
-          }
-          }
-          & powershell.exe -NoProfile -ExecutionPolicy Bypass -STA -File test_service_session.ps1 -Mode VerifyRemoved -StatePath "$env:RUNNER_TEMP/oa-service-session.json"
+          if ($LASTEXITCODE -eq 0) { throw 'the service template survived uninstall' }
+          if ($LASTEXITCODE -ne 1060) { throw "sc qc could not establish service absence: exit $LASTEXITCODE" }
+
+          # Deleting the template does not delete the instances the service
+          # manager cloned from it: the owner's own probe outlived sc delete and
+          # stayed AUTO_START. An uninstall that leaves one leaks a service per
+          # account that has ever signed in.
+          $left = @(Get-Service -Name 'OpenAbstractionsSupervisor_*' -ErrorAction SilentlyContinue)
+          if ($left.Count -ne 0) { $left | Format-List Name, Status; throw 'a per-session instance survived uninstall' }
+          if (Test-Path (Join-Path $env:ProgramFiles 'OpenAbstractions')) { throw 'the install folder survived uninstall' }
+          if (Test-Path 'HKLM:\Software\OpenAbstractions') { throw 'the machine registry key survived uninstall' }
+          if (Test-Path (Join-Path $env:ProgramData 'abstraction')) { throw 'the machine config folder survived uninstall' }
+          $key = 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Environment'
+          if ((Get-ItemProperty $key -Name Path).Path -like '*OpenAbstractions*') { throw 'the machine PATH entry survived uninstall' }
+          & powershell.exe -NoProfile -ExecutionPolicy Bypass -STA -File session-fixture/test_service_session.ps1 -Mode VerifyRemoved -StatePath "$env:RUNNER_TEMP/oa-service-session.json"
           if ($LASTEXITCODE -ne 0) { throw "Runtime removal verification exited $LASTEXITCODE" }
+          'ok    uninstall reversed it: no template, no instance, no folder, no key, no config folder, no PATH entry'
           exit 0
+
       - name: remove the machine predecessor left by a failed step
         if: always() && steps.machine-failed-upgrade.outputs.predecessor != ''
         shell: pwsh
@@ -589,389 +771,900 @@ jobs:
             if ($p.ExitCode -ne 0) { throw "machine predecessor cleanup exited $($p.ExitCode)" }
           }
           exit 0
+
       - name: remove only the disposable test session
         if: always()
         shell: pwsh
         timeout-minutes: 2
         run: |
-          if (Test-Path test_service_session.ps1) {
-            & powershell.exe -NoProfile -ExecutionPolicy Bypass -STA -File test_service_session.ps1 -Mode Cleanup -StatePath "$env:RUNNER_TEMP/oa-service-session.json" 2>&1 | Tee-Object service-session-cleanup.log
+          if (Test-Path session-fixture/test_service_session.ps1) {
+            & powershell.exe -NoProfile -ExecutionPolicy Bypass -STA -File session-fixture/test_service_session.ps1 -Mode Cleanup -StatePath "$env:RUNNER_TEMP/oa-service-session.json" 2>&1 | Tee-Object service-session-cleanup.log
             if ($LASTEXITCODE -ne 0) { throw "Session cleanup exited $LASTEXITCODE" }
           }
           exit 0
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+
+      - name: preserve installer diagnostics
         if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: windows-qualification-diagnostics
+          name: windows-installer-logs-${{ github.run_attempt }}
           path: |
-            predecessor-source.json
-            msi-policy.log
-            ${{ runner.temp }}/oa-msi-policy.json
-            user-runtime-diagnostics/
-            user-upgrade-diagnostics/
-            user-elsewhere-diagnostics/
-            user-failed-upgrade-diagnostics/
-            user-same-version-diagnostics/
-            user-unscoped-diagnostics/
-            hosted-log-checks.txt
-            elevated-unscoped.log
-            machine-predecessor-install.log
-            machine-failed-upgrade.log
+            user-install.log
+            user-uninstall.log
             machine-install.log
-            machine-host.log
-            predecessor-session-cleanup.log
-            machine-uninstall.log
+            machine-failed-upgrade.log
+            machine-predecessor-install.log
             machine-predecessor-cleanup.log
+            predecessor-session-cleanup.log
+            machine-host.log
+            machine-uninstall.log
             service-session.log
             service-session-cleanup.log
+            elevated-unscoped.log
+          if-no-files-found: ignore
 
-  posix:
-    runs-on: ${{ matrix.runner }}
-    timeout-minutes: 30
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-        - runner: ubuntu-latest
-          platform: linux
-        - runner: macos-latest
-          platform: macos
+  linux:
+    needs: candidate
+    outputs:
+      package-artifact: ${{ steps.artifact-names.outputs.package }}
     env:
-      GOWORK: 'off'
-      GOFLAGS: -mod=readonly -trimpath
-      CGO_ENABLED: '0'
-      REDIST_SHA: ${{ inputs.redist_sha }}
-      CHARTER_SHA: ${{ inputs.charter_sha }}
-      DOWNLOAD_SHA: ${{ inputs.download_sha }}
-      JOB_SHA: ${{ inputs.job_sha }}
-      CANDIDATE_VERSION: ${{ inputs.version }}
-      PACKAGE_PLATFORM: ${{ matrix.platform }}
+      CANDIDATE_VERSION: ${{ needs.candidate.outputs.version }}
       GOTOOLCHAIN: local
+    runs-on: ubuntu-latest
     steps:
-    - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
-    - name: validate immutable inputs
-      shell: python
-      run: |
-        import os, re, subprocess
-        for key in ('REDIST_SHA', 'CHARTER_SHA', 'DOWNLOAD_SHA', 'JOB_SHA'):
-            if not re.fullmatch('[0-9a-f]{40}', os.environ[key]):
-                raise SystemExit(f'{key} must be a full lowercase public commit SHA')
-        if os.environ['REDIST_SHA'] != os.environ['GITHUB_SHA']:
-            raise SystemExit('Dispatched redist commit differs from redist_sha')
-        if subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip() != os.environ['REDIST_SHA']:
-            raise SystemExit('Redist checkout differs from requested commit')
-        version = os.environ['CANDIDATE_VERSION']
-        if not re.fullmatch(r'(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)', version):
-            raise SystemExit('MSI version must be MAJOR.MINOR.PATCH')
-        if any(int(n) > bound for n, bound in zip(version.split('.'), (255, 255, 65535))):
-            raise SystemExit('MSI version exceeds Windows Installer limits')
-    - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
-      with:
-        repository: openabstractions/abstractions
-        ref: ${{ inputs.charter_sha }}
-        path: source-charter
-        persist-credentials: false
-    - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
-      with:
-        repository: openabstractions/abstraction-download
-        ref: ${{ inputs.download_sha }}
-        path: source-download
-        persist-credentials: false
-    - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
-      with:
-        repository: openabstractions/abstraction-job
-        ref: ${{ inputs.job_sha }}
-        path: source-job
-        persist-credentials: false
-    - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
-      with:
-        go-version: '1.26.8'
-        cache: false
-    - name: record the Go toolchain
-      shell: bash
-      run: go version | tee go-version.txt
-    - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
-      with:
-        name: go-version-${{ matrix.platform }}
-        path: go-version.txt
-        if-no-files-found: error
-    - name: verify source and dependency provenance
-      shell: python
-      run: |
-        import json, os, pathlib, subprocess
-        sources = {'source-charter': 'CHARTER_SHA', 'source-download': 'DOWNLOAD_SHA', 'source-job': 'JOB_SHA'}
-        evidence = {'redist': os.environ['REDIST_SHA'], 'sources': {}, 'dependencies': {}}
-        for directory, key in sources.items():
-            actual = subprocess.check_output(['git', '-C', directory, 'rev-parse', 'HEAD'], text=True).strip()
-            if actual != os.environ[key]:
-                raise SystemExit(f'{directory} checkout differs from requested commit')
-            evidence['sources'][directory] = actual
-        def modules(raw):
-            decoder = json.JSONDecoder()
-            while raw.strip():
-                value, end = decoder.raw_decode(raw.lstrip())
-                yield value
-                raw = raw.lstrip()[end:]
-        expected = {'github.com/openabstractions/abstraction-download/go': os.environ['DOWNLOAD_SHA'],
-                    'github.com/openabstractions/abstraction-job/go': os.environ['JOB_SHA']}
-        for directory in ('source-charter/serve', 'source-charter/monitor', 'source-download/go', 'source-job/go'):
-            selected = list(modules(subprocess.check_output(['go', 'list', '-m', '-json', 'all'], cwd=directory, text=True)))
-            if not selected or sum(bool(item.get('Main')) for item in selected) != 1:
-                raise SystemExit(f'{directory} must select one main module')
-            if directory == 'source-charter/serve' and 'github.com/openabstractions/abstraction-download/go' not in {item.get('Path') for item in selected}:
-                raise SystemExit(f'{directory} is missing its required download dependency')
-            closure = []
-            for item in selected:
-                if item.get('Replace') or item.get('Error'):
-                    raise SystemExit(f'{directory} has a replaced or unresolved module: {item.get("Path")}')
-                if item.get('Main'):
-                    closure.append(item)
-                    continue
-                if not item.get('Path') or not item.get('Version'):
-                    raise SystemExit(f'{directory} dependency lacks an immutable module version')
-                downloaded = json.loads(subprocess.check_output(['go', 'mod', 'download', '-json', item['Path']+'@'+item['Version']], cwd=directory, text=True))
-                if downloaded.get('Replace') or downloaded.get('Error') or not downloaded.get('Sum') or not downloaded.get('GoModSum'):
-                    raise SystemExit(f'{directory} dependency lacks verified downloaded content: {item["Path"]}')
-                if item['Path'] in expected and downloaded.get('Origin', {}).get('Hash') != expected[item['Path']]:
-                    raise SystemExit(f'{directory} dependency does not identify the requested source SHA: {item["Path"]}')
-                closure.append({'selected': item, 'download': downloaded})
-            evidence['dependencies'][directory] = closure
-        pathlib.Path('dist').mkdir()
-        pathlib.Path('dist/source-provenance.json').write_text(json.dumps(evidence, indent=2))
-        pathlib.Path('dist/tools.tsv').write_bytes(pathlib.Path('tools.tsv').read_bytes())
-    - name: native POSIX shell fixtures
-      shell: bash
-      run: |
-        python3 posix/test_lifecycle.py
-    - name: build POSIX programs from pinned public sources
-      shell: python
-      run: |
-        import hashlib, importlib.util, json, os, pathlib, re, subprocess
-        spec = importlib.util.spec_from_file_location('packager', 'posix/build.py')
-        packager = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(packager)
-        platform = os.environ['PACKAGE_PLATFORM']
-        if platform not in ('linux', 'macos'):
-            raise SystemExit('Unsupported POSIX package platform')
-        items = packager.payload(platform)
-        names = [pathlib.PurePosixPath(path).name for path, kind, *_ in items if kind == 'gobuild']
-        if len(names) != len(set(names)) or 'openabstractions' not in names:
-            raise SystemExit('Required POSIX runtime payload is missing or duplicated')
-        rows = [[part.strip() for part in line.split('\t') if part.strip()] for line in pathlib.Path('tools.tsv').read_text().splitlines() if line.strip() and not line.startswith('>')][1:]
-        if any(len(row) != 5 for row in rows) or len({row[0] for row in rows}) != len(rows):
-            raise SystemExit('Invalid or duplicate tools.tsv rows')
-        tools = {row[0]: row for row in rows}
-        overrides = {'openabstractions': ('source-charter/serve', '.')}
-        plan, pins = {}, {}
-        for name in names:
-            if name+'.exe' not in tools or tools[name+'.exe'][4] != 'console':
-                raise SystemExit('POSIX payload requires an explicit console tools.tsv entry')
-            plan[name] = overrides[name]
-            directory, target = plan[name]
-            source = directory.split('/')[0]
-            source_key = {'source-charter': 'CHARTER_SHA'}[source]
-            pins[name] = {'directory': directory, 'package': target, 'sha': os.environ[source_key]}
-        goos = 'linux' if platform == 'linux' else 'darwin'
-        hashes = {}
-        for arch in ('amd64', 'arm64'):
-            output = pathlib.Path('binaries', arch).resolve()
-            output.mkdir(parents=True)
-            env = dict(os.environ, GOOS=goos, GOARCH=arch)
-            for name, (directory, target) in plan.items():
-                subprocess.run(['go', 'build', '-ldflags=-s -w -buildid=', '-o', str(output/name), target], cwd=directory, env=env, check=True)
-                hashes[arch+'/'+name] = hashlib.sha256((output/name).read_bytes()).hexdigest()
-        if platform == 'macos':
-            pathlib.Path('binaries/universal').mkdir()
-            for name in names:
-                output = 'binaries/universal/'+name
-                subprocess.run(['lipo', '-create', 'binaries/amd64/'+name, 'binaries/arm64/'+name, '-output', output], check=True)
-                subprocess.run(['lipo', output, '-verify_arch', 'x86_64', 'arm64'], check=True)
-                hashes['universal/'+name] = hashlib.sha256(pathlib.Path(output).read_bytes()).hexdigest()
-        provenance = pathlib.Path('dist/source-provenance.json')
-        evidence = json.loads(provenance.read_text())
-        evidence.update(platform=platform, tools=pins, binary_sha256=hashes)
-        provenance.write_text(json.dumps(evidence, indent=2))
-    - name: assemble and inspect POSIX packages
-      shell: python
-      run: |
-        import hashlib, importlib.util, json, os, pathlib, subprocess, tarfile
-        platform, version = os.environ['PACKAGE_PLATFORM'], os.environ['CANDIDATE_VERSION']
-        if platform not in ('linux', 'macos'):
-            raise SystemExit('Unsupported package platform')
-        packages = []
-        for arch in (('amd64', 'arm64') if platform == 'linux' else ('universal',)):
-            command = ['python3', 'posix/build.py', '--platform', platform, '--version', version, '--out', 'dist', '--bin', 'binaries/'+arch, '--license', 'LICENSE']
-            if platform == 'linux':
-                command += ['--arch', arch]
-            subprocess.run(command, check=True)
-            name = f'abstraction-{version}-linux-{arch}.tar.gz' if platform == 'linux' else f'abstraction-{version}-macos-universal.pkg'
-            artifact = pathlib.Path('dist', name)
-            if not artifact.is_file() or artifact.stat().st_size == 0:
-                raise SystemExit('Packager did not produce the expected artifact')
-            if platform == 'linux':
-                with tarfile.open(artifact) as archive:
-                    for program in ('openabstractions',):
-                        member = archive.getmember(f'abstraction-{version}-linux-{arch}/payload/.local/bin/'+program)
-                        if not member.isfile() or member.mode & 0o111 != 0o111 or archive.extractfile(member).read() != pathlib.Path('binaries', arch, program).read_bytes():
-                            raise SystemExit('Linux package executable differs from verified input')
-            else:
-                subprocess.run(['pkgutil', '--expand-full', str(artifact), 'package-inspect'], check=True)
-                for program in ('openabstractions',):
-                    matches = list(pathlib.Path('package-inspect').glob('*/Payload/.local/bin/'+program))
-                    if len(matches) != 1 or matches[0].read_bytes() != pathlib.Path('binaries/universal', program).read_bytes():
-                        raise SystemExit('macOS package executable differs from verified universal input')
-            packages.append(name)
-        pathlib.Path('dist/SHA256SUMS.'+platform).write_text(''.join(hashlib.sha256(pathlib.Path('dist', name).read_bytes()).hexdigest()+'  '+name+'\n' for name in packages))
-        pathlib.Path('dist/package-verification.json').write_text(json.dumps({'platform': platform, 'package_build': 'passed', 'installed_lifecycle': 'pending' if platform == 'linux' else 'not_exercised', 'macos_limit': 'Unsigned package build and native shell fixtures; Aqua login lifecycle unproven' if platform == 'macos' else None, 'packages': packages}, indent=2))
-    - name: Linux disposable-account installed lifecycle
-      if: matrix.platform == 'linux'
-      shell: bash
-      run: |
-        set -euo pipefail
-        [ "${GITHUB_ACTIONS:-}" = true ] && [ "${RUNNER_ENVIRONMENT:-}" = github-hosted ] && [ "${RUNNER_OS:-}" = Linux ] || { echo 'Disposable GitHub Linux runner required'; exit 1; }
-        account=oa-ci-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}
-        case "$account" in oa-ci-[0-9]*-[0-9]*) ;; *) exit 1;; esac
-        if getent passwd "$account" >/dev/null; then echo 'Test account already exists'; exit 1; fi
-        sudo useradd --user-group --create-home --shell /bin/sh "$account"
-        uid=$(id -u "$account")
-        printf '%s %s\n' "$account" "$uid" > "$RUNNER_TEMP/oa-posix-account"
-        home=/home/$account
-        sudo mkdir "$home/package" "$home/fixtures"
-        sudo tar -xzf "dist/abstraction-$CANDIDATE_VERSION-linux-amd64.tar.gz" -C "$home/package" --no-same-owner
-        sudo cp -R posix/. "$home/fixtures/"
-        sudo chown -R "$account:$account" "$home/package" "$home/fixtures"
-        sudo loginctl enable-linger "$account"
-        sudo systemctl start "user@$uid.service"
-        user() { sudo -u "$account" env HOME="$home" XDG_RUNTIME_DIR="/run/user/$uid" DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$uid/bus" "$@"; }
-        start_fixture_origin() {
-          origin_unit="oa-candidate-origin-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}.service"
-          user timeout --kill-after=2s 10s systemd-run --user --quiet --collect --unit="$origin_unit" \
-            python3 -m http.server 8099 --bind 127.0.0.1 --directory "$home/download-origin"
-          trap stop_fixture_origin EXIT
-        }
-        stop_fixture_origin() {
-          trap - EXIT
-          [ -z "${origin_unit:-}" ] || user timeout --kill-after=2s 10s systemctl --user stop "$origin_unit"
-          origin_unit=
-        }
-        configure_disposable_runtime_environment() {
-          [ "$(id -u "$account")" = "$uid" ] || { echo 'Disposable account identity changed'; return 1; }
-          expected=/run/user/$uid
-          [ "$(stat -c '%F %u %a' "$expected")" = "directory $uid 700" ] || { echo 'Private account runtime directory unavailable'; return 1; }
-          # Hosted Ubuntu globally exports the runner's XDG_RUNTIME_DIR (runner-images#14649).
-          # Correct only this new account's manager; direct sudo env does not reach services.
-          before=$(user timeout --kill-after=2s 10s systemctl --user show-environment | sed -n 's/^XDG_RUNTIME_DIR=//p') || return 1
-          printf 'Disposable manager runtime directory: %s -> %s\n' "$before" "$expected"
-          user timeout --kill-after=2s 10s systemctl --user set-environment "XDG_RUNTIME_DIR=$expected" || return 1
-          after=$(user timeout --kill-after=2s 10s systemctl --user show-environment | sed -n 's/^XDG_RUNTIME_DIR=//p') || return 1
-          [ "$after" = "$expected" ] || { echo 'Disposable manager runtime environment was not established'; return 1; }
-        }
-        {
-          configure_disposable_runtime_environment
-          user sh "$home/fixtures/test_systemd.sh" --run
-          user mkdir -p "$home/.abstraction"
-          user sh -c 'printf preserved > "$HOME/.abstraction/candidate-data"'
-          user sh "$home/package/abstraction-$CANDIDATE_VERSION-linux-amd64/install.sh"
-          user test -x "$home/.local/bin/openabstractions"
-          for program in jobd dl jobctl; do user test ! -e "$home/.local/bin/$program"; done
-          user "$home/.local/bin/openabstractions" status --timeout 5s
-          # A download through the runtime, with no store named: the runtime
-          # fetches and verifies, the command copies the result out, and jobs
-          # show observes the same operation.
-          user mkdir -p "$home/download-origin" "$home/download-out"
-          user sh -c 'printf "bytes through the runtime" > "$HOME/download-origin/thing.bin"'
-          start_fixture_origin
-          for _ in $(seq 50); do curl -fsS -o /dev/null http://127.0.0.1:8099/thing.bin && break; sleep 0.2; done
-          user "$home/.local/bin/openabstractions" download http://127.0.0.1:8099/thing.bin --out "$home/download-out" --json --timeout 60s > "$RUNNER_TEMP/download.json"
-          stop_fixture_origin
-          user cmp "$home/download-out/thing.bin" "$home/download-origin/thing.bin"
-          operation=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["receipt"]["operation_id"])' "$RUNNER_TEMP/download.json")
-          [ -n "$operation" ]
-          user "$home/.local/bin/openabstractions" jobs show "$operation" --json | python3 -c 'import json,sys; s=json.load(sys.stdin)["snapshot"]; sys.exit(0 if s["state"] == "complete" and s["receipt"]["operation_id"] == sys.argv[1] else 1)' "$operation"
-          user sh "$home/.local/share/abstraction/uninstall.sh"
-          user test ! -e "$home/.local/bin/openabstractions"
-          user test ! -e "$home/.config/systemd/user/abstraction-runtime.service"
-          [ "$(user cat "$home/.abstraction/candidate-data")" = preserved ]
-          echo 'PASS Linux installed runtime readiness, a download through the runtime, native stop/removal and user-data preservation'
-        } 2>&1 | tee dist/linux-installed-lifecycle.log
-        python3 - <<'PY'
-        import json, pathlib
-        p = pathlib.Path('dist/package-verification.json')
-        evidence = json.loads(p.read_text())
-        evidence['installed_lifecycle'] = 'passed_disposable_user_systemd'
-        p.write_text(json.dumps(evidence, indent=2))
-        PY
-    - name: capture disposable Linux runtime diagnostics
-      if: always() && matrix.platform == 'linux'
-      shell: bash
-      run: |
-        set -euo pipefail
-        state=$RUNNER_TEMP/oa-posix-account
-        [ -f "$state" ] || exit 0
-        [ "${GITHUB_ACTIONS:-}" = true ] && [ "${RUNNER_ENVIRONMENT:-}" = github-hosted ] && [ "${RUNNER_OS:-}" = Linux ] || exit 1
-        read -r account uid < "$state"
-        [ "$account" = "oa-ci-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" ] && [ "$(id -u "$account")" = "$uid" ] || exit 1
-        {
-          printf 'Disposable principal: '; id "$account"
-          # Inspect only identity/runtime settings; never dump the full manager environment.
-          sudo -u "$account" env HOME="/home/$account" XDG_RUNTIME_DIR="/run/user/$uid" DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$uid/bus" \
-            timeout --kill-after=2s 10s systemctl --user show-environment | grep -E '^(HOME|USER|LOGNAME|XDG_RUNTIME_DIR)=' || true
-          # Include the exact directory named by failed run 34693195412.
-          for directory in "/run/user/$uid" /run/user/1001; do
-            sudo stat -c '%A %u:%g %n' "$directory" "$directory/openabstractions-logging-v1.sock.lock" 2>&1 || true
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+        with:
+          ref: ${{ needs.candidate.outputs.sha }}
+
+      - name: name this attempt's package artifact
+        id: artifact-names
+        run: printf 'package=abstraction-linux-unsigned-%s\n' "$GITHUB_RUN_ATTEMPT" >> "$GITHUB_OUTPUT"
+
+      # The same Go as the windows and macos jobs; see the windows job.
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: '1.26.8'
+          cache: false
+
+      - name: state
+        run: |
+          printf 'a hosted runner, %s logical CPUs, %s %s, on mains\n' \
+            "$(getconf _NPROCESSORS_ONLN)" "$RUNNER_OS" "$RUNNER_ARCH"
+          go version | tee go-version.txt
+          git rev-parse HEAD
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: go-version-linux-${{ github.run_attempt }}
+          path: go-version.txt
+          if-no-files-found: error
+
+      # The repository first, the proxy second, for the reason the windows job
+      # states: a cache that never forgets cannot say whether a tag exists.
+      - name: verify and record published module provenance
+        run: python3 scripts/module_provenance.py --tools tools.tsv --output module-provenance.json
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: module-provenance-${{ runner.os }}-${{ github.run_attempt }}
+          path: module-provenance.json
+          if-no-files-found: error
+
+      - name: native POSIX shell fixtures
+        shell: bash
+        run: |
+          python3 posix/test_lifecycle.py
+
+      - name: build from the published modules
+        env:
+          CGO_ENABLED: '0'
+          GOOS: linux
+          GOFLAGS: -trimpath
+        run: |
+          rows() { grep -v '^>' "$1" | sed '/^[[:space:]]*$/d' | tail -n +2 | tr -s '\t'; }
+          root=$PWD
+          for arch in amd64 arm64; do
+            while IFS=$'\t' read -r path module package feature subsystem; do
+              if [ "$subsystem" = windows ]; then
+                printf 'note  %s is a windows-subsystem image and is not in a Linux package\n' "$path"
+                continue
+              fi
+              mod=${module%@*}
+              version=${module##*@}
+              case "$package" in
+                .) target="$mod@$version" ;;
+                *) target="$mod/$package@$version" ;;
+              esac
+              gobin="$(go env GOPATH)/bin"
+              for pass in a b; do
+                mkdir -p "$root/$pass/$arch"
+                rm -rf "$gobin"
+                GOARCH="$arch" go install -ldflags '-s -w -buildid=' "$target"
+                built=$(find "$gobin" -type f)
+                n=$(printf '%s\n' "$built" | sed '/^$/d' | wc -l)
+                if [ "$n" -ne 1 ]; then
+                  printf 'FAIL  %s produced %s binaries, expected 1\n' "$target" "$n"
+                  exit 1
+                fi
+                mv "$built" "$root/$pass/$arch/${path%.exe}"
+              done
+              printf 'built %s %s from %s\n' "$arch" "${path%.exe}" "$target"
+            done < <(rows tools.tsv)
           done
-          # status returns nonzero for stopped/failed units; retain that diagnostic
-          # without changing the preceding install step's failure conclusion.
-          sudo -u "$account" env HOME="/home/$account" XDG_RUNTIME_DIR="/run/user/$uid" DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$uid/bus" \
-            timeout --kill-after=2s 10s systemctl --user status abstraction-runtime.service --no-pager --full || true
-          sudo timeout --kill-after=2s 10s journalctl --no-pager -n 60 "_UID=$uid" _SYSTEMD_USER_UNIT=abstraction-runtime.service
-        } 2>&1 | tee dist/linux-runtime-diagnostics.log
-    - name: remove only the disposable Linux account
-      if: always() && matrix.platform == 'linux'
-      shell: bash
-      run: |
-        set -euo pipefail
-        state=$RUNNER_TEMP/oa-posix-account
-        [ -f "$state" ] || exit 0
-        [ "${GITHUB_ACTIONS:-}" = true ] && [ "${RUNNER_ENVIRONMENT:-}" = github-hosted ] && [ "${RUNNER_OS:-}" = Linux ] || exit 1
-        read -r account uid < "$state"
-        [ "$account" = "oa-ci-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" ] && [ "$(id -u "$account")" = "$uid" ] || exit 1
-        {
-          # Cleanup after a failed assertion is explicit containment, not lifecycle PASS.
-          sudo loginctl disable-linger "$account"
-          sudo systemctl stop "user@$uid.service"
-          # Stopping the user manager may leave its session scope exiting for a
-          # short time. Terminate only this verified disposable login, then wait
-          # for the kernel's UID process inventory to drain before userdel.
-          # An earlier lifecycle failure may leave no registered login; the UID
-          # inventory below remains the authoritative cleanup condition.
-          sudo loginctl terminate-user "$account" || true
-          for _ in $(seq 1 50); do
-            if ! sudo pgrep -u "$uid" >/dev/null; then break; fi
-            sleep 0.2
+
+      - name: reproducible
+        run: |
+          rc=0
+          n=0
+          for f in a/*/*; do
+            n=$((n + 1))
+            if cmp -s "$f" "b/${f#a/}"; then
+              printf 'ok    %s is byte-identical across two builds of one module version\n' "${f#a/}"
+            else
+              printf 'FAIL  %s differs between two builds of one module version\n' "${f#a/}"
+              rc=1
+            fi
           done
-          if sudo pgrep -u "$uid" >/dev/null; then
-            echo "Disposable account still owns processes after bounded shutdown:"
-            sudo ps -o user:24,pid,ppid,stat,etimes,comm,args -u "$uid"
+          if [ "$n" -lt 2 ]; then
+            printf 'FAIL  binaries â€” %s inputs, and this rule cannot fail on fewer than 2\n' "$n"
             exit 1
           fi
-          sudo userdel --remove "$account"
-          if getent passwd "$account" >/dev/null; then echo 'Disposable account survived cleanup'; exit 1; fi
-          rm "$state"
-          echo 'PASS disposable account cleanup'
-        } 2>&1 | tee dist/linux-account-cleanup.log
-    - name: record candidate proof scope
-      if: always()
-      shell: python
-      run: |
-        import os, pathlib
-        path = pathlib.Path('dist/package-verification.json')
-        if path.exists():
-            with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as summary:
-                summary.write('\nPOSIX candidate evidence (unsigned, no release tag):\n```json\n'+path.read_text()+'\n```\n')
-    - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
-      if: always()
-      with:
-        name: abstraction-${{ matrix.platform }}-unsigned
-        path: dist/*.*
-        if-no-files-found: error
+          exit $rc
+
+      # No --src. The Python packages posix/payload.tsv can also carry are
+      # published on their own registry; a redistributable holding a second copy
+      # of them would be one file with two homes. build.py names every row it
+      # leaves out for that reason, and stops if a program is ever one of them.
+      - name: package
+        env:
+          CANDIDATE_VERSION: ${{ needs.candidate.outputs.version }}
+        run: |
+          version=$CANDIDATE_VERSION
+          mkdir -p dist
+          for arch in amd64 arm64; do
+            python3 posix/build.py --platform linux --arch "$arch" --version "$version" \
+              --out dist --bin "a/$arch" --license LICENSE
+          done
+          ls -l dist
+
+      - name: digests
+        run: |
+          n=$(ls dist/*.tar.gz | wc -l)
+          if [ "$n" -lt 2 ]; then
+            printf 'FAIL  packages â€” %s inputs, and this rule cannot fail on fewer than 2\n' "$n"
+            exit 1
+          fi
+          (cd dist && sha256sum ./*.tar.gz | sed 's#\./##' | tee SHA256SUMS.linux)
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ${{ steps.artifact-names.outputs.package }}
+          path: dist/
+          if-no-files-found: error
+
+  linux-verify:
+    needs: linux
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - name: fetch the package
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          PACKAGE_ARTIFACT: ${{ needs.linux.outputs.package-artifact }}
+        run: gh run download "$GITHUB_RUN_ID" -n "$PACKAGE_ARTIFACT" -D pkg
+
+      - name: the checksum file is true
+        run: (cd pkg && sha256sum -c SHA256SUMS.linux)
+
+      # A hosted runner has no systemd user manager, so install.sh takes its
+      # documented other path and says so. That is the half a person without
+      # systemd gets, and it is the half this job can prove.
+      - name: install
+        run: |
+          tar xzf pkg/*-linux-amd64.tar.gz -C /tmp
+          d=$(find /tmp -maxdepth 1 -type d -name 'abstraction-*-linux-amd64')
+          "$d/install.sh"
+
+      - name: what it installed
+        run: |
+          [ -x "$HOME/.local/bin/openabstractions" ] || { printf 'FAIL  openabstractions was not installed\n'; exit 1; }
+          for f in jobd dl jobctl; do
+            [ -e "$HOME/.local/bin/$f" ] && { printf 'FAIL  %s was removed in 0.2.0 and was installed\n' "$f"; exit 1; }
+          done
+          [ -f "$HOME/.local/share/abstraction/MANIFEST" ] || { printf 'FAIL  no MANIFEST, so uninstall.sh cannot know what to remove\n'; exit 1; }
+          [ -x "$HOME/.local/share/abstraction/uninstall.sh" ] || { printf 'FAIL  no uninstall.sh\n'; exit 1; }
+          [ -f "$HOME/.local/share/abstraction/LICENSE" ] || { printf 'FAIL  no LICENSE in the package\n'; exit 1; }
+          printf 'ok    openabstractions, a MANIFEST, an uninstaller and a licence\n'
+          cat "$HOME/.local/share/abstraction/MANIFEST"
+
+      - name: uninstall
+        run: |
+          "$HOME/.local/share/abstraction/uninstall.sh"
+          left=0
+          [ -e "$HOME/.local/bin/openabstractions" ] && { printf 'FAIL  openabstractions survived uninstall\n'; left=1; }
+          [ -e "$HOME/.local/share/abstraction" ] && { printf 'FAIL  the share directory survived uninstall\n'; ls -la "$HOME/.local/share/abstraction"; left=1; }
+          [ -e "$HOME/.config/systemd/user/abstraction-runtime.service" ] && { printf 'FAIL  the runtime unit survived uninstall\n'; left=1; }
+          [ "$left" = 0 ] || exit 1
+          printf 'ok    uninstall reversed it: no program, no unit, no share directory\n'
+
+  # The package is built the same way whether or not this repository holds
+  # signing material; only what happens to it afterwards differs. Gatekeeper
+  # refuses an unsigned, unnotarised .pkg, so attaching one is a download that
+  # cannot be opened, and a platform quietly missing from a release page is the
+  # defect this whole file exists to prevent. So an unsigned run keeps the
+  # package as a workflow artifact and says UNPROVEN in the summary and in the
+  # release notes; a signed run attaches it and says which it was.
+      - name: begin disposable lifecycle evidence
+        run: printf '%s\n' '{"installed_lifecycle":"pending"}' > pkg/package-verification.json
+
+      - name: Linux disposable-account installed lifecycle
+        shell: bash
+        run: |
+          set -euo pipefail
+          [ "${GITHUB_ACTIONS:-}" = true ] && [ "${RUNNER_ENVIRONMENT:-}" = github-hosted ] && [ "${RUNNER_OS:-}" = Linux ] || { echo 'Disposable GitHub Linux runner required'; exit 1; }
+          account=oa-ci-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}
+          case "$account" in oa-ci-[0-9]*-[0-9]*) ;; *) exit 1;; esac
+          if getent passwd "$account" >/dev/null; then echo 'Test account already exists'; exit 1; fi
+          sudo useradd --user-group --create-home --shell /bin/sh "$account"
+          uid=$(id -u "$account")
+          printf '%s %s\n' "$account" "$uid" > "$RUNNER_TEMP/oa-posix-account"
+          home=/home/$account
+          sudo mkdir "$home/package" "$home/fixtures"
+          sudo tar -xzf "pkg/abstraction-$CANDIDATE_VERSION-linux-amd64.tar.gz" -C "$home/package" --no-same-owner
+          sudo cp -R posix/. "$home/fixtures/"
+          sudo chown -R "$account:$account" "$home/package" "$home/fixtures"
+          sudo loginctl enable-linger "$account"
+          sudo systemctl start "user@$uid.service"
+          user() { sudo -u "$account" env HOME="$home" XDG_RUNTIME_DIR="/run/user/$uid" DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$uid/bus" "$@"; }
+          start_fixture_origin() {
+            origin_unit="oa-candidate-origin-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}.service"
+            user timeout --kill-after=2s 10s systemd-run --user --quiet --collect --unit="$origin_unit" \
+              python3 -m http.server 8099 --bind 127.0.0.1 --directory "$home/download-origin"
+            trap stop_fixture_origin EXIT
+          }
+          stop_fixture_origin() {
+            trap - EXIT
+            [ -z "${origin_unit:-}" ] || user timeout --kill-after=2s 10s systemctl --user stop "$origin_unit"
+            origin_unit=
+          }
+          configure_disposable_runtime_environment() {
+            [ "$(id -u "$account")" = "$uid" ] || { echo 'Disposable account identity changed'; return 1; }
+            expected=/run/user/$uid
+            [ "$(stat -c '%F %u %a' "$expected")" = "directory $uid 700" ] || { echo 'Private account runtime directory unavailable'; return 1; }
+            # Hosted Ubuntu globally exports the runner's XDG_RUNTIME_DIR (runner-images#14649).
+            # Correct only this new account's manager; direct sudo env does not reach services.
+            before=$(user timeout --kill-after=2s 10s systemctl --user show-environment | sed -n 's/^XDG_RUNTIME_DIR=//p') || return 1
+            printf 'Disposable manager runtime directory: %s -> %s\n' "$before" "$expected"
+            user timeout --kill-after=2s 10s systemctl --user set-environment "XDG_RUNTIME_DIR=$expected" || return 1
+            after=$(user timeout --kill-after=2s 10s systemctl --user show-environment | sed -n 's/^XDG_RUNTIME_DIR=//p') || return 1
+            [ "$after" = "$expected" ] || { echo 'Disposable manager runtime environment was not established'; return 1; }
+          }
+          {
+            configure_disposable_runtime_environment
+            user sh "$home/fixtures/test_systemd.sh" --run
+            user mkdir -p "$home/.abstraction"
+            user sh -c 'printf preserved > "$HOME/.abstraction/candidate-data"'
+            user sh "$home/package/abstraction-$CANDIDATE_VERSION-linux-amd64/install.sh"
+            user test -x "$home/.local/bin/openabstractions"
+            for program in jobd dl jobctl; do user test ! -e "$home/.local/bin/$program"; done
+            user "$home/.local/bin/openabstractions" status --timeout 5s
+            # A download through the runtime, with no store named: the runtime
+            # fetches and verifies, the command copies the result out, and jobs
+            # show observes the same operation.
+            user mkdir -p "$home/download-origin" "$home/download-out"
+            user sh -c 'printf "bytes through the runtime" > "$HOME/download-origin/thing.bin"'
+            start_fixture_origin
+            for _ in $(seq 50); do curl -fsS -o /dev/null http://127.0.0.1:8099/thing.bin && break; sleep 0.2; done
+            user "$home/.local/bin/openabstractions" download http://127.0.0.1:8099/thing.bin --out "$home/download-out" --json --timeout 60s > "$RUNNER_TEMP/download.json"
+            stop_fixture_origin
+            user cmp "$home/download-out/thing.bin" "$home/download-origin/thing.bin"
+            operation=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["receipt"]["operation_id"])' "$RUNNER_TEMP/download.json")
+            [ -n "$operation" ]
+            user "$home/.local/bin/openabstractions" jobs show "$operation" --json | python3 -c 'import json,sys; s=json.load(sys.stdin)["snapshot"]; sys.exit(0 if s["state"] == "complete" and s["receipt"]["operation_id"] == sys.argv[1] else 1)' "$operation"
+            user sh "$home/.local/share/abstraction/uninstall.sh"
+            user test ! -e "$home/.local/bin/openabstractions"
+            user test ! -e "$home/.config/systemd/user/abstraction-runtime.service"
+            [ "$(user cat "$home/.abstraction/candidate-data")" = preserved ]
+            echo 'PASS Linux installed runtime readiness, a download through the runtime, native stop/removal and user-data preservation'
+          } 2>&1 | tee pkg/linux-installed-lifecycle.log
+          python3 - <<'PY'
+          import json, pathlib
+          p = pathlib.Path('pkg/package-verification.json')
+          evidence = json.loads(p.read_text())
+          evidence['installed_lifecycle'] = 'passed_disposable_user_systemd'
+          p.write_text(json.dumps(evidence, indent=2))
+          PY
+
+      - name: capture disposable Linux runtime diagnostics
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          state=$RUNNER_TEMP/oa-posix-account
+          [ -f "$state" ] || exit 0
+          [ "${GITHUB_ACTIONS:-}" = true ] && [ "${RUNNER_ENVIRONMENT:-}" = github-hosted ] && [ "${RUNNER_OS:-}" = Linux ] || exit 1
+          read -r account uid < "$state"
+          [ "$account" = "oa-ci-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" ] && [ "$(id -u "$account")" = "$uid" ] || exit 1
+          {
+            printf 'Disposable principal: '; id "$account"
+            # Inspect only identity/runtime settings; never dump the full manager environment.
+            sudo -u "$account" env HOME="/home/$account" XDG_RUNTIME_DIR="/run/user/$uid" DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$uid/bus" \
+              timeout --kill-after=2s 10s systemctl --user show-environment | grep -E '^(HOME|USER|LOGNAME|XDG_RUNTIME_DIR)=' || true
+            # Include the exact directory named by failed run 34693195412.
+            for directory in "/run/user/$uid" /run/user/1001; do
+              sudo stat -c '%A %u:%g %n' "$directory" "$directory/openabstractions-logging-v1.sock.lock" 2>&1 || true
+            done
+            # status returns nonzero for stopped/failed units; retain that diagnostic
+            # without changing the preceding install step's failure conclusion.
+            sudo -u "$account" env HOME="/home/$account" XDG_RUNTIME_DIR="/run/user/$uid" DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$uid/bus" \
+              timeout --kill-after=2s 10s systemctl --user status abstraction-runtime.service --no-pager --full || true
+            sudo timeout --kill-after=2s 10s journalctl --no-pager -n 60 "_UID=$uid" _SYSTEMD_USER_UNIT=abstraction-runtime.service
+          } 2>&1 | tee pkg/linux-runtime-diagnostics.log
+
+      - name: remove only the disposable Linux account
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          state=$RUNNER_TEMP/oa-posix-account
+          [ -f "$state" ] || exit 0
+          [ "${GITHUB_ACTIONS:-}" = true ] && [ "${RUNNER_ENVIRONMENT:-}" = github-hosted ] && [ "${RUNNER_OS:-}" = Linux ] || exit 1
+          read -r account uid < "$state"
+          [ "$account" = "oa-ci-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" ] && [ "$(id -u "$account")" = "$uid" ] || exit 1
+          {
+            # Cleanup after a failed assertion is explicit containment, not lifecycle PASS.
+            sudo loginctl disable-linger "$account"
+            sudo systemctl stop "user@$uid.service"
+            # Stopping the user manager may leave its session scope exiting for a
+            # short time. Terminate only this verified disposable login, then wait
+            # for the kernel's UID process inventory to drain before userdel.
+            # An earlier lifecycle failure may leave no registered login; the UID
+            # inventory below remains the authoritative cleanup condition.
+            sudo loginctl terminate-user "$account" || true
+            for _ in $(seq 1 50); do
+              if ! sudo pgrep -u "$uid" >/dev/null; then break; fi
+              sleep 0.2
+            done
+            if sudo pgrep -u "$uid" >/dev/null; then
+              echo "Disposable account still owns processes after bounded shutdown:"
+              sudo ps -o user:24,pid,ppid,stat,etimes,comm,args -u "$uid"
+              exit 1
+            fi
+            sudo userdel --remove "$account"
+            if getent passwd "$account" >/dev/null; then echo 'Disposable account survived cleanup'; exit 1; fi
+            rm "$state"
+            echo 'PASS disposable account cleanup'
+          } 2>&1 | tee pkg/linux-account-cleanup.log
+
+      - name: retain Linux lifecycle evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: linux-lifecycle-evidence-${{ github.run_attempt }}
+          path: |
+            pkg/*.log
+            pkg/package-verification.json
+          if-no-files-found: warn
+
+  macos:
+    needs: candidate
+    env:
+      CANDIDATE_VERSION: ${{ needs.candidate.outputs.version }}
+      GOTOOLCHAIN: local
+    runs-on: macos-latest
+    outputs:
+      state: ${{ steps.material.outputs.state }}
+      missing: ${{ steps.material.outputs.missing }}
+      package-artifact: ${{ steps.material.outputs.artifact }}
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+        with:
+          ref: ${{ needs.candidate.outputs.sha }}
+
+      # This image carries no Go, and `go version` belongs in the state line, so
+      # Go is installed before the first number rather than the state line
+      # moving after the first build: state printed afterwards is the state of
+      # something else. The version is the one the windows and linux jobs pin.
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: '1.26.8'
+          cache: false
+
+      - name: state
+        run: |
+          printf 'a hosted runner, %s logical CPUs, %s %s, on mains\n' \
+            "$(getconf _NPROCESSORS_ONLN)" "$RUNNER_OS" "$RUNNER_ARCH"
+          go version | tee go-version.txt
+          sw_vers
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: go-version-macos-${{ github.run_attempt }}
+          path: go-version.txt
+          if-no-files-found: error
+
+      # Decided before anything is built, so every later step branches on one
+      # answer rather than each re-deciding. Names are printed and values never
+      # are. Some-but-not-all is its own state: it is a typo in a secret name,
+      # not a deliberate unsigned release, and it must not read like one.
+      - name: signing material, by name and never by value
+        id: material
+        env:
+          MACOS_CERTIFICATE: ${{ secrets.MACOS_CERTIFICATE }}
+          MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+          MACOS_INSTALLER_CERTIFICATE: ${{ secrets.MACOS_INSTALLER_CERTIFICATE }}
+          MACOS_INSTALLER_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_INSTALLER_CERTIFICATE_PASSWORD }}
+          APPLE_API_KEY_P8: ${{ secrets.APPLE_API_KEY_P8 }}
+          APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+          APPLE_API_ISSUER_ID: ${{ secrets.APPLE_API_ISSUER_ID }}
+        run: |
+          present=; missing=
+          for name in MACOS_CERTIFICATE MACOS_CERTIFICATE_PASSWORD \
+                      MACOS_INSTALLER_CERTIFICATE MACOS_INSTALLER_CERTIFICATE_PASSWORD \
+                      APPLE_API_KEY_P8 APPLE_API_KEY_ID APPLE_API_ISSUER_ID; do
+            if [ -n "${!name}" ]; then present="$present $name"; else missing="$missing $name"; fi
+          done
+          present=${present# }; missing=${missing# }
+          if [ -z "$missing" ]; then state=signed
+          elif [ -z "$present" ]; then state=absent
+          else state=partial
+          fi
+          printf 'state=%s\n' "$state" >> "$GITHUB_OUTPUT"
+          printf 'missing=%s\n' "$missing" >> "$GITHUB_OUTPUT"
+          if [ "$state" = signed ]; then package_state=signed; else package_state=unsigned-unnotarised; fi
+          printf 'artifact=abstraction-macos-%s-%s\n' "$package_state" "$GITHUB_RUN_ATTEMPT" >> "$GITHUB_OUTPUT"
+          printf 'signing material: %s\n' "$state"
+          [ -z "$missing" ] || printf 'not set: %s\n' "$missing"
+
+      # Imported into a keychain made for this run and deleted at the end of it,
+      # so nothing is added to any keychain that outlives the job. The keychain
+      # password is generated here, used here and never leaves this step: after
+      # unlock, securityd keeps it open for the rest of the job.
+      - name: a keychain for this run only
+        if: steps.material.outputs.state == 'signed'
+        env:
+          MACOS_CERTIFICATE: ${{ secrets.MACOS_CERTIFICATE }}
+          MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+          MACOS_INSTALLER_CERTIFICATE: ${{ secrets.MACOS_INSTALLER_CERTIFICATE }}
+          MACOS_INSTALLER_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_INSTALLER_CERTIFICATE_PASSWORD }}
+        run: |
+          kc="$RUNNER_TEMP/release.keychain-db"
+          pw=$(openssl rand -base64 24)
+          security create-keychain -p "$pw" "$kc"
+          security set-keychain-settings -lut 21600 "$kc"
+          security unlock-keychain -p "$pw" "$kc"
+          security list-keychains -d user | tr -d ' "' > "$RUNNER_TEMP/keychains.before"
+          security list-keychains -d user -s "$kc" $(cat "$RUNNER_TEMP/keychains.before")
+          for pair in MACOS_CERTIFICATE:MACOS_CERTIFICATE_PASSWORD \
+                      MACOS_INSTALLER_CERTIFICATE:MACOS_INSTALLER_CERTIFICATE_PASSWORD; do
+            b64=${pair%%:*}; pass=${pair#*:}
+            printf '%s' "${!b64}" | base64 --decode > "$RUNNER_TEMP/import.p12"
+            security import "$RUNNER_TEMP/import.p12" -k "$kc" -P "${!pass}" -f pkcs12 \
+              -T /usr/bin/codesign -T /usr/bin/productsign
+            rm -f "$RUNNER_TEMP/import.p12"
+          done
+          security set-key-partition-list -S apple-tool:,apple: -k "$pw" "$kc" > /dev/null
+          printf 'SIGNING_KEYCHAIN=%s\n' "$kc" >> "$GITHUB_ENV"
+          printf 'ok    two identities imported into a keychain this job will delete\n'
+
+      - name: verify and record published module provenance
+        run: python3 scripts/module_provenance.py --tools tools.tsv --output module-provenance.json
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: module-provenance-${{ runner.os }}-${{ github.run_attempt }}
+          path: module-provenance.json
+          if-no-files-found: error
+
+      - name: native POSIX shell fixtures
+        shell: bash
+        run: |
+          python3 posix/test_lifecycle.py
+
+      - name: build from the published modules, universal
+        env:
+          CGO_ENABLED: '0'
+          GOOS: darwin
+          GOFLAGS: -trimpath
+        run: |
+          rows() { grep -v '^>' "$1" | sed '/^[[:space:]]*$/d' | tail -n +2 | tr -s '\t'; }
+          root=$PWD
+          mkdir -p universal
+          while IFS=$'\t' read -r path module package feature subsystem; do
+            if [ "$subsystem" = windows ]; then
+              printf 'note  %s is a windows-subsystem image and is not in a macOS package\n' "$path"
+              continue
+            fi
+            mod=${module%@*}
+            version=${module##*@}
+            case "$package" in
+              .) target="$mod@$version" ;;
+              *) target="$mod/$package@$version" ;;
+            esac
+            gobin="$(go env GOPATH)/bin"
+            thin=""
+            for arch in amd64 arm64; do
+              rm -rf "$gobin"
+              GOARCH="$arch" go install -ldflags '-s -w -buildid=' "$target"
+              built=$(find "$gobin" -type f)
+              mkdir -p "$root/thin/$arch"
+              mv "$built" "$root/thin/$arch/${path%.exe}"
+              thin="$thin $root/thin/$arch/${path%.exe}"
+            done
+            lipo -create -output "universal/${path%.exe}" $thin
+            lipo -info "universal/${path%.exe}"
+          done < <(rows tools.tsv)
+
+      # Before the package, because build.py copies these bytes into the payload
+      # and a signature travels in the Mach-O file. The identity is looked up in
+      # the keychain rather than written here: this file is public and the
+      # certificate's common name is a person and a team identifier.
+      - name: sign the programs
+        if: steps.material.outputs.state == 'signed'
+        run: |
+          app=$(security find-identity -v -p codesigning "$SIGNING_KEYCHAIN" |
+                awk '/Developer ID Application:/ {print $2}' || true)
+          set -- $app
+          if [ $# -ne 1 ]; then
+            printf 'FAIL  %s Developer ID Application identities in the keychain, wanted 1\n' "$#"
+            exit 1
+          fi
+          for f in universal/*; do
+            codesign --force --timestamp --options runtime \
+              --keychain "$SIGNING_KEYCHAIN" --sign "$1" "$f"
+            codesign --verify --strict --verbose=2 "$f"
+            codesign -dv --verbose=4 "$f" > "$RUNNER_TEMP/dv" 2>&1
+            grep -q '^Timestamp=' "$RUNNER_TEMP/dv" ||
+              { printf 'FAIL  %s carries no secure timestamp\n' "$f"; cat "$RUNNER_TEMP/dv"; exit 1; }
+            grep -q '^CodeDirectory .*flags=0x[0-9a-f]*([^)]*runtime' "$RUNNER_TEMP/dv" ||
+              { printf 'FAIL  %s has no hardened runtime\n' "$f"; cat "$RUNNER_TEMP/dv"; exit 1; }
+            printf 'ok    %s signed, hardened, timestamped\n' "$f"
+          done
+
+      - name: package
+        env:
+          CANDIDATE_VERSION: ${{ needs.candidate.outputs.version }}
+        run: |
+          version=$CANDIDATE_VERSION
+          mkdir -p dist
+          python3 posix/build.py --platform macos --version "$version" \
+            --out dist --bin universal --license LICENSE
+          (cd dist && shasum -a 256 ./*.pkg | sed 's#\./##' | tee SHA256SUMS.macos)
+
+      # A .pkg takes the Installer certificate, which is a different certificate
+      # from the one the programs took; a .pkg signed with the Application one is
+      # rejected. Apple's notary service accepts a flat installer package as it
+      # stands, so nothing is zipped. The checksums are recomputed because
+      # productsign and stapler both rewrite the file.
+      - name: sign the package, notarise it, staple the ticket
+        if: steps.material.outputs.state == 'signed'
+        env:
+          APPLE_API_KEY_P8: ${{ secrets.APPLE_API_KEY_P8 }}
+          APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+          APPLE_API_ISSUER_ID: ${{ secrets.APPLE_API_ISSUER_ID }}
+        run: |
+          key="$RUNNER_TEMP/notary.p8"
+          trap 'rm -f "$key"' EXIT
+          inst=$(security find-identity -v "$SIGNING_KEYCHAIN" |
+                 awk '/Developer ID Installer:/ {print $2}' || true)
+          set -- $inst
+          if [ $# -ne 1 ]; then
+            printf 'FAIL  %s Developer ID Installer identities in the keychain, wanted 1\n' "$#"
+            exit 1
+          fi
+          pkg=$(ls dist/*.pkg)
+          productsign --keychain "$SIGNING_KEYCHAIN" --sign "$1" "$pkg" "$pkg.signed"
+          mv "$pkg.signed" "$pkg"
+          pkgutil --check-signature "$pkg"
+
+          printf '%s\n' "$APPLE_API_KEY_P8" > "$key"
+          chmod 600 "$key"
+          xcrun notarytool submit "$pkg" --key "$key" --key-id "$APPLE_API_KEY_ID" \
+            --issuer "$APPLE_API_ISSUER_ID" --wait --output-format json \
+            > "$RUNNER_TEMP/notary.json" || true
+          id=$(jq -r '.id // empty' "$RUNNER_TEMP/notary.json")
+          status=$(jq -r '.status // empty' "$RUNNER_TEMP/notary.json")
+          printf 'notary status %s for submission %s\n' "${status:-none}" "${id:-none}"
+          if [ "$status" != Accepted ]; then
+            [ -z "$id" ] || xcrun notarytool log "$id" --key "$key" \
+              --key-id "$APPLE_API_KEY_ID" --issuer "$APPLE_API_ISSUER_ID" || true
+            printf 'FAIL  the notary service did not accept the package\n'
+            exit 1
+          fi
+
+          xcrun stapler staple "$pkg"
+          xcrun stapler validate "$pkg"
+          spctl -a -vv -t install "$pkg" > "$RUNNER_TEMP/spctl" 2>&1 || true
+          cat "$RUNNER_TEMP/spctl"
+          grep -q ': accepted' "$RUNNER_TEMP/spctl" ||
+            { printf 'FAIL  Gatekeeper does not accept the package\n'; exit 1; }
+          grep -q 'source=Notarized Developer ID' "$RUNNER_TEMP/spctl" ||
+            { printf 'FAIL  Gatekeeper does not see a stapled notarisation ticket\n'; exit 1; }
+          (cd dist && shasum -a 256 ./*.pkg | sed 's#\./##' | tee SHA256SUMS.macos)
+
+      # The programs were signed before the package was built, so this asks the
+      # shipped bytes rather than the bytes we signed: a packager that rewrote
+      # them would strip the signature and nothing else here would notice.
+      - name: the programs inside the package are the signed ones
+        if: steps.material.outputs.state == 'signed'
+        run: |
+          pkg=$(ls dist/*.pkg)
+          pkgutil --expand-full "$pkg" "$RUNNER_TEMP/expanded"
+          for name in openabstractions; do
+            f=$(find "$RUNNER_TEMP/expanded" -type f -name "$name" | head -1)
+            [ -n "$f" ] || { printf 'FAIL  %s is not in the package\n' "$name"; exit 1; }
+            codesign --verify --strict --verbose=2 "$f"
+            codesign -dv --verbose=4 "$f" 2>&1 | grep -q '^Timestamp=' ||
+              { printf 'FAIL  %s in the package carries no secure timestamp\n' "$name"; exit 1; }
+            printf 'ok    %s in the package is signed and timestamped\n' "$name"
+          done
+
+      - name: which state this run was in
+        env:
+          STATE: ${{ steps.material.outputs.state }}
+          MISSING: ${{ steps.material.outputs.missing }}
+        run: |
+          {
+            if [ "$STATE" = signed ]; then
+              printf '\n### macOS â€” signed and notarised\n\n'
+              printf 'The universal `.pkg` is **attached to the release**. Its program is\n'
+              printf 'signed with a Developer ID Application certificate with the hardened\n'
+              printf 'runtime enabled; the package is signed with a Developer ID Installer\n'
+              printf 'certificate, notarised by Apple and stapled. `spctl -a -vv -t install`\n'
+              printf 'accepted it on this runner.\n\n'
+              printf -- '- Still UNPROVEN: it has never been **installed**.\n'
+              printf -- '  `installer/posix/macos/postinstall`, the LaunchAgent and `uninstall.sh`\n'
+              printf -- '  have run on no machine. Gatekeeper opening a package is not the same\n'
+              printf -- '  claim as the package working.\n'
+            else
+              printf '\n### macOS â€” UNPROVEN\n\n'
+              printf 'A universal `.pkg` was built here and is **not attached to the release**.\n\n'
+              printf -- '- It is unsigned and unnotarised, so Gatekeeper refuses it: a person who\n'
+              printf -- '  downloads it cannot open it, and a download that cannot be opened is\n'
+              printf -- '  worse than a platform that says it has no package.\n'
+              printf -- '- It has never been installed. `installer/posix/macos/postinstall`, the\n'
+              printf -- '  LaunchAgent and `uninstall.sh` have run on no machine.\n'
+              if [ "$STATE" = partial ]; then
+                printf -- '- **Signing was configured and did not run.** These repository secrets\n'
+                printf -- '  are empty or missing: `%s`. Nothing was signed and nothing was\n' "$MISSING"
+                printf -- '  attached.\n'
+              else
+                printf -- '- No signing material is configured in this repository: none of the\n'
+                printf -- '  seven signing secrets is set.\n'
+              fi
+              printf '\nUntil then the route on macOS is `go install`, which needs none of it.\n'
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ${{ steps.material.outputs.artifact }}
+          path: |
+            dist/*.pkg
+            dist/SHA256SUMS.macos
+          if-no-files-found: error
+
+      # By the fixed path rather than by $SIGNING_KEYCHAIN, because the step that
+      # exports that variable can fail after creating the keychain. `-s` with an
+      # empty argument list empties the search list, so the restore only happens
+      # when the file recording it was written.
+      - name: delete the keychain this run made
+        if: always()
+        run: |
+          kc="$RUNNER_TEMP/release.keychain-db"
+          [ -e "$kc" ] || exit 0
+          before="$RUNNER_TEMP/keychains.before"
+          if [ -s "$before" ]; then security list-keychains -d user -s $(cat "$before"); fi
+          security delete-keychain "$kc"
+          printf 'ok    the keychain this run made is gone\n'
+
+  draft:
+    needs: [candidate, windows, verify, linux, linux-verify, macos]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+        with:
+          ref: ${{ needs.candidate.outputs.sha }}
+
+      # The owner's ruling, VISION.md 2026-09-10: hold the release until the
+      # service passes; an explicitly incomplete preview is acceptable and a
+      # fallback that happens by itself is not. A candidate whose machine
+      # scope was not proved stops here
+      # and says which leg was not proved. Somebody choosing to publish anyway
+      # does it by name, on a run they started, and the release body says so.
+      - name: the machine scope is proven, or a person asked for a preview
+        env:
+          MACHINE_SERVICE: ${{ needs.verify.outputs.machine-service }}
+          PREVIEW: ${{ inputs.preview }}
+        run: |
+          if [ "$MACHINE_SERVICE" = proven ]; then
+            printf 'ok    the machine scope registered a supervisor and an instance was running\n'
+            exit 0
+          fi
+          printf 'UNPROVEN  the machine scope: verify reports "%s"\n' "${MACHINE_SERVICE:-nothing}"
+          if [ "$PREVIEW" != true ]; then
+            printf 'FAIL  this release is held. The Background supervisor feature promises a service\n'
+            printf '      to everyone who installs for everyone, and no run has seen one running.\n'
+            printf '      Re-run this workflow by hand with preview=true to draft it anyway; the\n'
+            printf '      body will say what was not proved.\n'
+            exit 1
+          fi
+          printf 'note  drafting anyway: preview=true was asked for by a person\n'
+
+      - name: fetch the packages
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          MACOS_STATE: ${{ needs.macos.outputs.state }}
+          WINDOWS_ARTIFACT: ${{ needs.windows.outputs.package-artifact }}
+          LINUX_ARTIFACT: ${{ needs.linux.outputs.package-artifact }}
+          MACOS_ARTIFACT: ${{ needs.macos.outputs.package-artifact }}
+        run: |
+          gh run download "$GITHUB_RUN_ID" -n "$WINDOWS_ARTIFACT" -D dist
+          gh run download "$GITHUB_RUN_ID" -n "$LINUX_ARTIFACT" -D dist
+          if [ "$MACOS_STATE" = signed ]; then
+            gh run download "$GITHUB_RUN_ID" -n "$MACOS_ARTIFACT" -D dist
+          fi
+
+      # Each line was computed by the job that made the bytes. Joining them is
+      # not recomputing them, so the file is checked once more here against what
+      # is actually about to be attached.
+      - name: one checksum file, checked
+        run: |
+          (cd dist && cat SHA256SUMS.* > SHA256SUMS && rm SHA256SUMS.[a-z]*)
+          (cd dist && sha256sum -c SHA256SUMS)
+          n=$(grep -c . dist/SHA256SUMS)
+          attached=$(ls dist | grep -cv '^SHA256SUMS$')
+          if [ "$n" != "$attached" ]; then
+            printf 'FAIL  SHA256SUMS has %s lines and %s files are attached\n' "$n" "$attached"
+            exit 1
+          fi
+          cat dist/SHA256SUMS
+
+      # NOTES.md is what is true of every release; this step is what only the
+      # run knows. One script writes both the release body and the run summary,
+      # because two scripts asserting the same state drifted apart once
+      # already: v0.1.3 attached a signed, notarised, stapled `.pkg` under a
+      # page that said in three places that nothing here was signed and that
+      # macOS had no asset. The step below is what stops that recurring.
+      - name: what only this run knows
+        env:
+          MACOS_STATE: ${{ needs.macos.outputs.state }}
+          MACOS_MISSING: ${{ needs.macos.outputs.missing }}
+          MACHINE_SERVICE: ${{ needs.verify.outputs.machine-service }}
+        run: |
+          [ -f NOTES.md ] || { printf 'FAIL  NOTES.md is not in this repository, and generated notes are not what this project ships\n'; exit 1; }
+          rc=0
+          for phrase in 'not signed' 'unsigned' 'no asset' '## Absent from' '## Signatures'; do
+            if grep -qiF -- "$phrase" NOTES.md; then
+              printf 'FAIL  NOTES.md says "%s". Only the run that built the assets may say that, and it says it here.\n' "$phrase"
+              rc=1
+            fi
+          done
+          [ "$rc" = 0 ] || exit 1
+          {
+            printf '\n## Signatures\n\n'
+            printf -- '- **Windows** â€” `abstraction-x64.msi` and `abstraction-arm64.msi` are\n'
+            printf -- '  **not signed**. SmartScreen will warn you and the publisher will show\n'
+            printf -- '  as unknown; that warning is correct.\n'
+            printf -- '- **Linux** â€” the tarballs are **not signed**. There is no signature\n'
+            printf -- '  scheme for them here.\n'
+            if [ "$MACOS_STATE" = signed ]; then
+              printf -- '- **macOS** â€” the `.pkg` **is signed**: a Developer ID Installer\n'
+              printf -- '  certificate, notarised by Apple and stapled, and `openabstractions`\n'
+              printf -- '  inside it signed with a Developer ID Application certificate with the\n'
+              printf -- '  hardened runtime enabled. It has still never been installed on a Mac.\n'
+              printf -- '  Gatekeeper opening a package is not the claim that the package works.\n'
+              printf '\nThe `.pkg` is the only signed file on this page. A checksum says the bytes\n'
+              printf 'did not change in transit and nothing about who made them.\n'
+            else
+              printf '\nNothing on this page is signed. A checksum says the bytes did not change\n'
+              printf 'in transit and nothing about who made them.\n'
+            fi
+            printf '\n## Absent from this release\n\n'
+            if [ "$MACHINE_SERVICE" != proven ]; then
+              printf -- '- **The Windows machine-scope supervisor was not proved on this run.**\n'
+              printf -- '  Installing for everyone registers a per-user service, and this run saw\n'
+              printf -- '  the registration and its restart policy but never saw an instance\n'
+              printf -- '  running: the service manager clones one into a session at sign-in and\n'
+              printf -- '  the runner had no session to clone into. Installing just for you is\n'
+              printf -- '  unaffected and gets a Startup shortcut, which is what it has always\n'
+              printf -- '  got.\n'
+            fi
+            case "$MACOS_STATE" in
+              signed) ;;
+              partial)
+                printf -- '- **macOS**: no asset. Signing is configured in this repository and did\n'
+                printf -- '  not run â€” `%s` is empty or missing â€” so the\n' "$MACOS_MISSING"
+                printf -- '  `.pkg` was built, left unsigned and not attached. `go install` is the\n'
+                printf -- '  route on macOS.\n' ;;
+              *)
+                printf -- '- **macOS**: no asset. A universal `.pkg` was built and kept as a\n'
+                printf -- '  workflow artifact; unsigned and unnotarised, Gatekeeper refuses it,\n'
+                printf -- '  and a download that cannot be opened is worse than a platform that\n'
+                printf -- '  says it has no package. `go install` is the route on macOS.\n' ;;
+            esac
+            printf -- '- **C++ development libraries** are not bundled in this redistributable.\n'
+            printf -- '  CMake package source is available at the corresponding layer repository\n'
+            printf -- '  revision, including [abstraction-cas](https://github.com/openabstractions/abstraction-cas).\n'
+            printf -- '- **Language SDK packages** are not bundled in this redistributable. Python\n'
+            printf -- '  wheels, Rust crates and npm packages keep independent versions and release\n'
+            printf -- '  status; this release makes no registry-publication claim for them. Their\n'
+            printf -- '  source is available at the corresponding layer repository revisions.\n'
+            printf -- '- **`jobd`, `dl` and `jobctl`** are removed in 0.2.0 with the file-store\n'
+            printf -- '  provider. `openabstractions download` and `openabstractions jobs` replace\n'
+            printf -- '  them. Downloads still in flight through the old file store are abandoned.\n'
+          } > "$RUNNER_TEMP/state.md"
+          cat NOTES.md "$RUNNER_TEMP/state.md" > "$RUNNER_TEMP/NOTES.md"
+          cat "$RUNNER_TEMP/state.md" >> "$GITHUB_STEP_SUMMARY"
+          cat "$RUNNER_TEMP/state.md"
+
+      # The body above is written from $MACOS_STATE; these are the questions
+      # that ask whether $MACOS_STATE is what is on the disk about to be
+      # uploaded. Prose is not matched, because prose gets reworded and a check
+      # that silently stops matching is how the last one failed â€” except for
+      # the two words the rule requires and a reworder must not lose.
+      - name: the body against the files, before either is published
+        env:
+          MACOS_STATE: ${{ needs.macos.outputs.state }}
+        run: |
+          rc=0
+          pkgs=0
+          for f in dist/*.pkg; do
+            if [ -e "$f" ]; then pkgs=$((pkgs + 1)); fi
+          done
+          if [ "$MACOS_STATE" = signed ] && [ "$pkgs" -ne 1 ]; then
+            printf 'FAIL  the body says a signed .pkg is attached and %s are here\n' "$pkgs"
+            rc=1
+          fi
+          if [ "$MACOS_STATE" != signed ] && [ "$pkgs" -ne 0 ]; then
+            printf 'FAIL  the body says macOS has no asset and %s .pkg files are here\n' "$pkgs"
+            rc=1
+          fi
+          n=$(grep -c 'not signed' "$RUNNER_TEMP/state.md" || true)
+          n=${n:-0}
+          if [ "$n" -lt 2 ]; then
+            printf 'FAIL  Windows and Linux are unsigned and the body says "not signed" %s times\n' "$n"
+            rc=1
+          fi
+          [ "$rc" = 0 ] || exit 1
+          printf 'ok    the body names %s .pkg, and says "not signed" %s times for the packages that are not\n' "$pkgs" "$n"
+
+      - name: assemble the verified release artifact
+        env:
+          CANDIDATE_SHA: ${{ needs.candidate.outputs.sha }}
+          RELEASE_VERSION: ${{ inputs.version }}
+          PREVIEW: ${{ inputs.preview }}
+          MACOS_STATE: ${{ needs.macos.outputs.state }}
+        run: |
+          mkdir verified-release
+          cp dist/abstraction-x64.msi dist/abstraction-arm64.msi \
+            dist/*-linux-amd64.tar.gz dist/*-linux-arm64.tar.gz \
+            dist/SHA256SUMS "$RUNNER_TEMP/NOTES.md" verified-release/
+          if [ "$MACOS_STATE" = signed ]; then cp dist/*.pkg verified-release/; fi
+          python3 - <<'PY'
+          import json, os, pathlib
+          preview = os.environ['PREVIEW'].lower()
+          if preview not in ('true', 'false'):
+              raise SystemExit('preview must be a boolean')
+          candidate = {'schema': 1, 'source': os.environ['CANDIDATE_SHA'],
+              'version': os.environ['RELEASE_VERSION'], 'run_id': int(os.environ['GITHUB_RUN_ID']),
+              'run_attempt': int(os.environ['GITHUB_RUN_ATTEMPT']), 'preview': preview == 'true',
+              'macos': os.environ['MACOS_STATE']}
+          pathlib.Path('verified-release/candidate.json').write_text(json.dumps(candidate, indent=2) + '\n', encoding='utf-8')
+          PY
+          (cd verified-release && sha256sum -c SHA256SUMS)
+
+      - name: retain the verified release for promotion
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: verified-release-${{ github.run_attempt }}
+          path: verified-release/
+          if-no-files-found: error
+          retention-days: 30
