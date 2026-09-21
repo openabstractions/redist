@@ -98,7 +98,7 @@ per-user, `service start --machine` for everyone). While the exclusion is held,
 `start`, `serve host` and SDK activation of the folders being replaced exit 3.
 The rollback activation releases the record and runs the previous version's own
 activation: `jobdw.exe start --runtime` for 0.1.6 and 0.1.7,
-`openabstractionsw.exe start` from 0.1.8, and `sc start` of stopped per-session
+`openabstractionsw.exe start` from 0.2.0, and `sc start` of stopped per-session
 instances for everyone. Restart Manager restarts a host that registered for
 restart when the transaction ends; that and `StartUserRuntime` meet at one
 endpoint and one of them exits. Every installer command appends its failure to

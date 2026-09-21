@@ -9,6 +9,21 @@ See [Releases](https://github.com/openabstractions/redist/releases) for availabl
 downloads and their release-specific verification. Draft builds are not releases.
 Each release lists its included capabilities, platform verification and signing state.
 
+## Available now: 0.2.0
+
+[Download 0.2.0](https://github.com/openabstractions/redist/releases/tag/v0.2.0) for Windows, Linux and macOS.
+Use one runtime to keep accepted work running, call AI providers with named
+credentials, manage application permissions, and find or activate registered
+applications. Windows includes the Panel for inspecting and managing the runtime.
+The SDK sources cover Go, C++17, Python, Rust and JavaScript; package versions
+and registry availability are documented separately by each capability.
+
+Windows x64 installation, upgrades, rollback and crash recovery passed.
+Linux amd64 installation and runtime-backed downloading passed. The macOS
+package is signed and notarised; protected service calls retain the documented
+caller-identity limitation. Windows and Linux packages are unsigned.
+[Release verification and limits](https://github.com/openabstractions/abstractions/blob/main/docs/results/release-0.2.0.md).
+
 ## Installing
 
 The Windows MSI defaults to *Just me*, under
@@ -31,7 +46,7 @@ Compare downloads against the release's `SHA256SUMS`:
 assets are unsigned in the current workflow; macOS assets are attached only
 after its signing and notarization gates. A checksum is not a signature.
 
-The current source candidate's central CLI provides:
+The 0.2.0 CLI provides:
 
     openabstractions status --json
     openabstractions probe --json
@@ -39,7 +54,7 @@ The current source candidate's central CLI provides:
 
 `status` reports service readiness. `probe` performs bounded reads and prints
 typed outcomes. `applications list` shows the caller's permission-filtered local
-application directory. Current source installers register the shared runtime,
+application directory. The 0.2.0 installers register the shared runtime,
 which supervises configured capabilities.
 Windows per-user installation starts it immediately and registers a windowless
 Startup launcher. Check `openabstractions status --json` for readiness. Consult

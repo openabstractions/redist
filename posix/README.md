@@ -11,9 +11,8 @@ Three assets, built by the release workflow in `openabstractions/redist`:
 All three are **per-user**. They install into the home directory, ask for no
 root and no administrator password, and the background runtime each registers
 belongs to the person who installed it — a systemd **user** unit on Linux, a
-**LaunchAgent** on macOS. Neither is a system service, for the same reason the
-Windows package is per-user: the runtime that finishes your accepted work runs
-as you, and registering one for another account needs that account's password.
+**LaunchAgent** on macOS. The runtime runs with the installing user's permissions. Windows additionally
+offers a machine-wide installation that registers per-user service instances.
 
 Each package installs one program, `openabstractions`. It hosts the runtime
 (`openabstractions serve runtime`), submits and observes downloads through it
@@ -46,8 +45,8 @@ review. Reinstalling over an existing install is how you upgrade, and
 
 ## Linux — what it places, and what removes it
 
-    tar -xzf abstraction-0.3.0-linux-amd64.tar.gz
-    cd abstraction-0.3.0-linux-amd64
+    tar -xzf abstraction-0.2.0-linux-amd64.tar.gz
+    cd abstraction-0.2.0-linux-amd64
     ./install.sh
 
 | what | where |
@@ -111,7 +110,7 @@ directory, and prints what it deliberately leaves: the runtime state and cache,
 
 ## macOS — what it places, and what removes it
 
-    open abstraction-0.3.0-macos-universal.pkg
+    open abstraction-0.2.0-macos-universal.pkg
 
 One `productbuild` archive around one `pkgbuild` component, identifier
 `com.openabstractions.abstraction`, with
@@ -194,7 +193,7 @@ command, which is runnable because the uninstaller is still in place.
 `openabstractions serve router-v1` run the selected capability in the foreground.
 Current macOS peer proof cannot establish the Program identity required by shared
 runtime clients. This package makes no macOS capability-readiness promise.
-Native macOS lifecycle verification remains required. Neither deleting a tarball
+Local launchd lifecycle checks passed; the signed 0.2.0 package still requires end-user installation qualification. Neither deleting a tarball
 nor deleting a `.pkg` performs uninstall; the installed `uninstall.sh` is the
 supported removal entry point. A receipt cleanup failure stops removal with the
 payload and the uninstaller in place.
@@ -205,10 +204,10 @@ Both build from published sources checked out at the commits `sources.tsv`
 pins, never from a working tree. `build.py` re-reads `git rev-parse HEAD` in
 each checkout and refuses a build where it does not match.
 
-    py -3 installer/posix/build.py --platform linux --arch amd64 --version 0.3.0 \
+    py -3 installer/posix/build.py --platform linux --arch amd64 --version 0.2.0 \
       --out dist --src charter=<abstractions>
 
-    python3 installer/posix/build.py --platform macos --version 0.3.0 \
+    python3 installer/posix/build.py --platform macos --version 0.2.0 \
       --out dist --src charter=<abstractions>
 
 The release route passes `--bin DIR` with `openabstractions` built from the
