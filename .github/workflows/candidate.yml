@@ -495,7 +495,12 @@ jobs:
           foreach ($action in 'BeginMachineUpgradeExclusion', 'InstallExecute') {
             if ($before -notmatch "Action ended [^\r\n]*: $action\. Return value 1\.") { throw "$action did not succeed before RemoveExistingProducts" }
           }
-          if ([regex]::IsMatch($log, 'StopPrevious(User)?Supervisor')) { throw 'the package ran a stop action; it stops nothing' }
+          # The predecessor's nested uninstall records skipped legacy actions.
+          # Forbid any stop action in this transaction and any execution in either.
+          if ([regex]::IsMatch($before, 'StopPrevious(User)?Supervisor') -or
+              [regex]::IsMatch($log, '(?m)^Action start [^\r\n]*: StopPrevious(User)?Supervisor\.')) {
+            throw 'the package ran a stop action; it stops nothing'
+          }
           if ($log -notmatch 'EndMachineUpgradeExclusion') { throw 'the machine exclusion release was not scheduled' }
           # The removal follows the commit, and the predecessor's own uninstall
           # deletes the shared service name, so registration must come after it.
@@ -838,6 +843,17 @@ jobs:
         sudo loginctl enable-linger "$account"
         sudo systemctl start "user@$uid.service"
         user() { sudo -u "$account" env HOME="$home" XDG_RUNTIME_DIR="/run/user/$uid" DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$uid/bus" "$@"; }
+        start_fixture_origin() {
+          origin_unit="oa-candidate-origin-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}.service"
+          user timeout --kill-after=2s 10s systemd-run --user --quiet --collect --unit="$origin_unit" \
+            python3 -m http.server 8099 --bind 127.0.0.1 --directory "$home/download-origin"
+          trap stop_fixture_origin EXIT
+        }
+        stop_fixture_origin() {
+          trap - EXIT
+          [ -z "${origin_unit:-}" ] || user timeout --kill-after=2s 10s systemctl --user stop "$origin_unit"
+          origin_unit=
+        }
         configure_disposable_runtime_environment() {
           [ "$(id -u "$account")" = "$uid" ] || { echo 'Disposable account identity changed'; return 1; }
           expected=/run/user/$uid
@@ -864,11 +880,10 @@ jobs:
           # show observes the same operation.
           user mkdir -p "$home/download-origin" "$home/download-out"
           user sh -c 'printf "bytes through the runtime" > "$HOME/download-origin/thing.bin"'
-          user python3 -m http.server 8099 --bind 127.0.0.1 --directory "$home/download-origin" >/dev/null 2>&1 &
-          origin=$!
+          start_fixture_origin
           for _ in $(seq 50); do curl -fsS -o /dev/null http://127.0.0.1:8099/thing.bin && break; sleep 0.2; done
           user "$home/.local/bin/openabstractions" download http://127.0.0.1:8099/thing.bin --out "$home/download-out" --json --timeout 60s > "$RUNNER_TEMP/download.json"
-          kill "$origin" || true
+          stop_fixture_origin
           user cmp "$home/download-out/thing.bin" "$home/download-origin/thing.bin"
           operation=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["receipt"]["operation_id"])' "$RUNNER_TEMP/download.json")
           [ -n "$operation" ]
