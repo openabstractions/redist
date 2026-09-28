@@ -1295,7 +1295,7 @@ jobs:
 
       - name: build from the published modules, universal
         env:
-          CGO_ENABLED: '0'
+          CGO_ENABLED: '1'
           GOOS: darwin
           GOFLAGS: -trimpath
         run: |
@@ -1332,7 +1332,7 @@ jobs:
       # packaging sources; it does not contain a monitor/ source directory.
       - name: build the Panel's app-bundle programs
         env:
-          CGO_ENABLED: '0'
+          CGO_ENABLED: '1'
           GOFLAGS: -trimpath
         run: |
           root=$PWD
@@ -1362,6 +1362,25 @@ jobs:
           lipo -create -output "universal/Abstraction Panel" \
             "$root/thin/amd64/Abstraction Panel" "$root/thin/arm64/Abstraction Panel"
           lipo -info "universal/Abstraction Panel"
+
+      # Each thin Go image is inspected before signing and packaging. The published
+      # identity XPC transport, Keychain and native network-cost backends select
+      # their Darwin implementation only when cgo is enabled.
+      - name: verify native cgo in every macOS Go image
+        run: |
+          rows() { grep -v '^>' "$1" | sed '/^[[:space:]]*$/d' | tail -n +2 | tr -s '\t'; }
+          names=$(rows tools.tsv | awk -F '\t' '$5 == "console" {sub(/\.exe$/, "", $1); print $1}')
+          test -n "$names" || { printf 'FAIL  no macOS Go programs in tools.tsv\n'; exit 1; }
+          for arch in amd64 arm64; do
+            for name in $names panel; do
+              image="thin/$arch/$name"
+              test -f "$image" || { printf 'FAIL  missing %s\n' "$image"; exit 1; }
+              info=$(go version -m "$image") || exit 1
+              printf '%s\n' "$info" | grep -Eq '^[[:space:]]*build[[:space:]]+CGO_ENABLED=1$' ||
+                { printf 'FAIL  %s was built without native cgo\n' "$image"; exit 1; }
+              printf 'ok    %s built with native cgo\n' "$image"
+            done
+          done
 
       # Before the package, because build.py copies these bytes into the payload
       # and a signature travels in the Mach-O file. Panel.app's nested programs
