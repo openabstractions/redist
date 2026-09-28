@@ -13,6 +13,10 @@ from typing import Callable
 ORG = "github.com/openabstractions/"
 VERSION = re.compile(r"v(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)$")
 IMMUTABLE = re.compile(r"v[0-9]+\.[0-9]+\.[0-9]+(?:[-+][0-9A-Za-z.-]+)?$")
+PSEUDO_VERSION = re.compile(r"v0\.0\.0-[0-9]{14}-([0-9a-f]{12})$")
+APPROVED_PSEUDO_MODULE = "github.com/openabstractions/websocket"
+APPROVED_PSEUDO_VERSION = "v0.0.0-20260926143434-ce87d3641bd1"
+APPROVED_PSEUDO_COMMIT = "ce87d3641bd1e04e7acfd4a848d193951d5da73f"
 Runner = Callable[..., subprocess.CompletedProcess[str]]
 
 
@@ -134,12 +138,24 @@ def verify(tools: Path, runner: Runner = run) -> dict:
                 row = {"path": path, "version": version, "sum": got["Sum"], "go_mod_sum": got["GoModSum"]}
                 origin = got.get("Origin") or {}
                 if path.startswith(ORG):
-                    tag = cached_tag(path, version)
-                    actual = origin.get("Hash")
-                    if actual != tag["commit"]:
-                        raise RuntimeError(f"Origin.Hash mismatch for {path}@{version}: expected {tag['commit']}, got {actual}")
-                    row.update({"expected_commit": tag["commit"], "origin_hash": actual,
-                                "repository": tag["repository"], "tag": tag["tag"]})
+                    if path == APPROVED_PSEUDO_MODULE and version == APPROVED_PSEUDO_VERSION:
+                        suffix = PSEUDO_VERSION.fullmatch(version).group(1)
+                        repository = "https://github.com/openabstractions/websocket"
+                        actual = origin.get("Hash")
+                        if origin.get("VCS") != "git" or origin.get("URL") != repository:
+                            raise RuntimeError(f"Origin repository mismatch for {path}@{version}: {origin}")
+                        if (not isinstance(actual, str) or not re.fullmatch(r"[0-9a-f]{40}", actual)
+                                or not actual.startswith(suffix) or actual != APPROVED_PSEUDO_COMMIT):
+                            raise RuntimeError(f"Origin.Hash mismatch for {path}@{version}: expected {APPROVED_PSEUDO_COMMIT}, got {actual}")
+                        row.update({"expected_commit": actual, "origin_hash": actual,
+                                    "repository": repository, "pseudo_version_commit": suffix})
+                    else:
+                        tag = cached_tag(path, version)
+                        actual = origin.get("Hash")
+                        if actual != tag["commit"]:
+                            raise RuntimeError(f"Origin.Hash mismatch for {path}@{version}: expected {tag['commit']}, got {actual}")
+                        row.update({"expected_commit": tag["commit"], "origin_hash": actual,
+                                    "repository": tag["repository"], "tag": tag["tag"]})
                 closure.append(row)
             records.append({"input": {"path": requested, "version": requested_version,
                                        "expected_commit": expected["commit"]}, "selected": closure})
