@@ -73,6 +73,71 @@ function Get-ProfileFolder([Environment+SpecialFolder]$Folder, [scriptblock]$Res
     if ([string]::IsNullOrWhiteSpace($path)) { throw "Profile folder is unavailable: $Folder" }
     return $path
 }
+# Keep the executor, Administrators and SYSTEM able to traverse every copied
+# SDK input before removing inherited grants. The parent diagnostics folder
+# grants the disposable account Modify; replace that grant with RX on each item.
+function Protect-SdkSmokeInputs {
+    param([Parameter(Mandatory)][string]$Path,
+          [Parameter(Mandatory)][ValidatePattern('^S-1-5-(?:\d+-)*\d+$')][string]$Sid)
+    Assert-DisposableRunner
+    $executor = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+    if ($Sid -in @($executor, 'S-1-5-32-544', 'S-1-5-18')) {
+        throw 'SDK smoke account must differ from executor, Administrators and SYSTEM'
+    }
+    $account = [Security.Principal.SecurityIdentifier]::new($Sid)
+    $privileged = @($executor, 'S-1-5-32-544', 'S-1-5-18') |
+        ForEach-Object { [Security.Principal.SecurityIdentifier]::new($_) }
+    $root = Get-Item -LiteralPath $Path -Force
+    if (-not $root.PSIsContainer) { throw 'SDK smoke inputs must be a directory' }
+    if ($root.Attributes -band [IO.FileAttributes]::ReparsePoint) {
+        throw "SDK smoke input is a reparse point: $($root.FullName)"
+    }
+    $items = New-Object Collections.ArrayList
+    $pending = New-Object Collections.Queue
+    $null = $items.Add($root)
+    $pending.Enqueue($root)
+    while ($pending.Count) {
+        $directory = $pending.Dequeue()
+        foreach ($child in @(Get-ChildItem -LiteralPath $directory.FullName -Force)) {
+            if ($child.Attributes -band [IO.FileAttributes]::ReparsePoint) {
+                throw "SDK smoke input is a reparse point: $($child.FullName)"
+            }
+            $null = $items.Add($child)
+            if ($child.PSIsContainer) { $pending.Enqueue($child) }
+        }
+    }
+    foreach ($item in $items) {
+        if ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) {
+            throw "SDK smoke input is a reparse point: $($item.FullName)"
+        }
+        $flags = if ($item.PSIsContainer) {
+            [Security.AccessControl.InheritanceFlags]'ContainerInherit, ObjectInherit'
+        } else { [Security.AccessControl.InheritanceFlags]::None }
+        $security = if ($item.PSIsContainer) {
+            [IO.Directory]::GetAccessControl($item.FullName)
+        } else { [IO.File]::GetAccessControl($item.FullName) }
+        # Complete one object's protected ACL before writing it to disk.
+        $security.SetAccessRuleProtection($true, $false)
+        foreach ($old in @($security.GetAccessRules($true, $false, [Security.Principal.SecurityIdentifier]))) {
+            $security.RemoveAccessRuleSpecific($old)
+        }
+        foreach ($principal in $privileged) {
+            $rule = [Security.AccessControl.FileSystemAccessRule]::new(
+                $principal, [Security.AccessControl.FileSystemRights]::FullControl, $flags,
+                [Security.AccessControl.PropagationFlags]::None,
+                [Security.AccessControl.AccessControlType]::Allow)
+            $security.SetAccessRule($rule)
+        }
+        $readOnly = [Security.AccessControl.FileSystemAccessRule]::new(
+            $account, [Security.AccessControl.FileSystemRights]::ReadAndExecute, $flags,
+            [Security.AccessControl.PropagationFlags]::None,
+            [Security.AccessControl.AccessControlType]::Allow)
+        $security.AddAccessRule($readOnly)
+        if ($item.PSIsContainer) {
+            [IO.Directory]::SetAccessControl($item.FullName, $security)
+        } else { [IO.File]::SetAccessControl($item.FullName, $security) }
+    }
+}
 # Removal leaves no account runtime process and no runtime capability pipe. At
 # the deadline a snapshot names what remained; its failure never changes the verdict.
 function Assert-RuntimeRemoved([string]$Sid, [string]$DiagnosticPath, [string]$Folder, [int]$Seconds = 10) {
@@ -1149,11 +1214,7 @@ exit $LASTEXITCODE
     if ($SdkSmokes) {
         $smokes = Join-Path $directory 'sdk-smokes'
         Copy-Item -LiteralPath (Resolve-Path -LiteralPath $SdkSmokes).Path -Destination $smokes -Recurse
-        # The parent diagnostics folder grants Modify to the account. Drop
-        # inherited ACEs on every copied client before granting read/execute.
-        & icacls.exe $smokes /inheritance:r /T /Q | Out-Null
-        if ($LASTEXITCODE -ne 0) { throw 'Cannot protect installed SDK smoke inputs' }
-        Grant-AccountAccess -Path $smokes -Sid $account.Sid -Access ReadExecute
+        Protect-SdkSmokeInputs -Path $smokes -Sid $account.Sid
         $probeAcl = (Get-Acl -LiteralPath (Join-Path $smokes 'python_probe.py')).GetAccessRules($true, $false, [Security.Principal.SecurityIdentifier])
         $accountRules = @($probeAcl | Where-Object { $_.IdentityReference.Value -eq $account.Sid })
         if ($accountRules.Count -ne 1 -or $accountRules[0].AccessControlType -ne 'Allow' -or
