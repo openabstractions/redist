@@ -335,6 +335,7 @@ jobs:
           (cd sdk-inputs/pypi && sha256sum -c "SHA256SUMS.pypi.win32-x64")
           python3 user-fixture/sdk_smokes/prepare.py --out sdk-smokes-ready \
             --npm sdk-inputs/npm --pypi sdk-inputs/pypi \
+            --tools user-fixture/tools.tsv \
             --provenance sdk-inputs/provenance/module-provenance.json
       - name: fetch reviewed predecessor package
         env:
