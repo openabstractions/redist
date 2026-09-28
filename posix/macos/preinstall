@@ -91,7 +91,10 @@ for label in com.openabstractions.jobd com.openabstractions.runtime com.openabst
     if [ "$state" = present ]; then
         manager bootout "gui/$uid/$label"
         booted=yes
-        state=$(agent_state "$label")
+        state=$(await_agent_absent "$label") || {
+            echo "preinstall: previous LaunchAgent $label remains registered or its absence is unverified; replacement refused" >&2
+            exit 1
+        }
     fi
     [ "$state" = absent ] || {
         echo "preinstall: previous LaunchAgent $label remains registered; replacement refused" >&2
