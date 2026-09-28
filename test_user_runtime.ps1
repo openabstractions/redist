@@ -411,12 +411,19 @@ function Assert-RemovedRegistration {
 function Get-PredecessorActivation([string]$Version) {
     if ($Version -notmatch '^\d+\.\d+\.\d+$') { throw "A predecessor version is required to select its activation arguments: '$Version'" }
     if ([version]$Version -le [version]'0.1.5') {
-        return [pscustomobject]@{ Images = @('jobd.exe','jobdw.exe'); Arguments = 'start'; Start = 'start'; Supervisor = @('jobd','jobdw') }
+        return [pscustomobject]@{ Images = @('jobd.exe','jobdw.exe'); Arguments = 'start'; Start = 'start'; Supervisor = @('jobd','jobdw'); Initializer = 'jobd.exe' }
     }
     if ([version]$Version -le [version]'0.1.7') {
-        return [pscustomobject]@{ Images = @('jobdw.exe'); Arguments = 'start --runtime'; Start = 'start --runtime'; Supervisor = @('jobdw') }
+        return [pscustomobject]@{ Images = @('jobdw.exe'); Arguments = 'start --runtime'; Start = 'start --runtime'; Supervisor = @('jobdw'); Initializer = 'jobd.exe' }
     }
-    return [pscustomobject]@{ Images = @('openabstractionsw.exe'); Arguments = 'serve host'; Start = 'start'; Supervisor = @('openabstractionsw') }
+    return [pscustomobject]@{ Images = @('openabstractionsw.exe'); Arguments = 'serve host'; Start = 'start'; Supervisor = @('openabstractionsw'); Initializer = '' }
+}
+function Initialize-PredecessorStore([string]$Tools, [string]$Version) {
+    $initializer = (Get-PredecessorActivation $Version).Initializer
+    # Legacy jobd status creates its store before start opens its log. From
+    # 0.1.8, openabstractions start activates and readies the runtime itself;
+    # status before start would correctly report that no runtime is listening.
+    if ($initializer) { Invoke-Bounded (Join-Path $Tools $initializer) @('status') }
 }
 function Start-PredecessorSupervisor([string]$Tools, [string]$Version) {
     $expected = Get-PredecessorActivation $Version
@@ -1049,8 +1056,7 @@ if ($Mode -eq 'User') {
             Assert-RetainedSentinel $sentinel $sentinelValue
             $predecessorImage = (Get-PredecessorActivation $PredecessorVersion).Images[-1]
             if ($PredecessorElsewhere -and (Test-Path -LiteralPath (Join-Path $tools $predecessorImage))) { throw 'The predecessor did not install into its chosen folder' }
-            # A predecessor start opens its log before creating the store. Initialize through its own CLI.
-            Invoke-Bounded (Join-Path $predecessorTools 'jobd.exe') @('status')
+            Initialize-PredecessorStore $predecessorTools $PredecessorVersion
             Start-PredecessorSupervisor $predecessorTools $PredecessorVersion
             $previousProcesses = @(Get-RunningFixtureProcesses $predecessorTools $ExpectedSid)
         }

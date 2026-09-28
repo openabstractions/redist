@@ -566,6 +566,9 @@ jobs:
         run: |
           $predecessor = (Resolve-Path predecessor\abstraction-x64.msi).Path
           $failing = (Resolve-Path failing\abstraction-x64.msi).Path
+          # This image is bound to the pinned, checksum-verified 0.2.0 MSI.
+          if ($env:PREDECESSOR_VERSION -ne '0.2.0') { throw 'Review the predecessor service image when changing the pinned MSI' }
+          $predecessorImage = 'openabstractionsw.exe'
           $installer = New-Object -ComObject WindowsInstaller.Installer
           $database = $installer.OpenDatabase($predecessor, 0)
           $view = $database.OpenView("SELECT ``Value`` FROM ``Property`` WHERE ``Property``='ProductCode'")
@@ -574,7 +577,7 @@ jobs:
           $p = Start-Process msiexec -Wait -PassThru -ArgumentList @('/i', $predecessor, '/qn', '/norestart', 'ALLUSERS=1', 'MSIINSTALLPERUSER=', '/l*v', 'machine-predecessor-install.log')
           if ($p.ExitCode -ne 0) { throw "machine predecessor install exited $($p.ExitCode)" }
           $statePath = "$env:RUNNER_TEMP/oa-predecessor-session.json"
-          & powershell.exe -NoProfile -ExecutionPolicy Bypass -STA -File session-fixture/test_service_session.ps1 -Mode Verify -StatePath $statePath -ExpectedImage jobdw.exe
+          & powershell.exe -NoProfile -ExecutionPolicy Bypass -STA -File session-fixture/test_service_session.ps1 -Mode Verify -StatePath $statePath -ExpectedImage $predecessorImage
           if ($LASTEXITCODE -ne 0) { throw "Predecessor session fixture exited $LASTEXITCODE" }
           $state = Get-Content -LiteralPath $statePath -Raw | ConvertFrom-Json
           function Get-SessionInstances {
@@ -599,7 +602,7 @@ jobs:
           if ($installer.ProductState($code) -ne 5) { throw 'rollback did not leave the machine predecessor installed' }
           & sc.exe qc OpenAbstractionsSupervisor | Out-Null
           if ($LASTEXITCODE -ne 0) { throw "rollback did not restore the predecessor service template: sc qc exited $LASTEXITCODE" }
-          if (-not (Test-Path -LiteralPath (Join-Path $env:ProgramFiles 'OpenAbstractions\tools\jobdw.exe'))) { throw 'rollback did not restore the predecessor programs' }
+          if (-not (Test-Path -LiteralPath (Join-Path (Join-Path $env:ProgramFiles 'OpenAbstractions\tools') $predecessorImage))) { throw 'rollback did not restore the predecessor programs' }
           $record = Join-Path $env:ProgramData 'abstraction\upgrade-v1\exclusion.json'
           if (Test-Path -LiteralPath $record) { throw "the machine upgrade exclusion survived rollback: $record" }
           $deadline = (Get-Date).AddSeconds(60)
