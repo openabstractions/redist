@@ -1323,22 +1323,28 @@ jobs:
             lipo -info "universal/${path%.exe}"
           done < <(rows tools.tsv)
 
-      # The Panel's own two programs (research/panel-native/MACOS-2026-09-22.md):
-      # panel, unchanged Go already built the tools.tsv way elsewhere in this
-      # job, and PanelLauncher.swift, which tools.tsv cannot carry — there is
-      # no published-module route for Swift source, only for a Go version tag.
-      # Both come from this job's own checkout instead, at the exact commit
-      # candidate validated, universal the same way as the loop above.
+      # Panel's Go and Swift programs come from the same published monitor
+      # module version named in tools.tsv. The redist checkout contains the
+      # packaging sources; it does not contain a monitor/ source directory.
       - name: build the Panel's app-bundle programs
         env:
           CGO_ENABLED: '0'
           GOFLAGS: -trimpath
         run: |
           root=$PWD
+          panel_module=$(awk -F '\t' '$1 == "Abstraction Panel.exe" {print $2}' tools.tsv)
+          case "$panel_module" in
+            github.com/openabstractions/abstractions/monitor@v*) ;;
+            *) printf 'FAIL  tools.tsv has no published Panel module\n'; exit 1 ;;
+          esac
+          module_dir=$(go mod download -json "$panel_module" |
+            python3 -c 'import json,sys; print(json.load(sys.stdin)["Dir"])')
+          test -f "$module_dir/macos/PanelLauncher.swift" ||
+            { printf 'FAIL  published Panel module has no macOS launcher source\n'; exit 1; }
           for arch in amd64 arm64; do
             mkdir -p "$root/thin/$arch"
-            ( cd monitor && GOOS=darwin GOARCH="$arch" go build -ldflags '-s -w -buildid=' \
-              -o "$root/thin/$arch/panel" . )
+            GOOS=darwin GOARCH="$arch" go -C "$module_dir" build -ldflags '-s -w -buildid=' \
+              -o "$root/thin/$arch/panel" .
           done
           lipo -create -output universal/panel "$root/thin/amd64/panel" "$root/thin/arm64/panel"
           lipo -info universal/panel
@@ -1347,7 +1353,7 @@ jobs:
             case $arch in amd64) swiftarch=x86_64 ;; arm64) swiftarch=arm64 ;; esac
             mkdir -p "$root/thin/$arch"
             swiftc -O -target "$swiftarch-apple-macos12.0" \
-              monitor/macos/PanelLauncher.swift -o "$root/thin/$arch/Abstraction Panel"
+              "$module_dir/macos/PanelLauncher.swift" -o "$root/thin/$arch/Abstraction Panel"
           done
           lipo -create -output "universal/Abstraction Panel" \
             "$root/thin/amd64/Abstraction Panel" "$root/thin/arm64/Abstraction Panel"

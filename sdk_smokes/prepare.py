@@ -24,28 +24,62 @@ MODULES = {
     "abstraction-facade": "github.com/openabstractions/abstraction-facade/go",
     "abstraction-config": "github.com/openabstractions/abstraction-config/go",
 }
+SERVICE_MODULE = "github.com/openabstractions/abstractions/serve"
+SERVICE_PROGRAMS = {"openabstractions.exe", "openabstractionsw.exe"}
+GO_CORE = "github.com/openabstractions/abstraction-facade/go-core"
 
 
 def checked(*args: object, cwd: Path | None = None, env: dict[str, str] | None = None) -> None:
     subprocess.run([str(arg) for arg in args], cwd=cwd, env=env, check=True, timeout=600)
 
 
-def provenance_rows(record: Path) -> dict[str, dict[str, str]]:
+def service_version(tools: Path) -> str:
+    programs = {}
+    for line in tools.read_text(encoding="utf-8").splitlines():
+        fields = line.split("\t")
+        if fields[0] not in SERVICE_PROGRAMS:
+            continue
+        if len(fields) != 5 or fields[0] in programs:
+            raise RuntimeError("invalid installed service module in tools.tsv")
+        programs[fields[0]] = fields[1]
+    if set(programs) != SERVICE_PROGRAMS or len(set(programs.values())) != 1:
+        raise RuntimeError("installed service programs have no single module pin in tools.tsv")
+    module, separator, version = next(iter(programs.values())).partition("@")
+    if module != SERVICE_MODULE or not separator or not version:
+        raise RuntimeError("installed service programs do not pin the serve module")
+    return version
+
+
+def provenance_rows(record: Path, tools: Path) -> dict[str, dict[str, str]]:
     evidence = json.loads(record.read_text(encoding="utf-8"))
     if evidence.get("schema") != 1:
         raise RuntimeError("unrecognized module provenance record")
+    version = service_version(tools)
+    graphs = [item for item in evidence["modules"]
+              if item.get("input", {}).get("path") == SERVICE_MODULE]
+    if len(graphs) != 1 or graphs[0]["input"].get("version") != version:
+        raise RuntimeError("candidate provenance lacks the exact installed service graph")
+    graph = graphs[0]
     rows: dict[str, dict[str, str]] = {}
-    for item in evidence["modules"]:
-        for selected in item["selected"]:
-            if not selected["path"].startswith("github.com/openabstractions/"):
-                continue
-            old = rows.setdefault(selected["path"], selected)
-            if old != selected:
-                raise RuntimeError("inconsistent SDK module provenance: " + selected["path"])
-    if not set(MODULES.values()).issubset(rows):
-        raise RuntimeError("candidate provenance lacks identity, facade or config SDK pin")
-    for row in rows.values():
-        if not row.get("expected_commit") or not row.get("tag"):
+    for selected in graph["selected"]:
+        path = selected["path"]
+        if not path.startswith("github.com/openabstractions/"):
+            continue
+        if path in rows:
+            raise RuntimeError("duplicate module in installed service graph: " + path)
+        rows[path] = selected
+    service = rows.get(SERVICE_MODULE)
+    if (not service or service.get("version") != version
+            or service.get("expected_commit") != graph["input"].get("expected_commit")):
+        raise RuntimeError("installed service graph contradicts its input pin")
+    required = set(MODULES.values()) | {GO_CORE}
+    if not required.issubset(rows):
+        raise RuntimeError("candidate service graph lacks identity, facade, config or facade core SDK pin")
+    for path in required:
+        row = rows[path]
+        if (not row.get("expected_commit") or not row.get("tag")
+                or row.get("origin_hash") != row["expected_commit"]
+                or not row.get("repository")):
             raise RuntimeError("SDK source has no verified published tag and commit")
     return rows
 
@@ -121,12 +155,20 @@ def prepare_javascript(out: Path, sources: Path, npm_dir: Path, temporary: Path)
     checked("node", "--check", out / "javascript_probe.mjs")
 
 
+def check_go_selection(raw: str, rows: dict[str, dict[str, str]]) -> None:
+    resolved = dict(line.rsplit("@", 1) for line in raw.splitlines() if "@" in line)
+    for path in set(MODULES.values()) | {GO_CORE}:
+        if resolved.get(path) != rows[path]["version"]:
+            raise RuntimeError(f"composed Go SDK selects {path}@{resolved.get(path)}, "
+                               f"expected verified service graph {rows[path]['version']}")
+
+
 def prepare_go(out: Path, selected: dict[str, dict[str, str]], rows: dict[str, dict[str, str]], temporary: Path) -> None:
     source = temporary / "go"
     source.mkdir()
     shutil.copy2(HERE / "go_probe.go", source / "main.go")
     facade = selected["abstraction-facade"]["version"]
-    core_row = rows.get("github.com/openabstractions/abstraction-facade/go-core")
+    core_row = rows.get(GO_CORE)
     if not core_row:
         raise RuntimeError("candidate provenance lacks facade/go-core")
     core = core_row["version"]
@@ -136,6 +178,9 @@ def prepare_go(out: Path, selected: dict[str, dict[str, str]], rows: dict[str, d
         f" github.com/openabstractions/abstraction-facade/go-core {core}\n)\n", encoding="utf-8")
     env = dict(os.environ, GOWORK="off", GOTOOLCHAIN="local", GOFLAGS="-trimpath -p=2")
     checked("go", "mod", "tidy", cwd=source, env=env)
+    graph = subprocess.check_output(["go", "list", "-m", "-f", "{{.Path}}@{{.Version}}", "all"],
+                                    cwd=source, env=env, text=True, timeout=600)
+    check_go_selection(graph, rows)
     checked("go", "build", "-o", out / "go_probe.exe", ".", cwd=source, env=env)
 
 
@@ -216,11 +261,12 @@ def main() -> None:
     parser.add_argument("--npm", required=True, type=Path)
     parser.add_argument("--pypi", required=True, type=Path)
     parser.add_argument("--provenance", required=True, type=Path)
+    parser.add_argument("--tools", type=Path, default=Path("tools.tsv"))
     args = parser.parse_args()
     out = args.out.resolve()
     if out.exists():
         raise RuntimeError("SDK smoke output already exists: " + str(out))
-    rows = provenance_rows(args.provenance)
+    rows = provenance_rows(args.provenance, args.tools)
     selected = pins(rows)
     out.mkdir(parents=True)
     with tempfile.TemporaryDirectory(prefix=".sdk-smokes-build-", dir=out.parent) as scratch:
