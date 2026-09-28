@@ -329,7 +329,7 @@ exit 1''')
         for gone in (self.payload, self.share/"MANIFEST", self.share/"uninstall.sh", self.share/"lifecycle.sh", self.share):
             self.assertFalse(gone.exists(), gone)
         self.assertEqual(self.data.read_text(), "accepted work")
-        self.assertIn("package receipt forgotten on " + str(self.home), result.stdout)
+        self.assertIn("package receipt com.openabstractions.abstraction forgotten on " + str(self.home), result.stdout)
         self.assert_notice(result.stdout)
 
     def test_macos_system_domain_receipt_falls_back_to_root_volume(self):
@@ -381,7 +381,9 @@ exit 1''')
         (self.share/"MANIFEST").unlink()
         result = self.uninstall("macos")
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn("pkgutil --volume '%s' --forget com.openabstractions.abstraction" % self.home, result.stderr)
+        self.assertIn("for r in com.openabstractions.abstraction com.openabstractions.abstraction.localstores "
+                      "com.openabstractions.abstraction.modelhost com.openabstractions.abstraction.mcpgateway", result.stderr)
+        self.assertIn("pkgutil --volume '%s' --forget $r" % self.home, result.stderr)
         self.assert_notice(result.stderr)
 
     def test_macos_file_removal_failure_keeps_uninstaller_for_retry(self):
@@ -533,9 +535,11 @@ for a do case "$a" in -*) ;; *) src=$a; break;; esac; done
 printf "mv:%s -> %s bin=%s\n" "$src" "$last" "$(grep -c '@BIN@' "$src")" >> "$LOG"
 exec /bin/mv "$@"''')
         plist = self.template()
+        current = self.home/".local/bin/openabstractions"
+        current.write_text("installed runtime")
         other = self.payload.parent/"other-tool"
         other.write_text("unrelated")
-        (self.share/"FILES").write_text(".local/bin/jobd\n.local/share/abstraction/com.openabstractions.runtime.plist\n")
+        (self.share/"FILES").write_text(".local/bin/openabstractions\n.local/share/abstraction/com.openabstractions.runtime.plist\n")
         result = subprocess.run(["sh", str(HERE/"macos/postinstall")], env=dict(self.env, ACTIVE="active"), text=True, capture_output=True, timeout=SCRIPT_TIMEOUT)
         self.assertEqual(result.returncode, 0, result.stderr)
         import plistlib
@@ -562,6 +566,8 @@ exec /bin/mv "$@"''')
                         calls.index("bootstrap gui/1000 " + str(plist)))
         for directory in [self.share, self.share.parent, self.home/".local", self.payload.parent, plist.parent, self.home/"Library"]:
             self.assertIn("chown:1000:1000 " + str(directory), calls)
+        self.assertIn("chown:1000:1000 " + str(current), calls)
+        self.assertFalse(self.payload.exists())
         self.assertNotIn("chown:1000:1000 " + str(self.home), calls)
         self.assertFalse(any(str(other) in line or "chown:-R" in line for line in calls))
         self.assertEqual(other.read_text(), "unrelated")
