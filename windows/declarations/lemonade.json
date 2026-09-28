@@ -1,0 +1,20 @@
+{
+  "version": 2,
+  "declaration": {
+    "name": "lemonade",
+    "program": "",
+    "arguments": [],
+    "endpoint": "",
+    "transport": "http@1",
+    "contracts": [],
+    "activation": "attach",
+    "role": "host",
+    "host": {
+      "base": "http://127.0.0.1:13305",
+      "kind": "lemonade",
+      "hosted": false
+    }
+  },
+  "declared_by": "installation",
+  "declared_unix_ms": 0
+}

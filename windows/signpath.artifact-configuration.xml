@@ -5,12 +5,18 @@
       <pe-file path="tools/openabstractions.exe"><authenticode-sign /></pe-file>
       <pe-file path="tools/openabstractionsw.exe"><authenticode-sign /></pe-file>
       <pe-file path="tools/Abstraction Panel.exe"><authenticode-sign /></pe-file>
+      <pe-file path="tools/inventoryd.exe"><authenticode-sign /></pe-file>
+      <pe-file path="tools/modelhostd.exe"><authenticode-sign /></pe-file>
+      <pe-file path="tools/openabstractions-mcp.exe"><authenticode-sign /></pe-file>
       <authenticode-sign />
     </msi-file>
     <msi-file path="abstraction-arm64.msi">
       <pe-file path="tools/openabstractions.exe"><authenticode-sign /></pe-file>
       <pe-file path="tools/openabstractionsw.exe"><authenticode-sign /></pe-file>
       <pe-file path="tools/Abstraction Panel.exe"><authenticode-sign /></pe-file>
+      <pe-file path="tools/inventoryd.exe"><authenticode-sign /></pe-file>
+      <pe-file path="tools/modelhostd.exe"><authenticode-sign /></pe-file>
+      <pe-file path="tools/openabstractions-mcp.exe"><authenticode-sign /></pe-file>
       <authenticode-sign />
     </msi-file>
   </zip-file>

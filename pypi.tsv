@@ -1,0 +1,21 @@
+> Where the Python source this release packs comes from.
+> .github/workflows/candidate.yml reads this and nothing else.
+>
+> package	the PyPI distribution name. abstraction-ipc also produces one
+>		platform-tagged wheel per qualified platform; those are
+>		assembled by scripts/py_wheels.py from a shared C ABI library
+>		this workflow builds and have no row of their own
+> repository	owner/name on github.com, public and readable by a stranger
+> commit		the exact published commit this package is built from, 40
+>		lowercase hexadecimal digits. A branch is refused: a release
+>		built from a moving ref is a release nobody can rebuild. These
+>		directories carry no tag of their own — the Go module tags in
+>		tools.tsv name Go modules and say nothing about the Python
+>		beside them — so the commit is what identifies them
+> directory	the package directory inside that repository
+>
+> Every wheel here is packed and retained as an artifact. Nothing is
+> published to PyPI: that needs the owner's PyPI organization and consent.
+
+package	repository	commit	directory
+abstraction-ipc	openabstractions/abstraction-identity	98a2d9a42684a9c58d9d137d91e196e51ba1e2d6	py

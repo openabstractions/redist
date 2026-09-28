@@ -9,22 +9,29 @@ See [Releases](https://github.com/openabstractions/redist/releases) for availabl
 downloads and their release-specific verification. Draft builds are not releases.
 Each release lists its included capabilities, platform verification and signing state.
 
-## Available now: 0.2.0
+## For people installing
 
-[Download 0.2.0](https://github.com/openabstractions/redist/releases/tag/v0.2.0) for Windows, Linux and macOS.
-Use one runtime to keep accepted work running, call AI providers with named
-credentials, manage application permissions, and find or activate registered
-applications. Windows includes the Panel for inspecting and managing the runtime.
-The SDK sources cover Go, C++17, Python, Rust and JavaScript; package versions
-and registry availability are documented separately by each capability.
+### Available now: 0.2.0
 
-Windows x64 installation, upgrades, rollback and crash recovery passed.
-Linux amd64 installation and runtime-backed downloading passed. The macOS
-package is signed and notarised; protected service calls retain the documented
-caller-identity limitation. Windows and Linux packages are unsigned.
-[Release verification and limits](https://github.com/openabstractions/abstractions/blob/main/docs/results/release-0.2.0.md).
+The charter README carries the current pitch and platform coverage for
+0.2.0. [Download 0.2.0](https://github.com/openabstractions/redist/releases/tag/v0.2.0)
+directly, or read
+[the charter's "Available now" section](https://github.com/openabstractions/abstractions#available-now-020)
+for what it includes and its verification state.
 
-## Installing
+### Planned 0.3.0 downloads (unpublished)
+
+The prepared 0.3.0 source passed its recorded Windows, Linux and macOS
+qualification stage. Installed-package acceptance and artifact promotion are
+in progress; no 0.3.0 downloads are available yet. The release adds provider
+admission and credential protections, clearer resource and rights contracts,
+expanded inference APIs, `inventoryd`, `modelhostd`, an optional MCP gateway,
+and the Windows Panel. Windows and Linux packages are unsigned; ARM64 packages
+are cross-built. The macOS universal package is conditional on its signing and
+notarization gates. See [candidate notes](NOTES.md) for package contents and
+verification scope.
+
+### Installing
 
 The Windows MSI defaults to *Just me*, under
 `%LOCALAPPDATA%\Programs\OpenAbstractions`. *Everyone* installs under
@@ -64,33 +71,75 @@ Developers can also run individual hosts in the foreground with
 `openabstractions serve logging`, `serve config` and `serve router-v1`. These
 commands do not install or register a service.
 
-## Without an installer
+## For developers using `go install`
+
+### Without an installer
 
 [`tools.tsv`](tools.tsv) names each published module version and package.
 Build the package at that version with `go install <package>@<version>`.
 The windowless Windows executables additionally need the build flags specified by
 the release workflow; plain `go install` does not reproduce their subsystem.
 
-## What this repository is
+### What this repository is
 
 One packaging repository for Windows, Linux and macOS. `tools.tsv` is the
 version list consumed by the workflow; `windows/` and `posix/` hold packaging.
-Programs' source stays in their own public modules. The workflow resolves the
-pinned modules and drafts a release; publishing remains a separate decision.
-Go's proxy may retain a version after its repository tag is deleted, so fetching
-an artifact alone does not prove that the tag still exists.
+Programs' source stays in their own public modules. The candidate workflow
+resolves pinned modules and retains verified packages. A separate promotion
+workflow creates the release draft from those packages.
 
-`tools.tsv` may name only versions that are tags on their repositories. The
-release workflow resolves every one before it builds anything, so a module we
-broke stops the release by name instead of shipping. That is the point of the
-repository: the package consumes our published artifacts exactly as a stranger
-does.
+`tools.tsv` may name only versions that are tags on their repositories, so a
+module we broke stops the release by name instead of shipping; the workflow
+checks that with `git ls-remote --tags` rather than `proxy.golang.org`, which
+can still serve a version whose tag was later deleted.
 
-It resolves them through `proxy.golang.org`, and the proxy serves a version it
-has cached for good — including one whose tag was deleted. So that check cannot
-see a deleted tag; `git ls-remote --tags` on the repository is what does.
+### Platform evidence and language packages
 
-## Preparing a release
+Each release reports which platform checks ran and which assets ship.
+For NAS delivery, see [docker-jobd](https://github.com/openabstractions/docker-jobd).
+
+The candidate also retains Python wheels and JavaScript package archives as
+separate artifacts. `pypi.tsv` pins the source of the native `abstraction-ipc`
+wheels, and `npm.tsv` pins JavaScript package sources. Installer promotion
+consumes the `verified-release-N` artifact. Package-index publication needs its
+own configured publisher and authorization; running a candidate does not upload
+packages to PyPI or npm.
+
+### Publishing the qualified Python wheels
+
+The `publish.yml` workflow is a manual PyPI trusted publisher for the native
+`abstraction-ipc` wheels. Dispatch the reviewed publisher workflow with the
+candidate's `vMAJOR.MINOR.PATCH` version, run ID, exact redist source SHA and
+current run attempt. The run must have succeeded without preview. The verifier checks the
+candidate's source, version and attempt metadata in `verified-release-N`, then
+selects the latest successful Python matrix job for each of Windows x64, Linux
+x64, macOS arm64 and macOS x64. A retry may retain a successful wheel from an
+earlier attempt of the same run. Each selected artifact must match its job's
+attempt and the candidate source. The verifier checks GitHub artifact digests,
+per-wheel SHA256SUMS, the exact wheel filenames and native wheel contents before
+staging four wheels. It builds nothing.
+
+Current candidates give each Python matrix job a stable `python (<platform-id>)`
+name. For an older candidate, the verifier accepts a matching default
+`python (<platform-id>, ...)` name when GitHub's run-jobs response proves it;
+unrecognized names or absent attempt numbers refuse. A failed upload can be
+retried without rerunning verification: the upload job downloads the exact
+artifact ID emitted by the successful verification job.
+
+The publisher workflow can be introduced after a candidate completed. Its
+dispatch ref may therefore be a later reviewed redist commit; the explicit
+candidate source input is checked against the candidate run and its artifacts.
+
+The upload job waits at the `pypi` environment gate and uses GitHub OIDC through
+PyPI Trusted Publishing. Before dispatch, the owner must verify that the
+`abstraction-ipc` PyPI publisher is configured for the `openabstractions/redist`
+repository, `.github/workflows/publish.yml` and `pypi` environment, including
+any required environment approval. The repository cannot verify those account
+settings offline. PyPI publication is permanent; inspect the candidate and
+the four wheels before approving that job. The old layer Python publisher has
+different source and artifact assumptions and remains separate.
+
+## For maintainers cutting a release
 
 Run `candidate.yml` from the reviewed `release/X.Y.Z` branch with
 `version=vX.Y.Z`. It builds from the published versions in `tools.tsv`, records
@@ -115,10 +164,3 @@ evidence exception. Compilation and installer checks remain required.
 If promotion stops after creating the tag or draft, inspect that run and use
 `resume=true` with the same candidate. Recovery accepts only the exact tag,
 notes and asset bytes already verified. Existing assets are never replaced.
-
-## What is not here
-
-- **No source for the programs.** They are built from the modules above.
-- **Uniform platform evidence.** The workflow builds Linux tarballs and macOS
-  packages, but each release reports which checks ran and which assets ship.
-For NAS delivery, see [docker-jobd](https://github.com/openabstractions/docker-jobd).

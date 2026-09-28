@@ -12,9 +12,11 @@ share=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 manifest=$share/MANIFEST
 self=$share/uninstall.sh
 home=${HOME:-/}
-receipt=com.openabstractions.abstraction
+# One receipt per component package: the runtime, and each optional provider
+# the person chose (VISION 2026-09-22). A receipt that is not there is a
+# feature that was not installed, which is not an error.
+receipts="com.openabstractions.abstraction com.openabstractions.abstraction.localstores com.openabstractions.abstraction.modelhost com.openabstractions.abstraction.mcpgateway"
 uid=$(id -u)
-service=gui/$uid/com.openabstractions.runtime
 
 # Single-quotes a value for a command line the person can paste.
 quote() { printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"; }
@@ -47,7 +49,7 @@ trap finish EXIT
 fail() { echo "uninstall.sh: $1" >&2; exit 1; }
 
 if [ ! -f "$manifest" ]; then
-    recovery="list and forget the receipt: pkgutil --volume $(quote "$home") --files $receipt; pkgutil --volume $(quote "$home") --forget $receipt"
+    recovery="list and forget each receipt: for r in $receipts; do pkgutil --volume $(quote "$home") --files \$r; pkgutil --volume $(quote "$home") --forget \$r; done"
     fail "no MANIFEST beside this script; refusing to guess what to delete"
 fi
 . "$share/lifecycle.sh"
@@ -72,56 +74,69 @@ manager_uid=$(manager manageruid) || fail "launchd manager query failed; payload
 manager_name=$(manager managername) || fail "launchd manager query failed; payload retained"
 [ "$manager_uid" = "$uid" ] && [ "$manager_name" = Aqua ] ||
     fail "run from this user's graphical login session; payload retained"
+# The native list command documents PID, status, label columns. Unknown
+# formats and query errors cannot establish absence.
 agent_state() {
+    label=$1
     jobs=$(manager list) || return 1
-    # The native list command documents PID, status, label columns. Unknown
-    # formats and query errors cannot establish absence.
-    printf '%s\n' "$jobs" | awk '
+    printf '%s\n' "$jobs" | awk -v label="$label" '
         NR == 1 { if (NF != 3 || $1 != "PID" || $2 != "Status" || $3 != "Label") bad=1; next }
         NF < 3 || $1 !~ /^(-|[0-9]+)$/ || $2 !~ /^-?[0-9]+$/ { bad=1 }
-        NF == 3 && $3 == "com.openabstractions.runtime" { found=1 }
+        NF == 3 && $3 == label { found=1 }
         END { if (bad || NR == 0) exit 2; print found ? "present" : "absent" }
     '
 }
-recovery="from Terminal in this user's desktop session: launchctl bootout $service; $rerun"
-state=$(agent_state) || state=unknown
-if [ "$state" = present ]; then
-    # ExitTimeOut bounds launchd's cooperative interval; escalation is possible.
-    manager bootout "$service" || fail "LaunchAgent bootout failed; payload retained"
-    state=$(agent_state) || state=unknown
-fi
-[ "$state" = absent ] || fail "LaunchAgent registration state is $state; payload retained"
-echo "ok    LaunchAgent absence verified (graceful exit is not independently established)"
+# One receipt per component package does not extend to LaunchAgents: the
+# Panel is part of the base package (like the Windows Tools feature), and its
+# label is absent, not present, on an install that never built it — that is
+# not a failure to verify here, only nothing to boot out.
+for label in com.openabstractions.runtime com.openabstractions.panel; do
+    service=gui/$uid/$label
+    recovery="from Terminal in this user's desktop session: launchctl bootout $service; $rerun"
+    state=$(agent_state "$label") || state=unknown
+    if [ "$state" = present ]; then
+        # ExitTimeOut bounds launchd's cooperative interval; escalation is possible.
+        manager bootout "$service" || fail "LaunchAgent bootout failed; payload retained"
+        state=$(await_agent_absent "$label") ||
+            fail "LaunchAgent registration state is $state for $label; payload retained"
+    fi
+    [ "$state" = absent ] || fail "LaunchAgent registration state is $state for $label; payload retained"
+    echo "ok    LaunchAgent absence verified for $label (graceful exit is not independently established)"
+done
 
 # The package installs into the current user's home domain, and its receipt is
 # on that volume. A receipt on / would come from a system-domain install. Only a
 # "No receipt" answer establishes absence; any other pkgutil failure stops here
 # with the payload and this script still in place.
 receipt_on() {
-    out=$(pkgutil --volume "$1" --pkg-info "$receipt" 2>&1) && { echo present; return 0; }
+    out=$(pkgutil --volume "$1" --pkg-info "$2" 2>&1) && { echo present; return 0; }
     case "$out" in *"No receipt"*) echo absent; return 0;; esac
     printf '%s\n' "$out" >&2
     return 1
 }
 forget_on() {
-    recovery="$2pkgutil --volume $(quote "$1") --forget $receipt; then $rerun"
-    pkgutil --volume "$1" --forget "$receipt" || fail "package receipt on $1 could not be forgotten; payload retained"
-    [ "$(receipt_on "$1")" = absent ] || fail "package receipt on $1 remains after forget; payload retained"
-    echo "ok    package receipt forgotten on $1"
+    recovery="$3pkgutil --volume $(quote "$1") --forget $2; then $rerun"
+    pkgutil --volume "$1" --forget "$2" || fail "package receipt $2 on $1 could not be forgotten; payload retained"
+    [ "$(receipt_on "$1" "$2")" = absent ] || fail "package receipt $2 on $1 remains after forget; payload retained"
+    echo "ok    package receipt $2 forgotten on $1"
 }
-recovery="check the receipt with pkgutil --volume $(quote "$home") --pkg-info $receipt, then $rerun"
-home_receipt=$(receipt_on "$home") || fail "package receipt query failed on $home; payload retained"
-if [ "$home_receipt" = present ]; then
-    forget_on "$home" ""
-else
-    recovery="check the receipt with pkgutil --volume / --pkg-info $receipt, then $rerun"
-    root_receipt=$(receipt_on /) || fail "package receipt query failed on /; payload retained"
-    if [ "$root_receipt" = present ]; then
-        forget_on / "sudo "
-    else
-        echo "ok    no package receipt present"
+found=0
+for receipt in $receipts; do
+    recovery="check the receipt with pkgutil --volume $(quote "$home") --pkg-info $receipt, then $rerun"
+    home_receipt=$(receipt_on "$home" "$receipt") || fail "package receipt query failed on $home; payload retained"
+    if [ "$home_receipt" = present ]; then
+        forget_on "$home" "$receipt" ""
+        found=$((found + 1))
+        continue
     fi
-fi
+    recovery="check the receipt with pkgutil --volume / --pkg-info $receipt, then $rerun"
+    root_receipt=$(receipt_on / "$receipt") || fail "package receipt query failed on /; payload retained"
+    if [ "$root_receipt" = present ]; then
+        forget_on / "$receipt" "sudo "
+        found=$((found + 1))
+    fi
+done
+[ "$found" -gt 0 ] || echo "ok    no package receipt present"
 
 # This script, its helper and MANIFEST stay until every other file is gone, so
 # a failure here can be retried by running this script again.

@@ -10,6 +10,52 @@ payload=$here/payload
 share=$HOME/.local/share/abstraction
 bin=$HOME/.local/bin
 manifest=$share/MANIFEST
+features=$payload/.local/share/abstraction/FEATURES
+
+# The optional providers of VISION 2026-09-22. FEATURES in the payload says
+# which feature puts each file there and what each one's default is: a provider
+# that only reads is installed unless this person says otherwise, and one that
+# writes elsewhere is installed only when asked for. --with and --without name
+# a feature; service, the runtime itself, is always installed and is not one
+# of them.
+usage() {
+	echo "usage: install.sh [--with FEATURE]... [--without FEATURE]..." >&2
+	echo "       optional features in this package, and their defaults:" >&2
+	if [ -f "$features" ]; then
+		while read -r kind feature state; do
+			[ "$kind" = default ] || continue
+			[ "$feature" != service ] || continue
+			echo "           $feature ($state by default)" >&2
+		done < "$features"
+	fi
+}
+selected=" service "
+if [ -f "$features" ]; then
+	while read -r kind feature state; do
+		[ "$kind" = default ] || continue
+		[ "$state" = on ] || continue
+		case "$selected" in *" $feature "*) ;; *) selected="$selected$feature ";; esac
+	done < "$features"
+fi
+known() {
+	[ -f "$features" ] || return 1
+	while read -r kind feature _; do
+		[ "$kind" = default ] && [ "$feature" = "$1" ] && [ "$1" != service ] && return 0
+	done < "$features"
+	return 1
+}
+while [ $# -gt 0 ]; do
+	case $1 in
+	--with|--without)
+		[ $# -ge 2 ] || { echo "install.sh: $1 names a feature" >&2; usage; exit 2; }
+		known "$2" || { echo "install.sh: this package has no feature called $2" >&2; usage; exit 2; }
+		selected=$(printf '%s' "$selected" | sed "s/ $2 / /")
+		[ "$1" = --without ] || selected="$selected$2 "
+		shift 2;;
+	-h|--help) usage; exit 0;;
+	*) echo "install.sh: unknown argument $1" >&2; usage; exit 2;;
+	esac
+done
 
 if [ "$(id -u)" = 0 ]; then
 	echo "install.sh: this package is per-user. Run it as the person who will use it, not as root." >&2
@@ -26,6 +72,9 @@ valid_path() (
     f=$1
     case "$f" in
         "$HOME/.local/bin/openabstractions"|"$HOME/.config/systemd/user/abstraction-runtime.service"|"$HOME/.local/share/abstraction/"*) ;;
+        # The installation's declaration files and the optional providers'
+        # programs, beside the runtime where it reads them.
+        "$HOME/.local/bin/declarations/"*|"$HOME/.local/bin/inventoryd"|"$HOME/.local/bin/modelhostd"|"$HOME/.local/bin/openabstractions-mcp") ;;
         # Retired by 0.2.0 (docs/REMOVED.md). A predecessor's ledger still names
         # them, and they are removed only when their recorded bytes match.
         "$HOME/.local/bin/jobd"|"$HOME/.local/bin/jobctl"|"$HOME/.local/bin/dl"|"$HOME/.config/systemd/user/abstraction-jobd.service"|"$HOME/.config/systemd/user/abstraction-jobd.timer") ;;
@@ -129,7 +178,21 @@ trap 'exit 143' TERM
 [ ! -f "$manifest" ] || cp -p -- "$manifest" "$stage/previous-manifest"
 ( cd "$payload" && find . -type f -print ) > "$stage/raw-files"
 sed 's|^\./||' "$stage/raw-files" > "$stage/unsorted-files"
-LC_ALL=C sort "$stage/unsorted-files" > "$stage/files"
+LC_ALL=C sort "$stage/unsorted-files" > "$stage/all-files"
+# Only the files of the features this run installs. A file FEATURES does not
+# name belongs to service, the runtime itself, which is always installed; a
+# feature turned off here is a file that never lands and never enters the
+# removal ledger.
+: > "$stage/files"
+while IFS= read -r rel; do
+	owner=service
+	if [ -f "$features" ]; then
+		while read -r kind feature path; do
+			if [ "$kind" = file ] && [ "$path" = "$rel" ]; then owner=$feature; break; fi
+		done < "$features"
+	fi
+	case "$selected" in *" $owner "*) printf '%s\n' "$rel" >> "$stage/files";; esac
+done < "$stage/all-files"
 : > "$stage/MANIFEST"
 while IFS= read -r rel; do
     dst=$HOME/$rel
@@ -180,6 +243,7 @@ mv -f -- "$stage/MANIFEST" "$manifest"
 committed=yes
 n=$(wc -l < "$stage/files" | tr -d ' ')
 echo "ok    $n files under $HOME"
+echo "ok    features installed:$selected"
 
 timer=no
 if [ "$managed" = yes ]; then

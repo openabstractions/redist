@@ -1,6 +1,16 @@
 > Every file the package installs, and which feature puts it there.
 >
-> feature	service | tools | developer
+> feature	service | tools | developer | localstores | modelhost | mcpgateway
+>		The optional provider features of VISION 2026-09-22. localstores
+>		installs inventoryd and the declaration file that declares it, and
+>		is on by default because it only reads. modelhost installs
+>		modelhostd only and is off by default; openabstractions models
+>		host writes its declaration later, so this package ships none.
+>		mcpgateway installs the stdio MCP server and is off by default.
+>		nas-download is a feature name held in abstraction.wxs with
+>		nothing behind it: the NAS delegator is a tier inside
+>		abstraction-download and no program of its own, so there is no
+>		row here for it
 > path		where it lands under the install folder, and the staging path the
 >		workflow builds: payload/<path>, which is what File@Source says
 > kind		gobuild  go build the package at <from> in <source>
@@ -32,14 +42,15 @@
 > but no public refs were present at the 2026-09-12 check. Until a public commit
 > is verified, its optional source stays UNRESOLVED.
 >
-> The Panel ships no side-by-side manifest. Its two elements were a dpiAware
-> setting that monitor/win/win_windows.go already applies by calling
-> SetProcessDpiAwarenessContext, and a Common-Controls 6.0.0.0 dependency that
-> names processorArchitecture="amd64" while this package is also built for arm64.
-> It was also a copy row against the same source as the program, so a --bin
-> release build could never obtain it, and its absence turned the whole Panel
-> feature off and took the program with it. monitor/README.md documents the
-> manual copy for anyone who wants the button styling in a local build.
+> The Panel embeds monitor/panel.manifest as a Windows resource instead of
+> shipping it as a side-by-side file: monitor/panel.rc names it RT_MANIFEST id
+> 1, and monitor/rsrc_windows_amd64.syso / rsrc_windows_arm64.syso (committed,
+> built by `go run ./monitor/icon/gen -syso`) carry the compiled result into
+> every `go build` of this package, --bin and --src alike, with no payload row
+> of its own to drop. The manifest's Common-Controls dependency still names
+> processorArchitecture="amd64"; on the arm64 build this is a known mismatch
+> that the OS resolves by falling back to unthemed controls for that
+> architecture only, not by losing the manifest or the Panel feature.
 
 feature		path						kind		source		from						sign	subsystem
 tools		tools/Abstraction Panel.exe			gobuild		panel		monitor						yes	windows
@@ -51,3 +62,11 @@ developer	dev/USING.txt					authored	installer	dev/USING.txt					no	-
 developer	dev/include/abstraction/download/over_curl.hpp	copy		UNRESOLVED	include/abstraction/download/over_curl.hpp	no	-
 service	tools/openabstractions.exe	gobuild	charter	serve	yes	console
 service	tools/openabstractionsw.exe	gobuild	charter	serve	yes	windows
+service	tools/declarations/lemonade.json	authored	installer	declarations/lemonade.json	no	-
+service	tools/declarations/lmstudio.json	authored	installer	declarations/lmstudio.json	no	-
+service	tools/declarations/ollama.json	authored	installer	declarations/ollama.json	no	-
+service	tools/declarations/comfyui.json	authored	installer	declarations/comfyui.json	no	-
+localstores	tools/inventoryd.exe	gobuild	localstores	go/cmd/inventoryd	yes	console
+localstores	tools/declarations/local-stores.json	authored	installer	declarations/local-stores.json	no	-
+modelhost	tools/modelhostd.exe	gobuild	modelhost	go/cmd/modelhostd	yes	console
+mcpgateway	tools/openabstractions-mcp.exe	gobuild	charter	mcp-gateway	yes	console

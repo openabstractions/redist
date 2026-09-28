@@ -34,3 +34,22 @@ manager() (
     if [ -f "$state/expired" ]; then echo "launchctl timed out; lifecycle completion unverified" >&2; exit 124; fi
     exit "$code"
 )
+
+# launchctl bootout can return while list still reports the removed job. The
+# caller supplies agent_state(label), which refuses unknown list formats. Poll
+# read-only for up to three seconds; any query failure remains a refusal.
+await_agent_absent() {
+    awaited_label=$1
+    awaited_polls=0
+    while :; do
+        awaited_state=$(agent_state "$awaited_label") || { echo unknown; return 1; }
+        case "$awaited_state" in
+            absent) echo absent; return 0;;
+            present) ;;
+            *) echo "$awaited_state"; return 1;;
+        esac
+        if [ "$awaited_polls" -ge 30 ]; then echo present; return 1; fi
+        sleep 0.1
+        awaited_polls=$((awaited_polls + 1))
+    done
+}

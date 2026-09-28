@@ -255,7 +255,7 @@ jobs:
   # install did rather than what the package promised. A manifest is checked by
   # windows/validate.py, before anything is built; nothing below reads one.
   verify:
-    needs: [candidate, windows]
+    needs: [candidate, windows, javascript, python]
     runs-on: windows-latest
     permissions:
       contents: read
@@ -263,13 +263,12 @@ jobs:
     outputs:
       machine-service: ${{ steps.instance.outputs.state }}
     env:
-      # The published release an upgrade is qualified from, in one place, as in
-      # redist-candidate.yml. v0.1.7's Startup shortcut runs `jobdw start
-      # --runtime`, and from 0.1.8 it runs `openabstractionsw serve host`; the
-      # fixture picks the activation from the version it is given.
+      # The published release an upgrade is qualified from. The fixture picks
+      # predecessor activation from this version.
       CANDIDATE_VERSION: ${{ needs.candidate.outputs.version }}
-      PREDECESSOR_RELEASE: v0.1.7
-      PREDECESSOR_VERSION: 0.1.7
+      PREDECESSOR_RELEASE: v0.2.0
+      PREDECESSOR_VERSION: 0.2.0
+      PREDECESSOR_SHA256_EXPECTED: 274816ade8e8294be9801d2ca519c22e24d68808c1427609d161aa44dc528fd4
     steps:
       - name: fetch the package
         env:
@@ -308,6 +307,35 @@ jobs:
         with:
           ref: ${{ github.sha }}
           path: user-fixture
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: '1.26.8'
+          cache: false
+      - uses: actions/setup-node@2028fbc5c25fe9cf00d9f06a71cc4710d4507903 # v6.0.0
+        with:
+          node-version: '22'
+      - uses: actions/setup-python@e797f83bcb11b83ae66e0230d6156d7c80228e7c # v6.0.0
+        with:
+          python-version: '3.12'
+      - name: prepare pinned installed SDK clients
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          gh api "repos/$GH_REPO/actions/runs/$GITHUB_RUN_ID/jobs?filter=all&per_page=100" > sdk-jobs.json
+          gh api "repos/$GH_REPO/actions/runs/$GITHUB_RUN_ID/artifacts?per_page=100" > sdk-artifacts.json
+          python3 user-fixture/sdk_smokes/artifact_attempts.py --jobs sdk-jobs.json --artifacts sdk-artifacts.json \
+            --source "$GITHUB_SHA" --run-id "$GITHUB_RUN_ID" --attempt "$GITHUB_RUN_ATTEMPT" \
+            --github-env "$GITHUB_ENV" --shell-env sdk-artifact-names.env
+          source sdk-artifact-names.env
+          gh run download "$GITHUB_RUN_ID" -n "$SDK_NPM_ARTIFACT" -D sdk-inputs/npm
+          gh run download "$GITHUB_RUN_ID" -n "$SDK_PYPI_ARTIFACT" -D sdk-inputs/pypi
+          gh run download "$GITHUB_RUN_ID" -n "$SDK_PROVENANCE_ARTIFACT" -D sdk-inputs/provenance
+          (cd sdk-inputs/npm && sha256sum -c "SHA256SUMS.npm.win32-x64")
+          (cd sdk-inputs/pypi && sha256sum -c "SHA256SUMS.pypi.win32-x64")
+          python3 user-fixture/sdk_smokes/prepare.py --out sdk-smokes-ready \
+            --npm sdk-inputs/npm --pypi sdk-inputs/pypi \
+            --provenance sdk-inputs/provenance/module-provenance.json
       - name: fetch reviewed predecessor package
         env:
           GH_TOKEN: ${{ github.token }}
@@ -330,6 +358,8 @@ jobs:
           actual = hashlib.sha256(package.read_bytes()).hexdigest()
           if entries != [actual]:
               raise SystemExit('Published predecessor checksum is absent, duplicated or mismatched')
+          if actual != os.environ['PREDECESSOR_SHA256_EXPECTED']:
+              raise SystemExit('Published predecessor differs from the reviewed 0.2.0 MSI')
           release = os.environ['PREDECESSOR_RELEASE']
           if release != 'v'+os.environ['PREDECESSOR_VERSION']:
               raise SystemExit('The predecessor release and the version the fixture asserts name different versions')
@@ -376,7 +406,7 @@ jobs:
         shell: pwsh
         timeout-minutes: 8
         run: |
-          & powershell.exe -NoProfile -ExecutionPolicy Bypass -File user-fixture/test_user_runtime.ps1 -Mode Verify -MsiPath (Resolve-Path pkg/abstraction-x64.msi).Path -CheckTools -PythonPath (Get-Command python.exe -ErrorAction Stop).Source -ResultDirectory user-runtime-diagnostics
+          & powershell.exe -NoProfile -ExecutionPolicy Bypass -File user-fixture/test_user_runtime.ps1 -Mode Verify -MsiPath (Resolve-Path pkg/abstraction-x64.msi).Path -CheckTools -PythonPath (Get-Command python.exe -ErrorAction Stop).Source -NodePath (Get-Command node.exe -ErrorAction Stop).Source -SdkSmokes (Resolve-Path sdk-smokes-ready).Path -ResultDirectory user-runtime-diagnostics
           if ($LASTEXITCODE -ne 0) { throw "Per-user release verification exited $LASTEXITCODE" }
       - name: private non-admin predecessor upgrade and reinstall
         shell: pwsh
@@ -407,8 +437,7 @@ jobs:
         run: |
           & powershell.exe -NoProfile -ExecutionPolicy Bypass -File user-fixture/test_user_runtime.ps1 -Mode Verify -MsiPath (Resolve-Path pkg/abstraction-x64.msi).Path -PredecessorMsiPath (Resolve-Path predecessor/abstraction-x64.msi).Path -PredecessorSHA256 $env:PREDECESSOR_SHA256 -PredecessorVersion $env:PREDECESSOR_VERSION -ExpectedVersion $env:CANDIDATE_VERSION -PredecessorElsewhere -ResultDirectory user-elsewhere-diagnostics
           if ($LASTEXITCODE -ne 0) { throw "Non-default-folder upgrade verification exited $LASTEXITCODE" }
-      # The rollback activation must leave the predecessor's supervisor running
-      # again before msiexec returns: the 0.1.7 known issue this release fixes.
+      # Rollback must reactivate the predecessor's supervisor before msiexec returns.
 
       - name: private non-admin forced failed upgrade rolls back to the running predecessor
         shell: pwsh
@@ -730,6 +759,8 @@ jobs:
           $msi = (Resolve-Path pkg\abstraction-x64.msi).Path
           $p = Start-Process msiexec -Wait -PassThru -ArgumentList @('/x', $msi, '/qn', '/norestart', '/l*v', 'machine-uninstall.log')
           if ($p.ExitCode -ne 0) { Get-Content machine-uninstall.log -Tail 60; throw "msiexec /x exited $($p.ExitCode)" }
+          & powershell.exe -NoProfile -ExecutionPolicy Bypass -File user-fixture/test_user_runtime.ps1 -Mode CheckLogs -RemovalLogs machine-uninstall.log
+          if ($LASTEXITCODE -ne 0) { throw "Machine removal log check exited $LASTEXITCODE" }
           & sc.exe qc OpenAbstractionsSupervisor | Out-Null
           if ($LASTEXITCODE -eq 0) { throw 'the service template survived uninstall' }
           if ($LASTEXITCODE -ne 1060) { throw "sc qc could not establish service absence: exit $LASTEXITCODE" }
@@ -984,8 +1015,8 @@ jobs:
           [ "$left" = 0 ] || exit 1
           printf 'ok    uninstall reversed it: no program, no unit, no share directory\n'
 
-  # The package is built the same way whether or not this repository holds
-  # signing material; only what happens to it afterwards differs. Gatekeeper
+  # Both paths assemble the same payload. The signed path seals Panel.app
+  # after assembly and then signs and notarises the installer. Gatekeeper
   # refuses an unsigned, unnotarised .pkg, so attaching one is a download that
   # cannot be opened, and a platform quietly missing from a release page is the
   # defect this whole file exists to prevent. So an unsigned run keeps the
@@ -1292,11 +1323,44 @@ jobs:
             lipo -info "universal/${path%.exe}"
           done < <(rows tools.tsv)
 
+      # The Panel's own two programs (research/panel-native/MACOS-2026-09-22.md):
+      # panel, unchanged Go already built the tools.tsv way elsewhere in this
+      # job, and PanelLauncher.swift, which tools.tsv cannot carry — there is
+      # no published-module route for Swift source, only for a Go version tag.
+      # Both come from this job's own checkout instead, at the exact commit
+      # candidate validated, universal the same way as the loop above.
+      - name: build the Panel's app-bundle programs
+        env:
+          CGO_ENABLED: '0'
+          GOFLAGS: -trimpath
+        run: |
+          root=$PWD
+          for arch in amd64 arm64; do
+            mkdir -p "$root/thin/$arch"
+            ( cd monitor && GOOS=darwin GOARCH="$arch" go build -ldflags '-s -w -buildid=' \
+              -o "$root/thin/$arch/panel" . )
+          done
+          lipo -create -output universal/panel "$root/thin/amd64/panel" "$root/thin/arm64/panel"
+          lipo -info universal/panel
+
+          for arch in amd64 arm64; do
+            case $arch in amd64) swiftarch=x86_64 ;; arm64) swiftarch=arm64 ;; esac
+            mkdir -p "$root/thin/$arch"
+            swiftc -O -target "$swiftarch-apple-macos12.0" \
+              monitor/macos/PanelLauncher.swift -o "$root/thin/$arch/Abstraction Panel"
+          done
+          lipo -create -output "universal/Abstraction Panel" \
+            "$root/thin/amd64/Abstraction Panel" "$root/thin/arm64/Abstraction Panel"
+          lipo -info "universal/Abstraction Panel"
+
       # Before the package, because build.py copies these bytes into the payload
-      # and a signature travels in the Mach-O file. The identity is looked up in
+      # and a signature travels in the Mach-O file. Panel.app's nested programs
+      # are signed after assembly by build.py, followed by the outer bundle.
+      # The identity is looked up in
       # the keychain rather than written here: this file is public and the
       # certificate's common name is a person and a team identifier.
       - name: sign the programs
+        id: app_sign
         if: steps.material.outputs.state == 'signed'
         run: |
           app=$(security find-identity -v -p codesigning "$SIGNING_KEYCHAIN" |
@@ -1306,7 +1370,9 @@ jobs:
             printf 'FAIL  %s Developer ID Application identities in the keychain, wanted 1\n' "$#"
             exit 1
           fi
+          printf 'identity=%s\n' "$1" >> "$GITHUB_OUTPUT"
           for f in universal/*; do
+            case "$(basename "$f")" in panel|"Abstraction Panel") continue ;; esac
             codesign --force --timestamp --options runtime \
               --keychain "$SIGNING_KEYCHAIN" --sign "$1" "$f"
             codesign --verify --strict --verbose=2 "$f"
@@ -1321,11 +1387,19 @@ jobs:
       - name: package
         env:
           CANDIDATE_VERSION: ${{ needs.candidate.outputs.version }}
+          SIGNING_STATE: ${{ steps.material.outputs.state }}
+          APP_SIGNING_IDENTITY: ${{ steps.app_sign.outputs.identity }}
         run: |
           version=$CANDIDATE_VERSION
           mkdir -p dist
+          sign=()
+          if [ "$SIGNING_STATE" = signed ]; then
+            [ -n "$APP_SIGNING_IDENTITY" ] && [ -n "$SIGNING_KEYCHAIN" ] ||
+              { printf 'FAIL  requested Panel.app signing has no identity or keychain\n'; exit 1; }
+            sign=(--sign-app-identity "$APP_SIGNING_IDENTITY" --signing-keychain "$SIGNING_KEYCHAIN")
+          fi
           python3 posix/build.py --platform macos --version "$version" \
-            --out dist --bin universal --license LICENSE
+            --out dist --bin universal --license LICENSE "${sign[@]}"
           (cd dist && shasum -a 256 ./*.pkg | sed 's#\./##' | tee SHA256SUMS.macos)
 
       # A .pkg takes the Installer certificate, which is a different certificate
@@ -1379,15 +1453,23 @@ jobs:
             { printf 'FAIL  Gatekeeper does not see a stapled notarisation ticket\n'; exit 1; }
           (cd dist && shasum -a 256 ./*.pkg | sed 's#\./##' | tee SHA256SUMS.macos)
 
-      # The programs were signed before the package was built, so this asks the
-      # shipped bytes rather than the bytes we signed: a packager that rewrote
-      # them would strip the signature and nothing else here would notice.
-      - name: the programs inside the package are the signed ones
+      # Verify the shipped bundle and its nested programs after pkg expansion.
+      - name: the app bundle and programs inside the package are signed
         if: steps.material.outputs.state == 'signed'
         run: |
           pkg=$(ls dist/*.pkg)
           pkgutil --expand-full "$pkg" "$RUNNER_TEMP/expanded"
-          for name in openabstractions; do
+          app=$(find "$RUNNER_TEMP/expanded" -type d -name 'Abstraction Panel.app' -print -quit)
+          [ -n "$app" ] || { printf 'FAIL  Panel.app is not in the package\n'; exit 1; }
+          codesign --verify --deep --strict --verbose=2 "$app"
+          codesign -dv --verbose=4 "$app" > "$RUNNER_TEMP/app-signature" 2>&1
+          grep -q '^Authority=Developer ID Application:' "$RUNNER_TEMP/app-signature" ||
+            { printf 'FAIL  packaged Panel.app has no Developer ID Application signature\n'; exit 1; }
+          grep -q '^Timestamp=' "$RUNNER_TEMP/app-signature" ||
+            { printf 'FAIL  packaged Panel.app has no secure timestamp\n'; exit 1; }
+          grep -q '^CodeDirectory .*flags=0x[0-9a-f]*([^)]*runtime' "$RUNNER_TEMP/app-signature" ||
+            { printf 'FAIL  packaged Panel.app has no hardened runtime\n'; exit 1; }
+          for name in openabstractions panel "Abstraction Panel"; do
             f=$(find "$RUNNER_TEMP/expanded" -type f -name "$name" | head -1)
             [ -n "$f" ] || { printf 'FAIL  %s is not in the package\n' "$name"; exit 1; }
             codesign --verify --strict --verbose=2 "$f"
@@ -1454,6 +1536,297 @@ jobs:
           if [ -s "$before" ]; then security list-keychains -d user -s $(cat "$before"); fi
           security delete-keychain "$kc"
           printf 'ok    the keychain this run made is gone\n'
+
+  # The JavaScript client's native code ships inside its npm package, never from
+  # the runtime installation (VISION.md, 2026-09-22): the library decides which
+  # runtime an application trusts, and that decision cannot come from the party
+  # being judged. The three platforms that build an installer here also build
+  # @openabstractions/ipc-<os>-<cpu>, at this candidate's version, from the
+  # published commits npm.tsv names. A platform without hardware qualification —
+  # ARM64 Windows and Linux — gets no package rather than an untested one.
+  #
+  # Nothing here publishes. `npm publish` needs the owner's npm organization and
+  # consent; the tarballs are retained as artifacts beside the installers for
+  # that decision.
+  javascript:
+    name: javascript (${{ matrix.id }})
+    needs: candidate
+    env:
+      CANDIDATE_VERSION: ${{ needs.candidate.outputs.version }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - id: win32-x64
+            runner: windows-latest
+            platforms: win32-x64
+          - id: linux-x64
+            runner: ubuntu-latest
+            platforms: linux-x64
+          # One universal build serves both macOS platform packages, as one
+          # universal .pkg serves both architectures above.
+          - id: darwin
+            runner: macos-latest
+            platforms: darwin-arm64 darwin-x64
+            architectures: x86_64;arm64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+        with:
+          ref: ${{ needs.candidate.outputs.sha }}
+
+      - uses: actions/setup-node@2028fbc5c25fe9cf00d9f06a71cc4710d4507903 # v6.0.0
+        with:
+          node-version: '22'
+
+      - name: state
+        run: |
+          printf 'a hosted runner, %s logical CPUs, %s %s, on mains\n' \
+            "$(getconf _NPROCESSORS_ONLN)" "$RUNNER_OS" "$RUNNER_ARCH"
+          node --version
+          npm --version
+          cmake --version | head -1
+
+      # A commit is the identity of a JavaScript directory here: these
+      # directories carry no tag of their own, and a release built from a moving
+      # ref is a release nobody can rebuild. Each checkout is checked against
+      # the row that asked for it.
+      - name: check out the published JavaScript sources
+        run: |
+          rows() { grep -v '^>' "$1" | sed '/^[[:space:]]*$/d' | tail -n +2 | tr -s '\t'; }
+          while IFS=$'\t' read -r package repository commit directory; do
+            if ! [[ "$commit" =~ ^[0-9a-f]{40}$ ]]; then
+              printf 'FAIL  %s names %s, which is not a full lowercase commit\n' "$package" "$commit"
+              exit 1
+            fi
+            name=${repository#*/}
+            [ -d "sources/$name" ] || git clone --quiet "https://github.com/$repository.git" "sources/$name"
+            git -C "sources/$name" checkout --quiet "$commit"
+            head=$(git -C "sources/$name" rev-parse HEAD)
+            if [ "$head" != "$commit" ]; then
+              printf 'FAIL  %s checked out %s, not %s\n' "$repository" "$head" "$commit"
+              exit 1
+            fi
+            if [ ! -f "sources/$name/$directory/package.json" ]; then
+              printf 'FAIL  %s has no package.json in %s\n' "$repository" "$directory"
+              exit 1
+            fi
+            printf 'ok    %s from %s %s\n' "$package" "$repository" "$commit"
+          done < <(rows npm.tsv)
+
+      # Official Node-API headers, and on Windows the matching architecture's
+      # official node.lib: the addon links against the running Node, and a
+      # header set from anywhere else describes a different one.
+      - name: Node-API headers
+        run: |
+          npm install --no-save node-api-headers
+          include=$PWD/node_modules/node-api-headers/include
+          if [ ! -f "$include/node_api.h" ]; then
+            printf 'FAIL  no node_api.h under %s\n' "$include"
+            exit 1
+          fi
+          printf 'NODE_INCLUDE_DIR=%s\n' "$include" >> "$GITHUB_ENV"
+          if [ "$RUNNER_OS" = Windows ]; then
+            curl -fsSL -o "$PWD/node.lib" \
+              "https://nodejs.org/dist/v$(node -p process.versions.node)/win-x64/node.lib"
+            printf 'NODE_IMPORT_LIBRARY=%s\n' "$PWD/node.lib" >> "$GITHUB_ENV"
+          fi
+
+      # Two builds of one source: the shared library Bun opens through bun:ffi,
+      # and the static archive the Node addon links into itself. The addon's
+      # CMakeLists refuses a shared package for exactly that reason.
+      - name: build the shared C ABI library and the Node addon
+        env:
+          ARCHITECTURES: ${{ matrix.architectures }}
+        run: |
+          identity=sources/abstraction-identity
+          arch=()
+          [ -z "$ARCHITECTURES" ] || arch=(-DCMAKE_OSX_ARCHITECTURES="$ARCHITECTURES")
+          node_lib=()
+          [ -z "${NODE_IMPORT_LIBRARY:-}" ] || node_lib=(-DNODE_IMPORT_LIBRARY="$NODE_IMPORT_LIBRARY")
+          cmake -S "$identity/cpp" -B build/shared -DCMAKE_BUILD_TYPE=Release \
+            -DBUILD_SHARED_LIBS=ON -DABSTRACTION_IPC_BUILD_TESTS=OFF "${arch[@]}"
+          cmake --build build/shared --config Release
+          cmake -S "$identity/cpp" -B build/static -DCMAKE_BUILD_TYPE=Release \
+            -DBUILD_SHARED_LIBS=OFF -DABSTRACTION_IPC_BUILD_TESTS=OFF \
+            -DCMAKE_INSTALL_PREFIX="$PWD/build/prefix" "${arch[@]}"
+          cmake --build build/static --config Release
+          cmake --install build/static --config Release
+          cmake -S "$identity/javascript" -B build/addon -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_PREFIX_PATH="$PWD/build/prefix" -DNODE_INCLUDE_DIR="$NODE_INCLUDE_DIR" \
+            "${node_lib[@]}" "${arch[@]}"
+          cmake --build build/addon --config Release
+          case "$RUNNER_OS" in
+            Windows) library=abstraction_ipc.dll ;;
+            Linux) library=libabstraction_ipc.so ;;
+            macOS) library=libabstraction_ipc.dylib ;;
+          esac
+          mkdir -p native
+          cp "$(find build/shared -name "$library" -type f | head -1)" "native/$library"
+          cp "$(find build/addon -name oa_ipc_node.node -type f | head -1)" native/oa_ipc_node.node
+          printf 'IPC_LIBRARY=%s\n' "$PWD/native/$library" >> "$GITHUB_ENV"
+          printf 'IPC_ADDON=%s\n' "$PWD/native/oa_ipc_node.node" >> "$GITHUB_ENV"
+          ls -l native
+
+      # One script for this job and for a workstation, because two assemblers
+      # cannot be kept agreeing about what a package contains. It refuses a
+      # tarball that misses a file its own package.json names.
+      - name: assemble the platform packages and pack every tarball
+        env:
+          PLATFORMS: ${{ matrix.platforms }}
+          ARTIFACT: ${{ matrix.id }}
+        run: |
+          for platform in $PLATFORMS; do
+            python3 scripts/npm_packages.py --version "$CANDIDATE_VERSION" --platform "$platform" \
+              --library "$IPC_LIBRARY" --addon "$IPC_ADDON" --output npm \
+              --ipc sources/abstraction-identity/javascript \
+              --facade sources/abstraction-facade/javascript \
+              --inference sources/abstraction-inference/javascript \
+              --opencode sources/abstractions/adopters/opencode \
+              --license LICENSE
+          done
+          n=$(ls npm/*.tgz | wc -l)
+          if [ "$n" -lt 5 ]; then
+            printf 'FAIL  packed %s tarballs, expected at least 5\n' "$n"
+            exit 1
+          fi
+          digests() { if command -v sha256sum >/dev/null 2>&1; then sha256sum "$@"; else shasum -a 256 "$@"; fi; }
+          (cd npm && digests ./*.tgz | sed 's#\./##' | tee "SHA256SUMS.npm.$ARTIFACT")
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: abstraction-npm-${{ matrix.id }}-${{ github.run_attempt }}
+          path: npm/
+          if-no-files-found: error
+
+  # The Python client's native library ships inside its wheel, never from the
+  # runtime installation, for the reason the javascript job above states: the
+  # library decides which runtime an application trusts, and that decision
+  # cannot come from the party being judged. The platforms the javascript job
+  # already qualifies build one abstraction-ipc wheel per platform tag here,
+  # at this candidate's version, from the shared C ABI library alone — the
+  # Node addon javascript builds is not needed. A platform without hardware
+  # qualification gets no wheel rather than an untested one.
+  #
+  # Nothing here publishes. Uploading to PyPI needs the owner's organization
+  # and consent; the wheels are retained as artifacts beside the installers
+  # and the npm tarballs for that decision.
+  python:
+    name: python (${{ matrix.id }})
+    needs: candidate
+    env:
+      CANDIDATE_VERSION: ${{ needs.candidate.outputs.version }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - id: win32-x64
+            runner: windows-latest
+            platform: win_amd64
+          - id: linux-x64
+            runner: ubuntu-latest
+            platform: manylinux_2_28_x86_64
+          - id: darwin-arm64
+            runner: macos-latest
+            platform: macosx_11_0_arm64
+            architectures: arm64
+          - id: darwin-x64
+            runner: macos-latest
+            platform: macosx_11_0_x86_64
+            architectures: x86_64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+        with:
+          ref: ${{ needs.candidate.outputs.sha }}
+
+      - uses: actions/setup-python@e797f83bcb11b83ae66e0230d6156d7c80228e7c # v6.0.0
+        with:
+          python-version: '3.12'
+
+      - name: state
+        run: |
+          printf 'a hosted runner, %s logical CPUs, %s %s, on mains\n' \
+            "$(getconf _NPROCESSORS_ONLN)" "$RUNNER_OS" "$RUNNER_ARCH"
+          python3 --version
+          cmake --version | head -1
+
+      # A commit is the identity of this checkout, the same as the javascript
+      # job: abstraction-identity carries no tag of its own, and a release
+      # built from a moving ref is a release nobody can rebuild.
+      - name: check out the published source
+        run: |
+          rows() { grep -v '^>' "$1" | sed '/^[[:space:]]*$/d' | tail -n +2 | tr -s '\t'; }
+          while IFS=$'\t' read -r package repository commit directory; do
+            if ! [[ "$commit" =~ ^[0-9a-f]{40}$ ]]; then
+              printf 'FAIL  %s names %s, which is not a full lowercase commit\n' "$package" "$commit"
+              exit 1
+            fi
+            name=${repository#*/}
+            [ -d "sources/$name" ] || git clone --quiet "https://github.com/$repository.git" "sources/$name"
+            git -C "sources/$name" checkout --quiet "$commit"
+            head=$(git -C "sources/$name" rev-parse HEAD)
+            if [ "$head" != "$commit" ]; then
+              printf 'FAIL  %s checked out %s, not %s\n' "$repository" "$head" "$commit"
+              exit 1
+            fi
+            if [ ! -f "sources/$name/$directory/pyproject.toml" ]; then
+              printf 'FAIL  %s has no pyproject.toml in %s\n' "$repository" "$directory"
+              exit 1
+            fi
+            printf 'ok    %s from %s %s\n' "$package" "$repository" "$commit"
+          done < <(rows pypi.tsv)
+
+      # Only the shared library, unlike the javascript job: the wheel loads it
+      # through ctypes, and no Node addon or Node-API headers enter here.
+      - name: build the shared C ABI library
+        env:
+          ARCHITECTURES: ${{ matrix.architectures }}
+        run: |
+          identity=sources/abstraction-identity
+          arch=()
+          [ -z "$ARCHITECTURES" ] || arch=(-DCMAKE_OSX_ARCHITECTURES="$ARCHITECTURES")
+          cmake -S "$identity/cpp" -B build/shared -DCMAKE_BUILD_TYPE=Release \
+            -DBUILD_SHARED_LIBS=ON -DABSTRACTION_IPC_BUILD_TESTS=OFF "${arch[@]}"
+          cmake --build build/shared --config Release
+          case "$RUNNER_OS" in
+            Windows) library=abstraction_ipc.dll ;;
+            Linux) library=libabstraction_ipc.so ;;
+            macOS) library=libabstraction_ipc.dylib ;;
+          esac
+          mkdir -p native
+          cp "$(find build/shared -name "$library" -type f | head -1)" "native/$library"
+          printf 'IPC_LIBRARY=%s\n' "$PWD/native/$library" >> "$GITHUB_ENV"
+          ls -l native
+
+      # scripts/py_wheels.py is the assembler for this job and for a
+      # workstation, the way scripts/npm_packages.py is for the javascript
+      # job above: one script for both routes, so nothing keeps two ideas of
+      # what a wheel contains agreeing. --check re-reads the wheel it just
+      # built rather than trusting the process that wrote it.
+      - name: assemble and check the wheel
+        env:
+          PLATFORM: ${{ matrix.platform }}
+          ARTIFACT: ${{ matrix.id }}
+        run: |
+          python3 scripts/py_wheels.py --version "$CANDIDATE_VERSION" --platform "$PLATFORM" \
+            --library "$IPC_LIBRARY" --output pypi \
+            --package sources/abstraction-identity/py \
+            --license LICENSE
+          n=$(ls pypi/*.whl | wc -l)
+          if [ "$n" -ne 1 ]; then
+            printf 'FAIL  built %s wheels, expected 1\n' "$n"
+            exit 1
+          fi
+          python3 scripts/py_wheels.py --check pypi/*.whl
+          digests() { if command -v sha256sum >/dev/null 2>&1; then sha256sum "$@"; else shasum -a 256 "$@"; fi; }
+          (cd pypi && digests ./*.whl | sed 's#\./##' | tee "SHA256SUMS.pypi.$ARTIFACT")
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: abstraction-pypi-${{ matrix.id }}-${{ github.run_attempt }}
+          path: pypi/
+          if-no-files-found: error
 
   draft:
     needs: [candidate, windows, verify, linux, linux-verify, macos]

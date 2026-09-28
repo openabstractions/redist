@@ -14,6 +14,15 @@
 > A source whose tag is "-" has no release. It is shipped from a commit on a
 > branch, and the release notes say so in those words. Nothing here can invent a
 > tag.
+>
+> A source whose commit is "-" as well has never been published at all:
+> scripts/split.manifest carries no rule for the repository and published.tsv no
+> row. The build does not check what it was handed against a commit it does not
+> have, and prints the source as unpinned every run. Only an optional feature's
+> program may come from such a source, and a build that is handed no checkout
+> for it leaves that feature out and says so.
 
 id		repo					tag		commit
 charter	openabstractions/abstractions	serve/v0.1.0	3ef816c8bbd62a9e1da21c8e51ce69f99b70af41
+localstores	openabstractions/abstraction-storage-over-local-stores	-	-
+modelhost	openabstractions/abstraction-provider-modelhost	-	-

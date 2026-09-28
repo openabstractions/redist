@@ -1,118 +1,74 @@
-The Open Abstractions redistributable packages programs built from published
-module versions. The build appends this release's asset and signing state at
-the end of these notes; those facts apply to this release only.
+Open Abstractions 0.3.0 packages the shared runtime and tools built from
+published module versions. The appended build record lists the attached assets,
+signing state, package verification and tested architectures.
 
-## Changes in this release
+## Release 0.3.0
 
-- **Inference covers chat, embeddings, transcription, speech, image generation
-  and live voice.** The runtime selects an eligible configured host, applies
-  rights and named credentials, and records attributed outcomes. Durable video
-  generation and image batches use the job service for observation,
-  reconciliation, cancellation and retained results.
-- **Named credentials stay with the runtime service.** Operators can add,
-  inspect, rotate and revoke credentials through the command line or Panel.
-  The service applies an authorized credential inside the consuming service
-  without returning its stored bytes to the application.
-- **Applications can publish their presence and supported interfaces.** The
-  permission-filtered directory lists registered applications and live
-  instances. A separately authorized activation request can start a registered
-  application and wait for its fresh announcement.
-  On Linux, announcement and activation require a usable kernel audit-session
-  ID matching the runtime. Our WSL test environment had an unset session ID
-  and correctly refused these protected calls.
-- **Typed client source surfaces cover Go, C++17, Python, Rust and JavaScript.**
-  Go, C++ and Python facade clients use their default native IPC paths. Rust
-  and JavaScript use their separate native connector packages. Each source SDK
-  is available at the corresponding repository revision used for this release;
-  its package version, registry availability and release status remain
-  independent of the redistributable.
-- **`jobd`, `dl` and `jobctl` are removed, with the job-store provider inside
-  `jobd` and its `supervisor.json` heartbeat.** `openabstractions download`
-  submits a download to the installed runtime and copies the result out;
-  `openabstractions jobs list|show|wait|cancel|result` observes and controls
-  the work `openabstractions` submitted. Downloads still in flight through the
-  old job store at upgrade are abandoned: their records and partial files stay
-  where they are, and nothing finishes them. The Linux `abstraction-jobd`
-  sweep timer is stopped and disabled by the upgrade. On macOS the LaunchAgent
-  label is now `com.openabstractions.runtime`; the upgrade boots out
-  `com.openabstractions.jobd` and removes its plist. The Python file-store
-  packages are no longer carried in the developer files. What existed is
-  recorded in the project's `docs/REMOVED.md`.
-- **`openabstractions` runs the Windows runtime.** `openabstractions serve host`
-  starts the runtime, restarts it after a failure, and is started at sign-in by
-  the Startup shortcut (*Just me*) or the per-user service (*Everyone*).
-  `openabstractionsw` is the same program without a console window and replaces
-  `jobdw`. The installer stops no process itself: Windows ends the running host
-  before replacing files, and the host registers to be started again.
-- **A failed Windows upgrade leaves the previous version running.** Rolling back
-  starts the previous version's runtime again from its own folder, so it no
-  longer waits for the next sign-in.
-- **Windows upgrades keep one owner.** While an upgrade replaces an
-  installation, its runtime cannot start again from the Startup shortcut, the
-  service manager, `openabstractions start` or an application. The
-  installation activates normally once the upgrade finishes.
-- **A failed Windows upgrade leaves the previous version installed.** The
-  previous version is removed only after the new one is fully installed, so an
-  upgrade that fails keeps the earlier installation registered in Apps and
-  features with its programs and your data.
-- **Per-user upgrades find an installation in another folder.** An upgrade
-  covers the previous version where it was installed, including a folder chosen
-  at install time.
-- **An elevated per-user install is refused before anything is copied.** See
-  [Installing from an elevated session](#installing-from-an-elevated-session).
-- **The panel shows what the installed runtime owns.** `Abstraction Panel`
-  reads runtime readiness, accepted work, questions, rights and user
-  configuration through the runtime's services. Its `--legacy-local` mode and
-  the delegation, downloads and may-reach screens that read the job store
-  directly are removed. With no runtime it reports the absence.
-- **Rights rules can expire and record their origin.** The runtime's rights
-  service accepts registered action names, rule expiry and rule provenance.
-- **`services.json` is no longer read or reserved.** A store written by an
-  earlier release may still hold one; a download may now use that name.
-- **Every program is built with Go 1.26.8.**
-- **Downgrading after a retry or lost result is refused.** See
-  [Downgrading to an earlier release](#downgrading-to-an-earlier-release).
+- **Provider admission is tied to declared identity.** The facade registry now
+  records declaration roles and service contract identities. Admission rules
+  and credential policy are reconciled before provider work; credential
+  redirects are refused rather than forwarding stored secrets to another host.
+- **Resource access and rights carry clearer scope.** The release adds the
+  versioned resource table and lease contracts, physical-path subjects, and
+  expiry/provenance for rights rules. Resource-consuming child processes keep
+  the owning identity and rights boundary.
+- **Inference requests expose more precise guarantees.** The inference API adds
+  provider admission, named refusal words and native embeddings. Realtime
+  upgrades check rights before changing transport. Unsupported guarantees are
+  refused before provider work begins.
+- **Routing exposes more model and context information.** Model identity has a
+  dedicated module. Router families describe their components, source and
+  context length, and accepted-work records expose the resource they hold.
+- **Local model integrations are available as optional build targets.**
+  `inventoryd` reports local model stores; `modelhostd` serves a model file
+  already on the machine. Storage owns the lending schema used by model
+  providers. `openabstractions-mcp` is also an optional stdio gateway.
+- **The Panel has a macOS application build.** It presents runtime-owned status
+  and service controls. Candidate build targets include the Windows executable
+  and macOS `Abstraction Panel.app`; Linux has no graphical Panel package.
 
-This release packages the runtime and tools. It bundles no Python wheels, Rust
-crates or npm packages, and does not promise that those packages are published
-to a registry. Language SDK source is available from the corresponding
-repository revisions and keeps its own package versions and release status. The
-architecture roadmap continues beyond this release. The known macOS
-caller-identity limitation still applies to verified service readiness.
+The hosted build workflow pins Go 1.26.8 with `GOTOOLCHAIN=local` and records
+`go version` for each platform job. The final package record will identify the
+toolchain actually used for attached binaries.
+
+The focused source-level macOS XPC proof passed resolver, configuration and
+Rights calls. It is source evidence, not installed-package or signing evidence.
+The Linux source-stage WSL environment lacked a matching audit-session ID, so
+application announcement and activation correctly refused there.
+
+The redistributable packages native programs only. Python wheels, Rust crates
+and npm packages have separate source versions and publication status.
 
 ## Updating application code
 
-The regenerated SDK source introduces named choices for closed options. In Go, use
-constants such as `facade.ScopeLocal`; use an enum's `String()` method when a
-wire word is needed. A Go `string(value)` conversion produces a Unicode character from a numeric
-enum value. Existing JSON wire words stay unchanged.
+Use named constants for closed options and an enum's `String()` method when a
+Go wire word is needed. A Go `string(value)` conversion produces a Unicode
+character from the numeric enum value. Existing JSON wire words stay
+unchanged. Extensible catalogues retain unknown words. Inference guarantees
+have named constants; unsupported guarantees receive a typed refusal before
+provider work begins. Match client package versions to the release's module
+pins.
 
-Extensible catalogues retain unknown words. Inference request guarantees have
-named constants and a dedicated type; an unsupported guarantee receives the
-service's typed refusal before provider work begins. Match the client package
-versions to the release's published module pins.
+## Candidate build targets
 
-## What is in it
+[`tools.tsv`](tools.tsv) names the module versions and packages consumed by the
+build workflow. These are workflow build targets, not a promise that every optional
+program appears in a final asset; installer feature selection can omit optional
+components.
 
-| program | what it does | platforms |
+| Program | Role | Build targets |
 |---|---|---|
-| `Abstraction Panel` | runtime readiness, accepted work, questions, rights and user configuration | Windows |
-| `openabstractions` | hosts the installed runtime, submits and observes downloads through it (`download`, `jobs`), and reports readiness (`status`) | Windows, Linux, macOS |
-| `openabstractionsw` | the same program built without a console window, which Windows starts at sign-in | Windows |
+| `openabstractions` | Runtime host and CLI | Windows, Linux, macOS |
+| `openabstractionsw` | Windowless Windows runtime host | Windows |
+| `Abstraction Panel` | Runtime status and control UI | Windows, macOS |
+| `inventoryd` | Local model-store inventory provider | Windows, Linux, macOS |
+| `modelhostd` | Local model-file provider | Windows, Linux, macOS |
+| `openabstractions-mcp` | stdio MCP gateway | Windows, Linux, macOS |
 
-There are three Windows executables and one Linux/macOS program. `openabstractions`
-and `openabstractionsw` are two builds of the same source. [`tools.tsv`](tools.tsv) at this release's
-commit names the exact module versions and packages the workflow builds.
-Resolving a module through the Go proxy proves it is fetchable; the proxy may
-retain versions after a tag is deleted.
-
-Every program on every platform is built with Go 1.26.8, with
-`GOTOOLCHAIN=local` so no other toolchain is fetched. Each build job keeps
-its `go version` output as a `go-version-<platform>` workflow artifact.
-
-`openabstractions jobs list` shows the work `openabstractions` submitted in
-your account. Work an application submitted through its own connection belongs
-to that application and is observed there.
+The POSIX installer includes local-store inventory by default. Model host and
+MCP gateway are optional selections. Windows selections follow MSI feature
+configuration. The appended release record names the exact packages and
+features delivered in each asset.
 
 ## Installing
 
@@ -160,6 +116,7 @@ states the signing outcome; consult the linked release build for its install
 and uninstall checks. Building an architecture does not prove installation on
 that architecture. Do not infer a Windows install result from Linux verification,
 or an installed macOS service from a signed package.
+
 
 ## Installing from an elevated session
 

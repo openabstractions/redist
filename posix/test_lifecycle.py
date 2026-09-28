@@ -1,6 +1,7 @@
 """Run with python3 installer/posix/test_lifecycle.py; isolated shell/manager fixtures."""
 import os
 from pathlib import Path
+import re
 import shutil
 import subprocess
 import tempfile
@@ -17,7 +18,15 @@ class Lifecycle(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.root = Path(self.tmp.name).resolve()
-        self.home = self.root / "user & <home>|back\\slash"
+        # Exercises naive shell quoting with characters a script must not
+        # trust unescaped. `<`, `|` and `\` are illegal in a Windows path
+        # component, so that platform keeps the rest of the alphabet: `&`,
+        # space, `$`, `;`, `'` and parens are all legal there and just as
+        # unsafe to interpolate unquoted.
+        if os.name == "nt":
+            self.home = self.root / "user & (home)$tail;'quote"
+        else:
+            self.home = self.root / "user & <home>|back\\slash"
         self.share = self.home / ".local/share/abstraction"
         self.share.mkdir(parents=True)
         self.bin = self.root / "commands"
@@ -52,8 +61,15 @@ list)
     if [ "${FAIL:-}" = after ] && [ -f "$LOG.stopped" ]; then exit 5; fi
     [ "${FAIL:-}" != format ] || { echo unexpected; exit 0; }
     printf 'PID\tStatus\tLabel\n'
+    linger=no
+    if [ "${DELAYED_ABSENCE:-}" = yes ] && [ -f "$LOG.stopped" ]; then
+        polls=$(cat "$LOG.after-bootout-polls" 2>/dev/null || echo 0)
+        polls=$((polls + 1))
+        echo "$polls" > "$LOG.after-bootout-polls"
+        [ "$polls" -lt 3 ] && linger=yes
+    fi
     if [ "${UNRELATED:-}" = yes ]; then printf '%s\n' '- 0 unrelated label with spaces'; fi
-    if [ "${ABSENT:-}" != yes ] && { [ ! -f "$LOG.stopped" ] || [ "${ACTIVE:-}" = active ]; }; then
+    if [ "${ABSENT:-}" != yes ] && { [ ! -f "$LOG.stopped" ] || [ "${ACTIVE:-}" = active ] || [ "$linger" = yes ]; }; then
         printf -- '- 0 %s\n' "${AGENT_LABEL:-com.openabstractions.runtime}"
     fi;;
 bootout) [ "${FAIL:-}" != stop ] || exit 5; touch "$LOG.stopped";;
@@ -279,6 +295,24 @@ exit 1''')
         self.assertTrue(self.data.exists())
         self.assertIn("graceful exit is not independently established", result.stdout)
 
+    def test_macos_panel_bootout_waits_for_delayed_absence(self):
+        result = self.uninstall("macos", AGENT_LABEL="com.openabstractions.panel", DELAYED_ABSENCE="yes")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertGreaterEqual(int((self.root / "calls.after-bootout-polls").read_text()), 3)
+        calls = (self.root / "calls").read_text().splitlines()
+        self.assertIn("bootout gui/1000/com.openabstractions.panel", calls)
+        self.assertLess(calls.index("bootout gui/1000/com.openabstractions.panel"),
+                        next(i for i, call in enumerate(calls) if call.startswith("pkgutil --forget")))
+        self.assertFalse(self.payload.exists())
+
+    def test_macos_panel_bootout_timeout_retains_payload_and_receipt(self):
+        result = self.uninstall("macos", AGENT_LABEL="com.openabstractions.panel", ACTIVE="active")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("registration state is present for com.openabstractions.panel", result.stderr)
+        self.assertTrue(self.payload.exists())
+        self.assertTrue((self.root / "calls.receipt").exists())
+        self.assertNotIn("pkgutil --forget", (self.root / "calls").read_text())
+
     def assert_notice(self, text):
         for line in ("retained user data", "~/.abstraction", "~/Library/Application Support/abstraction",
                      "~/Library/Application Support/openabstractions/runtime-v1", "~/Library/Caches/openabstractions"):
@@ -478,7 +512,7 @@ exit 1''')
         return self.home/"Library/LaunchAgents/com.openabstractions.runtime.plist"
 
     def test_macos_bootstrap_failure_is_installation_failure(self):
-        self.command("stat", "echo 1000")
+        self.command("stat", 'case "$2" in %Lp) echo 755;; *) echo 1000;; esac')
         self.command("chown", "exit 0")
         self.template()
         # A fresh install: no predecessor ledger names a retired file to remove.
@@ -489,7 +523,7 @@ exit 1''')
         self.assertTrue(self.payload.exists())
 
     def test_macos_owns_installed_ancestors_without_touching_siblings(self):
-        self.command("stat", "echo 1000")
+        self.command("stat", 'case "$2" in %Lp) echo 755;; *) echo 1000;; esac')
         self.command("chown", 'printf "chown:%s\\n" "$*" >> "$LOG"')
         self.command("chmod", 'printf "chmod:%s\\n" "$*" >> "$LOG"; exec /bin/chmod "$@"')
         # Every rename is logged with what the source held, so a placeholder
@@ -506,7 +540,16 @@ exec /bin/mv "$@"''')
         self.assertEqual(result.returncode, 0, result.stderr)
         import plistlib
         parsed = plistlib.loads(plist.read_bytes())
-        self.assertEqual(parsed["ProgramArguments"], [str(self.home/".local/bin/openabstractions"), "serve", "runtime"])
+        self.assertEqual(parsed["ProgramArguments"], [str(self.home/".local/bin/openabstractions"), "serve", "runtime", "--xpc"])
+        self.assertEqual(set(parsed["MachServices"]), {
+            "com.openabstractions." + service for service in (
+                "runtime-v1", "logging-v1", "config-v1", "job-acceptance-v1",
+                "router-v1", "model-v1", "storage-content-v1", "asks-application-v1",
+                "rights-authorization-v1", "credentials-v1", "inference-v1",
+                "inference-remote-v1", "registry-v1", "applications-v1",
+                "resource-table-v1", "lend-v1")
+        })
+        self.assertTrue(all(parsed["MachServices"].values()))
         self.assertEqual(sorted(p.name for p in plist.parent.iterdir()), [plist.name])
         self.assertEqual(sorted(p.name for p in self.share.iterdir() if p.name.startswith(".com.")), [])
         self.assertIn(str(plist), (self.share/"MANIFEST").read_text().splitlines())
@@ -519,13 +562,12 @@ exec /bin/mv "$@"''')
                         calls.index("bootstrap gui/1000 " + str(plist)))
         for directory in [self.share, self.share.parent, self.home/".local", self.payload.parent, plist.parent, self.home/"Library"]:
             self.assertIn("chown:1000:1000 " + str(directory), calls)
-            self.assertIn("chmod:u+rwx " + str(directory), calls)
         self.assertNotIn("chown:1000:1000 " + str(self.home), calls)
         self.assertFalse(any(str(other) in line or "chown:-R" in line for line in calls))
         self.assertEqual(other.read_text(), "unrelated")
 
     def test_macos_upgrade_removes_the_retired_label_and_programs_the_predecessor_listed(self):
-        self.command("stat", "echo 1000")
+        self.command("stat", 'case "$2" in %Lp) echo 755;; *) echo 1000;; esac')
         self.command("chown", "exit 0")
         self.template()
         retired_plist = self.home/"Library/LaunchAgents/com.openabstractions.jobd.plist"
@@ -549,7 +591,7 @@ exec /bin/mv "$@"''')
         self.assertIn(str(self.home/"Library/LaunchAgents/com.openabstractions.runtime.plist"), manifest)
 
     def test_macos_refuses_symlink_ancestor_before_ownership_change(self):
-        self.command("stat", "echo 1000")
+        self.command("stat", 'case "$2" in %Lp) echo 755;; *) echo 1000;; esac')
         self.command("chown", 'echo "chown $*" >> "$LOG"')
         self.template()
         outside = self.root/"outside"
@@ -563,6 +605,22 @@ exec /bin/mv "$@"''')
         self.assertFalse((self.root/"calls").exists())
         self.assertEqual((outside/"file").read_text(), "untouched")
 
+    def test_macos_refuses_writable_existing_ancestor_before_registration(self):
+        unsafe = self.home/".local"
+        self.command("stat", 'case "$2" in %Lp) [ "$3" = "$UNSAFE_DIR" ] && echo 775 || echo 755;; *) echo 1000;; esac')
+        self.command("chown", 'echo "chown $*" >> "$LOG"')
+        self.template()
+        before = (self.share/"MANIFEST").read_bytes()
+        result = subprocess.run(
+            ["sh", str(HERE/"macos/postinstall")],
+            env=dict(self.env, UNSAFE_DIR=str(unsafe)), text=True,
+            capture_output=True, timeout=SCRIPT_TIMEOUT)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("unsafe writable directory", result.stderr)
+        self.assertIn("chmod go-w", result.stderr)
+        self.assertEqual((self.share/"MANIFEST").read_bytes(), before)
+        self.assertFalse((self.root/"calls").exists())
+
     def test_native_units_own_shutdown_and_keep_job_admission_opt_in(self):
         runtime = (HERE/"linux/abstraction-runtime.service").read_text()
         self.assertIn('ExecStart="%h/.local/bin/openabstractions" serve runtime\n', runtime)
@@ -574,7 +632,15 @@ exec /bin/mv "$@"''')
         self.assertEqual(plist["Label"], "com.openabstractions.runtime")
         self.assertEqual(plist["ExitTimeOut"], 10)
         self.assertFalse(plist["AbandonProcessGroup"])
-        self.assertEqual(plist["ProgramArguments"], ["@BIN@/openabstractions", "serve", "runtime"])
+        self.assertEqual(plist["ProgramArguments"], ["@BIN@/openabstractions", "serve", "runtime", "--xpc"])
+
+        import xml.etree.ElementTree as ET
+        distribution = ET.parse(HERE/"macos/distribution.xml").getroot()
+        minimum = distribution.find("./allowed-os-versions/os-version")
+        self.assertIsNotNone(minimum)
+        self.assertEqual(minimum.attrib, {"min": "12.0"})
+        self.assertEqual(len(plist["MachServices"]), 16)
+        self.assertTrue(all(plist["MachServices"].values()))
         self.assertTrue(plist["KeepAlive"])
         self.assertNotIn("StartInterval", plist)
         # The payload carries only a template; postinstall places the plist.
@@ -584,6 +650,43 @@ exec /bin/mv "$@"''')
         rows = "\n".join(line for line in payload.splitlines() if not line.startswith(">"))
         for retired in (".local/bin/jobd", ".local/bin/dl", ".local/bin/jobctl", "abstraction-jobd", "com.openabstractions.jobd", "abstraction_job.py", "abstraction_download.py"):
             self.assertNotIn(retired, rows)
+
+    def test_macos_agent_advertises_runtime_default_endpoints(self):
+        # Every literal default endpoint in the runtime must be published by
+        # its installed --xpc LaunchAgent. Host options use the same endpoint
+        # namespace but receive their service names through this table.
+        import plistlib
+        services = set()
+        serve = HERE.parent.parent / "serve"
+        if not serve.is_dir():
+            self.skipTest("runtime source is absent from the published installer checkout")
+        for source in serve.glob("*.go"):
+            if source.name.endswith("_test.go"):
+                continue
+            services.update(re.findall(r'defaultEndpoint\("([a-z-]+-v[0-9]+)"\)', source.read_text()))
+        host_source = (serve / "runtime_xpc.go").read_text()
+        host_table = host_source.split("func installedHostEndpoints(", 1)[1].split("\n}", 1)[0]
+        services.update(re.findall(r'\{&options\.\w+,\s*"([a-z-]+-v[0-9]+)"', host_table))
+        self.assertIn("resource-table-v1", services)
+        self.assertIn("lend-v1", services)
+        plist = plistlib.loads((HERE / "macos/com.openabstractions.runtime.plist").read_bytes())
+        self.assertEqual(set(plist["MachServices"]), {"com.openabstractions." + name for name in services})
+        bootstrap = HERE.parent.parent / "openabstractions-flat/abstraction-facade/go-core/bootstrap/endpoint_installed_darwin.go"
+        roster = bootstrap.read_text().split("var installedXPCServices = map[string]struct{}{", 1)[1].split("\n}", 1)[0]
+        installed = set(re.findall(r'^\s*"([a-z-]+-v[0-9]+)":\s*\{\},', roster, re.MULTILINE))
+        self.assertEqual(installed, services)
+        flat = HERE.parent.parent / "openabstractions-flat"
+        if flat.is_dir():
+            native = flat / "abstraction-identity/cpp/src/runtime_selection_darwin.h"
+            fixture = flat / "abstraction-identity/cpp/test/runtime_selection/darwin.h"
+            native_roster = native.read_text().split("static const char* const names[] = {", 1)[1].split("};", 1)[0]
+            native_names = re.findall(r'"(com\.openabstractions\.[a-z-]+-v[0-9]+)"', native_roster)
+            self.assertEqual(len(native_names), len(services))
+            self.assertEqual(set(native_names), set(plist["MachServices"]))
+            fixture_roster = fixture.read_text().split("static const char* const services[] = {", 1)[1].split("};", 1)[0]
+            fixture_names = re.findall(r'"([a-z-]+-v[0-9]+)"', fixture_roster)
+            self.assertEqual(len(fixture_names), len(services))
+            self.assertEqual({"com.openabstractions." + name for name in fixture_names}, set(plist["MachServices"]))
 
     def test_macos_manager_watchdog_bounds_only_its_child(self):
         self.command("launchctl", 'trap "" TERM; exec sleep 5')

@@ -6,6 +6,7 @@
 # directory. This script turns home-relative facts into absolute ones and
 # registers the LaunchAgent in that person's gui/<uid> domain.
 set -eu
+umask 022
 
 home=${HOME:-}
 case "$home" in
@@ -16,7 +17,6 @@ home=$(CDPATH= cd -- "$home" && pwd -P)
 [ "$home" != / ] || { echo "postinstall: target must be a user home" >&2; exit 1; }
 share=$home/.local/share/abstraction
 bin=$home/.local/bin
-. "$share/lifecycle.sh"
 # The payload carries the plist as a template in the share directory. Only the
 # finished file ever appears in ~/Library/LaunchAgents: it is written under a
 # temporary name outside that directory, then renamed into place on the same
@@ -29,7 +29,24 @@ uid=$(stat -f %u "$home")
 gid=$(stat -f %g "$home")
 
 [ -f "$template" ] || { echo "postinstall: LaunchAgent template missing" >&2; exit 1; }
-[ ! -L "$home/Library" ] && [ ! -L "$agents" ] || { echo "postinstall: unsafe payload directory" >&2; exit 1; }
+# Refuse an unsafe existing ancestor before changing the registration or its
+# ownership. Some of these directories can contain unrelated user files, so
+# tightening their permissions here would be an unexpected side effect.
+check_existing_dir() {
+    dir=$1
+    [ -e "$dir" ] || return 0
+    [ -d "$dir" ] && [ ! -L "$dir" ] || { echo "postinstall: unsafe payload directory: $dir" >&2; exit 1; }
+    permissions=$(stat -f %Lp "$dir")
+    case "$permissions" in *[!0-7]*|'') echo "postinstall: cannot inspect directory permissions: $dir" >&2; exit 1;; esac
+    [ $((0$permissions & 0022)) -eq 0 ] || {
+        echo "postinstall: unsafe writable directory: $dir; run chmod go-w '$dir' and retry" >&2
+        exit 1
+    }
+}
+for dir in "$home" "$home/.local" "$bin" "$home/.local/share" "$share" "$home/Library" "$agents"; do
+    check_existing_dir "$dir"
+done
+. "$share/lifecycle.sh"
 mkdir -p -- "$agents"
 tmp=$(mktemp "$share/.com.openabstractions.runtime.plist.XXXXXX")
 trap 'rm -f -- "$tmp"' EXIT
@@ -40,6 +57,29 @@ if grep -q '@BIN@' "$tmp"; then echo "postinstall: LaunchAgent placeholder left 
 chmod 644 "$tmp"
 mv -f -- "$tmp" "$plist"
 trap - EXIT
+
+# The Panel's own LaunchAgent, the analogue of the Windows Startup-folder
+# shortcut PanelTrayLogonStart: RunAtLoad with no KeepAlive, so it opens once
+# at login and quitting it stays quit until the next one. Its template ships
+# with the base package; the app bundle is present only when it built, the
+# way the Windows package's Tools feature bundles the Panel when it built and
+# not as a person's choice. Rendered here, before MANIFEST is written, so its
+# path is in the ledger uninstall.sh removes; registered near the runtime's
+# own registration below, once $domain is known.
+panel_template=$share/com.openabstractions.panel.plist
+panel_plist=$agents/com.openabstractions.panel.plist
+panel_exe="$bin/Abstraction Panel.app/Contents/MacOS/Abstraction Panel"
+panel_registered=
+if [ -f "$panel_template" ] && [ -x "$panel_exe" ]; then
+    ptmp=$(mktemp "$share/.com.openabstractions.panel.plist.XXXXXX")
+    trap 'rm -f -- "$ptmp"' EXIT
+    sed "s|@BIN@|$replacement|g" "$panel_template" > "$ptmp"
+    if grep -q '@BIN@' "$ptmp"; then echo "postinstall: Panel LaunchAgent placeholder left unsubstituted" >&2; exit 1; fi
+    chmod 644 "$ptmp"
+    mv -f -- "$ptmp" "$panel_plist"
+    trap - EXIT
+    panel_registered=$panel_plist
+fi
 
 # 0.1.7 and earlier installed jobd, dl and jobctl and registered the runtime as
 # com.openabstractions.jobd (docs/REMOVED.md). preinstall booted that label out.
@@ -55,16 +95,22 @@ if [ -f "$share/MANIFEST" ]; then
     done
 fi
 
+# FILES names every file this package could install, the optional features of
+# VISION 2026-09-22 included. Each of those is its own component package and
+# its own choice, installed before this one, so a path that is not on disk now
+# is a choice the person did not take and belongs in no removal ledger.
 manifest_tmp=$share/MANIFEST.new
 : > "$manifest_tmp"
 while read -r rel; do
 	[ -n "$rel" ] || continue
+	[ -e "$home/$rel" ] || continue
 	echo "$home/$rel" >> "$manifest_tmp"
 done < "$share/FILES"
 echo "$plist" >> "$manifest_tmp"
+[ -z "$panel_registered" ] || echo "$panel_registered" >> "$manifest_tmp"
 mv -f -- "$manifest_tmp" "$share/MANIFEST"
 
-# Restore ownership and directory access along each installed path. This walks
+# Restore ownership along each installed path. This walks
 # ancestors only; unrelated siblings in ~/.local/bin or Library stay untouched.
 own_path() {
     installed=$1
@@ -80,7 +126,6 @@ own_path() {
     dir=${installed%/*}
     while [ "$dir" != "$home" ]; do
         chown "$uid:$gid" "$dir"
-        chmod u+rwx "$dir"
         dir=${dir%/*}
     done
 }
@@ -99,4 +144,17 @@ manager enable "$service"
 manager bootstrap "$domain" "$plist"
 manager print "$service" >/dev/null
 echo "ok    shared runtime LaunchAgent registered for this user; capability identity proof remains separately required"
+
+if [ -n "$panel_registered" ]; then
+    panel_service=$domain/com.openabstractions.panel
+    if manager print "$panel_service" >/dev/null 2>&1; then
+        manager bootout "$panel_service"
+    fi
+    manager enable "$panel_service"
+    manager bootstrap "$domain" "$panel_plist"
+    manager print "$panel_service" >/dev/null
+    echo "ok    Panel LaunchAgent registered for this user"
+else
+    echo "note  Panel app not installed; its LaunchAgent is not registered"
+fi
 exit 0

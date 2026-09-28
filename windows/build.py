@@ -10,7 +10,10 @@ from validate import rows
 HERE = Path(__file__).resolve().parent
 GOARCH = {"x64": "amd64", "arm64": "arm64"}
 GATE = {"tools/Abstraction Panel.exe": "Panel",
-        "dev/include/abstraction/download/over_curl.hpp": "Cpp"}
+        "dev/include/abstraction/download/over_curl.hpp": "Cpp",
+        "tools/inventoryd.exe": "LocalStores",
+        "tools/modelhostd.exe": "ModelHost",
+        "tools/openabstractions-mcp.exe": "McpGateway"}
 
 
 def prebuilt(binaries, kind, path):

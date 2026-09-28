@@ -1,11 +1,27 @@
 > Every file the Linux and macOS packages install, and where it lands.
 >
 > platform	both | linux | macos
+> feature	service | localstores | modelhost | mcpgateway
+>		Which selectable part of the package puts this file there, the
+>		Windows package's features under the names the two POSIX routes
+>		use for them. service is everything the package is for and is not
+>		selectable. The optional providers of VISION 2026-09-22 are:
+>		localstores, inventoryd and the declaration that declares it,
+>		installed unless the person says otherwise because it only reads;
+>		modelhost, modelhostd alone, installed only when asked for — the
+>		declaration is written later by openabstractions models host, so
+>		this package ships none; mcpgateway, the stdio MCP server,
+>		installed only when asked for.
+>		On Linux install.sh reads the FEATURES file this column generates
+>		and installs the chosen ones. On macOS each optional feature is
+>		its own component package and its own choice in the installer
 > path		where it lands, relative to the person's home directory. On macOS
 >		that is the payload tree pkgbuild is handed; on Linux it is the
 >		tree install.sh copies out of the tarball.
 > kind		gobuild    go build the package at <from> in <source>, unless --bin
 >		           names a directory that already holds the built programs
+>		swiftbuild swiftc the single file at <from> in <source>, macOS only,
+>		           unless --bin names a directory that already holds it
 >		copy       take the file at <from> out of <source>
 >		authored   written here, in installer/posix/, and shipped as it stands
 >		generated  written by build.py; <from> is "-"
@@ -18,32 +34,50 @@
 > mode		the permission bits, because a tar and a pkg both carry them and
 >		the machine this is built on may not be able to say what they are
 >
-> The Panel is not here: it has no publishable source on any platform, and it is
-> a Windows program. The C++ header is not here either — bindings/download-over-curl
-> publishes from nowhere. The Windows package gates both away and says so; these
-> two do not carry the rows at all, and the release notes name both.
+> The Panel is here for macOS, four rows below: the app bundle's own files, in
+> the service feature like the Windows package's Tools bundling, because it is
+> not a person's choice, only whether it built. It is not here for Linux, which
+> ships no GUI (research/panel-native/DECISION.md). The C++ header is not here
+> either — bindings/download-over-curl publishes from nowhere. The Windows
+> package gates it away and says so; that one row carries no path here, and the
+> release notes name it.
 >
 > @BIN@ in an authored file is the absolute directory openabstractions lands in.
 > install.sh on Linux and scripts/postinstall on macOS substitute it. Nothing
 > else is substituted at install time anywhere.
 >
 > A source with no --src has its rows left out of the package and each one named,
-> the way the Windows build gates the UNRESOLVED rows. A program is never left
-> out that way: a gobuild row with neither --src nor --bin stops the build. That
-> is what lets a package built only from published module versions ship
-> openabstractions without checking out any repository. jobd, dl, jobctl, the
-> jobd sweep units and the Python file-store packages leave the payload in 0.2.0
-> (docs/REMOVED.md).
+> the way the Windows build gates the UNRESOLVED rows. A runtime program is never
+> left out that way: a runtime gobuild row with neither --src nor --bin stops the
+> build. That is what lets a package built only from published module versions
+> ship openabstractions without checking out any repository. An optional
+> feature's program is different: a build that cannot obtain it leaves that whole
+> feature out, names it, and the package that results offers one fewer choice
+> rather than failing. jobd, dl, jobctl, the jobd sweep units and the Python
+> file-store packages leave the payload in 0.2.0 (docs/REMOVED.md).
 
-platform	path								kind		source		from						mode
-both		.local/share/abstraction/LICENSE				license		posix		-						644
-both		.local/share/abstraction/dev/USING.txt				authored	posix		dev/USING.txt					644
-linux		.local/share/abstraction/uninstall.sh				authored	posix		linux/uninstall.sh				755
-macos		.local/share/abstraction/com.openabstractions.runtime.plist	authored	posix		macos/com.openabstractions.runtime.plist		644
-macos		.local/share/abstraction/FILES					generated	posix		-						644
-macos		.local/share/abstraction/uninstall.sh				authored	posix		macos/uninstall.sh				755
-both	.local/bin/openabstractions	gobuild	charter	serve	755
-linux	.config/systemd/user/abstraction-runtime.service	authored	posix	linux/abstraction-runtime.service	644
-linux	.local/share/abstraction/lifecycle.sh	authored	posix	linux/lifecycle.sh	644
+platform	feature	path								kind		source		from						mode
+both		service	.local/share/abstraction/LICENSE				license		posix		-						644
+both		service	.local/share/abstraction/dev/USING.txt				authored	posix		dev/USING.txt					644
+linux		service	.local/share/abstraction/uninstall.sh				authored	posix		linux/uninstall.sh				755
+macos		service	.local/share/abstraction/com.openabstractions.runtime.plist	authored	posix		macos/com.openabstractions.runtime.plist		644
+macos		service	.local/share/abstraction/FILES					generated	posix		-						644
+macos		service	.local/share/abstraction/uninstall.sh				authored	posix		macos/uninstall.sh				755
+macos		service	.local/share/abstraction/com.openabstractions.panel.plist	authored	posix		macos/com.openabstractions.panel.plist		644
+macos		service	.local/bin/Abstraction Panel.app/Contents/Info.plist		authored	posix		macos/Info.plist				644
+macos		service	.local/bin/Abstraction Panel.app/Contents/MacOS/panel		gobuild		charter		monitor						755
+macos		service	.local/bin/Abstraction Panel.app/Contents/MacOS/Abstraction Panel	swiftbuild	charter		monitor/macos/PanelLauncher.swift		755
+linux		service	.local/share/abstraction/FEATURES				generated	posix		-						644
+both	service	.local/bin/openabstractions	gobuild	charter	serve	755
+linux	service	.config/systemd/user/abstraction-runtime.service	authored	posix	linux/abstraction-runtime.service	644
+linux	service	.local/share/abstraction/lifecycle.sh	authored	posix	linux/lifecycle.sh	644
 
-macos	.local/share/abstraction/lifecycle.sh	authored	posix	macos/lifecycle.sh	644
+macos	service	.local/share/abstraction/lifecycle.sh	authored	posix	macos/lifecycle.sh	644
+both	service	.local/bin/declarations/lemonade.json	authored	posix	declarations/lemonade.json	644
+both	service	.local/bin/declarations/lmstudio.json	authored	posix	declarations/lmstudio.json	644
+both	service	.local/bin/declarations/ollama.json	authored	posix	declarations/ollama.json	644
+both	service	.local/bin/declarations/comfyui.json	authored	posix	declarations/comfyui.json	644
+both	localstores	.local/bin/inventoryd	gobuild	localstores	go/cmd/inventoryd	755
+both	localstores	.local/bin/declarations/local-stores.json	authored	posix	declarations/local-stores.json	644
+both	modelhost	.local/bin/modelhostd	gobuild	modelhost	go/cmd/modelhostd	755
+both	mcpgateway	.local/bin/openabstractions-mcp	gobuild	charter	mcp-gateway	755

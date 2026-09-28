@@ -20,7 +20,9 @@
 >		not packages: asking it for .../go/cmd/dl answers 404 whatever the
 >		version, and a check that cannot tell that from a deleted tag is
 >		not a check
-> feature	service | tools — the WiX feature that installs it
+> feature	service | tools | localstores | modelhost | mcpgateway — the
+>		installer feature that installs it; optional feature defaults stay
+>		in the Windows and POSIX package definitions
 > subsystem	console | windows. "windows" appends -H=windowsgui to the link,
 >		which is the only way to build an image the loader gives no
 >		console, and it is also what says the row is a Windows image and
@@ -37,6 +39,9 @@
 > leave in 0.2.0 (docs/REMOVED.md).
 
 path		module							package		feature		subsystem
-Abstraction Panel.exe	github.com/openabstractions/abstractions/monitor@v0.2.0	.		tools		windows
-openabstractions.exe	github.com/openabstractions/abstractions/serve@v0.2.0	.	service	console
-openabstractionsw.exe	github.com/openabstractions/abstractions/serve@v0.2.0	.	service	windows
+Abstraction Panel.exe	github.com/openabstractions/abstractions/monitor@v0.3.0	.		tools		windows
+inventoryd.exe	github.com/openabstractions/abstraction-storage-over-local-stores/go@v0.1.0	cmd/inventoryd	localstores	console
+modelhostd.exe	github.com/openabstractions/abstraction-provider-modelhost/go@v0.1.0	cmd/modelhostd	modelhost	console
+openabstractions-mcp.exe	github.com/openabstractions/abstractions/mcp-gateway@v0.3.0	.	mcpgateway	console
+openabstractions.exe	github.com/openabstractions/abstractions/serve@v0.3.0	.	service	console
+openabstractionsw.exe	github.com/openabstractions/abstractions/serve@v0.3.0	.	service	windows

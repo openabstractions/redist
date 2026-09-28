@@ -33,6 +33,13 @@ from pathlib import Path
 
 UNITS = ("abstraction-runtime.service",)
 PROGRAMS = ("openabstractions",)
+DEFAULT_CONTRACTS = (
+    "abstraction.logging/sink@1",
+    "abstraction.config/reader@1",
+    "abstraction.config/editor@1",
+    "abstraction.job/acceptance@1",
+    "abstraction.job/operations@1",
+)
 
 PROBE = r'''
 import json, sys
@@ -51,20 +58,22 @@ try:
         out.update(status="OK", principal_kind=selected.principal_kind,
                    principal=selected.principal, program=selected.program)
     elif mode == "trusted":
+        from abstraction.facade import Scope
         from abstraction.facade.client import Machine
         import abstraction.config as config
         import abstraction.logging as logging
         machine = Machine(library=library, timeout=5)
-        snapshot = machine.resolve_config(scope="local").read(config.RunOverrides())
-        machine.resolve_log(scope="local").write(logging.Record(
+        snapshot = machine.resolve_config(scope=Scope.LOCAL).read(config.RunOverrides())
+        machine.resolve_log(scope=Scope.LOCAL).write(logging.Record(
             schema=1, time="2026-09-15T12:00:00.000000Z", level=2,
             msg="linux qualification", attrs={"fixture": "qualify_linux"}))
         out.update(status="OK", config_stamp=snapshot.stamp, endpoint=library.runtime_endpoint())
     elif mode == "wrong-program":
+        from abstraction.facade import Scope
         from abstraction.facade.client import Machine
         selected = library.select_runtime(timeout=5)
         wrong = ServerExpectation(selected.principal_kind, selected.principal, selected.program + ".wrong")
-        Machine(library=library, server=wrong, timeout=5).resolve_config(scope="local")
+        Machine(library=library, server=wrong, timeout=5).resolve_config(scope=Scope.LOCAL)
         out.update(status="OK")
     else:
         out.update(status="EXCEPTION", detail="unknown probe mode")
@@ -190,10 +199,59 @@ class Qualification:
             report = json.loads(result.stdout.strip().splitlines()[-1])
         except (ValueError, IndexError):
             return False, {"rc": result.returncode, "detail": tail(result, 500)}
-        contracts = {item["contract"]: item.get("status") for item in report.get("capabilities", [])}
-        ok = result.returncode == 0 and contracts and all(v == "resolved" for v in contracts.values())
+        if not isinstance(report, dict):
+            return False, {"rc": result.returncode, "detail": "status is not an object"}
+        entries = report.get("capabilities")
+        contracts, references = {}, {}
+        valid = isinstance(entries, list)
+        for item in entries if valid else []:
+            if not isinstance(item, dict) or not isinstance(item.get("contract"), str) or item["contract"] in contracts:
+                valid = False
+                continue
+            contract = item["contract"]
+            contracts[contract] = item.get("status")
+            if item.get("capability") != contract.split("/", 1)[0]:
+                valid = False
+            if item.get("status") == "resolved":
+                reference = item.get("result", {}).get("reference") if isinstance(item.get("result"), dict) else None
+                endpoint = reference.get("endpoint") if isinstance(reference, dict) else None
+                if not isinstance(endpoint, str) or not endpoint.startswith("/"):
+                    valid = False
+                else:
+                    references[contract] = endpoint
+        ok = (result.returncode == 0 and valid and set(contracts) == set(DEFAULT_CONTRACTS)
+              and all(contracts[c] == "resolved" and c in references for c in DEFAULT_CONTRACTS))
         return ok, {"rc": result.returncode, "bootstrap": report.get("bootstrap"), "contracts": contracts,
-                    "error": report.get("error")}
+                    "references": references, "error": report.get("error")}
+
+    def described_status(self, references, program="openabstractions"):
+        grouped = {}
+        for contract in DEFAULT_CONTRACTS:
+            grouped.setdefault(references[contract], []).append(contract)
+        observed = {}
+        for endpoint, expected in grouped.items():
+            result = self.user([program, "status", "describe", endpoint, "--json", "--timeout", "5s"],
+                               timeout=10, check=False)
+            if result.returncode:
+                return False, {"described": observed, "describe_error": "command_failed", "endpoint": endpoint}
+            try:
+                description = json.loads(result.stdout.strip().splitlines()[-1])
+            except (ValueError, IndexError):
+                return False, {"described": observed, "describe_error": "invalid_json", "endpoint": endpoint}
+            if (not isinstance(description, dict) or description.get("Outcome") != "described"
+                    or not isinstance(description.get("Services"), list)):
+                return False, {"described": observed, "describe_error": "invalid_description", "endpoint": endpoint}
+            for contract in expected:
+                matches = [service for service in description["Services"]
+                           if isinstance(service, dict) and service.get("Contract") == contract]
+                if len(matches) != 1:
+                    return False, {"described": observed, "describe_error": "missing_or_duplicate_contract",
+                                   "contract": contract, "endpoint": endpoint}
+                observed[contract] = matches[0].get("Readiness")
+                if observed[contract] != "ready" or matches[0].get("Why") != "":
+                    return False, {"described": observed, "describe_error": "not_ready",
+                                   "contract": contract, "endpoint": endpoint}
+        return True, {"described": observed}
 
     def root_abstraction_units(self):
         env = self.root_env()
@@ -273,7 +331,11 @@ class Qualification:
             ok, detail = self.status()
             outcome.update(detail)
             return ok
-        return bool(self.wait(attempt, seconds, 0.5)), outcome
+        if not self.wait(attempt, seconds, 0.5):
+            return False, outcome
+        described, detail = self.described_status(outcome["references"])
+        outcome.update(detail)
+        return described, outcome
 
     def cases(self, archive):
         home = Path(self.home)

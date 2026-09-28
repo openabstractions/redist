@@ -11,6 +11,8 @@ param(
     [switch]$NewProductCode,
     [string]$Output,
     [string]$PythonPath,
+    [string]$NodePath,
+    [string]$SdkSmokes,
     [string]$PredecessorMsiPath,
     [string]$PredecessorSHA256,
     [string]$PredecessorVersion,
@@ -40,7 +42,7 @@ Modes
                     unscoped install may ask for elevation.
 
 Case options (Verify and LocalAccount)
-  -MsiPath PATH  -CheckTools -PythonPath PATH  -Unscoped (Verify only)
+  -MsiPath PATH  -CheckTools -PythonPath PATH  -SdkSmokes DIR -NodePath PATH  -Unscoped (Verify only)
   -PredecessorMsiPath PATH -PredecessorSHA256 HEX -PredecessorVersion X.Y.Z -ExpectedVersion X.Y.Z
   -PredecessorElsewhere  -FailUpgrade  -FailSameVersion
   -ResultDirectory DIR   logs and evidence (default .\user-runtime-diagnostics)
@@ -212,11 +214,38 @@ function Assert-RuntimeReady([string]$central, [string]$Evidence) {
     if ($null -eq $status -or $status -is [array] -or $status -isnot [Management.Automation.PSCustomObject]) {
         throw 'Runtime status report is malformed: expected an object'
     }
+    $endpoints = @{}
     foreach ($contract in @('abstraction.logging/sink@1','abstraction.config/reader@1','abstraction.config/editor@1','abstraction.job/acceptance@1','abstraction.job/operations@1')) {
         $capability = $contract.Split('/')[0]
         $matches = @($status.capabilities | Where-Object { $_.capability -eq $capability -and $_.contract -eq $contract })
         if ($matches.Count -ne 1 -or $matches[0].status -ne 'resolved') {
             throw "Expected exactly one ready contract: $contract"
+        }
+        $endpoint = $matches[0].result.reference.endpoint
+        if ($endpoint -isnot [string] -or -not $endpoint -or $endpoint.Contains('"') -or $endpoint.Contains("`r") -or $endpoint.Contains("`n")) {
+            throw "Resolved contract lacks a usable endpoint: $contract"
+        }
+        if (-not $endpoints.ContainsKey($endpoint)) { $endpoints[$endpoint] = @() }
+        $endpoints[$endpoint] += $contract
+    }
+    # Resolve proves the binding; Describe supplies the endpoint's current
+    # readiness facts. Its self-reported metadata grants no authority.
+    foreach ($endpoint in $endpoints.Keys) {
+        $describeInfo = New-Object Diagnostics.ProcessStartInfo
+        $describeInfo.FileName = $central
+        $describeInfo.Arguments = 'status describe "' + $endpoint + '" --json --timeout 5s'
+        $described = Invoke-FixtureProcess $describeInfo 10
+        if ($described.ExitCode -ne 0) { throw "Endpoint Describe failed for $endpoint" }
+        try { $description = ConvertFrom-Json -InputObject $described.Output -ErrorAction Stop }
+        catch { throw "Endpoint Describe returned invalid JSON for $endpoint" }
+        if ($null -eq $description -or $description -is [array] -or $description.outcome -cne 'described') {
+            throw "Endpoint Describe did not describe $endpoint"
+        }
+        foreach ($contract in $endpoints[$endpoint]) {
+            $matches = @($description.services | Where-Object { $_.contract -ceq $contract })
+            if ($matches.Count -ne 1 -or $matches[0].readiness -cne 'ready' -or $matches[0].why -cne '') {
+                throw "Endpoint Describe did not list ready $contract"
+            }
         }
     }
 }
@@ -664,6 +693,24 @@ foreach ($t in 'jobd','jobd-logon') {
 }
 'ok    programs, a user PATH entry, a Startup shortcut — and no service, no machine key, no task'
 }
+function Assert-InstalledPanelWebView2([string]$Tools, [string]$EvidencePath = 'webview2-availability.txt') {
+    $panel = Join-Path $Tools 'Abstraction Panel.exe'
+    if (-not (Test-Path -LiteralPath $panel)) { throw "Installed Panel missing: $panel" }
+    $info = New-Object Diagnostics.ProcessStartInfo
+    $info.FileName = $panel
+    $info.Arguments = '-check-webview2'
+    $result = Invoke-FixtureProcess $info 15
+    $answer = $result.Output.Trim()
+    if ($result.ExitCode -eq 0 -and $answer -eq 'WebView2: available (native rendering untested)') {
+        $answer | Set-Content -LiteralPath $EvidencePath
+        return 'ok: installed Panel resolved the WebView2 runtime export; native rendering remains a separate check'
+    }
+    if ($result.ExitCode -eq 3 -and $answer -eq 'WebView2: unavailable (browser fallback)') {
+        $answer | Set-Content -LiteralPath $EvidencePath
+        return 'ok: installed Panel reported WebView2 unavailable and will use the browser fallback'
+    }
+    throw "Installed Panel WebView2 diagnostic returned exit $($result.ExitCode): $(Protect-DiagnosticText ($result.Output + $result.Diagnostics))"
+}
 # A download through the installed runtime, with no store named anywhere: the
 # runtime fetches and verifies, the command copies the result out, jobs show and
 # jobs list observe the operation this program submitted, an equal submission
@@ -823,6 +870,7 @@ if ($Mode -eq 'LocalAccount') {
     if ($Unscoped) { throw 'LocalAccount refuses -Unscoped: an unscoped install may ask for elevation' }
     if (($PredecessorElsewhere -or $FailUpgrade) -and -not $PredecessorMsiPath) { throw 'PredecessorElsewhere and FailUpgrade qualify an upgrade and need -PredecessorMsiPath' }
     if ($FailSameVersion -and ($PredecessorMsiPath -or $CheckTools)) { throw 'FailSameVersion installs the candidate as its own predecessor and takes no other variant' }
+    if ($SdkSmokes -and (-not $CheckTools -or -not $NodePath)) { throw 'SDK smokes require -CheckTools and -NodePath' }
     if ($PredecessorMsiPath -and $PredecessorVersion -notmatch '^\d+\.\d+\.\d+$') { throw 'An upgrade needs -PredecessorVersion naming the predecessor release' }
     Assert-UnelevatedToken
     # The installer and runtime started from here must see the real profile.
@@ -856,6 +904,12 @@ if ($Mode -eq 'LocalAccount') {
         if ($CheckTools) {
             if (-not $PythonPath -or -not (Test-Path -LiteralPath $PythonPath -PathType Leaf)) { throw 'Release tools check requires an explicit existing Python executable' }
             $arguments += @('-CheckTools','-PythonPath',"`"$PythonPath`"")
+        }
+    if ($SdkSmokes) {
+        Copy-Item -LiteralPath (Resolve-Path -LiteralPath $SdkSmokes).Path -Destination (Join-Path $directory 'sdk-smokes') -Recurse
+        # The invoking local account owns this copy; hosted Verify uses a separate
+        # disposable SID and protects that copy before it starts the child.
+        $arguments += @('-SdkSmokes',"`"$directory\sdk-smokes`"",'-NodePath',"`"$NodePath`"")
         }
         $info = New-Object Diagnostics.ProcessStartInfo
         $info.FileName = 'powershell.exe'
@@ -974,11 +1028,18 @@ if ($Mode -eq 'User') {
                     'ok: the upgrade replaced and removed the predecessor installed in a non-default folder' | Set-Content 'upgrade-elsewhere.txt'
                 }
             }
-            if ($CheckTools -or $Unscoped) { Assert-InstalledUserTools $tools }
+            if ($CheckTools -or $Unscoped) {
+                Assert-InstalledUserTools $tools
+                Assert-InstalledPanelWebView2 $tools
+            }
             if ($Unscoped) { Assert-SingleUserScope }
             $central = Join-Path $tools 'openabstractions.exe'
             Assert-RuntimeReady $central post-install-status
             if ($CheckTools) { Assert-ServiceDownload $central $PythonPath }
+            if ($SdkSmokes) {
+                & (Join-Path $SdkSmokes 'run.ps1') -Directory $SdkSmokes -ExpectedSid $ExpectedSid -ExpectedProgram $central -PythonPath $PythonPath -NodePath $NodePath |
+                    Set-Content -LiteralPath 'installed-sdk-smokes.txt' -Encoding UTF8
+            }
             if ($PredecessorMsiPath) {
                 Assert-InstalledVersion $ExpectedVersion $productCode
                 Assert-RetainedSentinel $sentinel $sentinelValue
@@ -1044,6 +1105,7 @@ if ([IO.Path]::GetExtension($MsiPath) -ne '.msi') { throw 'Expected an MSI packa
 if ($Unscoped -and $PredecessorMsiPath) { throw 'Unscoped verification installs a fresh package and takes no predecessor' }
 if (($PredecessorElsewhere -or $FailUpgrade) -and -not $PredecessorMsiPath) { throw 'PredecessorElsewhere and FailUpgrade qualify an upgrade and need -PredecessorMsiPath' }
 if ($FailSameVersion -and ($PredecessorMsiPath -or $Unscoped -or $CheckTools)) { throw 'FailSameVersion installs the candidate as its own predecessor and takes no other variant' }
+if ($SdkSmokes -and (-not $CheckTools -or -not $NodePath)) { throw 'SDK smokes require -CheckTools and -NodePath' }
 # The predecessor release is the caller's choice, not a constant of this fixture.
 if ($PredecessorMsiPath -and $PredecessorVersion -notmatch '^\d+\.\d+\.\d+$') { throw 'An upgrade needs -PredecessorVersion naming the predecessor release' }
 if (@(Get-Service | Where-Object { $_.Name -like 'OpenAbstractionsSupervisor*' }).Count) { throw 'Run per-user verification on a separate clean runner' }
@@ -1083,6 +1145,22 @@ exit $LASTEXITCODE
     if ($CheckTools) {
         if (-not $PythonPath -or -not (Test-Path -LiteralPath $PythonPath -PathType Leaf)) { throw 'Release tools check requires an explicit existing Python executable' }
         $arguments += @('-CheckTools','-PythonPath',"`"$PythonPath`"")
+    }
+    if ($SdkSmokes) {
+        $smokes = Join-Path $directory 'sdk-smokes'
+        Copy-Item -LiteralPath (Resolve-Path -LiteralPath $SdkSmokes).Path -Destination $smokes -Recurse
+        # The parent diagnostics folder grants Modify to the account. Drop
+        # inherited ACEs on every copied client before granting read/execute.
+        & icacls.exe $smokes /inheritance:r /T /Q | Out-Null
+        if ($LASTEXITCODE -ne 0) { throw 'Cannot protect installed SDK smoke inputs' }
+        Grant-AccountAccess -Path $smokes -Sid $account.Sid -Access ReadExecute
+        $probeAcl = (Get-Acl -LiteralPath (Join-Path $smokes 'python_probe.py')).GetAccessRules($true, $false, [Security.Principal.SecurityIdentifier])
+        $accountRules = @($probeAcl | Where-Object { $_.IdentityReference.Value -eq $account.Sid })
+        if ($accountRules.Count -ne 1 -or $accountRules[0].AccessControlType -ne 'Allow' -or
+            ($accountRules[0].FileSystemRights -band [Security.AccessControl.FileSystemRights]::Write)) {
+            throw 'Disposable account can alter installed SDK smoke inputs'
+        }
+        $arguments += @('-SdkSmokes',"`"$directory\sdk-smokes`"",'-NodePath',"`"$NodePath`"")
     }
     $child = Invoke-AccountProcess -Account $account -FileName 'powershell.exe' -Arguments $arguments -WorkingDirectory $directory -Seconds $(if ($PredecessorMsiPath) { 600 } else { 300 })
     $child.Output | Set-Content -Encoding UTF8 (Join-Path $directory 'fixture.log')

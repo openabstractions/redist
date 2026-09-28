@@ -52,7 +52,13 @@
     <?else?><?define NoPanel = " The Abstraction Panel, the graphical front end, is not in it." ?><?endif?>
     <?if $(var.Cpp) = yes ?><?define NoCpp = "" ?>
     <?else?><?define NoCpp = " The C++ header is not in it; no module carries it." ?><?endif?>
-    <?define Absent = "$(var.NoPanel)$(var.NoCpp)" ?>
+    <?if $(var.LocalStores) = yes ?><?define NoLocalStores = "" ?>
+    <?else?><?define NoLocalStores = " The local model stores feature is not in it; abstraction-storage-over-local-stores publishes nowhere yet, so this build could not obtain inventoryd." ?><?endif?>
+    <?if $(var.ModelHost) = yes ?><?define NoModelHost = "" ?>
+    <?else?><?define NoModelHost = " The model host feature is not in it; abstraction-provider-modelhost publishes nowhere yet, so this build could not obtain modelhostd." ?><?endif?>
+    <?if $(var.McpGateway) = yes ?><?define NoMcpGateway = "" ?>
+    <?else?><?define NoMcpGateway = " The MCP gateway feature is not in it; this build was given no source or binary for openabstractions-mcp." ?><?endif?>
+    <?define Absent = "$(var.NoPanel)$(var.NoCpp)$(var.NoLocalStores)$(var.NoModelHost)$(var.NoMcpGateway)" ?>
     <?if $(var.Absent) = "" ?>
     <Property Id="ARPCOMMENTS" Value="Downloads that survive the program that started them." />
     <?else?>
@@ -82,7 +88,14 @@
     <StandardDirectory Id="LocalAppDataFolder">
       <Directory Id="ProgramsFolder" Name="Programs">
         <Directory Id="APPLICATIONFOLDER" Name="OpenAbstractions">
-          <Directory Id="ToolsFolder" Name="tools" />
+          <Directory Id="ToolsFolder" Name="tools">
+            <!-- The declaration files the installation places beside the
+                 runtime executable. The runtime reads them at start and lists
+                 them as declared by the installation; an operator's removal
+                 of one is recorded in the runtime's own state, so this
+                 package writing the file again does not bring it back. -->
+            <Directory Id="DeclarationsFolder" Name="declarations" />
+          </Directory>
           <Directory Id="ExamplesFolder" Name="examples">
             <Directory Id="ExampleMachine" Name="what-this-machine-does" />
             <Directory Id="ExampleLifecycle" Name="job-lifecycle" />
@@ -142,6 +155,18 @@
       </Component>
       <Component Directory="ToolsFolder">
         <File Id="openabstractionsw.exe" Source="payload/tools/openabstractionsw.exe" KeyPath="yes" />
+      </Component>
+      <Component Directory="DeclarationsFolder">
+        <File Id="declaration.lemonade.json" Source="payload/tools/declarations/lemonade.json" KeyPath="yes" />
+      </Component>
+      <Component Directory="DeclarationsFolder">
+        <File Id="declaration.lmstudio.json" Source="payload/tools/declarations/lmstudio.json" KeyPath="yes" />
+      </Component>
+      <Component Directory="DeclarationsFolder">
+        <File Id="declaration.ollama.json" Source="payload/tools/declarations/ollama.json" KeyPath="yes" />
+      </Component>
+      <Component Directory="DeclarationsFolder">
+        <File Id="declaration.comfyui.json" Source="payload/tools/declarations/comfyui.json" KeyPath="yes" />
       </Component>
       <Component Id="RegistryRoot" Directory="APPLICATIONFOLDER"
                  Guid="8821E881-5E73-465E-904E-EF7FC1223A5C">
@@ -396,6 +421,14 @@
     </ComponentGroup>
 
     <?if $(var.Panel) = yes ?>
+    <!-- The exe itself carries the icon: monitor/panel.rc packs
+         monitor/icon/panel.ico at resource id 1 and go build links it in
+         through monitor/rsrc_windows_*.syso (monitor/README.md). WiX reads
+         that resource straight out of the staged binary rather than a
+         second copy of the ico file, so ARPPRODUCTICON and both shortcuts
+         below always show the same icon the exe does. -->
+    <Icon Id="PanelIcon" SourceFile="payload/tools/Abstraction Panel.exe" />
+    <Property Id="ARPPRODUCTICON" Value="PanelIcon" />
     <ComponentGroup Id="PanelFiles" Directory="ToolsFolder">
       <Component>
         <File Id="panel.exe" Name="Abstraction Panel.exe" Source="payload/tools/Abstraction Panel.exe" KeyPath="yes" />
@@ -405,11 +438,30 @@
       <Component Id="PanelStartMenu" Guid="E5D9EA35-65C8-4930-9FC0-06120E9F39BE">
         <Shortcut Id="PanelShortcutFile" Name="Abstraction Panel"
                   Description="What this machine is doing with downloads, and what is holding the card"
-                  Target="[#panel.exe]" WorkingDirectory="ToolsFolder" />
+                  Target="[#panel.exe]" WorkingDirectory="ToolsFolder" Icon="PanelIcon" />
         <RemoveFolder Id="RemoveStartMenuFolder" On="uninstall" />
         <RegistryValue Root="HKMU" Key="Software\OpenAbstractions\Abstraction\Panel"
                        Name="installed" Type="integer" Value="1" KeyPath="yes" />
         <RemoveRegistryKey Root="HKMU" Key="Software\OpenAbstractions\Abstraction\Panel"
+                           Action="removeOnUninstall" />
+      </Component>
+    </ComponentGroup>
+
+    <!-- The Panel's own notification-area icon at sign-in, the same
+         Startup-folder pattern LogonStart above uses for the runtime host.
+         Per-user only: a per-user install has no administrator to register
+         a machine-wide logon task, and a machine-scope install leaves this
+         off for every account rather than start a tray icon nobody asked
+         for in sessions that never open the Panel (installer/README.md). -->
+    <ComponentGroup Id="PanelTrayLogonStart" Directory="StartupFolder">
+      <Component Id="PanelTrayLogonStartShortcut" Guid="332A435E-CCA6-4D6B-B814-596735F40DE1"
+                 Condition="NOT ALLUSERS">
+        <Shortcut Id="PanelTrayLogonStartFile" Name="Abstraction Panel notifications"
+                  Description="Shows a notification-area icon for pending OpenAbstractions questions"
+                  Target="[#panel.exe]" Arguments="--tray" WorkingDirectory="ToolsFolder" Icon="PanelIcon" />
+        <RegistryValue Root="HKCU" Key="Software\OpenAbstractions\Abstraction\Panel"
+                       Name="trayAtLogon" Type="integer" Value="1" KeyPath="yes" />
+        <RemoveRegistryKey Root="HKCU" Key="Software\OpenAbstractions\Abstraction\Panel"
                            Action="removeOnUninstall" />
       </Component>
     </ComponentGroup>
@@ -425,6 +477,82 @@
       </Component>
       <?endif?>
     </ComponentGroup>
+
+    <!-- The optional providers of VISION.md 2026-09-22. Each one is a separate
+         process the runtime launches, carried by the one package as a feature
+         a person ticks rather than by an installer of its own, because it
+         versions with the runtime it serves.
+
+         A provider feature installs its program into tools\, beside the
+         runtime, and the declaration file that declares it into
+         tools\declarations\. The runtime reads that directory at start and
+         lists what it finds as declared by the installation. Removing the
+         feature removes both components, so the declaration goes with the
+         program it named and nothing is left declaring a program that is no
+         longer there. An operator's own withdrawal is recorded in the
+         runtime's state, so reinstalling the feature does not bring back a
+         provider that person disabled.
+
+         inventoryd reads model stores and writes in none of them, which is
+         why LocalStores is on by default; the rights model draws that line
+         and so does this feature's level. -->
+    <?if $(var.LocalStores) = yes ?>
+    <ComponentGroup Id="LocalStoresFiles">
+      <Component Directory="ToolsFolder">
+        <File Id="inventoryd.exe" Source="payload/tools/inventoryd.exe" KeyPath="yes" />
+      </Component>
+      <Component Directory="DeclarationsFolder">
+        <File Id="declaration.local_stores.json" Source="payload/tools/declarations/local-stores.json" KeyPath="yes" />
+      </Component>
+    </ComponentGroup>
+    <?endif?>
+
+    <!-- Model host is a program the runtime launches, but not one this
+         package can declare: the declaration names the objects and the
+         llama.cpp engine path the person chooses, and `openabstractions
+         models host` writes it after the program is installed. So, unlike
+         LocalStores, this feature ships no declaration file — its marker is
+         written the way the Panel's and the MCP gateway's are, and the same
+         removal rule applies: taking the feature away takes modelhostd with
+         it, and any declaration that command wrote afterward is the
+         runtime's own state to keep or drop. -->
+    <?if $(var.ModelHost) = yes ?>
+    <ComponentGroup Id="ModelHostFiles" Directory="ToolsFolder">
+      <Component>
+        <File Id="modelhostd.exe" Source="payload/tools/modelhostd.exe" KeyPath="yes" />
+      </Component>
+      <Component Id="ModelHostMarker" Guid="13905645-2D4B-4ADA-89BF-0A12F6ABA2C2">
+        <RegistryValue Root="HKMU" Key="Software\OpenAbstractions\Abstraction\ModelHost"
+                       Name="installed" Type="integer" Value="1" KeyPath="yes" />
+        <RemoveRegistryKey Root="HKMU" Key="Software\OpenAbstractions\Abstraction\ModelHost"
+                           Action="removeOnUninstall" />
+      </Component>
+    </ComponentGroup>
+    <?endif?>
+
+    <!-- The MCP gateway is a program an assistant launches, not a provider the
+         runtime launches, so it ships with no declaration file: nothing in the
+         registry describes it and the runtime never starts it. Its authority
+         is the one the Panel has — a named program installed beside the
+         runtime, holding whatever an operator granted that exact path — and
+         the marker below is written the way the Panel's is, so the same
+         removal rule applies to both. The installation grants it nothing:
+         mcp-gateway/README.md names the four rules an operator writes for the
+         hosts and applications it should reach, and says not to copy the
+         runtime's own broad grants onto it. -->
+    <?if $(var.McpGateway) = yes ?>
+    <ComponentGroup Id="McpGatewayFiles" Directory="ToolsFolder">
+      <Component>
+        <File Id="openabstractions_mcp.exe" Source="payload/tools/openabstractions-mcp.exe" KeyPath="yes" />
+      </Component>
+      <Component Id="McpGatewayMarker" Guid="0B0C2E74-9A5E-4F1C-8B24-3D6A1E5F7C08">
+        <RegistryValue Root="HKMU" Key="Software\OpenAbstractions\Abstraction\McpGateway"
+                       Name="installed" Type="integer" Value="1" KeyPath="yes" />
+        <RemoveRegistryKey Root="HKMU" Key="Software\OpenAbstractions\Abstraction\McpGateway"
+                           Action="removeOnUninstall" />
+      </Component>
+    </ComponentGroup>
+    <?endif?>
 
     <Feature Id="Service" Level="1" AllowAbsent="no" AllowAdvertise="no"
              Title="Background supervisor"
@@ -442,6 +570,7 @@
       <?if $(var.Panel) = yes ?>
       <ComponentGroupRef Id="PanelFiles" />
       <ComponentGroupRef Id="PanelShortcut" />
+      <ComponentGroupRef Id="PanelTrayLogonStart" />
       <?endif?>
 
       <Feature Id="Path" Level="1" AllowAdvertise="no"
@@ -462,6 +591,50 @@
              Description="$(var.DeveloperText)">
       <ComponentGroupRef Id="DeveloperFiles" />
     </Feature>
+
+    <!-- Level 1 is ticked when the feature list opens and installed by a
+         command line that names no ADDLOCAL. msiexec /i abstraction-x64.msi
+         ADDLOCAL=Service,LocalStores installs exactly what it names, REMOVE=
+         takes a feature away, and Change in Apps and features reopens this
+         same list: nothing here is advertised and nothing is permanent, so a
+         feature left out today is added later without reinstalling the
+         product. -->
+    <?if $(var.LocalStores) = yes ?>
+    <Feature Id="LocalStores" Level="1" AllowAdvertise="no"
+             Title="Local model stores"
+             Description="Reads every model store on this machine — Ollama, Hugging Face, LM Studio, ComfyUI, FastFlowLM and Jan — and reports what each one holds to applications that ask the runtime. It reads listings, sizes and the programs' own index files. It writes in no store, which is why it is ticked to begin with. Untick it and the runtime lists only what each application tells it.">
+      <ComponentGroupRef Id="LocalStoresFiles" />
+    </Feature>
+    <?endif?>
+
+    <?if $(var.ModelHost) = yes ?>
+    <Feature Id="ModelHost" Level="1000" AllowAdvertise="no"
+             Title="Model host"
+             Description="modelhostd, the provider that loads one model file this machine already holds with a llama-server this machine already has, and serves it through the runtime under a lease. Installing it starts nothing: openabstractions models host names the model and the engine path afterward, and writes the declaration that tells the runtime it exists.">
+      <ComponentGroupRef Id="ModelHostFiles" />
+    </Feature>
+    <?endif?>
+
+    <?if $(var.McpGateway) = yes ?>
+    <Feature Id="McpGateway" Level="1000" AllowAdvertise="no"
+             Title="MCP gateway"
+             Description="openabstractions-mcp, a local stdio MCP server that gives an assistant six OA abilities: list applications, list models, one bounded completion, and submit, read or cancel durable image and video work. The runtime never starts it; an assistant does, by its absolute path. It holds nothing by being installed — grant it the applications and hosts it may reach with openabstractions rights.">
+      <ComponentGroupRef Id="McpGatewayFiles" />
+    </Feature>
+    <?endif?>
+
+    <!-- The NAS download provider's feature name, held and installing nothing.
+         The NAS delegator is a tier inside the download layer
+         (abstraction-download/go/nas): the runtime writes a job record into a
+         share a jobd over there is watching, and there is no separate program
+         on this machine to install. Level 0 keeps it out of the feature list
+         and out of every install, so nobody ticks a box that does nothing.
+         When that provider becomes a program, its components come here and its
+         level becomes 1000 — off unless chosen, because it writes into a share
+         and needs configuring. -->
+    <Feature Id="NasDownload" Level="0" Display="0" AllowAdvertise="no"
+             Title="NAS downloads"
+             Description="Reserved. The NAS delegator ships inside the runtime today and installs no program of its own." />
 
     <ui:WixUI Id="WixUI_Advanced" />
     <WixVariable Id="WixUILicenseRtf" Value="license.rtf" />

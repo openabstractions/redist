@@ -16,6 +16,9 @@ valid_path() (
     f=$1
     case "$f" in
         "$HOME/.local/bin/openabstractions"|"$HOME/.config/systemd/user/abstraction-runtime.service"|"$HOME/.local/share/abstraction/"*) ;;
+        # The installation's declaration files and the optional providers'
+        # programs, beside the runtime where it reads them.
+        "$HOME/.local/bin/declarations/"*|"$HOME/.local/bin/inventoryd"|"$HOME/.local/bin/modelhostd"|"$HOME/.local/bin/openabstractions-mcp") ;;
         # Retired by 0.2.0 (docs/REMOVED.md). A predecessor's ledger still names
         # them, and they are removed only when their recorded bytes match.
         "$HOME/.local/bin/jobd"|"$HOME/.local/bin/jobctl"|"$HOME/.local/bin/dl"|"$HOME/.config/systemd/user/abstraction-jobd.service"|"$HOME/.config/systemd/user/abstraction-jobd.timer") ;;

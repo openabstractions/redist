@@ -132,13 +132,23 @@ function Get-RuntimeReadiness([string]$Json) {
     $known = @('resolved','unavailable','forbidden','incompatible','unmet_requirements','not_ready','invalid_request')
     $fields = @()
     $ready = $true
+    $bindings = @{}
     foreach ($contract in @('abstraction.logging/sink@1','abstraction.config/reader@1','abstraction.config/editor@1','abstraction.job/acceptance@1','abstraction.job/operations@1')) {
         $found = @($entries | Where-Object { $_.contract -ceq $contract })
         if ($found.Count -eq 0) { throw "Runtime status report omits required $contract" }
         if ($found.Count -gt 1) { throw "Runtime status report lists $contract more than once" }
         $entry = $found[0]
         if ($entry.capability -cne $contract.Split('/')[0]) { throw "Runtime status report lists $contract under another capability" }
-        if ($entry.status -ceq 'resolved') { $fields += "$contract=resolved"; continue }
+        if ($entry.status -ceq 'resolved') {
+            $endpoint = $entry.result.reference.endpoint
+            if ($endpoint -isnot [string] -or -not $endpoint -or $endpoint.Contains('"') -or $endpoint.Contains("`r") -or $endpoint.Contains("`n")) {
+                throw "Resolved contract lacks a usable endpoint: $contract"
+            }
+            if (-not $bindings.ContainsKey($endpoint)) { $bindings[$endpoint] = @() }
+            $bindings[$endpoint] += $contract
+            $fields += "$contract=resolved"
+            continue
+        }
         $ready = $false
         $status = if ($entry.status -cin $known) { $entry.status } else { 'unrecognized' }
         # Only fixed vocabulary reaches this line: error text becomes classes.
@@ -154,7 +164,7 @@ function Get-RuntimeReadiness([string]$Json) {
         $classes = if ($text.Count) { @(Get-ErrorClasses ($text -join ' ')) -join ',' } else { 'none' }
         $fields += "$contract=$status error-classes=$classes"
     }
-    return [pscustomobject]@{ Ready = $ready; Summary = ($fields -join '; ') }
+    return [pscustomobject]@{ Ready = $ready; Summary = ($fields -join '; '); Bindings = $bindings }
 }
 function Protect-StatusText([string]$Text) {
     $Text = $Text.Substring(0, [Math]::Min(16384, $Text.Length)) -replace '\r?\n', ' '
@@ -368,23 +378,28 @@ try {
     $script:lastStatusFailure = $null
     $script:lastObserved = $null
     $script:lastStatusJson = $null
+    $script:lastResolvedBindings = $null
+    function New-RuntimeProbeInfo([string]$Arguments) {
+        $info = New-Object Diagnostics.ProcessStartInfo
+        $info.FileName = $runtimeImage
+        $info.Arguments = $Arguments
+        $info.UseShellExecute = $false
+        $info.CreateNoWindow = $true
+        $info.WorkingDirectory = Split-Path $runtimeImage
+        $info.RedirectStandardOutput = $true
+        $info.RedirectStandardError = $true
+        $info.UserName = $credential.GetNetworkCredential().UserName
+        $info.Domain = $credential.GetNetworkCredential().Domain
+        $info.Password = $credential.Password
+        $info.LoadUserProfile = $true
+        return $info
+    }
     function Test-RuntimeReady {
         $previousEndpoint = $env:ABSTRACTION_RUNTIME_ENDPOINT
         try {
             $env:ABSTRACTION_RUNTIME_ENDPOINT = $null
             # Keep the creation handle and derive bootstrap from the fresh user's token.
-            $info = New-Object Diagnostics.ProcessStartInfo
-            $info.FileName = $runtimeImage
-            $info.Arguments = 'status --json --timeout 5s'
-            $info.UseShellExecute = $false
-            $info.CreateNoWindow = $true
-            $info.WorkingDirectory = Split-Path $runtimeImage
-            $info.RedirectStandardOutput = $true
-            $info.RedirectStandardError = $true
-            $info.UserName = $credential.GetNetworkCredential().UserName
-            $info.Domain = $credential.GetNetworkCredential().Domain
-            $info.Password = $credential.Password
-            $info.LoadUserProfile = $true
+            $info = New-RuntimeProbeInfo 'status --json --timeout 5s'
             $probe = Invoke-StatusProcess $info
             if ($null -eq $probe.ExitCode) { throw 'Runtime status exit code was not observed' }
             $script:lastStatusJson = $probe.Output
@@ -396,10 +411,32 @@ try {
             }
             $readiness = Get-RuntimeReadiness $probe.Output
             $script:lastObserved = $readiness.Summary
-            if ($readiness.Ready) { return $true }
+            if ($readiness.Ready) { $script:lastResolvedBindings = $readiness.Bindings; return $true }
             $line = 'runtime not ready: ' + $readiness.Summary
             if ($line -ne $script:lastStatusFailure) { Write-Diagnostic $line | Out-Null; $script:lastStatusFailure = $line }
             return $false
+        } finally { $env:ABSTRACTION_RUNTIME_ENDPOINT = $previousEndpoint }
+    }
+    function Assert-DescribedReady([hashtable]$Bindings) {
+        $previousEndpoint = $env:ABSTRACTION_RUNTIME_ENDPOINT
+        try {
+            $env:ABSTRACTION_RUNTIME_ENDPOINT = $null
+            foreach ($endpoint in $Bindings.Keys) {
+                $info = New-RuntimeProbeInfo ('status describe "' + $endpoint + '" --json --timeout 5s')
+                $described = Invoke-StatusProcess $info
+                if ($described.ExitCode -ne 0) { throw "Endpoint Describe failed for $endpoint" }
+                try { $description = ConvertFrom-Json -InputObject $described.Output -ErrorAction Stop }
+                catch { throw "Endpoint Describe returned invalid JSON for $endpoint" }
+                if ($null -eq $description -or $description -is [array] -or $description.outcome -cne 'described') {
+                    throw "Endpoint Describe did not describe $endpoint"
+                }
+                foreach ($contract in $Bindings[$endpoint]) {
+                    $matches = @($description.services | Where-Object { $_.contract -ceq $contract })
+                    if ($matches.Count -ne 1 -or $matches[0].readiness -cne 'ready' -or $matches[0].why -cne '') {
+                        throw "Endpoint Describe did not list ready $contract"
+                    }
+                }
+            }
         } finally { $env:ABSTRACTION_RUNTIME_ENDPOINT = $previousEndpoint }
     }
     # service-session.log is the uploaded windows-installer-logs file.
@@ -411,7 +448,11 @@ try {
         $script:lastStatusFailure = $null
         $script:lastObserved = $null
         $script:lastStatusJson = $null
-        try { Wait-Condition { Test-RuntimeReady } $Seconds $Description | Out-Null }
+        $script:lastResolvedBindings = $null
+        try {
+            Wait-Condition { Test-RuntimeReady } $Seconds $Description | Out-Null
+            Assert-DescribedReady $script:lastResolvedBindings
+        }
         catch {
             $failure = $_
             try { Save-LastRuntimeStatus $Description } catch { Write-Warning 'Could not record the last runtime status' }

@@ -1,0 +1,24 @@
+> Where each JavaScript package this release packs comes from.
+> .github/workflows/candidate.yml reads this and nothing else.
+>
+> package	the npm name. @openabstractions/ipc also produces one platform
+>		package per qualified platform; those are assembled by
+>		scripts/npm_packages.py from binaries this workflow builds and
+>		have no row of their own
+> repository	owner/name on github.com, public and readable by a stranger
+> commit		the exact published commit this package is built from, 40
+>		lowercase hexadecimal digits. A branch is refused: a release
+>		built from a moving ref is a release nobody can rebuild. These
+>		directories carry no tag of their own — the Go module tags in
+>		tools.tsv name Go modules and say nothing about the JavaScript
+>		beside them — so the commit is what identifies them
+> directory	the package directory inside that repository
+>
+> Every package here is packed and retained as an artifact. Nothing is
+> published to npm: that needs the owner's npm organization and consent.
+
+package	repository	commit	directory
+@openabstractions/ipc	openabstractions/abstraction-identity	98a2d9a42684a9c58d9d137d91e196e51ba1e2d6	javascript
+@openabstractions/facade	openabstractions/abstraction-facade	ed97a08e0a9b925fc5c26500a1e7b8a67931c027	javascript
+@openabstractions/inference	openabstractions/abstraction-inference	15f94953800be30719ffc21558bb674bae593548	javascript
+@openabstractions/opencode	openabstractions/abstractions	d7471c44a03cdefa6bd6d418eb518657d0d7be8e	adopters/opencode

@@ -7,11 +7,34 @@ import xml.etree.ElementTree as ET
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
-FEATURES = {"service": "Service", "tools": "Tools", "developer": "Developer"}
+sys.path.insert(0, str(HERE))
+from feature_invariants import FEATURE_NAMES, check_installed_declarations  # noqa: E402
+
+# The vocabulary payload.tsv's "feature" column draws from; shared with
+# installer/posix/payload.tsv through feature_invariants.py. Windows never
+# has a row naming "path" — Path installs nothing of its own, only the
+# PathEntry component group nested under Tools — so it never appears as a
+# payload.tsv feature, which FILELESS records below.
+FEATURES = FEATURE_NAMES
 FILELESS = {"Path"}
+# A feature whose name is held and whose components do not exist yet. It
+# installs nothing, is hidden from the feature list, and is at level 0, so
+# nobody ticks a box that does nothing. Every rule below that asks what a
+# feature installs skips these and asks instead that they stay empty.
+HELD = {"NasDownload"}
+# What each feature's tick is when the list opens, as INSTALLLEVEL is 1 by
+# default: 1 on, 1000 off, 0 hidden and never installed. The number lives in
+# abstraction.wxs and is recorded here so a level nobody meant to change is a
+# failure rather than a silent change of what a default install contains.
+LEVELS = {"Service": 1, "Tools": 1, "Path": 1, "Developer": 1000,
+          "LocalStores": 1, "ModelHost": 1000, "McpGateway": 1000, "NasDownload": 0}
 KINDS = {"gobuild", "copy", "authored"}
+# build.py's GOARCH keys. Not imported from build.py: build.py imports rows
+# from this module, and importing back would be circular. The two are kept
+# in step by hand, the same way payload.tsv's own kind vocabulary is.
 SUBSYSTEMS = {"console", "windows"}
 WIDTH = 7
+DECLARATIONS = "tools/declarations/"
 
 MACHINE, USER = "ALLUSERS", "NOT ALLUSERS"
 SCOPES = {"for everyone": True, "just for me": False}
@@ -189,6 +212,30 @@ def check_elevated_scope(root):
     return bad
 
 
+IDENTIFIER_TAGS = {"File", "Component", "Feature", "Directory", "Property", "CustomAction"}
+IDENTIFIER_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_.]{0,71}$")
+
+
+def check_wix_identifiers(root):
+    """Every File/Component/Feature/Directory/Property/CustomAction Id, against
+    WiX's identifier rule: letters, digits, underscore and period; no hyphen;
+    72 characters at most; the first character a letter or underscore. A
+    hyphenated Id compiles here and fails only when WiX links it (WIX0014,
+    59f1eb7c fixed two); this finds it without WiX installed."""
+    bad = []
+    for el in root.iter():
+        tag = untag(el)
+        if tag not in IDENTIFIER_TAGS:
+            continue
+        ident = el.get("Id")
+        if ident is None or IDENTIFIER_RE.match(ident):
+            continue
+        bad.append(f"abstraction.wxs: {tag} Id={ident!r} is not a legal WiX identifier "
+                   f"(letters, digits, underscore, period; no hyphen; 72 characters at "
+                   f"most; first character a letter or underscore)")
+    return bad
+
+
 def gated_sources(text):
     stack, gated = [], {}
     for line in text.splitlines():
@@ -237,6 +284,35 @@ def wxs_features(root):
                 r.get("Id") for r in el.iter() if untag(r) == "ComponentGroupRef"
             ]
     return groups, features
+
+
+def feature_elements(root):
+    return {el.get("Id"): el for el in root.iter() if untag(el) == "Feature"}
+
+
+def check_feature_levels(root, features):
+    """Every feature's tick when the list opens, against LEVELS."""
+    bad = []
+    elements = feature_elements(root)
+    for fid, element in elements.items():
+        level = element.get("Level")
+        if fid not in LEVELS:
+            bad.append(f"abstraction.wxs: feature {fid} has no recorded default in validate.py's "
+                       f"LEVELS. What a default install contains is decided here and recorded there")
+            continue
+        if level != str(LEVELS[fid]):
+            bad.append(f"abstraction.wxs: feature {fid} is Level={level!r}, and validate.py records "
+                       f"its default as {LEVELS[fid]}. A level is a change to what a default install "
+                       f"contains, so the two say it together or neither says it")
+        if (fid in HELD) != (element.get("Display") == "0"):
+            bad.append(f"abstraction.wxs: feature {fid} is {'held' if fid in HELD else 'offered'} and "
+                       f"Display={element.get('Display')!r}. A held feature is hidden from the feature "
+                       f"list; an offered one is in it")
+    for fid in HELD:
+        if features.get(fid):
+            bad.append(f"abstraction.wxs: held feature {fid} references {features[fid]}. It installs "
+                       f"nothing until the program behind it exists")
+    return bad
 
 
 def folders(root):
@@ -326,8 +402,10 @@ def main():
             print("FAIL ", line)
         return 1
 
-    payload = {}
+    payload, authored = {}, {}
     for feature, path, kind, source, frm, sign, subsystem in rows("payload.tsv"):
+        if kind == "authored":
+            authored[path] = frm
         if kind == "gobuild" and subsystem not in SUBSYSTEMS:
             bad.append(f"payload.tsv: {path} subsystem={subsystem} — a gobuild row is "
                        f"{' or '.join(sorted(SUBSYSTEMS))}")
@@ -363,9 +441,12 @@ def main():
         if not any(gid in refs for refs in features.values()):
             bad.append(f"abstraction.wxs: component group {gid} is referenced by no feature")
 
-    expected = set(FEATURES.values()) | FILELESS
+    expected = set(FEATURES.values()) | FILELESS | HELD
     if set(features) != expected:
         bad.append(f"abstraction.wxs: features are {sorted(features)}, want {sorted(expected)}")
+    bad.extend(check_feature_levels(root, features))
+    bad.extend(check_installed_declarations(placed, placed, authored, HERE, DECLARATIONS))
+    bad.extend(check_wix_identifiers(root))
 
     where, conditions = scoped(root)
     for cid, condition in conditions.items():
@@ -377,6 +458,8 @@ def main():
     member = {fid: [c for c, g in where.items() if g in refs]
               for fid, refs in features.items()}
     for fid, members in member.items():
+        if fid in HELD:
+            continue
         for name, machine in SCOPES.items():
             if not any(installs(conditions[c], machine) for c in members):
                 bad.append(f"abstraction.wxs: feature {fid} installs nothing {name}. A feature a "
@@ -489,6 +572,13 @@ def main():
     print(f"ok    every file has a source in sources.tsv and one feature that installs it")
     print(f"ok    every feature installs something in both scopes, each scope starts the "
           f"supervisor its own way, and whatever a build can drop, ARPCOMMENTS names")
+    print("features, their default and what they install:")
+    tick = {1: "on", 1000: "off", 0: "held, hidden, never installed"}
+    for fid in sorted(features):
+        files = sorted(p for p, f in placed.items() if f == fid)
+        level = LEVELS[fid]
+        carries = ", ".join(files) if files else "no files"
+        print(f"      {fid:<13} level {level:<4} {tick.get(level, '?'):<30} {carries}")
     for s in unpinned:
         print(f"note  {s} carries no commit yet: a --src build pins nothing and a --bin "
               f"build has nothing to take")

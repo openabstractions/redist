@@ -1,0 +1,93 @@
+name: publish qualified native Python wheels
+
+# An owner dispatches this with the exact redist candidate source. No push,
+# release event or scheduled run can spend the PyPI publisher identity.
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Qualified candidate version (vMAJOR.MINOR.PATCH)
+        required: true
+        type: string
+      candidate_run:
+        description: Successful candidate.yml run ID
+        required: true
+        type: string
+      candidate_source:
+        description: Exact 40-character redist source SHA of the candidate run
+        required: true
+        type: string
+      candidate_attempt:
+        description: Current candidate run attempt (earlier successful wheel jobs may be retained)
+        required: true
+        type: string
+
+concurrency:
+  group: redist-pypi-${{ inputs.version }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  actions: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    outputs:
+      artifact_id: ${{ steps.verified_wheels.outputs.artifact-id }}
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+        with:
+          ref: ${{ github.sha }}
+      - uses: actions/setup-python@e797f83bcb11b83ae66e0230d6156d7c80228e7c # v6.0.0
+        with:
+          python-version: '3.12'
+      - name: stage exact qualified wheel bytes
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          CANDIDATE_RUN: ${{ inputs.candidate_run }}
+          CANDIDATE_SOURCE: ${{ inputs.candidate_source }}
+          CANDIDATE_ATTEMPT: ${{ inputs.candidate_attempt }}
+          RELEASE_VERSION: ${{ inputs.version }}
+        run: |
+          python3 scripts/pypi_publish.py \
+            --repo "$GH_REPO" --run "$CANDIDATE_RUN" \
+            --attempt "$CANDIDATE_ATTEMPT" --source "$CANDIDATE_SOURCE" \
+            --version "$RELEASE_VERSION" --output dist
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        id: verified_wheels
+        with:
+          name: qualified-pypi-${{ github.run_id }}-${{ github.run_attempt }}
+          path: dist/*.whl
+          if-no-files-found: error
+          retention-days: 1
+
+  publish:
+    needs: verify
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/project/abstraction-ipc/
+    permissions:
+      contents: read
+      actions: read
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          artifact-ids: ${{ needs.verify.outputs.artifact_id }}
+          path: dist/
+      - name: show the exact upload set
+        run: |
+          test "$(find dist -maxdepth 1 -type f -name '*.whl' | wc -l)" -eq 4
+          test "$(find dist -maxdepth 1 -type f | wc -l)" -eq 4
+          sha256sum dist/*.whl
+      - uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # v1.14.2
+        with:
+          packages-dir: dist/
+          print-hash: true

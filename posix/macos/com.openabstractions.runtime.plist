@@ -9,7 +9,43 @@
 		<string>@BIN@/openabstractions</string>
 		<string>serve</string>
 		<string>runtime</string>
+		<string>--xpc</string>
 	</array>
+	<key>MachServices</key>
+	<dict>
+		<key>com.openabstractions.runtime-v1</key>
+		<true/>
+		<key>com.openabstractions.logging-v1</key>
+		<true/>
+		<key>com.openabstractions.config-v1</key>
+		<true/>
+		<key>com.openabstractions.job-acceptance-v1</key>
+		<true/>
+		<key>com.openabstractions.router-v1</key>
+		<true/>
+		<key>com.openabstractions.model-v1</key>
+		<true/>
+		<key>com.openabstractions.storage-content-v1</key>
+		<true/>
+		<key>com.openabstractions.asks-application-v1</key>
+		<true/>
+		<key>com.openabstractions.rights-authorization-v1</key>
+		<true/>
+		<key>com.openabstractions.credentials-v1</key>
+		<true/>
+		<key>com.openabstractions.inference-v1</key>
+		<true/>
+		<key>com.openabstractions.inference-remote-v1</key>
+		<true/>
+		<key>com.openabstractions.registry-v1</key>
+		<true/>
+		<key>com.openabstractions.applications-v1</key>
+		<true/>
+		<key>com.openabstractions.resource-table-v1</key>
+		<true/>
+		<key>com.openabstractions.lend-v1</key>
+		<true/>
+	</dict>
 	<key>RunAtLoad</key>
 	<true/>
 	<key>KeepAlive</key>

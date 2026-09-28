@@ -16,14 +16,32 @@
 > a placeholder to be filled in silently: somebody has to decide where that file
 > is published from and verify its commit.
 >
+> localstores is abstraction-storage-over-local-stores, the layer whose
+> go/cmd/inventoryd is the first optional provider feature. scripts/split.manifest
+> carries no rule for that repository and published.tsv has no row for it, so it
+> has never been published and its ref is "-": a --src build takes the directory
+> it is handed, a --bin build has nothing to take, and abstraction.wxs gates the
+> LocalStores feature out of a package that could not obtain the program. It
+> becomes a commit on the day the split publishes it.
+>
 > panel is the control panel, published into openabstractions/abstractions as the
 > module github.com/openabstractions/abstractions/monitor. The directory reaches
 > that repository through scripts/split.manifest's "tree monitor monitor"; the
 > tag a module in a subdirectory takes is monitor/vX.Y.Z. The release route
 > builds its Panel executable from the module version in redist/tools.tsv.
+>
+> modelhost is abstraction-provider-modelhost, the layer whose go/cmd/modelhostd
+> is the second optional provider feature. scripts/split.manifest carries no rule
+> for that repository and published.tsv has no row for it, so it has never been
+> published and its ref is "-": a --src build takes the directory it is handed, a
+> --bin build has nothing to take, and abstraction.wxs gates the ModelHost feature
+> out of a package that could not obtain the program. It becomes a commit on the
+> day the split publishes it.
 
 id		repo						ref
 installer	-						-
 panel		openabstractions/abstractions			fc273d2f6bffc54623081a0b28e5c2701ccc4651
 UNRESOLVED	-						-
 charter	openabstractions/abstractions	3ef816c8bbd62a9e1da21c8e51ce69f99b70af41
+localstores	openabstractions/abstraction-storage-over-local-stores	-
+modelhost	openabstractions/abstraction-provider-modelhost	-

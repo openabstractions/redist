@@ -30,6 +30,39 @@ case "$target" in
 esac
 uid=$(stat -f %u "$home")
 case "$uid" in ''|*[!0-9]*|0) echo "preinstall: non-root target owner required" >&2; exit 1;; esac
+# postinstall must rename a plist into LaunchAgents after the package payload
+# lands. Check the existing destination (or the parent mkdir will use) as the
+# target user now, before stopping a predecessor or replacing its files. Root's
+# own -w result would accept a root-owned 0755 directory that the user cannot
+# modify. Leave existing directory ownership and permissions to the owner.
+agents=$home/Library/LaunchAgents
+for dir in "$home/Library" "$agents"; do
+    if [ -e "$dir" ] || [ -L "$dir" ]; then
+        [ -d "$dir" ] && [ ! -L "$dir" ] || {
+            echo "preinstall: unsafe LaunchAgents ancestor: $dir" >&2
+            exit 1
+        }
+    fi
+done
+writable=$agents
+[ -d "$writable" ] || writable=$home/Library
+[ -d "$writable" ] || writable=$home
+installer_uid=$(id -u)
+if [ "$installer_uid" = "$uid" ]; then
+    target_can_write=no
+    if [ -w "$writable" ] && [ -x "$writable" ]; then target_can_write=yes; fi
+elif [ "$installer_uid" = 0 ]; then
+    target_can_write=no
+    if sudo -n -u "#$uid" /bin/test -w "$writable" &&
+       sudo -n -u "#$uid" /bin/test -x "$writable"; then target_can_write=yes; fi
+else
+    echo "preinstall: installer must run as the target user or root" >&2
+    exit 1
+fi
+[ "$target_can_write" = yes ] || {
+    echo "preinstall: LaunchAgents destination is not writable by target user: $writable; fix ownership or permissions and retry" >&2
+    exit 1
+}
 # Select and verify the target user's GUI bootstrap. A home-domain install runs
 # this script as that user; asuser names the target domain explicitly.
 manager print "gui/$uid" >/dev/null
@@ -49,8 +82,10 @@ agent_state() {
     '
 }
 # 0.1.7 and earlier registered the same runtime as com.openabstractions.jobd.
-# Both labels are booted out and verified absent before any file is replaced.
-for label in com.openabstractions.jobd com.openabstractions.runtime; do
+# All three labels are booted out and verified absent before any file is
+# replaced: a running Panel holds its own executable open, the same reason
+# the runtime is booted out before its payload is replaced.
+for label in com.openabstractions.jobd com.openabstractions.runtime com.openabstractions.panel; do
     state=$(agent_state "$label")
     booted=no
     if [ "$state" = present ]; then
