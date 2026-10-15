@@ -197,6 +197,14 @@ function Assert-CertumChain($Certificate) {
     } finally { $chain.Dispose() }
 }
 
+function Get-CertumOptionalRegistryValue([string]$Path, [string]$Name) {
+    # Missing optional settings are normal on a fresh signing runner. GetValue
+    # returns null for absence while preserving key/access failures.
+    $key = Get-Item -LiteralPath $Path -ErrorAction Stop
+    try { return $key.GetValue($Name, $null, [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames) }
+    finally { $key.Dispose() }
+}
+
 function Initialize-CertumWindows {
     if ('CertumWindow' -as [type]) { return }
     Add-Type @'
@@ -349,7 +357,7 @@ function Connect-CertumSession($Policy, [string]$Msi, [string]$OutputPath) {
         $script:CertumStage = 'desktop-configuration'
         $null = New-Item -Path $registry -Force
         foreach ($name in @('ShowLoginDialogOnStart','ShowLoginDialogOnAppRequest','LangID')) {
-            $value = Get-ItemPropertyValue -LiteralPath $registry -Name $name -ErrorAction SilentlyContinue
+            $value = Get-CertumOptionalRegistryValue $registry $name
             $saved[$name] = $value
             Set-ItemProperty -LiteralPath $registry -Name $name -Type DWord -Value $(if ($name -eq 'LangID') {9} else {1})
         }
