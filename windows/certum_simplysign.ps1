@@ -36,7 +36,7 @@ function Write-CertumFailure {
         'process-stopped','failed','no-owned-receipt')
     $stage = if ($script:CertumStage -cin $stages) { $script:CertumStage } else { 'unknown' }
     $cleanup = if ($script:CertumCleanup -cin $cleanups) { $script:CertumCleanup } else { 'unknown' }
-    $reasons = @('not-checked','assemblies','focus','window-identity','field-discovery','edit-count',
+    $reasons = @('not-checked','assemblies','provider-initialization','focus','window-identity','field-discovery','edit-count',
         'field-owner','field-state','label-absent','label-owner','label-state','label-role','accepted')
     $reason = if ($script:CertumSchemaReason -cin $reasons) { $script:CertumSchemaReason } else { 'unknown' }
     $count = if ($script:CertumEditCount -cin @('zero','one','two','many')) { $script:CertumEditCount } else { 'unknown' }
@@ -334,9 +334,44 @@ function Get-CertumLoginWindow([IntPtr]$Handle, $Process) {
     return $window
 }
 
+function Initialize-CertumClientProviders {
+    if ($script:CertumClientProvidersReady) { return }
+    $script:CertumSchemaReason = 'provider-initialization'
+    try {
+        # FromHandle must initialize UIA before registering the Microsoft proxy table.
+        # Caller has already established the exact owned root. Use the OS-installed
+        # runtime provider beside the already loaded Microsoft UIA client, never
+        # a current-directory/PATH lookup. CoreCLR unifies framework LoadFrom
+        # requests to this runtime assembly; validate the bytes actually loaded.
+        $client = [Windows.Automation.AutomationElement].Assembly
+        $path = Join-Path ([IO.Path]::GetDirectoryName($client.Location)) 'UIAutomationClientSideProviders.dll'
+        $file = Get-Item -LiteralPath $path -ErrorAction Stop
+        if ($file.Attributes -band [IO.FileAttributes]::ReparsePoint) { throw 'provider path differs' }
+        $signature = Get-AuthenticodeSignature -LiteralPath $path
+        if ($signature.Status -ne 'Valid' -or $signature.SignerCertificate.Subject -cne
+            'CN=.NET, O=Microsoft Corporation, L=Redmond, S=Washington, C=US') { throw 'provider publisher differs' }
+        $identity = [Reflection.AssemblyName]::GetAssemblyName($path)
+        $expected = 'UIAutomationClientSideProviders, Version=' + $client.GetName().Version + ', Culture=neutral, PublicKeyToken=b77a5c561934e089'
+        if ($identity.FullName -cne $expected) { throw 'provider identity differs' }
+        $expectedBytes = (Get-FileHash -LiteralPath $file.FullName -Algorithm SHA256).Hash
+        $assembly = [Reflection.Assembly]::LoadFrom($path)
+        # Exact frozen locator agreement plus expected bytes is provenance for
+        # this load; it makes no general filesystem same-file identity claim.
+        if (-not [string]::Equals($assembly.Location, $file.FullName, [StringComparison]::Ordinal) -or
+            $assembly.FullName -cne $identity.FullName -or
+            (Get-FileHash -LiteralPath $assembly.Location -Algorithm SHA256).Hash -cne $expectedBytes) { throw 'loaded provider differs' }
+        $type = $assembly.GetType('UIAutomationClientsideProviders.UIAutomationClientSideProviders', $true)
+        $table = $type.GetField('ClientSideProviderDescriptionTable').GetValue($null)
+        if ($null -eq $table -or $table.Length -eq 0) { throw 'provider table absent' }
+        [Windows.Automation.ClientSettings]::RegisterClientSideProviders($table)
+        $script:CertumClientProvidersReady = $true
+    } catch { throw 'Microsoft UI Automation provider initialization failed' }
+}
+
 function Get-CertumLoginFields([IntPtr]$Handle, $Process) {
     $script:CertumSchemaReason = 'assemblies'; $script:CertumEditCount = 'unknown'
     $window = Get-CertumLoginWindow $Handle $Process
+    Initialize-CertumClientProviders
     $condition = [Windows.Automation.PropertyCondition]::new(
         [Windows.Automation.AutomationElement]::ControlTypeProperty, [Windows.Automation.ControlType]::Edit)
     # Roles come from the fixed English associated labels, never screen position.
