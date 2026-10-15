@@ -17,6 +17,14 @@ $script:CertumStage = 'policy'
 $script:CertumCleanup = 'not-started'
 $script:CertumSchemaReason = 'not-checked'
 $script:CertumEditCount = 'unknown'
+$script:CertumObservationResult = 'not-checked'
+$script:CertumInitialCounts = $null
+$script:CertumRepeatedCounts = $null
+
+function ConvertTo-CertumCountBucket($Count) {
+    if ($Count -cin @('zero','one','two','many')) { return $Count }
+    return 'unknown'
+}
 
 function Write-CertumFailure {
     # Only fixed public categories are emitted. Never format an ErrorRecord.
@@ -33,6 +41,15 @@ function Write-CertumFailure {
     $reason = if ($script:CertumSchemaReason -cin $reasons) { $script:CertumSchemaReason } else { 'unknown' }
     $count = if ($script:CertumEditCount -cin @('zero','one','two','many')) { $script:CertumEditCount } else { 'unknown' }
     [Console]::Error.WriteLine("SimplySign session operation failed; stage=$stage; category=operation-failed; cleanup=$cleanup; schema_reason=$reason; edit_count=$count; credential diagnostics are disabled.")
+    if ($script:CertumObservationResult -cne 'not-checked') {
+        $result = if ($script:CertumObservationResult -cin @('observed','guard-or-query-failed','deadline')) { $script:CertumObservationResult } else { 'unknown' }
+        $initial = $script:CertumInitialCounts; $repeated = $script:CertumRepeatedCounts
+        $it = ConvertTo-CertumCountBucket $initial.uia_total; $ie = ConvertTo-CertumCountBucket $initial.uia_edit
+        $ine = ConvertTo-CertumCountBucket $initial.native_edit
+        $rt = ConvertTo-CertumCountBucket $repeated.uia_total; $re = ConvertTo-CertumCountBucket $repeated.uia_edit
+        $rne = ConvertTo-CertumCountBucket $repeated.native_edit
+        [Console]::Error.WriteLine("SimplySign schema observation; result=$result; initial_uia_total=$it; initial_uia_edit=$ie; initial_native_edit=$ine; repeated_uia_total=$rt; repeated_uia_edit=$re; repeated_native_edit=$rne.")
+    }
 }
 
 function Read-CertumPolicy([string]$Path) {
@@ -221,6 +238,8 @@ public static class CertumWindow {
     public delegate bool EnumProc(IntPtr h, IntPtr unused);
     [DllImport("user32.dll")] static extern bool EnumWindows(EnumProc callback, IntPtr unused);
     [DllImport("user32.dll")] static extern bool IsWindowVisible(IntPtr h);
+    [DllImport("user32.dll")] static extern bool EnumChildWindows(IntPtr h, EnumProc callback, IntPtr unused);
+    [DllImport("user32.dll", CharSet=CharSet.Unicode)] static extern int GetClassName(IntPtr h, System.Text.StringBuilder value, int maximum);
     [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr h, out uint pid);
     [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr h);
     [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
@@ -229,6 +248,22 @@ public static class CertumWindow {
         EnumWindows((h, unused) => { uint owner; GetWindowThreadProcessId(h, out owner);
             if (owner == pid && IsWindowVisible(h)) found.Add(h); return true; }, IntPtr.Zero);
         return found.ToArray();
+    }
+    public static int EditChildren(IntPtr handle, uint pid) {
+        int count = 0; bool expired = false;
+        var clock = System.Diagnostics.Stopwatch.StartNew();
+        EnumChildWindows(handle, (h, unused) => {
+            if (clock.ElapsedMilliseconds >= 250) { expired = true; return false; }
+            uint owner; if (GetWindowThreadProcessId(h, out owner) == 0) { expired = true; return false; }
+            if (owner == pid) {
+                var value = new System.Text.StringBuilder(256);
+                if (GetClassName(h, value, value.Capacity) == 0) { expired = true; return false; }
+                string name = value.ToString();
+                if (name == "Edit" || name.StartsWith("WindowsForms10.EDIT.", StringComparison.Ordinal)) count++;
+            }
+            return true;
+        }, IntPtr.Zero);
+        return expired ? -1 : count;
     }
 }
 '@
@@ -286,8 +321,7 @@ function Select-CertumLoginFields($Fields, [int]$ProcessId) {
     return $ordered
 }
 
-function Get-CertumLoginFields([IntPtr]$Handle, $Process) {
-    $script:CertumSchemaReason = 'assemblies'; $script:CertumEditCount = 'unknown'
+function Get-CertumLoginWindow([IntPtr]$Handle, $Process) {
     Add-Type -AssemblyName UIAutomationClient, UIAutomationTypes
     $script:CertumSchemaReason = 'focus'
     Assert-CertumFocus $Handle $Process
@@ -297,6 +331,12 @@ function Get-CertumLoginFields([IntPtr]$Handle, $Process) {
         $window.Current.Name -cne 'SimplySign Desktop') {
         throw 'expected Desktop login window identity'
     }
+    return $window
+}
+
+function Get-CertumLoginFields([IntPtr]$Handle, $Process) {
+    $script:CertumSchemaReason = 'assemblies'; $script:CertumEditCount = 'unknown'
+    $window = Get-CertumLoginWindow $Handle $Process
     $condition = [Windows.Automation.PropertyCondition]::new(
         [Windows.Automation.AutomationElement]::ControlTypeProperty, [Windows.Automation.ControlType]::Edit)
     # Roles come from the fixed English associated labels, never screen position.
@@ -304,6 +344,57 @@ function Get-CertumLoginFields([IntPtr]$Handle, $Process) {
     $script:CertumSchemaReason = 'field-discovery'
     $fields = @($window.FindAll([Windows.Automation.TreeScope]::Descendants, $condition))
     return Select-CertumLoginFields $fields $Process.Id
+}
+
+function Get-CertumNumberBucket([int]$Number) {
+    switch ($Number) { 0 {'zero'} 1 {'one'} 2 {'two'} default { if ($Number -gt 2) {'many'} else {'unknown'} } }
+}
+
+function Assert-CertumDiagnosticIdentity([IntPtr]$Handle, $Process, $Session, $Clock) {
+    Assert-CertumDeadline $Clock
+    Assert-CertumFocus $Handle $Process
+    if ($Process.Id -ne $Session.process_id -or $Process.Path -ine $Session.executable -or
+        $Process.StartTime.ToUniversalTime().Ticks -ne ([datetime]$Session.process_started).ToUniversalTime().Ticks) {
+        throw 'diagnostic process identity changed'
+    }
+    return Get-CertumLoginWindow $Handle $Process
+}
+
+function Measure-CertumLoginSchema([IntPtr]$Handle, $Process, $Session, $Clock) {
+    $window = Assert-CertumDiagnosticIdentity $Handle $Process $Session $Clock
+    $total = $window.FindAll([Windows.Automation.TreeScope]::Descendants, [Windows.Automation.Condition]::TrueCondition).Count
+    Assert-CertumDeadline $Clock
+    $condition = [Windows.Automation.PropertyCondition]::new(
+        [Windows.Automation.AutomationElement]::ControlTypeProperty, [Windows.Automation.ControlType]::Edit)
+    $edits = $window.FindAll([Windows.Automation.TreeScope]::Descendants, $condition).Count
+    Assert-CertumDeadline $Clock
+    $native = [CertumWindow]::EditChildren($Handle, $Process.Id)
+    $null = Assert-CertumDiagnosticIdentity $Handle $Process $Session $Clock
+    return @{uia_total=(Get-CertumNumberBucket $total);uia_edit=(Get-CertumNumberBucket $edits);native_edit=(Get-CertumNumberBucket $native)}
+}
+
+function Assert-CertumInitialLoginSchema([IntPtr]$Handle, $Process, $Session, $Clock) {
+    $script:CertumObservationResult = 'not-checked'; $script:CertumInitialCounts = $null; $script:CertumRepeatedCounts = $null
+    try { $null = Get-CertumLoginFields $Handle $Process }
+    catch {
+        $reason = $script:CertumSchemaReason; $count = $script:CertumEditCount
+        if ($reason -ceq 'edit-count' -and $count -ceq 'zero') {
+            $script:CertumObservationResult = 'guard-or-query-failed'
+            try {
+                $script:CertumInitialCounts = Measure-CertumLoginSchema $Handle $Process $Session $Clock
+                if ($Clock.Elapsed.TotalSeconds -ge 118) { $script:CertumObservationResult = 'deadline' }
+                else {
+                    Start-Sleep -Milliseconds 1000
+                    Assert-CertumDeadline $Clock
+                    $script:CertumRepeatedCounts = Measure-CertumLoginSchema $Handle $Process $Session $Clock
+                    $script:CertumObservationResult = 'observed'
+                }
+            } catch { $script:CertumObservationResult = if ($Clock.Elapsed.TotalSeconds -ge 120) {'deadline'} else {'guard-or-query-failed'} }
+        }
+        $script:CertumSchemaReason = $reason; $script:CertumEditCount = $count
+        # A later observation never changes the original refusal or routes credentials.
+        throw 'login schema refused'
+    }
 }
 
 function Set-CertumFieldFocus($Field, [IntPtr]$Handle, $Process) {
@@ -359,6 +450,7 @@ function Stop-CertumSession($Session) {
 }
 
 function Connect-CertumSession($Policy, [string]$Msi, [string]$OutputPath) {
+    $script:CertumObservationResult = 'not-checked'; $script:CertumInitialCounts = $null; $script:CertumRepeatedCounts = $null
     $username = $env:CERTUM_USERNAME; $text = $env:CERTUM_OTP_URI
     Remove-Item Env:CERTUM_USERNAME, Env:CERTUM_OTP_URI -ErrorAction SilentlyContinue
     $credential = $null; $process = $null; $session = $null; $registry = 'HKCU:\Software\Certum\SimplySign'
@@ -416,7 +508,7 @@ function Connect-CertumSession($Policy, [string]$Msi, [string]$OutputPath) {
         Start-Sleep -Milliseconds 200
         Assert-CertumFocus $handle $process
         $script:CertumStage = 'login-schema'
-        $null = Get-CertumLoginFields $handle $process
+        Assert-CertumInitialLoginSchema $handle $process $session $clock
         # Every serial signing job starts in a new period; no same-window replay.
         $period = [Math]::Floor([DateTimeOffset]::UtcNow.ToUnixTimeSeconds() / 30)
         while ([Math]::Floor([DateTimeOffset]::UtcNow.ToUnixTimeSeconds() / 30) -le $period) {
