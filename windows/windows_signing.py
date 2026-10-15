@@ -608,7 +608,8 @@ def phase_main(argv):
         targets = [member(root, 'hello.exe'), member(root, 'hello.msi')]
     else:
         raise ValueError('unknown Windows signature phase')
-    proofs = [dict(operation(path, policy, args.signtool), name=path.relative_to(root).as_posix()) for path in targets]
+    # Serialize targets already selected above as relative wire member names.
+    proofs = [dict(operation(path, policy, args.signtool), name=Path(os.path.relpath(path, root)).as_posix()) for path in targets]
     receipt = {'schema': 1, 'policy_sha256': hashlib.sha256(args.policy.read_bytes()).hexdigest(), 'result': 'pass', 'files': proofs}
     args.receipt.write_text(json.dumps(receipt, indent=2) + '\n')
     if args.operation == 'smoke-sign':

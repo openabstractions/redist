@@ -13,6 +13,21 @@ param(
     [switch]$Help
 )
 $PolicyPath = Join-Path $PSScriptRoot 'certum_simplysign.json'
+$script:CertumStage = 'policy'
+$script:CertumCleanup = 'not-started'
+
+function Write-CertumFailure {
+    # Only fixed public categories are emitted. Never format an ErrorRecord.
+    $stages = @('policy','runner','session-path','credential-validation','installer-validation',
+        'installer-execution','desktop-validation','desktop-configuration','desktop-launch',
+        'login-window','login-schema','credential-submit','certificate-discovery',
+        'certificate-validation','certificate-chain','session-persist','disconnect-receipt','disconnect-process')
+    $cleanups = @('not-started','no-process-started','process-unproven','owned-process-active',
+        'process-stopped','failed','no-owned-receipt')
+    $stage = if ($script:CertumStage -cin $stages) { $script:CertumStage } else { 'unknown' }
+    $cleanup = if ($script:CertumCleanup -cin $cleanups) { $script:CertumCleanup } else { 'unknown' }
+    [Console]::Error.WriteLine("SimplySign session operation failed; stage=$stage; category=operation-failed; cleanup=$cleanup; credential diagnostics are disabled.")
+}
 
 function Read-CertumPolicy([string]$Path) {
     try { $policy = Get-Content -LiteralPath $Path -Raw | ConvertFrom-Json -AsHashtable }
@@ -306,26 +321,32 @@ function Connect-CertumSession($Policy, [string]$Msi, [string]$OutputPath) {
     Remove-Item Env:CERTUM_USERNAME, Env:CERTUM_OTP_URI -ErrorAction SilentlyContinue
     $credential = $null; $process = $null; $session = $null; $registry = 'HKCU:\Software\Certum\SimplySign'
     $saved = @{}; $success = $false
+    $script:CertumCleanup = 'no-process-started'
     try {
+        $script:CertumStage = 'credential-validation'
         if (-not $username -or $username -match '[\r\n\x00]' -or -not $text) { throw 'missing signing credential' }
         $credential = ConvertFrom-CertumOtpUri $text
         $text = $null
+        $script:CertumStage = 'installer-validation'
         if (Test-Path -LiteralPath $OutputPath) { throw 'session output already exists' }
         if ((Get-Item -LiteralPath $Msi).Length -ne $Policy.installer.bytes -or
             (Get-FileHash -LiteralPath $Msi -Algorithm SHA256).Hash -ine $Policy.installer.sha256) { throw 'installer bytes differ' }
         $signature = Get-AuthenticodeSignature -LiteralPath $Msi
         if ($signature.Status -ne 'Valid' -or $signature.SignerCertificate.Thumbprint -ine $Policy.installer.publisher_sha1 -or
             $signature.SignerCertificate.GetNameInfo('SimpleName', $false) -cne $Policy.installer.publisher_cn) { throw 'installer publisher differs' }
+        $script:CertumStage = 'installer-execution'
         $installer = Start-CertumChild (Join-Path $env:SystemRoot 'System32\msiexec.exe') @('/i', [IO.Path]::GetFullPath($Msi), '/qn', '/norestart')
         try {
             if (-not $installer.WaitForExit(300000)) { $installer.Kill(); throw 'installer deadline exceeded' }
             if ($installer.ExitCode -ne 0) { throw 'pinned installer failed' }
         } finally { $installer.Dispose() }
+        $script:CertumStage = 'desktop-validation'
         $exe = Join-Path $env:ProgramFiles 'Certum\SimplySign Desktop\SimplySignDesktop.exe'
         $installed = Get-AuthenticodeSignature -LiteralPath $exe
         if ($installed.Status -ne 'Valid' -or $installed.SignerCertificate.GetNameInfo('SimpleName', $false) -cne $Policy.installer.publisher_cn) {
             throw 'installed Desktop publisher differs'
         }
+        $script:CertumStage = 'desktop-configuration'
         $null = New-Item -Path $registry -Force
         foreach ($name in @('ShowLoginDialogOnStart','ShowLoginDialogOnAppRequest','LangID')) {
             $value = Get-ItemPropertyValue -LiteralPath $registry -Name $name -ErrorAction SilentlyContinue
@@ -334,8 +355,12 @@ function Connect-CertumSession($Policy, [string]$Msi, [string]$OutputPath) {
         }
         Initialize-CertumWindows
         $clock = [Diagnostics.Stopwatch]::StartNew()
+        $script:CertumStage = 'desktop-launch'
+        $script:CertumCleanup = 'process-unproven'
         $process = Start-CertumChild $exe @()
         $session = @{schema=1; process_id=$process.Id; process_started=$process.StartTime.ToUniversalTime().ToString('o'); executable=$exe}
+        $script:CertumCleanup = 'owned-process-active'
+        $script:CertumStage = 'login-window'
         $handle = [IntPtr]::Zero
         while ($clock.Elapsed.TotalSeconds -lt 30) {
             $process.Refresh(); if ($process.HasExited) { throw 'Desktop exited before login' }
@@ -348,6 +373,7 @@ function Connect-CertumSession($Policy, [string]$Msi, [string]$OutputPath) {
         $null = [CertumWindow]::SetForegroundWindow($handle)
         Start-Sleep -Milliseconds 200
         Assert-CertumFocus $handle $process
+        $script:CertumStage = 'login-schema'
         $null = Get-CertumLoginFields $handle $process
         # Every serial signing job starts in a new period; no same-window replay.
         $period = [Math]::Floor([DateTimeOffset]::UtcNow.ToUnixTimeSeconds() / 30)
@@ -356,17 +382,22 @@ function Connect-CertumSession($Policy, [string]$Msi, [string]$OutputPath) {
             Start-Sleep -Milliseconds 100
         }
         $otp = Get-CertumTotp $credential.Key ([DateTimeOffset]::UtcNow.ToUnixTimeSeconds())
+        $script:CertumStage = 'credential-submit'
         Submit-CertumCredential $handle $process $username $otp $clock
         $otp = $null; $username = $null
+        $script:CertumStage = 'certificate-discovery'
         while ($clock.Elapsed.TotalSeconds -lt 120) {
             $process.Refresh(); if ($process.HasExited) { throw 'Desktop exited during authentication' }
             if (@([CertumWindow]::Owned($process.Id)).Count -gt 1) { throw 'unexpected Desktop modal window' }
             $matches = @(Get-ChildItem Cert:\CurrentUser\My | Where-Object { $_.Thumbprint -ieq $Policy.certificate.sha1 })
             if ($matches.Count -gt 1) { throw 'ambiguous pinned certificate' }
             if ($matches.Count -eq 1) {
+                $script:CertumStage = 'certificate-validation'
                 $session.certificate = Get-CertumCertificateInfo $matches[0] $Policy.certificate
+                $script:CertumStage = 'certificate-chain'
                 Assert-CertumChain $matches[0]
                 Assert-CertumDeadline $clock
+                $script:CertumStage = 'session-persist'
                 $session.source_sha = $env:GITHUB_SHA
                 $session.policy_sha256 = (Get-FileHash -LiteralPath $PolicyPath -Algorithm SHA256).Hash
                 $session.runner_disposal_required = $true
@@ -387,12 +418,35 @@ function Connect-CertumSession($Policy, [string]$Msi, [string]$OutputPath) {
                 if ($null -eq $saved[$name]) { Remove-ItemProperty -LiteralPath $registry -Name $name -ErrorAction SilentlyContinue }
                 else { Set-ItemProperty -LiteralPath $registry -Name $name -Type DWord -Value $saved[$name] }
             }
-        } catch { $success = $false; throw }
+        } catch { $success = $false; $script:CertumCleanup = 'failed'; throw }
         finally {
-            try { if (-not $success -and $null -ne $session) { $null = Stop-CertumSession $session } }
+            try {
+                if (-not $success -and $null -ne $session) {
+                    $null = Stop-CertumSession $session
+                    if ($script:CertumCleanup -ne 'failed') { $script:CertumCleanup = 'process-stopped' }
+                }
+            } catch { $script:CertumCleanup = 'failed'; throw }
             finally { if ($null -ne $process) { $process.Dispose() } }
         }
     }
+}
+
+function Disconnect-CertumSession($Policy, [string]$SessionFile) {
+    $script:CertumStage = 'disconnect-receipt'
+    $script:CertumCleanup = 'process-unproven'
+    if (-not (Test-Path -LiteralPath $SessionFile -PathType Leaf)) {
+        $script:CertumCleanup = 'no-owned-receipt'
+        throw 'owned session receipt absent; cleanup is unproven'
+    }
+    $session = Get-Content -LiteralPath $SessionFile -Raw | ConvertFrom-Json -AsHashtable
+    if ($session.schema -ne 1 -or $session.source_sha -cne $env:GITHUB_SHA -or
+        $session.policy_sha256 -ine (Get-FileHash -LiteralPath $PolicyPath -Algorithm SHA256).Hash -or
+        $session.certificate.sha256 -ine $Policy.certificate.sha256) { throw 'session binding differs' }
+    $script:CertumStage = 'disconnect-process'
+    $result = Stop-CertumSession $session
+    $script:CertumCleanup = 'process-stopped'
+    if ($IsWindows) { Set-Clipboard -Value '' }
+    return $result
 }
 
 if ($LibraryOnly) { return }
@@ -405,21 +459,18 @@ if ($Help -or -not $Mode) {
 try {
     $ErrorActionPreference = 'Stop'
     $policy = Read-CertumPolicy $PolicyPath
+    $script:CertumStage = 'runner'
     Assert-CertumRunner $policy
+    $script:CertumStage = 'session-path'
     $sessionFile = Assert-CertumSessionPath $SessionPath
     if ($Mode -eq 'Connect') { $result = Connect-CertumSession $policy $InstallerPath $sessionFile }
     else {
         Remove-Item Env:CERTUM_USERNAME, Env:CERTUM_OTP_URI -ErrorAction SilentlyContinue
-        $session = Get-Content -LiteralPath $sessionFile -Raw | ConvertFrom-Json -AsHashtable
-        if ($session.schema -ne 1 -or $session.source_sha -cne $env:GITHUB_SHA -or
-            $session.policy_sha256 -ine (Get-FileHash -LiteralPath $PolicyPath -Algorithm SHA256).Hash -or
-            $session.certificate.sha256 -ine $policy.certificate.sha256) { throw 'session binding differs' }
-        $result = Stop-CertumSession $session
-        if ($IsWindows) { Set-Clipboard -Value '' }
+        $result = Disconnect-CertumSession $policy $sessionFile
     }
     $result | ConvertTo-Json -Depth 8 -Compress
 } catch {
     Remove-Item Env:CERTUM_USERNAME, Env:CERTUM_OTP_URI -ErrorAction SilentlyContinue
-    [Console]::Error.WriteLine('SimplySign session operation failed; credential diagnostics are disabled.')
+    Write-CertumFailure
     exit 1
 }
