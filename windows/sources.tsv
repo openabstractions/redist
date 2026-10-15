@@ -1,14 +1,18 @@
-> Where every file in the package comes from. installer/validate.py and the
-> release workflow read this and nothing else.
+> Source-reference records for the files named by installer/payload.tsv.
+> installer/validate.py checks their shape. The final release checks the
+> optional provider refs below against prepared/published public commits;
+> redist/tools.tsv separately selects exact executable module versions.
 >
 > id      the name payload.tsv uses
 > repo    owner/name on github.com, or "-" for the repository being built
-> ref     a full 40-hex commit, because a branch is not a pin, or "-" for a
->         repository that does not carry these files yet. A "-" ref is loud, not
->         silent: validate.py prints the source as unpinned every run, a --src
->         build takes whatever directory it is handed, and a --bin build has
->         nothing to take. It becomes a commit on the day the split publishes
->         the files there, and never moves afterwards.
+> ref     a full 40-hex commit, because a branch is not a pin, or "-" while
+>         the exact release source remains unselected. A "-" ref is loud:
+>         validate.py prints the source as unpinned, and --src takes the
+>         checkout it is handed. A --bin build may take a separately qualified
+>         prebuilt executable regardless of this ref. The 0.4 release gate
+>         requires exact source commits for localstores, modelhost,
+>         lemonadeimage, thenoiseimage, pytorchimage and pytorchengine before
+>         publishing its final package candidate.
 >
 > UNRESOLVED is a source with no verified published commit. A payload row naming
 > it must be gated by a preprocessor variable in abstraction.wxs, and the
@@ -16,14 +20,64 @@
 > a placeholder to be filled in silently: somebody has to decide where that file
 > is published from and verify its commit.
 >
+> localstores is abstraction-storage-over-local-stores, whose
+> go/cmd/inventoryd is an optional provider feature. The split manifest and
+> published.tsv already name that public repository. Its row remains "-"
+> until the final 0.4 candidate pins its exact source; redist/tools.tsv
+> supplies the separately qualified prebuilt executable to a --bin package.
+>
 > panel is the control panel, published into openabstractions/abstractions as the
 > module github.com/openabstractions/abstractions/monitor. The directory reaches
 > that repository through scripts/split.manifest's "tree monitor monitor"; the
 > tag a module in a subdirectory takes is monitor/vX.Y.Z. The release route
 > builds its Panel executable from the module version in redist/tools.tsv.
+> The panel and charter refs here retain historical source-reference commits;
+> they do not select the final candidate's executable bytes or module versions.
+>
+> modelhost is abstraction-provider-modelhost, whose go/cmd/modelhostd is
+> another optional provider feature. The split manifest and published.tsv
+> already name that public repository. Its row remains "-" until the final
+> 0.4 candidate pins its exact source; redist/tools.tsv supplies the
+> separately qualified prebuilt executable to a --bin package.
+>
+> modelhostengine is the reviewed upstream llama.cpp b10825 Windows x64 Vulkan
+> release asset. The source commit identifies its publisher's build; the
+> archive's exact SHA-256 and every kept file are checked before the reduced
+> 24-file OA bundle is derived. Only that separately pinned bundle enters the
+> x64 MSI. Windows ARM64 retains the provider but has no reviewed bundle.
+>
+> lemonadeimage is abstraction-provider-lemonade. The release tools roster
+> selects its planned go/v0.4.0 module for lemonaded.exe. The Windows x64
+> --bin route includes the executable and its declaration when the qualified
+> binary is supplied. The pin below identifies its exact prepared public
+> source; binary qualification remains separate. The engine and model are
+> separate Setup effects with their own consent and pins.
+>
+> pytorchimage and pytorchengine both name the same prepared
+> abstraction-provider-pytorch source commit. The first builds pytorchd; the
+> second is a prepared local-input directory, whose existing enginefiles
+> manifest comes from that same-source pytorchd setup inputs command. Its
+> CPython, lock-selected wheels and Hummingbird byte pins and license notices
+> remain owned by the provider. This source reference does not qualify those
+> native inputs or claim that Go built the third-party binaries. Genuine CI
+> input provenance and the final measured bundle identity remain release holds.
+>
+> ipclibrary is the abstraction-identity commit the abstraction-ipc wheel is
+> built from (research/org-edits/redist/pypi.tsv). Its directory is the one file
+> the release workflow takes out of that run's win_amd64 wheel,
+> abstraction/ipc/_native/abstraction_ipc.dll; a workstation passes a folder
+> holding a built abstraction_ipc.dll as --src ipclibrary=DIR.
 
 id		repo						ref
 installer	-						-
 panel		openabstractions/abstractions			fc273d2f6bffc54623081a0b28e5c2701ccc4651
 UNRESOLVED	-						-
 charter	openabstractions/abstractions	3ef816c8bbd62a9e1da21c8e51ce69f99b70af41
+localstores	openabstractions/abstraction-storage-over-local-stores	25014a7734abe03d758a14b927653855ee549757
+modelhost	openabstractions/abstraction-provider-modelhost	ac4156c01d4905d7999c187c3ec68b4733bfaa46
+modelhostengine	ggml-org/llama.cpp	9e0e220594af405a62835dc3a27495729fd8506b
+lemonadeimage	openabstractions/abstraction-provider-lemonade	77bc45249a673ff67035edf19797bd96b1b7beb6
+thenoiseimage	openabstractions/abstraction-provider-thenoise	eda2e2b96d1a1d1fa109b47bf17ad68853945ac6
+pytorchimage	openabstractions/abstraction-provider-pytorch	8c237ffe5a46a2058fb82a30becc9cf29735cb9f
+pytorchengine	openabstractions/abstraction-provider-pytorch	8c237ffe5a46a2058fb82a30becc9cf29735cb9f
+ipclibrary	openabstractions/abstraction-identity	64a253fee9410c76e6b04b061934c823e0e89db3

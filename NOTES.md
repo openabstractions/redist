@@ -1,118 +1,82 @@
-The Open Abstractions redistributable packages programs built from published
-module versions. The build appends this release's asset and signing state at
-the end of these notes; those facts apply to this release only.
+Open Abstractions 0.4.0 includes the shared runtime and tools built from pinned
+module versions. The appended build record identifies delivered assets, signing
+status, package verification and tested architectures.
 
-## Changes in this release
+## Release 0.4.0
 
-- **Inference covers chat, embeddings, transcription, speech, image generation
-  and live voice.** The runtime selects an eligible configured host, applies
-  rights and named credentials, and records attributed outcomes. Durable video
-  generation and image batches use the job service for observation,
-  reconciliation, cancellation and retained results.
-- **Named credentials stay with the runtime service.** Operators can add,
-  inspect, rotate and revoke credentials through the command line or Panel.
-  The service applies an authorized credential inside the consuming service
-  without returning its stored bytes to the application.
-- **Applications can publish their presence and supported interfaces.** The
-  permission-filtered directory lists registered applications and live
-  instances. A separately authorized activation request can start a registered
-  application and wait for its fresh announcement.
-  On Linux, announcement and activation require a usable kernel audit-session
-  ID matching the runtime. Our WSL test environment had an unset session ID
-  and correctly refused these protected calls.
-- **Typed client source surfaces cover Go, C++17, Python, Rust and JavaScript.**
-  Go, C++ and Python facade clients use their default native IPC paths. Rust
-  and JavaScript use their separate native connector packages. Each source SDK
-  is available at the corresponding repository revision used for this release;
-  its package version, registry availability and release status remain
-  independent of the redistributable.
-- **`jobd`, `dl` and `jobctl` are removed, with the job-store provider inside
-  `jobd` and its `supervisor.json` heartbeat.** `openabstractions download`
-  submits a download to the installed runtime and copies the result out;
-  `openabstractions jobs list|show|wait|cancel|result` observes and controls
-  the work `openabstractions` submitted. Downloads still in flight through the
-  old job store at upgrade are abandoned: their records and partial files stay
-  where they are, and nothing finishes them. The Linux `abstraction-jobd`
-  sweep timer is stopped and disabled by the upgrade. On macOS the LaunchAgent
-  label is now `com.openabstractions.runtime`; the upgrade boots out
-  `com.openabstractions.jobd` and removes its plist. The Python file-store
-  packages are no longer carried in the developer files. What existed is
-  recorded in the project's `docs/REMOVED.md`.
-- **`openabstractions` runs the Windows runtime.** `openabstractions serve host`
-  starts the runtime, restarts it after a failure, and is started at sign-in by
-  the Startup shortcut (*Just me*) or the per-user service (*Everyone*).
-  `openabstractionsw` is the same program without a console window and replaces
-  `jobdw`. The installer stops no process itself: Windows ends the running host
-  before replacing files, and the host registers to be started again.
-- **A failed Windows upgrade leaves the previous version running.** Rolling back
-  starts the previous version's runtime again from its own folder, so it no
-  longer waits for the next sign-in.
-- **Windows upgrades keep one owner.** While an upgrade replaces an
-  installation, its runtime cannot start again from the Startup shortcut, the
-  service manager, `openabstractions start` or an application. The
-  installation activates normally once the upgrade finishes.
-- **A failed Windows upgrade leaves the previous version installed.** The
-  previous version is removed only after the new one is fully installed, so an
-  upgrade that fails keeps the earlier installation registered in Apps and
-  features with its programs and your data.
-- **Per-user upgrades find an installation in another folder.** An upgrade
-  covers the previous version where it was installed, including a folder chosen
-  at install time.
-- **An elevated per-user install is refused before anything is copied.** See
-  [Installing from an elevated session](#installing-from-an-elevated-session).
-- **The panel shows what the installed runtime owns.** `Abstraction Panel`
-  reads runtime readiness, accepted work, questions, rights and user
-  configuration through the runtime's services. Its `--legacy-local` mode and
-  the delegation, downloads and may-reach screens that read the job store
-  directly are removed. With no runtime it reports the absence.
-- **Rights rules can expire and record their origin.** The runtime's rights
-  service accepts registered action names, rule expiry and rule provenance.
-- **`services.json` is no longer read or reserved.** A store written by an
-  earlier release may still hold one; a download may now use that name.
-- **Every program is built with Go 1.26.8.**
-- **Downgrading after a retry or lost result is refused.** See
-  [Downgrading to an earlier release](#downgrading-to-an-earlier-release).
+- **Keep a preferred model choice across providers.** A named selection policy
+  can try ordered model candidates, with fallback only when the preferred route
+  is known unavailable before dispatch. The OA operation record identifies the
+  host and model that answered; credential, rights and uncertain-execution
+  failures remain explicit.
+- **Find newly available local models without restarting OpenCode.** The optional
+  OpenCode adopter refreshes the running model list while preserving configured
+  defaults and custom models. Model context is an observed estimate; the selected
+  host decides whether a request fits.
+- **Prepare a ComfyUI workflow with verified assets and approval.** The optional
+  adopter checks required files and asks before replacing the current canvas.
+  The demonstration loaded an editable FLUX.2 Klein workflow and produced a
+  512 × 512 image.
+- **Share GPU resources between cooperating applications.** ComfyUI can wait
+  while Lemonade is busy, cancel its own waiting request, then continue after an
+  idle Lemonade model yields. The tested Windows run recorded memory release
+  and a ComfyUI render.
+- **Keep provider keys out of OpenCode.** A guided Panel flow stores a named
+  DeepSeek credential and requests scoped access for an identified application.
+  OpenCode uses the credential name while the key remains in Open Abstractions.
+- **Approve operation-log access before sharing details.** The optional OpenCode
+  source-watch tool asks before reading a source and separately before sending
+  event contents to the current model.
 
-This release packages the runtime and tools. It bundles no Python wheels, Rust
-crates or npm packages, and does not promise that those packages are published
-to a registry. Language SDK source is available from the corresponding
-repository revisions and keeps its own package versions and release status. The
-architecture roadmap continues beyond this release. The known macOS
-caller-identity limitation still applies to verified service readiness.
+**Demonstration scope.** The OpenCode API demonstration routed two requests
+through one saved Lemonade-to-Ollama preference; a separate rendered picker check
+selected a synthetic local model. The ComfyUI render began with all three assets
+already present, so empty-store setup and download-step savings were not measured.
+The guided credential flow used a synthetic key, and source-watch used synthetic
+records; no real DeepSeek request, native host logs or hosted log-sharing route
+was tested. The GPU handover was demonstrated on one Windows machine. Its original
+run had a final measurement assertion failure after rendering; a focused fix was
+reviewed, but the full run was not repeated. First-use effort, support on every
+platform and every provider combination require separate qualification. The
+OpenCode and ComfyUI integrations are optional adopter packages with their own
+version and setup requirements. The OA package carries the OpenCode patches but
+does not apply them to an installed OpenCode binary; running inventory refresh
+and detailed source-watch approval dialogs require a patched OpenCode 1.18.31
+build.
+
+The redistributable carries native programs only. Python wheels, Rust crates and
+npm packages have separate source versions and publication status.
 
 ## Updating application code
 
-The regenerated SDK source introduces named choices for closed options. In Go, use
-constants such as `facade.ScopeLocal`; use an enum's `String()` method when a
-wire word is needed. A Go `string(value)` conversion produces a Unicode character from a numeric
-enum value. Existing JSON wire words stay unchanged.
+Use named constants for closed options and an enum's `String()` method when a
+Go wire word is needed. A Go `string(value)` conversion produces a Unicode
+character from the numeric enum value. Existing JSON wire words stay
+unchanged. Extensible catalogues retain unknown words. Inference guarantees
+have named constants; unsupported guarantees receive a typed refusal before
+provider work begins. Match client package versions to the release's module
+pins.
 
-Extensible catalogues retain unknown words. Inference request guarantees have
-named constants and a dedicated type; an unsupported guarantee receives the
-service's typed refusal before provider work begins. Match the client package
-versions to the release's published module pins.
+## Candidate build targets
 
-## What is in it
+[`tools.tsv`](tools.tsv) names the module versions and packages consumed by the
+build workflow. These are workflow build targets, not a promise that every optional
+program appears in a final asset; installer feature selection can omit optional
+components.
 
-| program | what it does | platforms |
+| Program | Role | Build targets |
 |---|---|---|
-| `Abstraction Panel` | runtime readiness, accepted work, questions, rights and user configuration | Windows |
-| `openabstractions` | hosts the installed runtime, submits and observes downloads through it (`download`, `jobs`), and reports readiness (`status`) | Windows, Linux, macOS |
-| `openabstractionsw` | the same program built without a console window, which Windows starts at sign-in | Windows |
+| `openabstractions` | Runtime host and CLI | Windows, Linux, macOS |
+| `openabstractionsw` | Windowless Windows runtime host | Windows |
+| `Abstraction Panel` | Runtime status and control UI | Windows, macOS |
+| `inventoryd` | Local model-store inventory provider | Windows, Linux, macOS |
+| `modelhostd` | Local model-file provider | Windows, Linux, macOS |
+| `openabstractions-mcp` | stdio MCP gateway | Windows, Linux, macOS |
 
-There are three Windows executables and one Linux/macOS program. `openabstractions`
-and `openabstractionsw` are two builds of the same source. [`tools.tsv`](tools.tsv) at this release's
-commit names the exact module versions and packages the workflow builds.
-Resolving a module through the Go proxy proves it is fetchable; the proxy may
-retain versions after a tag is deleted.
-
-Every program on every platform is built with Go 1.26.8, with
-`GOTOOLCHAIN=local` so no other toolchain is fetched. Each build job keeps
-its `go version` output as a `go-version-<platform>` workflow artifact.
-
-`openabstractions jobs list` shows the work `openabstractions` submitted in
-your account. Work an application submitted through its own connection belongs
-to that application and is observed there.
+The POSIX installer includes local-store inventory by default. Model host and
+MCP gateway are optional selections. Windows selections follow MSI feature
+configuration. The appended release record names the exact packages and
+features delivered in each asset.
 
 ## Installing
 
@@ -160,6 +124,7 @@ states the signing outcome; consult the linked release build for its install
 and uninstall checks. Building an architecture does not prove installation on
 that architecture. Do not infer a Windows install result from Linux verification,
 or an installed macOS service from a signed package.
+
 
 ## Installing from an elevated session
 

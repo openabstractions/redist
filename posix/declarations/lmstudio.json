@@ -1,0 +1,20 @@
+{
+  "version": 2,
+  "declaration": {
+    "name": "lmstudio",
+    "program": "",
+    "arguments": [],
+    "endpoint": "",
+    "transport": "http@1",
+    "contracts": [],
+    "activation": "attach",
+    "role": "host",
+    "host": {
+      "base": "http://127.0.0.1:1234",
+      "kind": "lmstudio",
+      "hosted": false
+    }
+  },
+  "declared_by": "installation",
+  "declared_unix_ms": 0
+}

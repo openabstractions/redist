@@ -10,7 +10,7 @@
            InstallerVersion="500"
            Compressed="yes">
 
-    <SummaryInformation Description="Downloads that survive the program that started them" />
+    <SummaryInformation Description="Shared capabilities for applications" />
 
     <!-- The predecessor is removed after this installation is committed.
          Inside the transaction, a failure rolls the removal back, and an
@@ -52,9 +52,27 @@
     <?else?><?define NoPanel = " The Abstraction Panel, the graphical front end, is not in it." ?><?endif?>
     <?if $(var.Cpp) = yes ?><?define NoCpp = "" ?>
     <?else?><?define NoCpp = " The C++ header is not in it; no module carries it." ?><?endif?>
-    <?define Absent = "$(var.NoPanel)$(var.NoCpp)" ?>
+    <?if $(var.LocalStores) = yes ?><?define NoLocalStores = "" ?>
+    <?else?><?define NoLocalStores = " The local model stores feature is not in it; abstraction-storage-over-local-stores publishes nowhere yet, so this build could not obtain inventoryd." ?><?endif?>
+    <?if $(var.ModelHost) = yes ?><?define NoModelHost = "" ?>
+    <?else?><?define NoModelHost = " The model host feature is not in it; this build was given no source or binary for modelhostd." ?><?endif?>
+    <?if $(var.ModelHostEngine) = yes ?><?define NoModelHostEngine = "" ?>
+    <?else?><?define NoModelHostEngine = " The reviewed ModelHost chat engine is not in this package; Windows ARM64 has no reviewed engine pin." ?><?endif?>
+    <?if $(var.LemonadeImage) = yes ?><?define NoLemonadeImage = "" ?>
+    <?else?><?define NoLemonadeImage = " Local image generation is not in it; this build has no qualified x64 lemonaded provider." ?><?endif?>
+    <?if $(var.TheNoiseImage) = yes ?><?define NoTheNoiseImage = "" ?>
+    <?else?><?define NoTheNoiseImage = " The TheNoise image adapter is not in this build." ?><?endif?>
+    <?if $(var.PyTorchImage) = yes ?><?define NoPyTorchImage = "" ?>
+    <?else?><?define NoPyTorchImage = " The PyTorch picture feature is not in this build." ?><?endif?>
+    <?if $(var.McpGateway) = yes ?><?define NoMcpGateway = "" ?>
+    <?else?><?define NoMcpGateway = " The MCP gateway feature is not in it; this build was given no source or binary for openabstractions-mcp." ?><?endif?>
+    <?if $(var.IpcLibrary) = yes ?><?define NoIpcLibrary = "" ?>
+    <?else?><?define NoIpcLibrary = " The native IPC library for applications is not in it; this build was given none, and Windows ARM64 has no build of it." ?><?endif?>
+    <?if $(var.SystemHelper) = yes ?><?define NoSystemHelper = "" ?>
+    <?else?><?define NoSystemHelper = " The protected-operation helper is not in it; this build was given no source or binary for openabstractions-system." ?><?endif?>
+    <?define Absent = "$(var.NoSystemHelper)$(var.NoIpcLibrary)$(var.NoPanel)$(var.NoCpp)$(var.NoLocalStores)$(var.NoModelHost)$(var.NoModelHostEngine)$(var.NoLemonadeImage)$(var.NoTheNoiseImage)$(var.NoPyTorchImage)$(var.NoMcpGateway)" ?>
     <?if $(var.Absent) = "" ?>
-    <Property Id="ARPCOMMENTS" Value="Downloads that survive the program that started them." />
+    <Property Id="ARPCOMMENTS" Value="The OpenAbstractions runtime shares downloads, model access, credentials and permissions among applications." />
     <?else?>
     <Property Id="ARPCOMMENTS" Value="This build is incomplete and says so.$(var.Absent)" />
     <?endif?>
@@ -82,7 +100,18 @@
     <StandardDirectory Id="LocalAppDataFolder">
       <Directory Id="ProgramsFolder" Name="Programs">
         <Directory Id="APPLICATIONFOLDER" Name="OpenAbstractions">
-          <Directory Id="ToolsFolder" Name="tools" />
+          <Directory Id="ToolsFolder" Name="tools">
+            <Directory Id="EnginesFolder" Name="engines" />
+            <!-- The declaration files the installation places beside the
+                 runtime executable. The runtime reads them at start and lists
+                 them as declared by the installation; an operator's removal
+                 of one is recorded in the runtime's own state, so this
+                 package writing the file again does not bring it back. -->
+            <Directory Id="DeclarationsFolder" Name="declarations" />
+          </Directory>
+          <Directory Id="ComponentEnginesFolder" Name="engines">
+            <Directory Id="PyTorchInputsFolder" Name="pytorch" />
+          </Directory>
           <Directory Id="ExamplesFolder" Name="examples">
             <Directory Id="ExampleMachine" Name="what-this-machine-does" />
             <Directory Id="ExampleLifecycle" Name="job-lifecycle" />
@@ -143,6 +172,43 @@
       <Component Directory="ToolsFolder">
         <File Id="openabstractionsw.exe" Source="payload/tools/openabstractionsw.exe" KeyPath="yes" />
       </Component>
+      <?if $(var.SystemHelper) = yes ?>
+      <!-- The protected-operation helper (facade FAC-H1): the one program OA
+           raises the Windows administrator prompt for, after the person's yes
+           in OA's own prompt. Only a machine install places it, under Program
+           Files where only administrators can change it; the runtime and the
+           Panel refuse a copy anywhere else (identity ID-D2), so a per-user
+           install leaves it out. -->
+      <Component Id="SystemHelper" Directory="ToolsFolder" Condition="ALLUSERS">
+        <File Id="openabstractions_system.exe" Source="payload/tools/openabstractions-system.exe" KeyPath="yes" />
+      </Component>
+      <?endif?>
+      <?if $(var.IpcLibrary) = yes ?>
+      <!-- OA's native IPC library for applications, as a redistributable
+           ships its runtime DLLs: an application's OA client that carries
+           no native library of its own loads this one. Its full path is
+           recorded beside the runtime's version, in the same hive as the
+           Panel's program value, so a client reads one value and needs no
+           search. Uninstall removes the file and the value with the
+           component. -->
+      <Component Id="IpcLibrary" Directory="ToolsFolder">
+        <File Id="abstraction_ipc.dll" Source="payload/tools/abstraction_ipc.dll" KeyPath="yes" />
+        <RegistryValue Root="HKMU" Key="Software\OpenAbstractions\Abstraction"
+                       Name="ipc_library" Type="string" Value="[#abstraction_ipc.dll]" />
+      </Component>
+      <?endif?>
+      <Component Directory="DeclarationsFolder">
+        <File Id="declaration.lemonade.json" Source="payload/tools/declarations/lemonade.json" KeyPath="yes" />
+      </Component>
+      <Component Directory="DeclarationsFolder">
+        <File Id="declaration.lmstudio.json" Source="payload/tools/declarations/lmstudio.json" KeyPath="yes" />
+      </Component>
+      <Component Directory="DeclarationsFolder">
+        <File Id="declaration.ollama.json" Source="payload/tools/declarations/ollama.json" KeyPath="yes" />
+      </Component>
+      <Component Directory="DeclarationsFolder">
+        <File Id="declaration.comfyui.json" Source="payload/tools/declarations/comfyui.json" KeyPath="yes" />
+      </Component>
       <Component Id="RegistryRoot" Directory="APPLICATIONFOLDER"
                  Guid="8821E881-5E73-465E-904E-EF7FC1223A5C">
         <RegistryValue Root="HKMU" Key="Software\OpenAbstractions\Abstraction"
@@ -172,7 +238,7 @@
     <Binary Id="UpgradeSupervisorCode" SourceFile="payload/tools/openabstractions.exe" />
     <!-- Upgrade exclusion. The incoming openabstractions records the folders
          being replaced and this installer process; every activation path of
-         those folders (start, serve host, SDK activation) exits 3 while the
+         those folders (start, serve supervisor, SDK activation) exits 3 while the
          installer lives. The commit action releases it. The rollback action
          releases it and runs the previous version's own activation. Order in
          the early script, per scope: begin, commit release, rollback
@@ -240,6 +306,42 @@
          shared service name from RegisterSupervisorAfterRemoval onwards. -->
     <CustomAction Id="UnregisterSupervisor" FileRef="openabstractions.exe" ExeCommand="host unregister"
                   Execute="deferred" Impersonate="no" Return="check" />
+    <!-- TEMPORARY EXCEPTION (owner, 2026-10-06; TODO.md "Temporary exception:
+         sandbox root attributes"). Every OA sandbox carries one capability,
+         derived from the name openabstractions.sandbox (facade FAC-P3). A
+         machine install gives that capability one non-inherited entry on the
+         system drive's root and one on the profiles folder: SYNCHRONIZE and
+         FILE_READ_ATTRIBUTES on the folder itself, nothing it holds (provider
+         kit KIT-S7). An application whose start lstat-s every ancestor of its
+         folder needs it; an account's own folders are granted per session.
+         `host sandbox-roots` writes the entry with SetKernelObjectSecurity,
+         which never propagates through the drive; icacls and SetSecurityInfo
+         would. Removal takes exactly that entry back by SID, rights and
+         flags; a successor's upgrade keeps it. A failure is logged to
+         installer-actions.txt and stops nothing: only the sandboxed start
+         needs the entry. A per-user install has no administrator token and
+         writes neither. Remove these three actions once that application's
+         native path resolution is released and pinned. -->
+    <CustomAction Id="RollbackSandboxRoots" FileRef="openabstractions.exe" ExeCommand="host sandbox-roots revoke"
+                  Execute="rollback" Impersonate="no" Return="ignore" />
+    <CustomAction Id="GrantSandboxRoots" FileRef="openabstractions.exe" ExeCommand="host sandbox-roots grant"
+                  Execute="deferred" Impersonate="no" Return="ignore" />
+    <CustomAction Id="RevokeSandboxRoots" FileRef="openabstractions.exe" ExeCommand="host sandbox-roots revoke"
+                  Execute="deferred" Impersonate="no" Return="ignore" />
+    <!-- A sandboxed session takes its own grants back at exit, the account's
+         ancestors' attribute entries included. One that crashed and was never
+         opened again leaves its manifest in the account's runtime state.
+         Before the program goes, a real removal runs `service
+         remove-sandboxes` as the removing account, which removes each
+         leftover sandbox from its manifest's recorded snapshots and deletes
+         its profile. Other accounts' leftovers stay until each account runs
+         the same command. The command refuses an elevated token (a forged
+         folder entry must never be revoked with administrator rights), so an
+         elevated removal leaves them; as with the engine unlocks, an elevated
+         removal of a per-user install does not run it, and a failure stops
+         nothing. -->
+    <CustomAction Id="RemoveLeftoverSandboxes" FileRef="openabstractions.exe" ExeCommand="service remove-sandboxes"
+                  Execute="immediate" Return="ignore" />
     <!-- Activation follows the committed install and the predecessor's removal.
          `start` refuses an elevated token before anything else, launches the
          windowless host detached and waits for readiness. When Restart Manager
@@ -248,6 +350,13 @@
     <CustomAction Id="StartUserRuntime" FileRef="openabstractionsw.exe"
                   ExeCommand="start --require-unelevated"
                   Execute="immediate" Impersonate="yes" Return="check" />
+    <?if $(var.Panel) = yes ?>
+    <!-- The shared activation owner verifies the installed sibling and asks
+         this account's unelevated desktop shell to dispatch it. No shell or a
+         foreign desktop retains a deferred-delivery installer diagnostic. -->
+    <CustomAction Id="StartMachinePresenter" FileRef="openabstractionsw.exe" ExeCommand="service start-presenter --machine"
+                  Execute="immediate" Impersonate="yes" Return="ignore" />
+    <?endif?>
     <!-- ALLUSERS=2 with MSIINSTALLPERUSER=1 resolves per-user for every token,
          including a full administrator or a deployment tool running as SYSTEM.
          Per-user activation refuses that token after InstallFinalize. This
@@ -256,6 +365,25 @@
          here instead would be a scope change nobody asked for. -->
     <CustomAction Id="RefuseElevatedPerUserInstall"
                   Error="Abstraction cannot install for your account from an elevated administrator session, because its runtime does not start with administrator rights. Run the installer without administrator rights to install for your account, or pass ALLUSERS=1 to install for everyone." />
+    <!-- The providers make the engine folders they install read-only for the
+         account (inference CONTRACT.md INF-F3). Removal leaves those folders
+         as user data, and once a provider is gone nothing gives them back:
+         the person could not delete them. Before a provider's program goes,
+         for a real removal of its feature and never under a successor's
+         upgrade, the provider gives this account's engine folders back. The
+         folders and the private model stay. Immediate, as the removing user,
+         whose folders they are; a failure leaves the folders read-only and
+         never stops the removal. An elevated removal of a per-user install
+         runs neither: the program lives under the account's own profile,
+         which the account can rewrite, and must not run at high integrity. -->
+    <?if $(var.ModelHost) = yes ?>
+    <CustomAction Id="UnlockModelHostEngine" FileRef="modelhostd.exe" ExeCommand="engine unlock"
+                  Execute="immediate" Return="ignore" />
+    <?endif?>
+    <?if $(var.LemonadeImage) = yes ?>
+    <CustomAction Id="UnlockLemonadeEngine" FileRef="lemonaded.exe" ExeCommand="engine unlock"
+                  Execute="immediate" Return="ignore" />
+    <?endif?>
 
     <InstallExecuteSequence>
       <Custom Action="RefuseElevatedPerUserInstall" Before="CostInitialize"
@@ -275,14 +403,39 @@
       <InstallExecute After="RestartPreviousUserSupervisor" />
       <Custom Action="UnregisterSupervisor" Before="RemoveFiles"
               Condition="ALLUSERS AND REMOVE=&quot;ALL&quot; AND NOT UPGRADINGPRODUCTCODE" />
+      <?if $(var.ModelHost) = yes ?>
+      <Custom Action="UnlockModelHostEngine" Before="RemoveFiles"
+              Condition="(&amp;ModelHost=2) AND (!ModelHost=3) AND NOT UPGRADINGPRODUCTCODE AND NOT (AdminUser AND NOT ALLUSERS)" />
+      <?endif?>
+      <?if $(var.LemonadeImage) = yes ?>
+      <Custom Action="UnlockLemonadeEngine" Before="RemoveFiles"
+              Condition="(&amp;LemonadeImage=2) AND (!LemonadeImage=3) AND NOT UPGRADINGPRODUCTCODE AND NOT (AdminUser AND NOT ALLUSERS)" />
+      <?endif?>
+      <!-- A feature-add maintenance transaction already owns this host. Its
+           rollback must never unregister the existing machine supervisor. -->
       <Custom Action="RollbackSupervisor" After="InstallFiles"
-              Condition="ALLUSERS AND NOT (REMOVE=&quot;ALL&quot;) AND NOT WIX_UPGRADE_DETECTED" />
+              Condition="ALLUSERS AND NOT Installed AND NOT (REMOVE=&quot;ALL&quot;) AND NOT WIX_UPGRADE_DETECTED" />
       <Custom Action="RegisterSupervisor" After="RollbackSupervisor"
-              Condition="ALLUSERS AND NOT (REMOVE=&quot;ALL&quot;) AND NOT WIX_UPGRADE_DETECTED" />
+              Condition="ALLUSERS AND NOT Installed AND NOT (REMOVE=&quot;ALL&quot;) AND NOT WIX_UPGRADE_DETECTED" />
+      <!-- TEMPORARY EXCEPTION: the sandbox root entries; see the actions.
+           Privileged as well as ALLUSERS: an elevated transaction is the one
+           that can write C:\ and the profiles folder. -->
+      <Custom Action="RollbackSandboxRoots" After="RegisterSupervisor"
+              Condition="ALLUSERS AND Privileged AND NOT Installed AND NOT (REMOVE=&quot;ALL&quot;) AND NOT WIX_UPGRADE_DETECTED" />
+      <Custom Action="GrantSandboxRoots" After="RollbackSandboxRoots"
+              Condition="ALLUSERS AND Privileged AND NOT (REMOVE=&quot;ALL&quot;)" />
+      <Custom Action="RevokeSandboxRoots" Before="RemoveFiles"
+              Condition="ALLUSERS AND Privileged AND REMOVE=&quot;ALL&quot; AND NOT UPGRADINGPRODUCTCODE" />
+      <Custom Action="RemoveLeftoverSandboxes" Before="RemoveFiles"
+              Condition="REMOVE=&quot;ALL&quot; AND NOT UPGRADINGPRODUCTCODE AND NOT (AdminUser AND NOT ALLUSERS)" />
       <Custom Action="RegisterSupervisorAfterRemoval" After="RemoveExistingProducts"
               Condition="ALLUSERS AND WIX_UPGRADE_DETECTED AND NOT REMOVE" />
       <Custom Action="StartUserRuntime" After="RegisterSupervisorAfterRemoval"
               Condition="NOT ALLUSERS AND NOT (REMOVE=&quot;ALL&quot;) AND NOT UPGRADINGPRODUCTCODE" />
+      <?if $(var.Panel) = yes ?>
+      <Custom Action="StartMachinePresenter" After="StartUserRuntime"
+              Condition="ALLUSERS AND NOT REMOVE AND NOT UPGRADINGPRODUCTCODE AND ((&amp;Tools=3) OR (!Tools=3))" />
+      <?endif?>
     </InstallExecuteSequence>
 
     <ComponentGroup Id="SupervisorService" Directory="APPLICATIONFOLDER">
@@ -305,7 +458,7 @@
                  Condition="NOT ALLUSERS">
         <Shortcut Id="LogonStartFile" Name="Abstraction supervisor"
                   Description="Starts the OpenAbstractions runtime host"
-                  Target="[#openabstractionsw.exe]" Arguments="serve host"
+                  Target="[#openabstractionsw.exe]" Arguments="serve supervisor"
                   WorkingDirectory="ToolsFolder" />
         <RegistryValue Root="HKCU" Key="Software\OpenAbstractions\Abstraction\Supervisor"
                        Name="atLogon" Type="integer" Value="1" KeyPath="yes" />
@@ -396,6 +549,14 @@
     </ComponentGroup>
 
     <?if $(var.Panel) = yes ?>
+    <!-- The exe itself carries the icon: monitor/panel.rc packs
+         monitor/icon/panel.ico at resource id 1 and go build links it in
+         through monitor/rsrc_windows_*.syso (monitor/README.md). WiX reads
+         that resource straight out of the staged binary rather than a
+         second copy of the ico file, so ARPPRODUCTICON and both shortcuts
+         below always show the same icon the exe does. -->
+    <Icon Id="PanelIcon" SourceFile="payload/tools/Abstraction Panel.exe" />
+    <Property Id="ARPPRODUCTICON" Value="PanelIcon" />
     <ComponentGroup Id="PanelFiles" Directory="ToolsFolder">
       <Component>
         <File Id="panel.exe" Name="Abstraction Panel.exe" Source="payload/tools/Abstraction Panel.exe" KeyPath="yes" />
@@ -403,12 +564,50 @@
     </ComponentGroup>
     <ComponentGroup Id="PanelShortcut" Directory="AbstractionMenuFolder">
       <Component Id="PanelStartMenu" Guid="E5D9EA35-65C8-4930-9FC0-06120E9F39BE">
+        <!-- The AppUserModelID and toast activator make the Panel the sender of
+             OA-held notifications (monitor/notification_windows.go, ASK-N7).
+             Windows starts the activator's LocalServer32 to deliver a click
+             after every OA process exited. -->
         <Shortcut Id="PanelShortcutFile" Name="Abstraction Panel"
                   Description="What this machine is doing with downloads, and what is holding the card"
-                  Target="[#panel.exe]" WorkingDirectory="ToolsFolder" />
+                  Target="[#panel.exe]" WorkingDirectory="ToolsFolder" Icon="PanelIcon">
+          <ShortcutProperty Key="System.AppUserModel.ID" Value="OpenAbstractions.Panel" />
+          <ShortcutProperty Key="System.AppUserModel.ToastActivatorCLSID" Value="{CC32C67F-0E49-4CC5-A212-C4CB329CD06C}" />
+        </Shortcut>
+        <RegistryValue Root="HKMU" Key="Software\Classes\CLSID\{CC32C67F-0E49-4CC5-A212-C4CB329CD06C}\LocalServer32"
+                       Type="string" Value="&quot;[#panel.exe]&quot; --background" />
+        <RemoveRegistryKey Root="HKMU" Key="Software\Classes\CLSID\{CC32C67F-0E49-4CC5-A212-C4CB329CD06C}"
+                           Action="removeOnUninstall" />
+        <Shortcut Id="SetupShortcutFile" Name="OpenAbstractions Setup"
+                  Description="Choose and prepare applications with OpenAbstractions"
+                  Target="[#panel.exe]" Arguments="--page setup"
+                  WorkingDirectory="ToolsFolder" Icon="PanelIcon" />
         <RemoveFolder Id="RemoveStartMenuFolder" On="uninstall" />
         <RegistryValue Root="HKMU" Key="Software\OpenAbstractions\Abstraction\Panel"
                        Name="installed" Type="integer" Value="1" KeyPath="yes" />
+        <!-- An application's own installer starts this Panel to register
+             the application (installer/apps/app.wxs); it finds the program
+             here. -->
+        <RegistryValue Root="HKMU" Key="Software\OpenAbstractions\Abstraction\Panel"
+                       Name="program" Type="string" Value="[#panel.exe]" />
+        <RemoveRegistryKey Root="HKMU" Key="Software\OpenAbstractions\Abstraction\Panel"
+                           Action="removeOnUninstall" />
+      </Component>
+    </ComponentGroup>
+
+    <!-- The Panel's background question presenter at sign-in, the same
+         Startup-folder pattern LogonStart above uses for the runtime host.
+         MSI resolves StartupFolder for the installing account or all users
+         according to installation scope; HKMU keeps its marker in that scope.
+         The component and registry names are retained
+         for upgrades of existing per-user registrations (installer/README.md). -->
+    <ComponentGroup Id="PanelTrayLogonStart" Directory="StartupFolder">
+      <Component Id="PanelTrayLogonStartShortcut" Guid="332A435E-CCA6-4D6B-B814-596735F40DE1">
+        <Shortcut Id="PanelTrayLogonStartFile" Name="Abstraction Panel notifications"
+                  Description="Presents pending OpenAbstractions questions in your session"
+                  Target="[#panel.exe]" Arguments="--background" WorkingDirectory="ToolsFolder" Icon="PanelIcon" />
+        <RegistryValue Root="HKMU" Key="Software\OpenAbstractions\Abstraction\Panel"
+                       Name="trayAtLogon" Type="integer" Value="1" KeyPath="yes" />
         <RemoveRegistryKey Root="HKMU" Key="Software\OpenAbstractions\Abstraction\Panel"
                            Action="removeOnUninstall" />
       </Component>
@@ -426,6 +625,137 @@
       <?endif?>
     </ComponentGroup>
 
+    <!-- The optional providers of VISION.md 2026-09-22. Each one is a separate
+         process the runtime launches, carried by the one package as a feature
+         a person ticks rather than by an installer of its own, because it
+         versions with the runtime it serves.
+
+         A provider feature installs its program into tools\, beside the
+         runtime, and the declaration file that declares it into
+         tools\declarations\. The runtime reads that directory at start and
+         lists what it finds as declared by the installation. Removing the
+         feature removes both components, so the declaration goes with the
+         program it named and nothing is left declaring a program that is no
+         longer there. An operator's own withdrawal is recorded in the
+         runtime's state, so reinstalling the feature does not bring back a
+         provider that person disabled.
+
+         inventoryd reads model stores and writes in none of them, which is
+         why LocalStores is on by default; the rights model draws that line
+         and so does this feature's level. -->
+    <?if $(var.LocalStores) = yes ?>
+    <ComponentGroup Id="LocalStoresFiles">
+      <Component Directory="ToolsFolder">
+        <File Id="inventoryd.exe" Source="payload/tools/inventoryd.exe" KeyPath="yes" />
+      </Component>
+      <Component Directory="DeclarationsFolder">
+        <File Id="declaration.local_stores.json" Source="payload/tools/declarations/local-stores.json" KeyPath="yes" />
+      </Component>
+    </ComponentGroup>
+    <?endif?>
+
+    <!-- Model host is a program the runtime launches, but not one this
+         package can declare: the declaration names the hosted object and the
+         staged engine path, and `openabstractions models host` writes it after
+         Setup. The bundled archive is inert until that setup. Unlike
+         LocalStores, this feature ships no declaration file — its marker is
+         written the way the Panel's and the MCP gateway's are, and the same
+         removal rule applies: taking the feature away takes modelhostd with
+         it, and any declaration that command wrote afterward is the
+         runtime's own state to keep or drop. -->
+    <?if $(var.ModelHost) = yes ?>
+    <ComponentGroup Id="ModelHostFiles" Directory="ToolsFolder">
+      <Component>
+        <File Id="modelhostd.exe" Source="payload/tools/modelhostd.exe" KeyPath="yes" />
+      </Component>
+      <?if $(var.ModelHostEngine) = yes ?>
+      <Component Directory="EnginesFolder">
+        <File Id="modelhost.b10825.archive" Source="payload/tools/engines/llama-b10825-oa-win-vulkan-x64.zip" KeyPath="yes" />
+      </Component>
+      <Component Directory="EnginesFolder">
+        <File Id="modelhost.b10825.receipt" Source="payload/tools/engines/llama-b10825-oa-win-vulkan-x64.receipt.json" KeyPath="yes" />
+      </Component>
+      <Component Directory="EnginesFolder">
+        <File Id="modelhost.b10825.mit" Source="payload/tools/engines/llama.cpp-MIT.txt" KeyPath="yes" />
+      </Component>
+      <Component Directory="EnginesFolder">
+        <File Id="modelhost.b10825.boringssl" Source="payload/tools/engines/BoringSSL-LICENSE.txt" KeyPath="yes" />
+      </Component>
+      <?endif?>
+      <Component Id="ModelHostMarker" Guid="13905645-2D4B-4ADA-89BF-0A12F6ABA2C2">
+        <RegistryValue Root="HKMU" Key="Software\OpenAbstractions\Abstraction\ModelHost"
+                       Name="installed" Type="integer" Value="1" KeyPath="yes" />
+        <RemoveRegistryKey Root="HKMU" Key="Software\OpenAbstractions\Abstraction\ModelHost"
+                           Action="removeOnUninstall" />
+      </Component>
+    </ComponentGroup>
+    <?endif?>
+
+    <!-- The image provider reads each account's reviewed selection when the
+         runtime starts it on demand. The engine and model are separate Panel
+         setup effects; MSI installs neither and launches neither. -->
+    <?if $(var.LemonadeImage) = yes ?>
+    <ComponentGroup Id="LemonadeImageFiles">
+      <Component Directory="ToolsFolder">
+        <File Id="lemonaded.exe" Source="payload/tools/lemonaded.exe" KeyPath="yes" />
+      </Component>
+      <Component Directory="DeclarationsFolder">
+        <File Id="declaration.lemonade_image.json" Source="payload/tools/declarations/lemonade-image.json" KeyPath="yes" />
+      </Component>
+    </ComponentGroup>
+    <?endif?>
+
+    <!-- Setup writes the TheNoise declaration after separate engine and
+         model approval. Its fixed CLI arguments name the journal-owned tree. -->
+    <?if $(var.TheNoiseImage) = yes ?>
+    <ComponentGroup Id="TheNoiseImageFiles">
+      <Component Directory="ToolsFolder">
+        <File Id="thenoise_provider.exe" Source="payload/tools/thenoise-provider.exe" KeyPath="yes" />
+      </Component>
+    </ComponentGroup>
+    <?endif?>
+
+    <!-- The x64 provider and its reviewed local runtime inputs ship together.
+         Setup prepares the component and writes its declaration after separate
+         model approval. Installation starts no interpreter or engine. -->
+    <?if $(var.PyTorchImage) = yes ?>
+    <ComponentGroup Id="PyTorchImageFiles">
+      <Component Directory="ToolsFolder">
+        <File Id="pytorchd.exe" Source="payload/tools/pytorchd.exe" KeyPath="yes" />
+      </Component>
+      <Component Directory="PyTorchInputsFolder">
+        <File Id="pytorch_inputs.zip" Source="payload/engines/pytorch/pytorch-2.11.0-rocm7.13.0-cpython3.12.10-gfx1151-inputs.zip" KeyPath="yes" />
+      </Component>
+      <Component Directory="PyTorchInputsFolder">
+        <File Id="pytorch_inputs.manifest.json" Source="payload/engines/pytorch/pytorch-2.11.0-rocm7.13.0-cpython3.12.10-gfx1151-inputs.manifest.json" KeyPath="yes" />
+      </Component>
+    </ComponentGroup>
+    <?endif?>
+
+    <!-- The MCP gateway is a program an assistant launches, not a provider the
+         runtime launches, so it ships with no declaration file: nothing in the
+         registry describes it and the runtime never starts it. Its authority
+         is the one the Panel has — a named program installed beside the
+         runtime, holding whatever an operator granted that exact path — and
+         the marker below is written the way the Panel's is, so the same
+         removal rule applies to both. The installation grants it nothing:
+         mcp-gateway/README.md names the four rules an operator writes for the
+         hosts and applications it should reach, and says not to copy the
+         runtime's own broad grants onto it. -->
+    <?if $(var.McpGateway) = yes ?>
+    <ComponentGroup Id="McpGatewayFiles" Directory="ToolsFolder">
+      <Component>
+        <File Id="openabstractions_mcp.exe" Source="payload/tools/openabstractions-mcp.exe" KeyPath="yes" />
+      </Component>
+      <Component Id="McpGatewayMarker" Guid="0B0C2E74-9A5E-4F1C-8B24-3D6A1E5F7C08">
+        <RegistryValue Root="HKMU" Key="Software\OpenAbstractions\Abstraction\McpGateway"
+                       Name="installed" Type="integer" Value="1" KeyPath="yes" />
+        <RemoveRegistryKey Root="HKMU" Key="Software\OpenAbstractions\Abstraction\McpGateway"
+                           Action="removeOnUninstall" />
+      </Component>
+    </ComponentGroup>
+    <?endif?>
+
     <Feature Id="Service" Level="1" AllowAbsent="no" AllowAdvertise="no"
              Title="Background supervisor"
              Description="Runs the OpenAbstractions runtime for applications, and keeps accepted work going after the calling program closes. For everyone, Windows starts the runtime host in each user's session at sign-in and restarts it after failure. For your account, installation starts the runtime host, a Startup shortcut starts it at sign-in, and the next command or application that needs it starts it again. The host restarts a runtime that fails, and upgrades restart it.">
@@ -435,13 +765,21 @@
       <ComponentGroupRef Id="MachineConfigFolderGroup" />
     </Feature>
 
+    <?if $(var.Panel) = yes ?>
+    <?define ToolsTitle = "Examples and the panel" ?>
+    <?define PanelStartText = " After installation, open OpenAbstractions Setup from Start to choose and prepare applications. Abstraction Panel shows runtime settings." ?>
+    <?else?>
+    <?define ToolsTitle = "Examples" ?>
+    <?define PanelStartText = " This build does not include the Abstraction Panel." ?>
+    <?endif?>
     <Feature Id="Tools" Level="1" AllowAdvertise="no"
-             Title="Examples and the panel"
-             Description="examples\ holds three that run openabstractions download, jobs and status against this install and need no checkout. The Abstraction Panel shows what the runtime serves.">
+             Title="$(var.ToolsTitle)"
+             Description="examples\ holds three that run openabstractions download, jobs and status against this install and need no checkout.$(var.PanelStartText)">
       <ComponentGroupRef Id="ExampleFiles" />
       <?if $(var.Panel) = yes ?>
       <ComponentGroupRef Id="PanelFiles" />
       <ComponentGroupRef Id="PanelShortcut" />
+      <ComponentGroupRef Id="PanelTrayLogonStart" />
       <?endif?>
 
       <Feature Id="Path" Level="1" AllowAdvertise="no"
@@ -462,6 +800,77 @@
              Description="$(var.DeveloperText)">
       <ComponentGroupRef Id="DeveloperFiles" />
     </Feature>
+
+    <!-- Level 1 is ticked when the feature list opens and installed by a
+         command line that names no ADDLOCAL. msiexec /i abstraction-x64.msi
+         ADDLOCAL=Service,LocalStores installs exactly what it names, REMOVE=
+         takes a feature away, and Change in Apps and features reopens this
+         same list: nothing here is advertised and nothing is permanent, so a
+         feature left out today is added later without reinstalling the
+         product. -->
+    <?if $(var.LocalStores) = yes ?>
+    <Feature Id="LocalStores" Level="1" AllowAdvertise="no"
+             Title="Local model stores"
+             Description="Reads every model store on this machine — Ollama, Hugging Face, LM Studio, ComfyUI, FastFlowLM and Jan — and reports what each one holds to applications that ask the runtime. It reads listings, sizes and the programs' own index files. It writes in no store, which is why it is ticked to begin with. Untick it and the runtime lists only what each application tells it.">
+      <ComponentGroupRef Id="LocalStoresFiles" />
+    </Feature>
+    <?endif?>
+
+    <?if $(var.ModelHost) = yes ?>
+    <?if $(var.ModelHostEngine) = yes ?>
+    <?define ModelHostDescription = "Installs modelhostd and OA's reduced, reviewed llama.cpp b10825 Windows x64 Vulkan bundle. Setup verifies and stages that bundled engine for chat; installation starts no engine or model. openabstractions models host writes the declaration after a model is selected." ?>
+    <?else?>
+    <?define ModelHostDescription = "Installs modelhostd. Windows ARM64 has no reviewed bundled local chat engine, so Setup cannot offer the x64 b10825 default. Installation starts no engine or model." ?>
+    <?endif?>
+    <Feature Id="ModelHost" Level="1" AllowAdvertise="no"
+             Title="Model host"
+             Description="$(var.ModelHostDescription)">
+      <ComponentGroupRef Id="ModelHostFiles" />
+    </Feature>
+    <?endif?>
+
+    <?if $(var.LemonadeImage) = yes ?>
+    <Feature Id="LemonadeImage" Level="1000" AllowAdvertise="no"
+             Title="Local image generation"
+             Description="Adds lemonaded, which serves image generation, transcription and speech through the Lemonade app. Get started in the Panel reviews and downloads the separate engine and model after you choose them. Installing this feature starts no engine and downloads no model.">
+      <ComponentGroupRef Id="LemonadeImageFiles" />
+    </Feature>
+    <?endif?>
+
+    <?if $(var.TheNoiseImage) = yes ?>
+    <Feature Id="TheNoiseImage" Level="1000" AllowAdvertise="no" Title="TheNoise local pictures"
+             Description="Adds the TheNoise image adapter. Setup reviews the separate pinned engine and model downloads, then registers CPU image generation on demand. GPU qualification is pending. Installing this feature starts no engine and downloads no model.">
+      <ComponentGroupRef Id="TheNoiseImageFiles" />
+    </Feature>
+    <?endif?>
+
+    <?if $(var.PyTorchImage) = yes ?>
+    <Feature Id="PyTorchImage" Level="1000" AllowAdvertise="no" Title="PyTorch local pictures"
+             Description="Adds the PyTorch provider and its reviewed interpreter, wheel and source inputs on Windows x64. Setup prepares the component after you choose a model. Installing this feature starts no engine and downloads no model.">
+      <ComponentGroupRef Id="PyTorchImageFiles" />
+    </Feature>
+    <?endif?>
+
+    <?if $(var.McpGateway) = yes ?>
+    <Feature Id="McpGateway" Level="1000" AllowAdvertise="no"
+             Title="MCP gateway"
+             Description="openabstractions-mcp, a local stdio MCP server that gives an assistant six OA abilities: list applications, list models, one bounded completion, and submit, read or cancel durable image and video work. The runtime never starts it; an assistant does, by its absolute path. It holds nothing by being installed — grant it the applications and hosts it may reach with openabstractions rights.">
+      <ComponentGroupRef Id="McpGatewayFiles" />
+    </Feature>
+    <?endif?>
+
+    <!-- The NAS download provider's feature name, held and installing nothing.
+         The NAS delegator is a tier inside the download layer
+         (abstraction-download/go/nas): the runtime writes a job record into a
+         share a jobd over there is watching, and there is no separate program
+         on this machine to install. Level 0 keeps it out of the feature list
+         and out of every install, so nobody ticks a box that does nothing.
+         When that provider becomes a program, its components come here and its
+         level becomes 1000 — off unless chosen, because it writes into a share
+         and needs configuring. -->
+    <Feature Id="NasDownload" Level="0" Display="0" AllowAdvertise="no"
+             Title="NAS downloads"
+             Description="Reserved. The NAS delegator ships inside the runtime today and installs no program of its own." />
 
     <ui:WixUI Id="WixUI_Advanced" />
     <WixVariable Id="WixUILicenseRtf" Value="license.rtf" />

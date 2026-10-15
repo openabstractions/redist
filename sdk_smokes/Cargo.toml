@@ -1,0 +1,13 @@
+[package]
+name = "openabstractions-installed-sdk-smokes"
+version = "0.0.0"
+edition = "2021"
+
+[[bin]]
+name = "rust_probe"
+path = "rust_probe.rs"
+
+[dependencies]
+abstraction-facade-config = { path = "../../sources/abstraction-facade/rust-config" }
+abstraction-facade-native = { path = "../../sources/abstraction-facade/rust-native" }
+abstraction-ipc = { path = "../../sources/abstraction-identity/rust" }

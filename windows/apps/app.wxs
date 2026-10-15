@@ -1,0 +1,95 @@
+<!--
+  One showcase application's own per-user installer ("<application> with
+  OA"), built by installer/apps/build_app.py from the release's
+  application ZIP and the application's manifest (VISION 2026-10-06). The
+  package names no application: every name, version and identity is a
+  preprocessor variable build_app.py passes.
+
+  Install places the ZIP's files under
+  %LOCALAPPDATA%\OpenAbstractions\apps\<AppId> and, last, starts the
+  OpenAbstractions Panel with the application manifest the package carries:
+  the person confirms the registration in the Panel, which registers it with
+  its own application.manage. Uninstall starts the Panel to remove the entry,
+  with the same confirmation, before the files go. Installing grants no
+  permission; the application asks at first use. Without OpenAbstractions
+  the package refuses and names the release page to download it from; it
+  downloads and installs nothing else.
+-->
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
+  <Package Name="$(var.AppTitle)"
+           Manufacturer="$(var.Publisher)"
+           Version="$(var.Version)"
+           UpgradeCode="$(var.UpgradeCode)"
+           Scope="perUser"
+           InstallerVersion="500"
+           Compressed="yes">
+    <MajorUpgrade AllowSameVersionUpgrades="yes"
+                  DowngradeErrorMessage="A newer $(var.AppTitle) is already installed." />
+    <MediaTemplate EmbedCab="yes" />
+
+    <!-- The core OpenAbstractions package records its Panel's program
+         (installer/abstraction.wxs, PanelShortcut). A machine-wide
+         installation, which only an administrator can change, is preferred
+         to a per-user one. Only the registry names the program this package
+         starts: OaPanel is private, so Windows Installer ignores it on the
+         command line, and the two search properties, which Windows
+         Installer requires to be public, are cleared before AppSearch fills
+         them, so a command-line value never reaches OaPanel. OaNoValue is
+         never set; it formats as the empty value that clears a property. -->
+    <SetProperty Id="OAPANEL_USER" Action="ClearOaPanelUser" Value="[OaNoValue]" Before="AppSearch" Sequence="both" />
+    <SetProperty Id="OAPANEL_MACHINE" Action="ClearOaPanelMachine" Value="[OaNoValue]" Before="AppSearch" Sequence="both" />
+    <Property Id="OAPANEL_USER">
+      <RegistrySearch Root="HKCU" Key="Software\OpenAbstractions\Abstraction\Panel" Name="program" Type="raw" />
+    </Property>
+    <Property Id="OAPANEL_MACHINE">
+      <RegistrySearch Root="HKLM" Key="Software\OpenAbstractions\Abstraction\Panel" Name="program" Type="raw" Bitness="always64" />
+    </Property>
+    <SetProperty Id="OaPanel" Action="SetOaPanelMachine" Value="[OAPANEL_MACHINE]" After="AppSearch" Condition="OAPANEL_MACHINE" Sequence="both" />
+    <SetProperty Id="OaPanel" Action="SetOaPanelUser" Value="[OAPANEL_USER]" After="SetOaPanelMachine" Condition="NOT OaPanel AND OAPANEL_USER" Sequence="both" />
+    <Launch Condition="OaPanel OR Installed" Message="$(var.AppTitle) needs OpenAbstractions, which is not installed. Download it from https://github.com/openabstractions/redist/releases/latest, install it, then run this installer again." />
+
+    <StandardDirectory Id="LocalAppDataFolder">
+      <Directory Id="OAFolder" Name="OpenAbstractions">
+        <Directory Id="OAAppsFolder" Name="apps">
+          <Directory Id="INSTALLFOLDER" Name="$(var.AppId)" />
+        </Directory>
+      </Directory>
+    </StandardDirectory>
+
+    <ComponentGroup Id="AppFiles" Directory="INSTALLFOLDER">
+      <Files Include="$(var.Payload)\**" />
+    </ComponentGroup>
+    <ComponentGroup Id="AppManifest" Directory="INSTALLFOLDER">
+      <Component Id="ApplicationManifest">
+        <File Id="application.manifest" Name="application-manifest.json" Source="$(var.Manifest)" KeyPath="yes" />
+      </Component>
+      <Component Id="ApplicationRecord">
+        <RegistryValue Root="HKCU" Key="Software\OpenAbstractions\Applications\$(var.AppId)"
+                       Name="manifest" Type="string" Value="[#application.manifest]" KeyPath="yes" />
+        <RemoveFolder Id="RemoveINSTALLFOLDER" Directory="INSTALLFOLDER" On="uninstall" />
+        <RemoveFolder Id="RemoveOAAppsFolder" Directory="OAAppsFolder" On="uninstall" />
+      </Component>
+    </ComponentGroup>
+
+    <!-- The Panel shows the manifest and registers it only after the
+         person's click; the installer does not wait for that click, and the
+         Panel prints nothing an installer could use to confirm it. -->
+    <CustomAction Id="RegisterApplication" Property="OaPanel"
+                  ExeCommand="--register-application &quot;[#application.manifest]&quot;"
+                  Execute="immediate" Return="asyncNoWait" />
+    <CustomAction Id="RemoveApplication" Property="OaPanel"
+                  ExeCommand="--remove-application $(var.AppId)"
+                  Execute="immediate" Return="asyncNoWait" />
+    <InstallExecuteSequence>
+      <Custom Action="RegisterApplication" After="InstallFinalize"
+              Condition="OaPanel AND NOT REMOVE AND NOT UPGRADINGPRODUCTCODE" />
+      <Custom Action="RemoveApplication" Before="RemoveFiles"
+              Condition="OaPanel AND REMOVE=&quot;ALL&quot; AND NOT UPGRADINGPRODUCTCODE" />
+    </InstallExecuteSequence>
+
+    <Feature Id="Application" Title="$(var.AppTitle)" AllowAbsent="no">
+      <ComponentGroupRef Id="AppFiles" />
+      <ComponentGroupRef Id="AppManifest" />
+    </Feature>
+  </Package>
+</Wix>

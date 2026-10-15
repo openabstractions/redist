@@ -3,18 +3,27 @@
 	<title>Abstraction</title>
 	<organization>com.openabstractions</organization>
 	<domains enable_anywhere="false" enable_currentUserHome="true" enable_localSystem="false"/>
-	<options customize="never" rootVolumeOnly="false" hostArchitectures="x86_64,arm64"/>
+	<!-- customize="allow": the shared runtime is the package and is not a
+	     choice, and the optional providers of VISION 2026-09-22 are. Customize
+	     opens the list; Install takes each choice's own default, which is the
+	     Windows package's feature level said the other way round. -->
+	<options customize="allow" rootVolumeOnly="false" hostArchitectures="x86_64,arm64"/>
+	<!-- XPC runtime startup requires macOS 12 or later; package behavior is measured on macOS 26. -->
+	<allowed-os-versions>
+		<os-version min="12.0"/>
+	</allowed-os-versions>
 	<welcome file="welcome.txt" mime-type="text/plain"/>
 	<license file="LICENSE" mime-type="text/plain"/>
 	<conclusion file="conclusion.txt" mime-type="text/plain"/>
+	<!-- build.py writes the outline and the choices out of payload.tsv's
+	     feature column, one choice per feature this package carries. The
+	     optional ones come first, so their payload is on disk before the base
+	     package's postinstall writes the removal ledger out of what is there. -->
 	<choices-outline>
 		<line choice="default">
-			<line choice="com.openabstractions.abstraction"/>
+			@OUTLINE@
 		</line>
 	</choices-outline>
 	<choice id="default"/>
-	<choice id="com.openabstractions.abstraction" visible="false">
-		<pkg-ref id="com.openabstractions.abstraction"/>
-	</choice>
-	<pkg-ref id="com.openabstractions.abstraction" version="@VERSION@" onConclusion="none">component.pkg</pkg-ref>
+	@CHOICES@
 </installer-gui-script>

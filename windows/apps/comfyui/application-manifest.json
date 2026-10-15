@@ -1,0 +1,29 @@
+{
+  "name": "comfyui",
+  "program": "{app}/ComfyUI_windows_portable/python_embeded/python.exe",
+  "title": "ComfyUI — OA build",
+  "start_guidance": "For the guided OA image example, ComfyUI uses CPU for preview/save tensors while the selected OA image engine performs inference. This recipe makes no claim about local ComfyUI GPU workflows. Readiness means the OA integration loaded; it does not probe ComfyUI's HTTP endpoint.",
+  "activation": {
+    "arguments": [
+      "-B", "-s", "{app}/ComfyUI_windows_portable/oa_comfyui_launch.py",
+      "--records", "@records_sha256@",
+      "--state", "{local_app_data}/OpenAbstractions/ComfyUI/launch",
+      "--", "{app}/ComfyUI_windows_portable/ComfyUI/main.py",
+      "--windows-standalone-build",
+      "--cpu",
+      "--listen", "127.0.0.1",
+      "--port", "8188",
+      "--disable-api-nodes",
+      "--user-directory", "{local_app_data}/OpenAbstractions/ComfyUI/user",
+      "--input-directory", "{local_app_data}/OpenAbstractions/ComfyUI/input",
+      "--temp-directory", "{local_app_data}/OpenAbstractions/ComfyUI/temp",
+      "--output-directory", "{pictures}/OpenAbstractions/ComfyUI"
+    ],
+    "readiness": {
+      "name": "oa-integration-loaded",
+      "protocol": "oa-comfyui",
+      "contract": "openabstractions.comfyui/integration-ready@1"
+    },
+    "readiness_timeout_ms": 30000
+  }
+}

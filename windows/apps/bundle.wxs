@@ -1,0 +1,53 @@
+<!--
+  "OpenAbstractions Setup": one WiX Burn bundle that installs the core
+  OpenAbstractions package and offers the showcase applications' own
+  installers as one extra, optional step (VISION 2026-10-06). Built by
+  installer/apps/build_bundle.py, which names the applications; this file
+  names none.
+
+  The chain is the core MSI first, then ShowcaseApplications, the package
+  group build_bundle.py writes into apps.wxs: one MsiPackage per application
+  MSI (installer/apps/build_app.py), each optional, not vital, outside the
+  bundle's own container and installed only when its checkbox
+  (InstallApp_<id>) is ticked. The core comes first because each application
+  MSI finds the Panel the core package records and refuses to install without
+  it.
+
+  build_bundle.py checks every package against its SHA-256 and size pin
+  before the build and checks the built bundle's own manifest against the
+  same bytes after it. Burn refuses at install time a package whose size or
+  SHA-512 differs from what it recorded at build, and reports a result per
+  package. Each application MSI then starts the OpenAbstractions Panel, where
+  the person confirms its registration; the bundle grants nothing.
+
+  The theme is the WiX standard bootstrapper's HyperlinkTheme, read out of
+  WixToolset.Bal.wixext 5.0.2, with its Options page's folder controls
+  replaced by one checkbox per application (build_bundle.py).
+
+  The bundle installs the core package per-machine, with one administrator
+  prompt, like a redistributable (owner, 2026-10-06). ForcePerMachine makes
+  WiX pass ALLUSERS=1 to the dual-purpose core MSI. The application MSIs stay per-user and prefer the machine-wide Panel the core
+  package records in HKLM.
+
+  Preprocessor variables: Version, CoreMsi, ThemeFile, SuppressOptionsUI (yes
+  when no application is offered). apps.wxs is compiled beside this file.
+-->
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs"
+     xmlns:bal="http://wixtoolset.org/schemas/v4/wxs/bal">
+  <Bundle Name="OpenAbstractions Setup"
+          Manufacturer="OpenAbstractions"
+          Version="$(var.Version)"
+          UpgradeCode="5C2E44B1-6F0B-4D7E-9B1F-2E7A0C3D9A41">
+    <BootstrapperApplication>
+      <bal:WixStandardBootstrapperApplication Theme="hyperlinkLicense"
+                                              ThemeFile="$(var.ThemeFile)"
+                                              SuppressOptionsUI="$(var.SuppressOptionsUI)"
+                                              LicenseUrl="https://github.com/openabstractions/redist/blob/main/LICENSE" />
+    </BootstrapperApplication>
+
+    <Chain>
+      <MsiPackage Id="OpenAbstractions" SourceFile="$(var.CoreMsi)" Vital="yes" ForcePerMachine="yes" />
+      <PackageGroupRef Id="ShowcaseApplications" />
+    </Chain>
+  </Bundle>
+</Wix>

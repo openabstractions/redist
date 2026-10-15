@@ -7,11 +7,36 @@ import xml.etree.ElementTree as ET
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
-FEATURES = {"service": "Service", "tools": "Tools", "developer": "Developer"}
+sys.path.insert(0, str(HERE))
+from feature_invariants import FEATURE_NAMES, check_installed_declarations  # noqa: E402
+
+# The vocabulary payload.tsv's "feature" column draws from; shared with
+# installer/posix/payload.tsv through feature_invariants.py. Windows never
+# has a row naming "path" — Path installs nothing of its own, only the
+# PathEntry component group nested under Tools — so it never appears as a
+# payload.tsv feature, which FILELESS records below.
+FEATURES = FEATURE_NAMES
 FILELESS = {"Path"}
+# A feature whose name is held and whose components do not exist yet. It
+# installs nothing, is hidden from the feature list, and is at level 0, so
+# nobody ticks a box that does nothing. Every rule below that asks what a
+# feature installs skips these and asks instead that they stay empty.
+HELD = {"NasDownload"}
+# What each feature's tick is when the list opens, as INSTALLLEVEL is 1 by
+# default: 1 on, 1000 off, 0 hidden and never installed. The number lives in
+# abstraction.wxs and is recorded here so a level nobody meant to change is a
+# failure rather than a silent change of what a default install contains.
+LEVELS = {"Service": 1, "Tools": 1, "Path": 1, "Developer": 1000,
+          "LocalStores": 1, "ModelHost": 1, "LemonadeImage": 1000, "TheNoiseImage": 1000,
+          "PyTorchImage": 1000,
+          "McpGateway": 1000, "NasDownload": 0}
 KINDS = {"gobuild", "copy", "authored"}
+# build.py's GOARCH keys. Not imported from build.py: build.py imports rows
+# from this module, and importing back would be circular. The two are kept
+# in step by hand, the same way payload.tsv's own kind vocabulary is.
 SUBSYSTEMS = {"console", "windows"}
 WIDTH = 7
+DECLARATIONS = "tools/declarations/"
 
 MACHINE, USER = "ALLUSERS", "NOT ALLUSERS"
 SCOPES = {"for everyone": True, "just for me": False}
@@ -43,9 +68,9 @@ UPGRADE_BINARY = "payload/tools/openabstractions.exe"
 # removed. (action, Execute, Return, After, Condition, FileRef, ExeCommand)
 LATE_REMOVAL = (
     ("RollbackSupervisor", "rollback", "ignore", "InstallFiles",
-     'ALLUSERS AND NOT (REMOVE="ALL") AND NOT WIX_UPGRADE_DETECTED', "openabstractions.exe", "host unregister"),
+     'ALLUSERS AND NOT Installed AND NOT (REMOVE="ALL") AND NOT WIX_UPGRADE_DETECTED', "openabstractions.exe", "host unregister"),
     ("RegisterSupervisor", "deferred", "check", "RollbackSupervisor",
-     'ALLUSERS AND NOT (REMOVE="ALL") AND NOT WIX_UPGRADE_DETECTED', "openabstractions.exe", "host register"),
+     'ALLUSERS AND NOT Installed AND NOT (REMOVE="ALL") AND NOT WIX_UPGRADE_DETECTED', "openabstractions.exe", "host register"),
     ("RegisterSupervisorAfterRemoval", "immediate", "check", "RemoveExistingProducts",
      "ALLUSERS AND WIX_UPGRADE_DETECTED AND NOT REMOVE", "openabstractions.exe", "host register"),
     ("StartUserRuntime", "immediate", "check", "RegisterSupervisorAfterRemoval",
@@ -53,7 +78,7 @@ LATE_REMOVAL = (
      "start --require-unelevated"),
 )
 # The per-user Startup shortcut runs the windowless host.
-LOGON_SHORTCUT = {"Target": "[#openabstractionsw.exe]", "Arguments": "serve host"}
+LOGON_SHORTCUT = {"Target": "[#openabstractionsw.exe]", "Arguments": "serve supervisor"}
 UPGRADE_MESSAGES = {
     "binary": "abstraction.wxs: the upgrade actions must run the embedded incoming openabstractions.exe "
               f"(Binary UpgradeSupervisorCode = {UPGRADE_BINARY}), and the old product must be removed only "
@@ -99,6 +124,118 @@ def check_supervisor_removal(root):
         return ["abstraction.wxs: supervisor removal must run for a real uninstall only, under exactly "
                 f"{UNREGISTER_CONDITION!r}, so a successor's registration survives this product's removal"]
     return []
+
+
+# TEMPORARY EXCEPTION (TODO.md "Temporary exception: sandbox root
+# attributes"): a machine install gives OA's sandbox capability one
+# non-inherited attributes entry on the system drive's root and the profiles
+# folder, and removal takes exactly that entry back. Each row is (action,
+# Execute, Return, After, Before, Condition); every one runs installed
+# openabstractions.exe as LocalSystem. Delete the rows with the actions.
+SANDBOX_ROOTS = (
+    ("RollbackSandboxRoots", "rollback", "ignore", "RegisterSupervisor", None,
+     'ALLUSERS AND Privileged AND NOT Installed AND NOT (REMOVE="ALL") AND NOT WIX_UPGRADE_DETECTED',
+     "host sandbox-roots revoke"),
+    ("GrantSandboxRoots", "deferred", "ignore", "RollbackSandboxRoots", None,
+     'ALLUSERS AND Privileged AND NOT (REMOVE="ALL")', "host sandbox-roots grant"),
+    ("RevokeSandboxRoots", "deferred", "ignore", None, "RemoveFiles",
+     'ALLUSERS AND Privileged AND REMOVE="ALL" AND NOT UPGRADINGPRODUCTCODE', "host sandbox-roots revoke"),
+)
+
+
+# A real removal takes back the sandboxes a crashed session left in the
+# removing account's runtime state, as that account, before the program goes.
+LEFTOVER_SANDBOXES = ("RemoveLeftoverSandboxes", "service remove-sandboxes",
+                      'REMOVE="ALL" AND NOT UPGRADINGPRODUCTCODE AND NOT (AdminUser AND NOT ALLUSERS)')
+
+
+def check_sandbox_roots(root):
+    def find(tag, key, value):
+        return next((el for el in root.iter() if untag(el) == tag and el.get(key) == value), None)
+
+    bad = []
+    action, command, condition = LEFTOVER_SANDBOXES
+    element, row = find("CustomAction", "Id", action), find("Custom", "Action", action)
+    if (element is None or element.get("FileRef") != "openabstractions.exe" or element.get("ExeCommand") != command
+            or element.get("Execute") != "immediate" or element.get("Return") != "ignore"
+            or element.get("Impersonate") is not None or row is None or row.get("Before") != "RemoveFiles"
+            or row.get("After") is not None or row.get("Condition") != condition):
+        bad.append(f"abstraction.wxs: {action} must be an immediate action running installed openabstractions.exe "
+                   f"`{command}` as the removing account with return=ignore, before RemoveFiles under exactly "
+                   f"{condition!r}, so a crashed session's grants do not outlive the program")
+    for action, execute, returns, after, before, condition, command in SANDBOX_ROOTS:
+        element = find("CustomAction", "Id", action)
+        row = find("Custom", "Action", action)
+        expected = {"FileRef": "openabstractions.exe", "ExeCommand": command, "Execute": execute,
+                    "Impersonate": "no", "Return": returns}
+        if (element is None or any(element.get(k) != v for k, v in expected.items())
+                or row is None or row.get("After") != after or row.get("Before") != before
+                or row.get("Condition") != condition):
+            bad.append(f"abstraction.wxs: {action} must be a {execute} LocalSystem action running installed "
+                       f"openabstractions.exe `{command}` with return={returns}, scheduled "
+                       f"{'after ' + after if after else 'before ' + before} under exactly {condition!r}: "
+                       "the sandbox root entries are written only by a machine install and taken back only "
+                       "by a real removal (a temporary exception)")
+    return bad
+
+
+# Providers whose programs install read-only engine folders (inference
+# CONTRACT.md INF-F3), by the action that gives the removing account's folders
+# back before the feature's removal deletes the program: its feature, the
+# build variable that gates the feature, and the program.
+ENGINE_UNLOCK = {
+    "UnlockModelHostEngine": ("ModelHost", "ModelHost", "modelhostd.exe"),
+    "UnlockLemonadeEngine": ("LemonadeImage", "LemonadeImage", "lemonaded.exe"),
+}
+
+
+def engine_unlock_condition(feature):
+    """A real removal of the feature, never a successor's upgrade, and never
+    an elevated removal of a per-user install: that program lives where the
+    account can rewrite it and must not run at high integrity."""
+    return f"(&{feature}=2) AND (!{feature}=3) AND NOT UPGRADINGPRODUCTCODE AND NOT (AdminUser AND NOT ALLUSERS)"
+
+
+def gating(text, attribute, value):
+    """The build variables of the <?if?> blocks around each line that carries
+    attribute="value"."""
+    stack, found = [], []
+    for line in text.splitlines():
+        for d in re.finditer(r"<\?(if|endif)\b(.*?)\?>", line):
+            if d.group(1) == "endif":
+                if stack:
+                    stack.pop()
+                continue
+            v = re.search(r"\$\(var\.(\w+)\)", d.group(2))
+            stack.append(v.group(1) if v else "?")
+        if f'{attribute}="{value}"' in line:
+            found.append(list(stack))
+    return found
+
+
+def check_engine_unlock(root, text):
+    def find(tag, key, value):
+        return next((el for el in root.iter() if untag(el) == tag and el.get(key) == value), None)
+
+    bad = []
+    for action, (feature, var, program) in ENGINE_UNLOCK.items():
+        element = find("CustomAction", "Id", action)
+        row = find("Custom", "Action", action)
+        condition = engine_unlock_condition(feature)
+        ok = (element is not None and element.get("FileRef") == program
+              and element.get("ExeCommand") == "engine unlock" and element.get("Execute") == "immediate"
+              and element.get("Return") == "ignore" and element.get("Impersonate") is None
+              and row is not None and row.get("Before") == "RemoveFiles" and row.get("After") is None
+              and row.get("Condition") == condition)
+        if not ok:
+            bad.append(f"abstraction.wxs: {action} must be an immediate action running installed {program} "
+                       f"`engine unlock` with return=ignore, scheduled before RemoveFiles under exactly "
+                       f"{condition!r}, so the account's read-only engine folders stay removable after the provider goes")
+        places = gating(text, "Id", action) + gating(text, "Action", action)
+        if not places or any(var not in stack for stack in places):
+            bad.append(f"abstraction.wxs: {action} and its sequence row must sit inside <?if $(var.{var}) = yes ?>, "
+                       f"the gate of {program}")
+    return bad
 
 
 def check_upgrade_shutdown(root):
@@ -189,6 +326,30 @@ def check_elevated_scope(root):
     return bad
 
 
+IDENTIFIER_TAGS = {"File", "Component", "Feature", "Directory", "Property", "CustomAction"}
+IDENTIFIER_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_.]{0,71}$")
+
+
+def check_wix_identifiers(root):
+    """Every File/Component/Feature/Directory/Property/CustomAction Id, against
+    WiX's identifier rule: letters, digits, underscore and period; no hyphen;
+    72 characters at most; the first character a letter or underscore. A
+    hyphenated Id compiles here and fails only when WiX links it (WIX0014,
+    59f1eb7c fixed two); this finds it without WiX installed."""
+    bad = []
+    for el in root.iter():
+        tag = untag(el)
+        if tag not in IDENTIFIER_TAGS:
+            continue
+        ident = el.get("Id")
+        if ident is None or IDENTIFIER_RE.match(ident):
+            continue
+        bad.append(f"abstraction.wxs: {tag} Id={ident!r} is not a legal WiX identifier "
+                   f"(letters, digits, underscore, period; no hyphen; 72 characters at "
+                   f"most; first character a letter or underscore)")
+    return bad
+
+
 def gated_sources(text):
     stack, gated = [], {}
     for line in text.splitlines():
@@ -237,6 +398,35 @@ def wxs_features(root):
                 r.get("Id") for r in el.iter() if untag(r) == "ComponentGroupRef"
             ]
     return groups, features
+
+
+def feature_elements(root):
+    return {el.get("Id"): el for el in root.iter() if untag(el) == "Feature"}
+
+
+def check_feature_levels(root, features):
+    """Every feature's tick when the list opens, against LEVELS."""
+    bad = []
+    elements = feature_elements(root)
+    for fid, element in elements.items():
+        level = element.get("Level")
+        if fid not in LEVELS:
+            bad.append(f"abstraction.wxs: feature {fid} has no recorded default in validate.py's "
+                       f"LEVELS. What a default install contains is decided here and recorded there")
+            continue
+        if level != str(LEVELS[fid]):
+            bad.append(f"abstraction.wxs: feature {fid} is Level={level!r}, and validate.py records "
+                       f"its default as {LEVELS[fid]}. A level is a change to what a default install "
+                       f"contains, so the two say it together or neither says it")
+        if (fid in HELD) != (element.get("Display") == "0"):
+            bad.append(f"abstraction.wxs: feature {fid} is {'held' if fid in HELD else 'offered'} and "
+                       f"Display={element.get('Display')!r}. A held feature is hidden from the feature "
+                       f"list; an offered one is in it")
+    for fid in HELD:
+        if features.get(fid):
+            bad.append(f"abstraction.wxs: held feature {fid} references {features[fid]}. It installs "
+                       f"nothing until the program behind it exists")
+    return bad
 
 
 def folders(root):
@@ -326,8 +516,10 @@ def main():
             print("FAIL ", line)
         return 1
 
-    payload = {}
+    payload, authored = {}, {}
     for feature, path, kind, source, frm, sign, subsystem in rows("payload.tsv"):
+        if kind == "authored":
+            authored[path] = frm
         if kind == "gobuild" and subsystem not in SUBSYSTEMS:
             bad.append(f"payload.tsv: {path} subsystem={subsystem} — a gobuild row is "
                        f"{' or '.join(sorted(SUBSYSTEMS))}")
@@ -340,7 +532,8 @@ def main():
             bad.append(f"payload.tsv: {path} claims kind {kind!r}")
         if source not in sources:
             bad.append(f"payload.tsv: {path} names source {source!r}, absent from sources.tsv")
-        if (sign == "yes") != path.endswith(".exe"):
+        oa_pe = kind == "gobuild" or (source == "ipclibrary" and path == "tools/abstraction_ipc.dll")
+        if sign not in {"yes", "no"} or ((sign == "yes") != (oa_pe and path.endswith((".exe", ".dll")))):
             bad.append(f"payload.tsv: {path} sign={sign} — only a PE file can be an Authenticode target")
         if path in payload:
             bad.append(f"payload.tsv: {path} listed twice")
@@ -363,9 +556,12 @@ def main():
         if not any(gid in refs for refs in features.values()):
             bad.append(f"abstraction.wxs: component group {gid} is referenced by no feature")
 
-    expected = set(FEATURES.values()) | FILELESS
+    expected = set(FEATURES.values()) | FILELESS | HELD
     if set(features) != expected:
         bad.append(f"abstraction.wxs: features are {sorted(features)}, want {sorted(expected)}")
+    bad.extend(check_feature_levels(root, features))
+    bad.extend(check_installed_declarations(placed, placed, authored, HERE, DECLARATIONS))
+    bad.extend(check_wix_identifiers(root))
 
     where, conditions = scoped(root)
     for cid, condition in conditions.items():
@@ -377,6 +573,8 @@ def main():
     member = {fid: [c for c, g in where.items() if g in refs]
               for fid, refs in features.items()}
     for fid, members in member.items():
+        if fid in HELD:
+            continue
         for name, machine in SCOPES.items():
             if not any(installs(conditions[c], machine) for c in members):
                 bad.append(f"abstraction.wxs: feature {fid} installs nothing {name}. A feature a "
@@ -395,6 +593,8 @@ def main():
     sequenced = {el.get("Action"): el.get("Condition", "")
                  for el in root.iter() if untag(el) == "Custom"}
     bad.extend(check_supervisor_removal(root))
+    bad.extend(check_sandbox_roots(root))
+    bad.extend(check_engine_unlock(root, text))
     bad.extend(check_upgrade_shutdown(root))
     bad.extend(check_elevated_scope(root))
     for action in SUPERVISOR_ACTIONS:
@@ -470,16 +670,6 @@ def main():
                        f"which no installed file lands in")
 
     targets = sorted(p for p, (_, sign) in payload.items() if sign == "yes")
-    conf = ET.fromstring((HERE / "signpath.artifact-configuration.xml").read_text(encoding="utf-8"))
-    for msi in (el for el in conf.iter() if untag(el) == "msi-file"):
-        named = sorted(pe.get("path") for pe in msi.iter() if untag(pe) == "pe-file")
-        if named != targets:
-            bad.append(
-                f"signpath.artifact-configuration.xml: {msi.get('path')} signs {named}, "
-                f"payload.tsv says {targets}"
-            )
-        if not any(untag(child) == "authenticode-sign" for child in msi):
-            bad.append(f"signpath.artifact-configuration.xml: {msi.get('path')} is not itself signed")
 
     for line in bad:
         print("FAIL ", line)
@@ -489,14 +679,23 @@ def main():
     print(f"ok    every file has a source in sources.tsv and one feature that installs it")
     print(f"ok    every feature installs something in both scopes, each scope starts the "
           f"supervisor its own way, and whatever a build can drop, ARPCOMMENTS names")
+    print("features, their default and what they install:")
+    tick = {1: "on", 1000: "off", 0: "held, hidden, never installed"}
+    for fid in sorted(features):
+        files = sorted(p for p, f in placed.items() if f == fid)
+        level = LEVELS[fid]
+        carries = ", ".join(files) if files else "no files"
+        print(f"      {fid:<13} level {level:<4} {tick.get(level, '?'):<30} {carries}")
     for s in unpinned:
-        print(f"note  {s} carries no commit yet: a --src build pins nothing and a --bin "
-              f"build has nothing to take")
-    print("signing targets, inside each MSI:")
-    for t in targets:
-        print(f"      {t}{'   (gated: absent unless the build is given its source)' if t in gated else ''}")
-    print("      abstraction-x64.msi")
-    print("      abstraction-arm64.msi")
+        print(f"note  {s} carries no commit yet: a --src checkout is unpinned; a --bin "
+              f"build needs a separately qualified prebuilt executable")
+    print("signing targets, by MSI architecture:")
+    for package in ("abstraction-x64.msi", "abstraction-arm64.msi"):
+        print(f"      {package}")
+        for t in targets:
+            if package == "abstraction-arm64.msi" and t in {"tools/lemonaded.exe", "tools/pytorchd.exe", "tools/abstraction_ipc.dll"}:
+                continue
+            print(f"        {t}{'   (gated: absent unless supplied by source or prebuilt binary)' if t in gated else ''}")
 
     for path in a.msi:
         bad += built(path, a.wix, root, gated)

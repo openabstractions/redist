@@ -11,6 +11,9 @@ param(
     [switch]$NewProductCode,
     [string]$Output,
     [string]$PythonPath,
+    [string]$NodePath,
+    [string]$SdkSmokes,
+    [string]$NativeCoreRequest,
     [string]$PredecessorMsiPath,
     [string]$PredecessorSHA256,
     [string]$PredecessorVersion,
@@ -40,7 +43,7 @@ Modes
                     unscoped install may ask for elevation.
 
 Case options (Verify and LocalAccount)
-  -MsiPath PATH  -CheckTools -PythonPath PATH  -Unscoped (Verify only)
+  -MsiPath PATH  -CheckTools -PythonPath PATH  -SdkSmokes DIR -NodePath PATH  -Unscoped (Verify only)
   -PredecessorMsiPath PATH -PredecessorSHA256 HEX -PredecessorVersion X.Y.Z -ExpectedVersion X.Y.Z
   -PredecessorElsewhere  -FailUpgrade  -FailSameVersion
   -ResultDirectory DIR   logs and evidence (default .\user-runtime-diagnostics)
@@ -70,6 +73,71 @@ function Get-ProfileFolder([Environment+SpecialFolder]$Folder, [scriptblock]$Res
     $path = & $Resolve $Folder ([Environment+SpecialFolderOption]::DoNotVerify)
     if ([string]::IsNullOrWhiteSpace($path)) { throw "Profile folder is unavailable: $Folder" }
     return $path
+}
+# Keep the executor, Administrators and SYSTEM able to traverse every copied
+# SDK input before removing inherited grants. The parent diagnostics folder
+# grants the disposable account Modify; replace that grant with RX on each item.
+function Protect-SdkSmokeInputs {
+    param([Parameter(Mandatory)][string]$Path,
+          [Parameter(Mandatory)][ValidatePattern('^S-1-5-(?:\d+-)*\d+$')][string]$Sid)
+    Assert-DisposableRunner
+    $executor = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+    if ($Sid -in @($executor, 'S-1-5-32-544', 'S-1-5-18')) {
+        throw 'SDK smoke account must differ from executor, Administrators and SYSTEM'
+    }
+    $account = [Security.Principal.SecurityIdentifier]::new($Sid)
+    $privileged = @($executor, 'S-1-5-32-544', 'S-1-5-18') |
+        ForEach-Object { [Security.Principal.SecurityIdentifier]::new($_) }
+    $root = Get-Item -LiteralPath $Path -Force
+    if (-not $root.PSIsContainer) { throw 'SDK smoke inputs must be a directory' }
+    if ($root.Attributes -band [IO.FileAttributes]::ReparsePoint) {
+        throw "SDK smoke input is a reparse point: $($root.FullName)"
+    }
+    $items = New-Object Collections.ArrayList
+    $pending = New-Object Collections.Queue
+    $null = $items.Add($root)
+    $pending.Enqueue($root)
+    while ($pending.Count) {
+        $directory = $pending.Dequeue()
+        foreach ($child in @(Get-ChildItem -LiteralPath $directory.FullName -Force)) {
+            if ($child.Attributes -band [IO.FileAttributes]::ReparsePoint) {
+                throw "SDK smoke input is a reparse point: $($child.FullName)"
+            }
+            $null = $items.Add($child)
+            if ($child.PSIsContainer) { $pending.Enqueue($child) }
+        }
+    }
+    foreach ($item in $items) {
+        if ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) {
+            throw "SDK smoke input is a reparse point: $($item.FullName)"
+        }
+        $flags = if ($item.PSIsContainer) {
+            [Security.AccessControl.InheritanceFlags]'ContainerInherit, ObjectInherit'
+        } else { [Security.AccessControl.InheritanceFlags]::None }
+        $security = if ($item.PSIsContainer) {
+            [IO.Directory]::GetAccessControl($item.FullName)
+        } else { [IO.File]::GetAccessControl($item.FullName) }
+        # Complete one object's protected ACL before writing it to disk.
+        $security.SetAccessRuleProtection($true, $false)
+        foreach ($old in @($security.GetAccessRules($true, $false, [Security.Principal.SecurityIdentifier]))) {
+            $security.RemoveAccessRuleSpecific($old)
+        }
+        foreach ($principal in $privileged) {
+            $rule = [Security.AccessControl.FileSystemAccessRule]::new(
+                $principal, [Security.AccessControl.FileSystemRights]::FullControl, $flags,
+                [Security.AccessControl.PropagationFlags]::None,
+                [Security.AccessControl.AccessControlType]::Allow)
+            $security.SetAccessRule($rule)
+        }
+        $readOnly = [Security.AccessControl.FileSystemAccessRule]::new(
+            $account, [Security.AccessControl.FileSystemRights]::ReadAndExecute, $flags,
+            [Security.AccessControl.PropagationFlags]::None,
+            [Security.AccessControl.AccessControlType]::Allow)
+        $security.AddAccessRule($readOnly)
+        if ($item.PSIsContainer) {
+            [IO.Directory]::SetAccessControl($item.FullName, $security)
+        } else { [IO.File]::SetAccessControl($item.FullName, $security) }
+    }
 }
 # Removal leaves no account runtime process and no runtime capability pipe. At
 # the deadline a snapshot names what remained; its failure never changes the verdict.
@@ -195,7 +263,7 @@ function Assert-InstalledShortcut($Shortcut, [string]$Tools) {
     $expectedDirectory = [IO.Path]::GetFullPath($Tools).TrimEnd([char[]]'\/')
     $actualTarget = if ($Shortcut.TargetPath) { [IO.Path]::GetFullPath($Shortcut.TargetPath) } else { '' }
     $actualDirectory = if ($Shortcut.WorkingDirectory) { [IO.Path]::GetFullPath($Shortcut.WorkingDirectory).TrimEnd([char[]]'\/') } else { '' }
-    if ($actualTarget -ne $expectedTarget -or $Shortcut.Arguments -ne 'serve host' -or $actualDirectory -ne $expectedDirectory) {
+    if ($actualTarget -ne $expectedTarget -or $Shortcut.Arguments -ne 'serve supervisor' -or $actualDirectory -ne $expectedDirectory) {
         throw 'Installed shortcut target, host arguments or working directory differ'
     }
 }
@@ -212,11 +280,38 @@ function Assert-RuntimeReady([string]$central, [string]$Evidence) {
     if ($null -eq $status -or $status -is [array] -or $status -isnot [Management.Automation.PSCustomObject]) {
         throw 'Runtime status report is malformed: expected an object'
     }
+    $endpoints = @{}
     foreach ($contract in @('abstraction.logging/sink@1','abstraction.config/reader@1','abstraction.config/editor@1','abstraction.job/acceptance@1','abstraction.job/operations@1')) {
         $capability = $contract.Split('/')[0]
         $matches = @($status.capabilities | Where-Object { $_.capability -eq $capability -and $_.contract -eq $contract })
         if ($matches.Count -ne 1 -or $matches[0].status -ne 'resolved') {
             throw "Expected exactly one ready contract: $contract"
+        }
+        $endpoint = $matches[0].result.reference.endpoint
+        if ($endpoint -isnot [string] -or -not $endpoint -or $endpoint.Contains('"') -or $endpoint.Contains("`r") -or $endpoint.Contains("`n")) {
+            throw "Resolved contract lacks a usable endpoint: $contract"
+        }
+        if (-not $endpoints.ContainsKey($endpoint)) { $endpoints[$endpoint] = @() }
+        $endpoints[$endpoint] += $contract
+    }
+    # Resolve proves the binding; Describe supplies the endpoint's current
+    # readiness facts. Its self-reported metadata grants no authority.
+    foreach ($endpoint in $endpoints.Keys) {
+        $describeInfo = New-Object Diagnostics.ProcessStartInfo
+        $describeInfo.FileName = $central
+        $describeInfo.Arguments = 'status describe "' + $endpoint + '" --json --timeout 5s'
+        $described = Invoke-FixtureProcess $describeInfo 10
+        if ($described.ExitCode -ne 0) { throw "Endpoint Describe failed for $endpoint" }
+        try { $description = ConvertFrom-Json -InputObject $described.Output -ErrorAction Stop }
+        catch { throw "Endpoint Describe returned invalid JSON for $endpoint" }
+        if ($null -eq $description -or $description -is [array] -or $description.outcome -cne 'described') {
+            throw "Endpoint Describe did not describe $endpoint"
+        }
+        foreach ($contract in $endpoints[$endpoint]) {
+            $matches = @($description.services | Where-Object { $_.contract -ceq $contract })
+            if ($matches.Count -ne 1 -or $matches[0].readiness -cne 'ready' -or $matches[0].why -cne '') {
+                throw "Endpoint Describe did not list ready $contract"
+            }
         }
     }
 }
@@ -317,12 +412,19 @@ function Assert-RemovedRegistration {
 function Get-PredecessorActivation([string]$Version) {
     if ($Version -notmatch '^\d+\.\d+\.\d+$') { throw "A predecessor version is required to select its activation arguments: '$Version'" }
     if ([version]$Version -le [version]'0.1.5') {
-        return [pscustomobject]@{ Images = @('jobd.exe','jobdw.exe'); Arguments = 'start'; Start = 'start'; Supervisor = @('jobd','jobdw') }
+        return [pscustomobject]@{ Images = @('jobd.exe','jobdw.exe'); Arguments = 'start'; Start = 'start'; Supervisor = @('jobd','jobdw'); Initializer = 'jobd.exe' }
     }
     if ([version]$Version -le [version]'0.1.7') {
-        return [pscustomobject]@{ Images = @('jobdw.exe'); Arguments = 'start --runtime'; Start = 'start --runtime'; Supervisor = @('jobdw') }
+        return [pscustomobject]@{ Images = @('jobdw.exe'); Arguments = 'start --runtime'; Start = 'start --runtime'; Supervisor = @('jobdw'); Initializer = 'jobd.exe' }
     }
-    return [pscustomobject]@{ Images = @('openabstractionsw.exe'); Arguments = 'serve host'; Start = 'start'; Supervisor = @('openabstractionsw') }
+    return [pscustomobject]@{ Images = @('openabstractionsw.exe'); Arguments = 'serve host'; Start = 'start'; Supervisor = @('openabstractionsw'); Initializer = '' }
+}
+function Initialize-PredecessorStore([string]$Tools, [string]$Version) {
+    $initializer = (Get-PredecessorActivation $Version).Initializer
+    # Legacy jobd status creates its store before start opens its log. From
+    # 0.1.8, openabstractions start activates and readies the runtime itself;
+    # status before start would correctly report that no runtime is listening.
+    if ($initializer) { Invoke-Bounded (Join-Path $Tools $initializer) @('status') }
 }
 function Start-PredecessorSupervisor([string]$Tools, [string]$Version) {
     $expected = Get-PredecessorActivation $Version
@@ -664,6 +766,24 @@ foreach ($t in 'jobd','jobd-logon') {
 }
 'ok    programs, a user PATH entry, a Startup shortcut — and no service, no machine key, no task'
 }
+function Assert-InstalledPanelWebView2([string]$Tools, [string]$EvidencePath = 'webview2-availability.txt') {
+    $panel = Join-Path $Tools 'Abstraction Panel.exe'
+    if (-not (Test-Path -LiteralPath $panel)) { throw "Installed Panel missing: $panel" }
+    $info = New-Object Diagnostics.ProcessStartInfo
+    $info.FileName = $panel
+    $info.Arguments = '-check-webview2'
+    $result = Invoke-FixtureProcess $info 15
+    $answer = $result.Output.Trim()
+    if ($result.ExitCode -eq 0 -and $answer -eq 'WebView2: available (native rendering untested)') {
+        $answer | Set-Content -LiteralPath $EvidencePath
+        return 'ok: installed Panel resolved the WebView2 runtime export; native rendering remains a separate check'
+    }
+    if ($result.ExitCode -eq 3 -and $answer -eq 'WebView2: unavailable (no Panel window)') {
+        $answer | Set-Content -LiteralPath $EvidencePath
+        return 'ok: installed Panel reported WebView2 unavailable; its window says so and opens no listener'
+    }
+    throw "Installed Panel WebView2 diagnostic returned exit $($result.ExitCode): $(Protect-DiagnosticText ($result.Output + $result.Diagnostics))"
+}
 # A download through the installed runtime, with no store named anywhere: the
 # runtime fetches and verifies, the command copies the result out, jobs show and
 # jobs list observe the operation this program submitted, an equal submission
@@ -707,6 +827,140 @@ try {
     $srv.Dispose()
 }
     'Service download passed' | Set-Content service-download.txt
+}
+# Observe the installer-started presenter before the short action window opens.
+# This check never starts it: a missing presenter is an installation failure.
+function Assert-InstalledNativePresenter([string]$Panel, [int]$Seconds = 10) {
+    $sid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+    $session = (Get-Process -Id $PID).SessionId
+    $deadline = [DateTime]::UtcNow.AddSeconds($Seconds)
+    $observed = @()
+    do {
+        $observed = @(Get-CimInstance Win32_Process -Filter "Name='Abstraction Panel.exe'" | Where-Object {
+            $_.ExecutablePath -eq $Panel -and $_.SessionId -eq $session -and
+            $_.CommandLine -match '(?:^|\s)--?background(?:\s|$)' -and
+            (Get-ProcessOwnerSid $_) -eq $sid
+        })
+        if ($observed.Count -eq 1) {
+            $first = $observed[0]
+            Start-Sleep -Milliseconds 3000
+            $survivor = @(Get-CimInstance Win32_Process -Filter "ProcessId=$([uint32]$first.ProcessId)" | Where-Object {
+                $_.ExecutablePath -eq $Panel -and $_.SessionId -eq $session -and
+                $_.CreationDate -eq $first.CreationDate -and
+                $_.CommandLine -match '(?:^|\s)--?background(?:\s|$)' -and
+                (Get-ProcessOwnerSid $_) -eq $sid
+            })
+            if ($survivor.Count -eq 1) {
+                [ordered]@{ path=$Panel; pid=[uint32]$first.ProcessId; sessionId=$session;
+                    account=$sid; observedAt=[DateTime]::UtcNow.ToString('o'); survivedMilliseconds=3000 } |
+                    ConvertTo-Json | Set-Content -LiteralPath 'native-presenter-preflight.json' -Encoding UTF8
+                return
+            }
+        }
+        if ([DateTime]::UtcNow -lt $deadline) { Start-Sleep -Milliseconds 200 }
+    } while ([DateTime]::UtcNow -lt $deadline)
+    throw 'Installed background native presenter missing or exited before the action window; preserve installation evidence'
+}
+function Assert-NativeCore([string]$Central, [string]$Tools, [string]$PythonPath, [string]$RequestPath) {
+    $native = Get-Content -LiteralPath $RequestPath -Raw | ConvertFrom-Json
+    if ($native.kind -ne 'local_msi' -or -not $native.core -or $native.core.source_sha -ne $native.source_sha) {
+        throw 'Fixed native core request/source required'
+    }
+    $panel = Join-Path $Tools 'Abstraction Panel.exe'
+    if ((Get-FileHash -LiteralPath $Central -Algorithm SHA256).Hash.ToLowerInvariant() -ne $native.runtime_sha256) {
+        throw 'Native core runtime differs from exact MSI payload'
+    }
+    if ((Get-FileHash -LiteralPath $panel -Algorithm SHA256).Hash.ToLowerInvariant() -ne $native.core.panel_sha256) {
+        throw 'Native core presenter differs from exact MSI payload'
+    }
+    Assert-InstalledNativePresenter $panel
+    foreach ($row in @($native.core.go,$native.core.journey,$native.core.helper,$native.core.native_library,$native.core.python) + @($native.core.python_files)) {
+        if ((Get-FileHash -LiteralPath $row.path -Algorithm SHA256).Hash.ToLowerInvariant() -ne $row.sha256 -or
+            (Get-Item -LiteralPath $row.path).Length -ne $row.bytes) { throw 'Native core input changed' }
+    }
+    if ((Get-FileHash -LiteralPath $PythonPath -Algorithm SHA256).Hash.ToLowerInvariant() -ne $native.core.python.sha256) {
+        throw 'Native core interpreter differs'
+    }
+    $directory = Join-Path (Get-Location) 'native-core'
+    New-Item -ItemType Directory -Path $directory | Out-Null
+    $env:PYTHONPATH = $native.core.pythonpath
+    $env:PYTHONDONTWRITEBYTECODE = '1'
+    $request = Join-Path $directory 'core-request.json'
+    $session = @{ schema=1; platform='win32'; core=$native.core; evidence_directory=$directory
+        native_request=@{path=$RequestPath;sha256=(Get-FileHash -LiteralPath $RequestPath -Algorithm SHA256).Hash.ToLowerInvariant();bytes=(Get-Item -LiteralPath $RequestPath).Length}
+        runtime=@{path=$Central;sha256=$native.runtime_sha256;bytes=(Get-Item -LiteralPath $Central).Length}
+        panel=@{path=$panel;sha256=$native.core.panel_sha256;bytes=(Get-Item -LiteralPath $panel).Length} }
+    $session | ConvertTo-Json -Depth 30 | Set-Content -LiteralPath $request -Encoding UTF8
+    Invoke-Bounded $PythonPath @('-B',"`"$($native.core.journey.path)`"",'--native-request',"`"$request`"") 90
+    $result = Join-Path $directory 'core-result.json'
+    $proof = Get-Content -LiteralPath $result -Raw | ConvertFrom-Json
+    if ($proof.result -ne 'pass' -or -not $proof.owned_children_exited) { throw 'Native core outcome incomplete' }
+    Copy-Item -LiteralPath $result -Destination (Join-Path (Split-Path -Parent $RequestPath) 'core-result.json')
+    if ($native.core.ordinary) {
+        # The new scene has its own bound and receipt after the original short core.
+        Invoke-Bounded $PythonPath @('-B',"`"$($native.core.helper.path)`"",'--ordinary-request',"`"$request`"") 600
+        $ordinaryResult = Join-Path $native.core.ordinary.directory 'scene\ordinary-result.json'
+        $ordinaryProof = Get-Content -LiteralPath $ordinaryResult -Raw | ConvertFrom-Json
+        if ($ordinaryProof.result -ne 'pass' -or -not $ordinaryProof.owned_children_exited -or
+            -not $ordinaryProof.native_owner_closed) { throw 'Actual ordinary native scene incomplete' }
+        Assert-OrdinaryNativeClosure $RequestPath
+        Copy-Item -LiteralPath $ordinaryResult -Destination (Join-Path (Split-Path -Parent $RequestPath) 'ordinary-result.json')
+    }
+}
+function Get-UserFixtureSeconds([bool]$HasPredecessor, [bool]$HasOrdinary) {
+    $seconds = if ($HasPredecessor) { 600 } else { 300 }
+    if ($HasOrdinary) { $seconds += 600 }
+    return $seconds
+}
+function Assert-OrdinaryNativeClosure([string]$RequestPath) {
+    if (-not $RequestPath) { return }
+    $native = Get-Content -LiteralPath $RequestPath -Raw | ConvertFrom-Json
+    if (-not $native.core.ordinary) { return }
+    $result = Join-Path $native.core.ordinary.directory 'scene\ordinary-result.json'
+    if (-not (Test-Path -LiteralPath $result -PathType Leaf)) {
+        throw 'Ordinary native closure unknown; retain installed runtime/data and its protected recovery state for the operator'
+    }
+    $proof = Get-Content -LiteralPath $result -Raw | ConvertFrom-Json
+    $requestHash = (Get-FileHash -LiteralPath $RequestPath -Algorithm SHA256).Hash.ToLowerInvariant()
+    if ($proof.native_request.path -ne $RequestPath -or $proof.native_request.sha256 -ne $requestHash -or
+        $proof.core.source_sha -ne $native.source_sha -or $proof.core.tool_source -ne $native.core.tool_source -or
+        $proof.runtime.sha256 -ne $native.runtime_sha256 -or $proof.panel.sha256 -ne $native.core.panel_sha256) {
+        throw 'Ordinary native closure receipt differs from this request/source/install; retain recovery state'
+    }
+    $launches = @($proof.commands | Where-Object { $_.operation -eq 'opencode-native' })
+    $control = Join-Path (Get-ProfileFolder LocalApplicationData) 'openabstractions\runtime-v1\apps\opencode\session.json'
+    if ($launches.Count -eq 0 -and -not (Test-Path -LiteralPath $control)) {
+        if (-not $proof.native_owner_closed -or -not $proof.ordinary.cleanup_completed) {
+            throw 'Ordinary scene interrupted before observed cleanup; retain install/data for the operator'
+        }
+        return
+    }
+    if ($launches.Count -ne 1 -or -not (Test-Path -LiteralPath $control -PathType Leaf)) {
+        throw 'Actual native launch/control binding missing; retain install/data for the operator'
+    }
+    $record = Get-Content -LiteralPath $control -Raw | ConvertFrom-Json
+    $launch = $launches[0]
+    $closed = $proof.ordinary.native_closed
+    if ($record.format -ne 1 -or -not $record.closed_job -or $record.phase -ne 'closed' -or
+        $record.owner_pid -ne $launch.pid -or $record.owner_program -ne $proof.runtime.path -or
+        $record.account -ne $native.core.ordinary.comfy.invoking_account -or
+        -not $record.child_pid -or -not $record.child_start -or -not $record.owner_start -or
+        -not $record.guest_program_id -or -not $record.package_root_id -or
+        $record.id -ne $closed.id -or $record.owner_start -ne $closed.owner_start -or
+        $record.child_start -ne $closed.child_start -or $record.guest_program_id -ne $closed.guest_program_id -or
+        $launch.argv[0] -ne $proof.runtime.path -or $launch.argv[1] -ne 'opencode' -or $launch.argv[2] -ne 'open' -or
+        $launch.argv[4] -ne $native.core.ordinary.roots.project -or
+        $launch.argv[6] -ne $native.core.ordinary.opencode.program.path -or
+        -not $launch.exited -or -not $proof.native_owner_closed) {
+        throw 'Actual native owner closure is unbound or unknown; retain installed runtime/data for the operator'
+    }
+    # A reused PID is uncertain too. No live process at either recorded PID
+    # can authorize removal of this launch's protected recovery state.
+    foreach ($processId in @($record.owner_pid,$record.child_pid)) {
+        if (Get-CimInstance Win32_Process -Filter "ProcessId=$processId") {
+            throw 'A recorded native PID remains live or was reused; retain install/data for the operator'
+        }
+    }
 }
 # The candidate is installed and its host runs long enough for Restart Manager
 # to restart it (60 seconds); then a same-version copy with its own ProductCode
@@ -823,6 +1077,7 @@ if ($Mode -eq 'LocalAccount') {
     if ($Unscoped) { throw 'LocalAccount refuses -Unscoped: an unscoped install may ask for elevation' }
     if (($PredecessorElsewhere -or $FailUpgrade) -and -not $PredecessorMsiPath) { throw 'PredecessorElsewhere and FailUpgrade qualify an upgrade and need -PredecessorMsiPath' }
     if ($FailSameVersion -and ($PredecessorMsiPath -or $CheckTools)) { throw 'FailSameVersion installs the candidate as its own predecessor and takes no other variant' }
+    if ($SdkSmokes -and (-not $CheckTools -or -not $NodePath)) { throw 'SDK smokes require -CheckTools and -NodePath' }
     if ($PredecessorMsiPath -and $PredecessorVersion -notmatch '^\d+\.\d+\.\d+$') { throw 'An upgrade needs -PredecessorVersion naming the predecessor release' }
     Assert-UnelevatedToken
     # The installer and runtime started from here must see the real profile.
@@ -857,28 +1112,46 @@ if ($Mode -eq 'LocalAccount') {
             if (-not $PythonPath -or -not (Test-Path -LiteralPath $PythonPath -PathType Leaf)) { throw 'Release tools check requires an explicit existing Python executable' }
             $arguments += @('-CheckTools','-PythonPath',"`"$PythonPath`"")
         }
+        $nativeRequest = Join-Path $ResultDirectory 'native-request.json'
+        $hasOrdinary = $false
+        if (Test-Path -LiteralPath $nativeRequest -PathType Leaf) {
+            $request = Get-Content -LiteralPath $nativeRequest -Raw | ConvertFrom-Json
+            if ($request.core) { $arguments += @('-NativeCoreRequest',"`"$nativeRequest`"") }
+            $hasOrdinary = [bool]$request.core.ordinary
+        }
+    if ($SdkSmokes) {
+        Copy-Item -LiteralPath (Resolve-Path -LiteralPath $SdkSmokes).Path -Destination (Join-Path $directory 'sdk-smokes') -Recurse
+        # The invoking local account owns this copy; hosted Verify uses a separate
+        # disposable SID and protects that copy before it starts the child.
+        $arguments += @('-SdkSmokes',"`"$directory\sdk-smokes`"",'-NodePath',"`"$NodePath`"")
+        }
         $info = New-Object Diagnostics.ProcessStartInfo
         $info.FileName = 'powershell.exe'
         $info.Arguments = $arguments -join ' '
         $info.WorkingDirectory = $directory
         $info.EnvironmentVariables['OA_FIXTURE_LOCAL_ACCOUNT'] = $sid
-        $child = Invoke-FixtureProcess $info $(if ($PredecessorMsiPath) { 600 } else { 300 })
+        $child = Invoke-FixtureProcess $info (Get-UserFixtureSeconds ([bool]$PredecessorMsiPath) $hasOrdinary)
         $child.Output | Set-Content -Encoding UTF8 (Join-Path $directory 'fixture.log')
         $child.Diagnostics | Set-Content -Encoding UTF8 (Join-Path $directory 'fixture.err')
         if ($child.ExitCode -ne 0) { throw "Local-account fixture exited $($child.ExitCode); inspect $directory" }
         Assert-RuntimeRemoved $sid (Join-Path $directory 'account-removal-remaining.json')
     } catch { $failure = $_ } finally {
         $cleanup = @()
-        if (-not $dataExisted -and (Test-Path -LiteralPath $data)) {
+        $canRemoveFixtureData = $true
+        if (Test-Path -LiteralPath $nativeRequest -PathType Leaf) {
+            try { Assert-OrdinaryNativeClosure $nativeRequest }
+            catch { $canRemoveFixtureData = $false; $cleanup += $_.Exception.Message }
+        }
+        if ($canRemoveFixtureData -and -not $dataExisted -and (Test-Path -LiteralPath $data)) {
             try { Remove-Item -LiteralPath $data -Recurse -Force } catch { $cleanup += "data folder $data`: $($_.Exception.Message)" }
-        } elseif (Test-Path -LiteralPath $sentinel) {
+        } elseif ($canRemoveFixtureData -and (Test-Path -LiteralPath $sentinel)) {
             try { Remove-Item -LiteralPath $sentinel -Force } catch { $cleanup += "sentinel $sentinel`: $($_.Exception.Message)" }
         }
         foreach ($copy in 'package.msi','predecessor.msi','failing-upgrade.msi','failing-same-version.msi') {
             $path = Join-Path $directory $copy
             try { if (Test-Path -LiteralPath $path) { Remove-Item -LiteralPath $path -Force } } catch { $cleanup += "package copy $path`: $($_.Exception.Message)" }
         }
-        $left = @(try { & $footprint } catch { "footprint unreadable: $($_.Exception.Message)" })
+        try { $left = & $footprint } catch { $left = @("footprint unreadable: $($_.Exception.Message)") }
         if ($left.Count) { $cleanup += "left installed: $($left -join '; ')" }
     }
     if ($failure) { throw $failure }
@@ -930,8 +1203,7 @@ if ($Mode -eq 'User') {
             Assert-RetainedSentinel $sentinel $sentinelValue
             $predecessorImage = (Get-PredecessorActivation $PredecessorVersion).Images[-1]
             if ($PredecessorElsewhere -and (Test-Path -LiteralPath (Join-Path $tools $predecessorImage))) { throw 'The predecessor did not install into its chosen folder' }
-            # A predecessor start opens its log before creating the store. Initialize through its own CLI.
-            Invoke-Bounded (Join-Path $predecessorTools 'jobd.exe') @('status')
+            Initialize-PredecessorStore $predecessorTools $PredecessorVersion
             Start-PredecessorSupervisor $predecessorTools $PredecessorVersion
             $previousProcesses = @(Get-RunningFixtureProcesses $predecessorTools $ExpectedSid)
         }
@@ -974,11 +1246,19 @@ if ($Mode -eq 'User') {
                     'ok: the upgrade replaced and removed the predecessor installed in a non-default folder' | Set-Content 'upgrade-elsewhere.txt'
                 }
             }
-            if ($CheckTools -or $Unscoped) { Assert-InstalledUserTools $tools }
+            if ($CheckTools -or $Unscoped) {
+                Assert-InstalledUserTools $tools
+                Assert-InstalledPanelWebView2 $tools
+            }
             if ($Unscoped) { Assert-SingleUserScope }
             $central = Join-Path $tools 'openabstractions.exe'
             Assert-RuntimeReady $central post-install-status
             if ($CheckTools) { Assert-ServiceDownload $central $PythonPath }
+            if ($NativeCoreRequest) { Assert-NativeCore $central $tools $PythonPath $NativeCoreRequest }
+            if ($SdkSmokes) {
+                & (Join-Path $SdkSmokes 'run.ps1') -Directory $SdkSmokes -ExpectedSid $ExpectedSid -ExpectedProgram $central -PythonPath $PythonPath -NodePath $NodePath |
+                    Set-Content -LiteralPath 'installed-sdk-smokes.txt' -Encoding UTF8
+            }
             if ($PredecessorMsiPath) {
                 Assert-InstalledVersion $ExpectedVersion $productCode
                 Assert-RetainedSentinel $sentinel $sentinelValue
@@ -1021,6 +1301,7 @@ if ($Mode -eq 'User') {
         }
     } finally {
         foreach ($process in $previousProcesses) { $process.Dispose() }
+        Assert-OrdinaryNativeClosure $NativeCoreRequest
         if ($installed -or $installAttempted) {
             # A post-InstallFinalize activation error can leave committed files.
             try { Invoke-Bounded msiexec.exe @('/x', "`"$MsiPath`"", '/qn', '/norestart', '/l*v', 'user-cleanup-uninstall.log') } catch { Write-Warning $_ }
@@ -1044,6 +1325,7 @@ if ([IO.Path]::GetExtension($MsiPath) -ne '.msi') { throw 'Expected an MSI packa
 if ($Unscoped -and $PredecessorMsiPath) { throw 'Unscoped verification installs a fresh package and takes no predecessor' }
 if (($PredecessorElsewhere -or $FailUpgrade) -and -not $PredecessorMsiPath) { throw 'PredecessorElsewhere and FailUpgrade qualify an upgrade and need -PredecessorMsiPath' }
 if ($FailSameVersion -and ($PredecessorMsiPath -or $Unscoped -or $CheckTools)) { throw 'FailSameVersion installs the candidate as its own predecessor and takes no other variant' }
+if ($SdkSmokes -and (-not $CheckTools -or -not $NodePath)) { throw 'SDK smokes require -CheckTools and -NodePath' }
 # The predecessor release is the caller's choice, not a constant of this fixture.
 if ($PredecessorMsiPath -and $PredecessorVersion -notmatch '^\d+\.\d+\.\d+$') { throw 'An upgrade needs -PredecessorVersion naming the predecessor release' }
 if (@(Get-Service | Where-Object { $_.Name -like 'OpenAbstractionsSupervisor*' }).Count) { throw 'Run per-user verification on a separate clean runner' }
@@ -1083,6 +1365,18 @@ exit $LASTEXITCODE
     if ($CheckTools) {
         if (-not $PythonPath -or -not (Test-Path -LiteralPath $PythonPath -PathType Leaf)) { throw 'Release tools check requires an explicit existing Python executable' }
         $arguments += @('-CheckTools','-PythonPath',"`"$PythonPath`"")
+    }
+    if ($SdkSmokes) {
+        $smokes = Join-Path $directory 'sdk-smokes'
+        Copy-Item -LiteralPath (Resolve-Path -LiteralPath $SdkSmokes).Path -Destination $smokes -Recurse
+        Protect-SdkSmokeInputs -Path $smokes -Sid $account.Sid
+        $probeAcl = (Get-Acl -LiteralPath (Join-Path $smokes 'python_probe.py')).GetAccessRules($true, $false, [Security.Principal.SecurityIdentifier])
+        $accountRules = @($probeAcl | Where-Object { $_.IdentityReference.Value -eq $account.Sid })
+        if ($accountRules.Count -ne 1 -or $accountRules[0].AccessControlType -ne 'Allow' -or
+            ($accountRules[0].FileSystemRights -band [Security.AccessControl.FileSystemRights]::Write)) {
+            throw 'Disposable account can alter installed SDK smoke inputs'
+        }
+        $arguments += @('-SdkSmokes',"`"$directory\sdk-smokes`"",'-NodePath',"`"$NodePath`"")
     }
     $child = Invoke-AccountProcess -Account $account -FileName 'powershell.exe' -Arguments $arguments -WorkingDirectory $directory -Seconds $(if ($PredecessorMsiPath) { 600 } else { 300 })
     $child.Output | Set-Content -Encoding UTF8 (Join-Path $directory 'fixture.log')

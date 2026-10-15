@@ -1,4 +1,5 @@
 name: promote verified release
+run-name: release ${{ inputs.version }} [oa-job:${{ inputs.oa_job_intent }}]
 
 on:
   workflow_dispatch:
@@ -15,6 +16,11 @@ on:
         description: Resume an exact partial promotion without replacing an existing tag, draft, or asset
         type: boolean
         default: false
+      oa_job_intent:
+        description: Stable OA Job intent ID for exact dispatch recovery
+        type: string
+        required: false
+        default: ''
 
 concurrency:
   group: redist-release-${{ inputs.version }}

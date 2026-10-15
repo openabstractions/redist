@@ -16,6 +16,13 @@ class Preinstall(unittest.TestCase):
     def setUp(self):
         fixtures.Lifecycle.setUp(self)
         self.command("stat", 'echo "${TARGET_UID:-1000}"')
+        self.command("id", '[ "$1" = -u ] && echo "${INSTALLER_UID:-1000}"')
+        self.command("sudo", r'''printf 'sudo:%s\n' "$*" >> "$LOG.sudo"
+[ "$1" = -n ] && [ "$2" = -u ] && [ "$3" = "#${TARGET_UID:-1000}" ] || exit 64
+shift 3
+for last do :; done
+if [ -n "${UNWRITABLE_DIR:-}" ] && [ "$last" = "$UNWRITABLE_DIR" ]; then exit 1; fi
+exec "$@"''')
         launchctl = self.bin / "launchctl"
         original = launchctl.read_text()
         launchctl.write_text(original.replace("#!/bin/sh\n", '#!/bin/sh\nif [ "$1" = asuser ]; then shift 3; exec "$0" "$@"; fi\n', 1))
@@ -46,6 +53,24 @@ class Preinstall(unittest.TestCase):
         self.assertIn("no previous LaunchAgent com.openabstractions.runtime", result.stdout)
         self.assertEqual(self.payload.read_text(), "payload")
 
+    def test_panel_bootout_waits_for_observed_absence_before_replacement(self):
+        result = self.run_preflight(AGENT_LABEL="com.openabstractions.panel", DELAYED_ABSENCE="yes")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertGreaterEqual(int((self.root / "calls.after-bootout-polls").read_text()), 3)
+        calls = (self.root / "calls").read_text()
+        self.assertIn("bootout gui/1000/com.openabstractions.panel", calls)
+        self.assertIn("booted out running previous LaunchAgent gui/1000/com.openabstractions.panel", result.stdout)
+        self.assertEqual(self.payload.read_text(), "payload")
+        self.assertEqual(self.data.read_text(), "accepted work")
+
+    def test_panel_still_registered_after_bootout_refuses_replacement(self):
+        result = self.run_preflight(AGENT_LABEL="com.openabstractions.panel", ACTIVE="active")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("previous LaunchAgent com.openabstractions.panel remains registered or its absence is unverified; replacement refused", result.stderr)
+        self.assertNotIn("booted out running previous LaunchAgent gui/1000/com.openabstractions.panel", result.stdout)
+        self.assertEqual(self.payload.read_text(), "payload")
+        self.assertEqual(self.data.read_text(), "accepted work")
+
     def test_stop_failure_or_unverifiable_absence_blocks_replacement(self):
         for env in ({"FAIL":"stop"}, {"ACTIVE":"active"}, {"FAIL":"after"}, {"FAIL":"format"}, {"FAIL":"manager_query"}, {"MANAGER_UID":"0"}, {"MANAGER_NAME":"Background"}, {"TARGET_UID":"0"}):
             with self.subTest(env=env):
@@ -61,6 +86,30 @@ class Preinstall(unittest.TestCase):
         self.assertNotIn("bootout", (self.root / "calls").read_text())
         self.assertIn("no previous LaunchAgent com.openabstractions.runtime registered in gui/1000; nothing booted out", result.stdout)
         self.assertNotIn("booted out running", result.stdout)
+
+    def test_launchagents_destination_requires_target_user_write_before_stop(self):
+        library = self.home / "Library"
+        agents = library / "LaunchAgents"
+        library.mkdir()
+        for blocked in (library, agents):
+            with self.subTest(blocked=blocked):
+                if blocked == agents:
+                    agents.mkdir()
+                result = self.run_preflight(INSTALLER_UID="0", UNWRITABLE_DIR=str(blocked))
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("LaunchAgents destination is not writable by target user", result.stderr)
+                self.assertIn(str(blocked), result.stderr)
+                self.assertFalse((self.root / "calls").exists())
+                self.assertEqual(self.payload.read_text(), "payload")
+                self.assertEqual(self.data.read_text(), "accepted work")
+
+    def test_root_preflight_checks_as_target_user(self):
+        (self.home / "Library/LaunchAgents").mkdir(parents=True)
+        result = self.run_preflight(INSTALLER_UID="0", ABSENT="yes")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        calls = (self.root / "calls.sudo").read_text()
+        self.assertIn("-u #1000 /bin/test -w", calls)
+        self.assertIn("-u #1000 /bin/test -x", calls)
 
     def test_conflicting_user_target_refuses_before_manager(self):
         other = self.root / "other-user"
@@ -82,9 +131,11 @@ class Preinstall(unittest.TestCase):
         share = package_root / ".local/share/abstraction"
         share.mkdir(parents=True)
         (share / "LICENSE").write_text("license")
+        license_path = ".local/share/abstraction/LICENSE"
         calls = []
         with mock.patch.object(build.subprocess, "run", side_effect=lambda args, **kw: calls.append(args)):
-            build.pkg(package_root, [], self.root / "out.pkg", "0.1.0", work)
+            build.pkg(package_root, [(license_path, 0o644)], self.root / "out.pkg", "0.1.0", work,
+                      {license_path: build.BASE})
         for name in ("preinstall", "postinstall", "lifecycle.sh"):
             self.assertEqual((work / "scripts" / name).read_bytes(), (HERE / name).read_bytes().replace(b"\r\n", b"\n"))
         self.assertEqual(calls[0][0], "pkgbuild")

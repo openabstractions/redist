@@ -175,9 +175,9 @@ function Remove-DisposableAccount {
     Remove-LocalUser -Name $Account.Name
 }
 
-# jobd, jobdw, openabstractions and openabstractionsw processes owned by the SID.
+# Installed runtime and native presenter processes owned by the SID.
 function Get-RuntimeProcesses([string]$Sid) {
-    foreach ($candidate in @(Get-CimInstance Win32_Process -Filter "Name='jobd.exe' OR Name='jobdw.exe' OR Name='openabstractions.exe' OR Name='openabstractionsw.exe'")) {
+    foreach ($candidate in @(Get-CimInstance Win32_Process -Filter "Name='jobd.exe' OR Name='jobdw.exe' OR Name='openabstractions.exe' OR Name='openabstractionsw.exe' OR Name='Abstraction Panel.exe'")) {
         $owner = Get-ProcessOwnerSid $candidate
         if ($null -ne $owner -and $owner -eq $Sid) { $candidate }
     }
@@ -209,7 +209,9 @@ function Assert-NoRuntime {
     throw "Runtime removal left processes $(@($processes | ForEach-Object ProcessId) -join ',') or pipes $($pipes -join ',')"
 }
 
-# Installed MSI products through WindowsInstaller.Installer.ProductsEx.
+# Installed and advertised MSI products through WindowsInstaller.Installer.ProductsEx.
+# VersionString is installed-only; advertised records remain visible with an
+# empty version. Unexpected state or property read failures refuse enumeration.
 # Context: 1 user-managed, 2 user-unmanaged, 4 machine, 7 all. UserSid '' with
 # machine context; a SID or 's-1-1-0' (everyone) with user contexts. The default
 # is the invoking user's unmanaged products.
@@ -222,11 +224,14 @@ function Get-InstalledProducts {
         try {
             foreach ($product in $products) {
                 try {
+                    $state = [string]$product.InstallProperty('State')
+                    if ($state -notin @('1', '5')) { throw 'Cannot establish MSI product state: expected advertised (1) or installed (5).' }
+                    $version = if ($state -eq '5') { [string]$product.InstallProperty('VersionString') } else { '' }
                     $item = [pscustomobject]@{
                         ProductCode = [string]$product.GetType().InvokeMember('ProductCode', [Reflection.BindingFlags]::GetProperty, $null, $product, $null)
                         ProductName = [string]$product.InstallProperty('ProductName')
-                        VersionString = [string]$product.InstallProperty('VersionString')
-                        State = [string]$product.InstallProperty('State')
+                        VersionString = $version
+                        State = $state
                         Context = [int]$product.GetType().InvokeMember('Context', [Reflection.BindingFlags]::GetProperty, $null, $product, $null)
                         UserSid = [string]$product.GetType().InvokeMember('UserSid', [Reflection.BindingFlags]::GetProperty, $null, $product, $null)
                     }

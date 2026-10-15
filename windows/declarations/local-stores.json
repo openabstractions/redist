@@ -1,0 +1,29 @@
+{
+  "version": 2,
+  "declaration": {
+    "name": "local-stores",
+    "program": "inventoryd.exe",
+    "arguments": [
+      "serve",
+      "--endpoint",
+      "{endpoint}"
+    ],
+    "endpoint": "local-stores",
+    "transport": "oa-native@1",
+    "contracts": [
+      "abstraction.storage/inventory-source@1"
+    ],
+    "resources": [
+      "store:ollama",
+      "store:huggingface",
+      "store:lmstudio",
+      "store:comfyui",
+      "store:fastflowlm",
+      "store:jan"
+    ],
+    "activation": "on_demand",
+    "role": "provider"
+  },
+  "declared_by": "installation",
+  "declared_unix_ms": 0
+}

@@ -1,0 +1,24 @@
+{
+  "version": 2,
+  "declaration": {
+    "name": "lemonade-image",
+    "program": "lemonaded.exe",
+    "arguments": ["serve", "--endpoint", "{endpoint}"],
+    "endpoint": "lemonade-image",
+    "transport": "oa-native@1",
+    "contracts": [
+      "abstraction.inference/image@1",
+      "abstraction.inference/transcription@1",
+      "abstraction.inference/speech@1",
+      "abstraction.storage/content-reader@1",
+      "abstraction.storage/content-writer@1"
+    ],
+    "resources": ["card:0", "profile:image", "profile:transcription", "profile:speech"],
+    "models": ["image:user.LocalApprovedKlein", "transcription:Whisper-Large-v3-Turbo", "speech:kokoro-v1"],
+    "supported_extensions": [{"profile": "image", "key": "lemonade/seed"}],
+    "activation": "on_demand",
+    "role": "provider"
+  },
+  "declared_by": "installation",
+  "declared_unix_ms": 0
+}

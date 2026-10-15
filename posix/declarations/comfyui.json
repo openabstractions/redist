@@ -1,0 +1,23 @@
+{
+  "version": 2,
+  "declaration": {
+    "name": "comfyui",
+    "program": "",
+    "arguments": [],
+    "endpoint": "",
+    "transport": "http@1",
+    "contracts": [],
+    "resources": [
+      "profile:image"
+    ],
+    "activation": "attach",
+    "role": "host",
+    "host": {
+      "base": "http://127.0.0.1:8188",
+      "kind": "comfyui",
+      "hosted": false
+    }
+  },
+  "declared_by": "installation",
+  "declared_unix_ms": 0
+}
