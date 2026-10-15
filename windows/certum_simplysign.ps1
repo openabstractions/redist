@@ -15,6 +15,8 @@ param(
 $PolicyPath = Join-Path $PSScriptRoot 'certum_simplysign.json'
 $script:CertumStage = 'policy'
 $script:CertumCleanup = 'not-started'
+$script:CertumSchemaReason = 'not-checked'
+$script:CertumEditCount = 'unknown'
 
 function Write-CertumFailure {
     # Only fixed public categories are emitted. Never format an ErrorRecord.
@@ -26,7 +28,11 @@ function Write-CertumFailure {
         'process-stopped','failed','no-owned-receipt')
     $stage = if ($script:CertumStage -cin $stages) { $script:CertumStage } else { 'unknown' }
     $cleanup = if ($script:CertumCleanup -cin $cleanups) { $script:CertumCleanup } else { 'unknown' }
-    [Console]::Error.WriteLine("SimplySign session operation failed; stage=$stage; category=operation-failed; cleanup=$cleanup; credential diagnostics are disabled.")
+    $reasons = @('not-checked','assemblies','focus','window-identity','field-discovery','edit-count',
+        'field-owner','field-state','label-absent','label-owner','label-state','label-role','accepted')
+    $reason = if ($script:CertumSchemaReason -cin $reasons) { $script:CertumSchemaReason } else { 'unknown' }
+    $count = if ($script:CertumEditCount -cin @('zero','one','two','many')) { $script:CertumEditCount } else { 'unknown' }
+    [Console]::Error.WriteLine("SimplySign session operation failed; stage=$stage; category=operation-failed; cleanup=$cleanup; schema_reason=$reason; edit_count=$count; credential diagnostics are disabled.")
 }
 
 function Read-CertumPolicy([string]$Path) {
@@ -240,23 +246,52 @@ function Assert-CertumDeadline($Clock) {
     if ($Clock.Elapsed.TotalSeconds -ge 120) { throw 'authentication deadline exceeded' }
 }
 
+function Get-CertumLoginFieldRole($Field) {
+    # Pinned 9.4.5.95 English resource CloudService.LangRes.Texts.en:
+    # UserName = ID:; Password = One-time code:. No text normalization/ordinals.
+    $label = $Field.Current.LabeledBy
+    if ($null -ne $label -and $label.Current.Name -ceq 'ID:') { return 'username' }
+    if ($null -ne $label -and $label.Current.Name -ceq 'One-time code:') { return 'token' }
+    return 'unknown'
+}
+
 function Assert-CertumLoginFields($Fields, [int]$ProcessId) {
-    if (@($Fields).Count -ne 2) { throw 'expected exactly two owned login fields' }
+    $number = @($Fields).Count
+    $script:CertumEditCount = switch ($number) { 0 {'zero'} 1 {'one'} 2 {'two'} default {'many'} }
+    $script:CertumSchemaReason = 'edit-count'
+    if ($number -ne 2) { throw 'expected exactly two owned login fields' }
     $index = 0
     foreach ($field in $Fields) {
+        $script:CertumSchemaReason = 'field-owner'
+        if ($field.Current.ProcessId -ne $ProcessId) { throw 'login field identity differs' }
+        $script:CertumSchemaReason = 'field-state'
+        if (-not $field.Current.IsEnabled -or -not $field.Current.IsKeyboardFocusable -or $field.Current.IsOffscreen) { throw 'login field identity differs' }
         $label = $field.Current.LabeledBy
-        if ($field.Current.ProcessId -ne $ProcessId -or -not $field.Current.IsEnabled -or
-            -not $field.Current.IsKeyboardFocusable -or $field.Current.IsOffscreen -or
-            $null -eq $label -or $label.Current.ProcessId -ne $ProcessId -or
-            $label.Current.IsOffscreen -or
-            $label.Current.Name -cne @('ID','Token')[$index]) { throw 'login field identity differs' }
+        $script:CertumSchemaReason = 'label-absent'
+        if ($null -eq $label) { throw 'login field identity differs' }
+        $script:CertumSchemaReason = 'label-owner'
+        if ($label.Current.ProcessId -ne $ProcessId) { throw 'login field identity differs' }
+        $script:CertumSchemaReason = 'label-state'
+        if ($label.Current.IsOffscreen) { throw 'login field identity differs' }
+        $script:CertumSchemaReason = 'label-role'
+        if ((Get-CertumLoginFieldRole $field) -cne @('username','token')[$index]) { throw 'login field identity differs' }
         $index++
     }
+    $script:CertumSchemaReason = 'accepted'
+}
+
+function Select-CertumLoginFields($Fields, [int]$ProcessId) {
+    $ordered = @($Fields | Sort-Object { switch (Get-CertumLoginFieldRole $_) { 'username' {0} 'token' {1} default {2} } })
+    Assert-CertumLoginFields $ordered $ProcessId
+    return $ordered
 }
 
 function Get-CertumLoginFields([IntPtr]$Handle, $Process) {
+    $script:CertumSchemaReason = 'assemblies'; $script:CertumEditCount = 'unknown'
     Add-Type -AssemblyName UIAutomationClient, UIAutomationTypes
+    $script:CertumSchemaReason = 'focus'
     Assert-CertumFocus $Handle $Process
+    $script:CertumSchemaReason = 'window-identity'
     $window = [Windows.Automation.AutomationElement]::FromHandle($Handle)
     if ($window.Current.ProcessId -ne $Process.Id -or $window.Current.IsOffscreen -or
         $window.Current.Name -cne 'SimplySign Desktop') {
@@ -266,10 +301,9 @@ function Get-CertumLoginFields([IntPtr]$Handle, $Process) {
         [Windows.Automation.AutomationElement]::ControlTypeProperty, [Windows.Automation.ControlType]::Edit)
     # Roles come from the fixed English associated labels, never screen position.
     # An unsupported provider schema refuses before any credential reaches the clipboard.
-    $fields = @($window.FindAll([Windows.Automation.TreeScope]::Descendants, $condition) |
-        Sort-Object { if ($_.Current.LabeledBy.Current.Name -ceq 'ID') { 0 } else { 1 } })
-    Assert-CertumLoginFields $fields $Process.Id
-    return $fields
+    $script:CertumSchemaReason = 'field-discovery'
+    $fields = @($window.FindAll([Windows.Automation.TreeScope]::Descendants, $condition))
+    return Select-CertumLoginFields $fields $Process.Id
 }
 
 function Set-CertumFieldFocus($Field, [IntPtr]$Handle, $Process) {
