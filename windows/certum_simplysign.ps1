@@ -298,11 +298,13 @@ function Assert-CertumDeadline($Clock) {
 }
 
 function Get-CertumLoginFieldRole($Field) {
-    # Pinned 9.4.5.95 English resource CloudService.LangRes.Texts.en:
-    # UserName = ID:; Password = One-time code:. No text normalization/ordinals.
-    $label = $Field.Current.LabeledBy
-    if ($null -ne $label -and $label.Current.Name -ceq 'ID:') { return 'username' }
-    if ($null -ne $label -and $label.Current.Name -ceq 'One-time code:') { return 'token' }
+    # Pinned LoginForm tUserName/tPassword identities are confirmed by the
+    # guarded hosted observation. WinForms' associated labels can name another
+    # field. Exact control ID plus actual password state owns credential roles.
+    $current = $Field.Current
+    if ($current.IsPassword -isnot [bool]) { return 'unknown' }
+    if ($current.AutomationId -ceq 'tUserName' -and $current.IsPassword -eq $false) { return 'username' }
+    if ($current.AutomationId -ceq 'tPassword' -and $current.IsPassword -eq $true) { return 'token' }
     return 'unknown'
 }
 
@@ -390,7 +392,7 @@ function Get-CertumLoginFields([IntPtr]$Handle, $Process) {
     Initialize-CertumClientProviders
     $condition = [Windows.Automation.PropertyCondition]::new(
         [Windows.Automation.AutomationElement]::ControlTypeProperty, [Windows.Automation.ControlType]::Edit)
-    # Roles come from the fixed English associated labels, never screen position.
+    # Roles come from exact pinned control IDs and password states, never position.
     # An unsupported provider schema refuses before any credential reaches the clipboard.
     $script:CertumSchemaReason = 'field-discovery'
     $fields = @($window.FindAll([Windows.Automation.TreeScope]::Descendants, $condition))
