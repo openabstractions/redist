@@ -24,8 +24,6 @@ $script:CertumRoleObservation = $null
 $script:CertumSubmitStep = 'not-checked'
 $script:CertumSubmitFailureStep = $null
 $script:CertumSubmitField = 'none'
-$script:CertumSubmitClipboardCleanup = 'not-attempted'
-$script:CertumSubmitComCleanup = 'not-attempted'
 $script:CertumSubmitFailed = $false
 
 function ConvertTo-CertumCountBucket($Count) {
@@ -49,15 +47,11 @@ function Write-CertumFailure {
     $count = if ($script:CertumEditCount -cin @('zero','one','two','many')) { $script:CertumEditCount } else { 'unknown' }
     [Console]::Error.WriteLine("SimplySign session operation failed; stage=$stage; category=operation-failed; cleanup=$cleanup; schema_reason=$reason; edit_count=$count; credential diagnostics are disabled.")
     if ($script:CertumSubmitFailed) {
-        $steps = @('shell-create','field-discovery','deadline','focus-owner-before','field-set-focus',
-            'focus-owner-after','focused-element','focus-compare','clipboard-owner','clipboard-set',
-            'select-owner','select-all','paste-owner','paste','enter-owner','enter','clipboard-clear','com-release')
+        $steps = @('target-discovery','pattern-preflight','target-revalidation','field-write','button-invoke')
         $rawStep = if ($script:CertumSubmitFailureStep) {$script:CertumSubmitFailureStep} else {$script:CertumSubmitStep}
         $step = if ($rawStep -cin $steps) {$rawStep} else {'unknown'}
         $field = if ($script:CertumSubmitField -cin @('username','token','none')) {$script:CertumSubmitField} else {'unknown'}
-        $clipboard = if ($script:CertumSubmitClipboardCleanup -cin @('not-attempted','cleared','failed')) {$script:CertumSubmitClipboardCleanup} else {'unknown'}
-        $com = if ($script:CertumSubmitComCleanup -cin @('not-attempted','released','not-com','failed')) {$script:CertumSubmitComCleanup} else {'unknown'}
-        [Console]::Error.WriteLine("SimplySign submit observation; step=$step; field=$field; clipboard_cleanup=$clipboard; com_cleanup=$com.")
+        [Console]::Error.WriteLine("SimplySign target submit observation; step=$step; field=$field.")
     }
     if ($null -ne $script:CertumRoleObservation) {
         $row = $script:CertumRoleObservation
@@ -504,92 +498,81 @@ function Assert-CertumInitialLoginSchema([IntPtr]$Handle, $Process, $Session, $C
     }
 }
 
-function Get-CertumFocusedField { return [Windows.Automation.AutomationElement]::FocusedElement }
-function Test-CertumSameField($Field, $Focused) { return [Windows.Automation.Automation]::Compare($Field, $Focused) }
+function Test-CertumSameTarget($Captured, $Fresh) { return [Windows.Automation.Automation]::Compare($Captured, $Fresh) }
 
-function Set-CertumFieldFocus($Field, [IntPtr]$Handle, $Process) {
-    $script:CertumSubmitStep = 'focus-owner-before'
-    Assert-CertumFocus $Handle $Process
-    $script:CertumSubmitStep = 'field-set-focus'
-    $Field.SetFocus()
-    $script:CertumSubmitStep = 'focus-owner-after'
-    Assert-CertumFocus $Handle $Process
-    $script:CertumSubmitStep = 'focused-element'
-    $focused = Get-CertumFocusedField
-    $script:CertumSubmitStep = 'focus-compare'
-    if ($focused.Current.ProcessId -ne $Process.Id -or -not (Test-CertumSameField $Field $focused)) {
-        throw 'login field focus differs'
+function Get-CertumSubmitButton([IntPtr]$Handle, $Process) {
+    $window = Get-CertumLoginWindow $Handle $Process
+    $condition = [Windows.Automation.PropertyCondition]::new(
+        [Windows.Automation.AutomationElement]::AutomationIdProperty, 'bOk')
+    $buttons = @($window.FindAll([Windows.Automation.TreeScope]::Descendants, $condition))
+    if ($buttons.Count -ne 1) { throw 'expected exactly one owned login button' }
+    $button = $buttons[0]; $current = $button.Current
+    # Pinned 9.4.5.95 LoginForm.InitializeComponent names Button bOk and
+    # binds Click to bOk_Click, which reads tUserName.Text/tPassword.Text.
+    if ($current.AutomationId -cne 'bOk' -or $current.ControlType -ne [Windows.Automation.ControlType]::Button -or
+        $current.ProcessId -ne $Process.Id -or -not $current.IsEnabled -or $current.IsOffscreen) {
+        throw 'login button identity differs'
     }
+    return $button
 }
 
-function Release-CertumSubmitShell($Shell) {
-    if ([Runtime.InteropServices.Marshal]::IsComObject($Shell)) {
-        $null = [Runtime.InteropServices.Marshal]::FinalReleaseComObject($Shell)
-        return 'released'
+function Get-CertumValuePattern($Field) {
+    $pattern = $Field.GetCurrentPattern([Windows.Automation.ValuePattern]::Pattern)
+    if ($null -eq $pattern -or $pattern.Current.IsReadOnly -isnot [bool] -or $pattern.Current.IsReadOnly) { throw 'login field is read-only or unsupported' }
+    return $pattern
+}
+function Get-CertumInvokePattern($Button) {
+    $pattern = $Button.GetCurrentPattern([Windows.Automation.InvokePattern]::Pattern)
+    if ($null -eq $pattern) { throw 'login button invoke is unsupported' }
+    return $pattern
+}
+
+function Assert-CertumSubmitTargets($CapturedFields, $CapturedButton, [IntPtr]$Handle, $Process, $Clock) {
+    Assert-CertumDeadline $Clock
+    $fresh = @(Get-CertumLoginFields $Handle $Process)
+    $button = Get-CertumSubmitButton $Handle $Process
+    foreach ($index in 0,1) {
+        if (-not (Test-CertumSameTarget $CapturedFields[$index] $fresh[$index])) { throw 'login field replaced' }
     }
-    return 'not-com'
+    if (-not (Test-CertumSameTarget $CapturedButton $button)) { throw 'login button replaced' }
+    Assert-CertumFocus $Handle $Process
+    Assert-CertumDeadline $Clock
 }
 
 function Submit-CertumCredential([IntPtr]$Handle, $Process, [string]$Username, [string]$Otp, $Clock) {
     $script:CertumSubmitFailed = $false
     $script:CertumSubmitFailureStep = $null; $script:CertumSubmitField = 'none'
-    $script:CertumSubmitClipboardCleanup = 'not-attempted'; $script:CertumSubmitComCleanup = 'not-attempted'
-    $script:CertumSubmitStep = 'shell-create'
-    try { $shell = New-Object -ComObject WScript.Shell }
-    catch { $script:CertumSubmitFailed = $true; $script:CertumSubmitFailureStep = 'shell-create'; throw }
     try {
-        $script:CertumSubmitStep = 'field-discovery'
-        $fields = @(Get-CertumLoginFields $Handle $Process)
-        $values = @($Username, $Otp)
-        for ($index = 0; $index -lt 2; $index++) {
-            $script:CertumSubmitField = @('username','token')[$index]
-            $script:CertumSubmitStep = 'deadline'
-            Assert-CertumDeadline $Clock
-            Set-CertumFieldFocus $fields[$index] $Handle $Process
-            $script:CertumSubmitStep = 'clipboard-owner'
-            Assert-CertumFocus $Handle $Process
-            $script:CertumSubmitStep = 'clipboard-set'
-            Set-Clipboard -Value $values[$index]
-            Set-CertumFieldFocus $fields[$index] $Handle $Process
-            $script:CertumSubmitStep = 'select-owner'
-            Assert-CertumFocus $Handle $Process
-            $script:CertumSubmitStep = 'select-all'
-            $shell.SendKeys('^a')
-            Set-CertumFieldFocus $fields[$index] $Handle $Process
-            $script:CertumSubmitStep = 'paste-owner'
-            Assert-CertumFocus $Handle $Process
-            $script:CertumSubmitStep = 'paste'
-            $shell.SendKeys('^v')
-        }
-        $script:CertumSubmitField = 'none'; $script:CertumSubmitStep = 'deadline'
+        $script:CertumSubmitStep = 'target-discovery'
         Assert-CertumDeadline $Clock
-        $script:CertumSubmitStep = 'enter-owner'
-        Assert-CertumFocus $Handle $Process
-        $script:CertumSubmitStep = 'enter'
-        $shell.SendKeys('{ENTER}')
+        $fields = @(Get-CertumLoginFields $Handle $Process)
+        $button = Get-CertumSubmitButton $Handle $Process
+        $script:CertumSubmitStep = 'pattern-preflight'
+        # Prove BOTH writable targets and the single invoke capability before
+        # the first private write. There is no keyboard/clipboard fallback.
+        foreach ($field in $fields) { $null = Get-CertumValuePattern $field }
+        $null = Get-CertumInvokePattern $button
+        $values = @($Username, $Otp)
+        foreach ($index in 0,1) {
+            $script:CertumSubmitField = @('username','token')[$index]
+            $script:CertumSubmitStep = 'target-revalidation'
+            Assert-CertumSubmitTargets $fields $button $Handle $Process $Clock
+            $pattern = Get-CertumValuePattern $fields[$index]
+            $script:CertumSubmitStep = 'field-write'
+            $pattern.SetValue($values[$index])
+            Assert-CertumFocus $Handle $Process
+            Assert-CertumDeadline $Clock
+        }
+        $script:CertumSubmitField = 'none'; $script:CertumSubmitStep = 'target-revalidation'
+        Assert-CertumSubmitTargets $fields $button $Handle $Process $Clock
+        $pattern = Get-CertumInvokePattern $button
+        $script:CertumSubmitStep = 'button-invoke'
+        $pattern.Invoke() # Exactly once; existing certificate polling owns the result.
     } catch {
         $script:CertumSubmitFailed = $true
         $script:CertumSubmitFailureStep = $script:CertumSubmitStep
         throw
-    } finally {
-        try {
-            Set-Clipboard -Value ''
-            $script:CertumSubmitClipboardCleanup = 'cleared'
-        } catch {
-            $script:CertumSubmitFailed = $true
-            $script:CertumSubmitClipboardCleanup = 'failed'
-            if (-not $script:CertumSubmitFailureStep) {$script:CertumSubmitFailureStep = 'clipboard-clear'}
-            throw
-        } finally {
-            try { $script:CertumSubmitComCleanup = Release-CertumSubmitShell $shell }
-            catch {
-                $script:CertumSubmitFailed = $true
-                $script:CertumSubmitComCleanup = 'failed'
-                if (-not $script:CertumSubmitFailureStep) {$script:CertumSubmitFailureStep = 'com-release'}
-                throw
-            }
-        }
-    }
+    } finally { $values = $null; $Username = $null; $Otp = $null }
 }
 
 function Stop-CertumSession($Session) {
@@ -707,7 +690,6 @@ function Connect-CertumSession($Policy, [string]$Msi, [string]$OutputPath) {
         $text = $null; $username = $null; $otp = $null
         Remove-Item Env:CERTUM_USERNAME, Env:CERTUM_OTP_URI -ErrorAction SilentlyContinue
         try {
-            if ($IsWindows) { Set-Clipboard -Value '' -ErrorAction Stop }
             foreach ($name in $saved.Keys) {
                 if ($null -eq $saved[$name]) { Remove-ItemProperty -LiteralPath $registry -Name $name -ErrorAction SilentlyContinue }
                 else { Set-ItemProperty -LiteralPath $registry -Name $name -Type DWord -Value $saved[$name] }
@@ -739,7 +721,6 @@ function Disconnect-CertumSession($Policy, [string]$SessionFile) {
     $script:CertumStage = 'disconnect-process'
     $result = Stop-CertumSession $session
     $script:CertumCleanup = 'process-stopped'
-    if ($IsWindows) { Set-Clipboard -Value '' }
     return $result
 }
 
