@@ -38,7 +38,10 @@ SIGNTOOL_SHA256 = 'e7b517a6a2828af2d1fba3da60ae1e322a95141bfae192622725329630caa
 # certificate identities and final artifact hashes, rather than host paths.
 INSPECT = r'''
 $ErrorActionPreference = 'Stop'
+$oaStage = 'authenticode-status'
+try {
 $signature = Get-AuthenticodeSignature -LiteralPath $env:OA_SIGNATURE_FILE
+$oaStage = 'cms-compile'
 $cmsSource = @'
 using System;
 using System.Formats.Asn1;
@@ -134,15 +137,23 @@ function Chain($certificate) {
 }
 $leaf = $signature.SignerCertificate
 $timestamp = $signature.TimeStamperCertificate
+$oaStage = 'leaf-chain'
 $chain = Chain $leaf
+$oaStage = 'timestamp-chain'
 $tsa = Chain $timestamp
+$oaStage = 'cms-read'
 $cms = if ($leaf) { [OASignatureCms]::Read($env:OA_SIGNATURE_FILE) } else { @($null,$null,$null,$null,$null) }
+$oaStage = 'serialization'
 @{status=$signature.Status.ToString();sha1=$(if ($leaf) {$leaf.Thumbprint.ToLowerInvariant()} else {$null})
   sha256=(Digest $leaf);subject=$(if ($leaf) {$leaf.Subject} else {$null})
   issuer=$(if ($leaf) {$leaf.Issuer} else {$null});eku=@(Usage $leaf)
   chain_valid=$chain.valid;chain_status=$chain.status;chain=$chain.certificates;timestamp_sha256=(Digest $timestamp)
   timestamp_eku=@(Usage $timestamp);timestamp_chain_valid=$tsa.valid;timestamp_chain_status=$tsa.status
   file_digest_oid=$cms[0];timestamp_digest_oid=$cms[1];cms_leaf_sha256=$cms[2];cms_timestamp_sha256=$cms[3];cms_digest_oid=$cms[4]} | ConvertTo-Json -Depth 5 -Compress
+} catch {
+  [Console]::Error.WriteLine("OA signature inspection failed; stage=$oaStage.")
+  exit 1
+}
 '''
 
 
@@ -192,24 +203,73 @@ def verify_receipt(receipt, policy, root=None, *, policy_sha256):
     return receipt
 
 
-def run(argv, *, env=None):
+def native_failure(operation, artifact, category, exit_code='none', detail='unknown'):
+    operation = operation if operation in ('inspect-before-sign', 'inspect-signed', 'sign', 'verify', 'tool-operation') else 'unknown'
+    artifact = artifact if artifact in ('pe', 'msi', 'other', 'none') else 'unknown'
+    category = category if category in ('native-exit', 'launch-failed', 'timeout', 'malformed-output') else 'unknown'
+    exit_code = str(exit_code) if type(exit_code) is int and exit_code in (1, 2) else ('none' if exit_code == 'none' else 'other')
+    detail = detail if detail in ('authenticode-status', 'cms-compile', 'leaf-chain', 'timestamp-chain', 'cms-read', 'serialization', 'keyset-missing', 'untrusted-root', 'timestamp-trust', 'no-selected-certificate') else 'unknown'
+    return ValueError('required Windows signature operation failed or warned; operation=' + operation
+                     + '; format=' + artifact + '; category=' + category + '; exit=' + exit_code + '; detail=' + detail)
+
+
+def artifact_format(path):
+    suffix = Path(path).suffix
+    return 'pe' if suffix in ('.exe', '.dll', '.node') else ('msi' if suffix == '.msi' else 'other')
+
+
+def signtool_indicator(output):
+    # Microsoft certificate/trust return values. These are observed indicators,
+    # not a diagnosis of the provider's underlying failure. Conflicts refuse
+    # classification; unknown native text is never returned.
+    indicators = set()
+    for code, label in (('80090016', 'keyset-missing'), ('800b0109', 'untrusted-root'),
+                        ('80096005', 'timestamp-trust')):
+        if re.search(r'(?i)(?<![a-z0-9])0x' + code + r'(?![a-z0-9])', output):
+            indicators.add(label)
+    if 'SignTool Error: No certificates were found that met all the given criteria.' in output.splitlines():
+        indicators.add('no-selected-certificate')
+    return next(iter(indicators)) if len(indicators) == 1 else 'unknown'
+
+
+def run(argv, *, env=None, operation='tool-operation', artifact='none'):
     child = dict(os.environ if env is None else env)
     for name in SECRET_ENV:
         child.pop(name, None)
-    result = subprocess.run([str(value) for value in argv], env=child, capture_output=True,
-                            text=True, encoding='utf-8', errors='replace', timeout=180)
+    try:
+        result = subprocess.run([str(value) for value in argv], env=child, capture_output=True,
+                                text=True, encoding='utf-8', errors='replace', timeout=180)
+    except OSError:
+        raise native_failure(operation, artifact, 'launch-failed') from None
+    except subprocess.TimeoutExpired:
+        raise native_failure(operation, artifact, 'timeout') from None
     # SignTool returns 2 for warnings, including a missing timestamp. Required
     # production signatures accept only a successful, warning-free result.
     if result.returncode != 0:
-        raise ValueError('required Windows signature operation failed or warned (exit ' + str(result.returncode) + ')')
+        detail = 'unknown'
+        if operation in ('inspect-before-sign', 'inspect-signed'):
+            marker = re.search(r'^OA signature inspection failed; stage=(authenticode-status|cms-compile|leaf-chain|timestamp-chain|cms-read|serialization)\.$',
+                               result.stderr or '', re.MULTILINE)
+            if marker:
+                detail = marker.group(1)
+        elif operation in ('sign', 'verify'):
+            detail = signtool_indicator((result.stdout or '') + '\n' + (result.stderr or ''))
+        raise native_failure(operation, artifact, 'native-exit', result.returncode, detail)
     return result.stdout
 
 
-def inspect_signature(path):
+def inspect_signature(path, *, operation='inspect-signed'):
     encoded = base64.b64encode(INSPECT.encode('utf-16-le')).decode('ascii')
     output = run(['pwsh', '-NoProfile', '-NonInteractive', '-EncodedCommand', encoded],
-                 env=dict(os.environ, OA_SIGNATURE_FILE=str(Path(path).resolve())))
-    return json.loads(output)
+                 env=dict(os.environ, OA_SIGNATURE_FILE=str(Path(path).resolve())),
+                 operation=operation, artifact=artifact_format(path))
+    try:
+        result = json.loads(output)
+        if not isinstance(result, dict):
+            raise ValueError('invalid inspection object')
+        return result
+    except (ValueError, TypeError):
+        raise native_failure(operation, artifact_format(path), 'malformed-output') from None
 
 
 def verify(path, policy, signtool):
@@ -230,8 +290,8 @@ def verify(path, policy, signtool):
             or signature.get('timestamp_digest_oid') != '2.16.840.1.101.3.4.2.1'
             or signature.get('cms_leaf_sha256') != expected['sha256']
             or signature.get('cms_timestamp_sha256') != signature.get('timestamp_sha256')):
-        raise ValueError('required expected-leaf, code-signing, chain or timestamp verification failed')
-    output = run([signtool, 'verify', '/pa', '/all', '/tw', '/v', path])
+        raise ValueError('required Windows signature policy refused; operation=verify; format=' + artifact_format(path) + '; category=signature-criteria')
+    output = run([signtool, 'verify', '/pa', '/all', '/tw', '/v', path], operation='verify', artifact=artifact_format(path))
     data = path.read_bytes()
     return {'name': path.name, 'sha256': hashlib.sha256(data).hexdigest(), 'bytes': len(data),
             'certificate': {key: signature[key] for key in ('sha1', 'sha256', 'subject', 'issuer')},
@@ -243,13 +303,13 @@ def verify(path, policy, signtool):
 
 def sign(path, policy, signtool):
     expected = identity(policy)
-    signature = inspect_signature(path)
+    signature = inspect_signature(path, operation='inspect-before-sign')
     created = signature.get('status') == 'NotSigned'
     if created:
         run([signtool, 'sign', '/sha1', expected['sha1'], '/u', CODE_SIGNING,
-             '/fd', 'SHA256', '/tr', TIMESTAMP_URL, '/td', 'SHA256', '/v', Path(path)])
+             '/fd', 'SHA256', '/tr', TIMESTAMP_URL, '/td', 'SHA256', '/v', Path(path)], operation='sign', artifact=artifact_format(path))
     elif signature.get('status') != 'Valid':
-        raise ValueError('existing invalid Windows signature cannot be overwritten')
+        raise ValueError('required Windows signature policy refused; operation=sign; format=' + artifact_format(path) + '; category=existing-invalid-signature')
     return dict(verify(path, policy, signtool), new_signature=created)
 
 
