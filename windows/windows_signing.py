@@ -203,13 +203,17 @@ def verify_receipt(receipt, policy, root=None, *, policy_sha256):
     return receipt
 
 
+class NativeSignatureFailure(ValueError):
+    """Contains only fixed public categories, never native diagnostics."""
+
+
 def native_failure(operation, artifact, category, exit_code='none', detail='unknown'):
     operation = operation if operation in ('inspect-before-sign', 'inspect-signed', 'sign', 'verify', 'tool-operation') else 'unknown'
     artifact = artifact if artifact in ('pe', 'msi', 'other', 'none') else 'unknown'
     category = category if category in ('native-exit', 'launch-failed', 'timeout', 'malformed-output') else 'unknown'
     exit_code = str(exit_code) if type(exit_code) is int and exit_code in (1, 2) else ('none' if exit_code == 'none' else 'other')
     detail = detail if detail in ('authenticode-status', 'cms-compile', 'leaf-chain', 'timestamp-chain', 'cms-read', 'serialization', 'keyset-missing', 'untrusted-root', 'timestamp-trust', 'no-selected-certificate') else 'unknown'
-    return ValueError('required Windows signature operation failed or warned; operation=' + operation
+    return NativeSignatureFailure('required Windows signature operation failed or warned; operation=' + operation
                      + '; format=' + artifact + '; category=' + category + '; exit=' + exit_code + '; detail=' + detail)
 
 
@@ -230,6 +234,109 @@ def signtool_indicator(output):
     if 'SignTool Error: No certificates were found that met all the given criteria.' in output.splitlines():
         indicators.add('no-selected-certificate')
     return next(iter(indicators)) if len(indicators) == 1 else 'unknown'
+
+
+def selection_counts(output):
+    counts = {}
+    observed = []
+    for field, label in (('eku', 'EKU'), ('expiry', 'expiry'), ('hash', 'Hash'), ('private_key', 'Private Key')):
+        matches = list(re.finditer(r'^After ' + label + r' filter, ([0-9]{1,9}) certs were left\.$', output, re.MULTILINE))
+        number = int(matches[0].group(1)) if len(matches) == 1 else None
+        counts[field] = ('zero' if number == 0 else 'one' if number == 1 else 'many') if number is not None else 'unknown'
+        if number is not None:
+            observed.append((field, matches[0].start(), number))
+    counts['first_reject'] = 'unknown'
+    if (len(observed) == 4 and all(left[1] < right[1] and left[2] >= right[2]
+                                   for left, right in zip(observed, observed[1:]))):
+        counts['first_reject'] = next((field for field, _, number in observed if number == 0), 'none')
+    return counts
+
+
+SELECTION_METADATA = r'''
+$ErrorActionPreference = 'Stop'
+$row = @{expected_leaf='unknown';association='unknown';provider='unknown';key_spec='unknown';session='unknown'}
+try {
+    . $env:OA_SELECTION_AUTH -LibraryOnly -PolicyPath $env:OA_SELECTION_POLICY
+    $policy = Read-CertumPolicy $env:OA_SELECTION_POLICY
+    Assert-CertumRunner $policy
+    if ($policy.certificate.sha1 -ine $env:OA_SELECTION_SHA1) { throw 'policy differs' }
+    $sessionFile = Assert-CertumSessionPath (Join-Path $env:RUNNER_TEMP 'signing-session.json')
+    $session = Get-Content -LiteralPath $sessionFile -Raw | ConvertFrom-Json -AsHashtable
+    if ($session.schema -ne 1 -or $session.source_sha -cne $env:GITHUB_SHA -or
+        $session.policy_sha256 -ine (Get-FileHash -LiteralPath $env:OA_SELECTION_POLICY -Algorithm SHA256).Hash -or
+        $session.certificate.sha256 -ine $policy.certificate.sha256) { throw 'session binding differs' }
+    $expected = Join-Path $env:ProgramFiles 'Certum\SimplySign Desktop\SimplySignDesktop.exe'
+    if (($session.process_id -isnot [int] -and $session.process_id -isnot [long]) -or
+        $session.process_id -le 0 -or $session.process_id -gt [int]::MaxValue -or
+        -not [string]::Equals($session.executable,$expected,[StringComparison]::Ordinal) -or
+        -not $session.process_started) { throw 'session ownership differs' }
+    $started = ([datetime]$session.process_started).ToUniversalTime()
+    $process = Get-Process -Id $session.process_id -ErrorAction SilentlyContinue
+    if ($null -eq $process) { $row.session='absent' }
+    elseif ($process.StartTime.ToUniversalTime().Ticks -eq $started.Ticks -and
+        [string]::Equals($process.Path,$expected,[StringComparison]::Ordinal)) { $row.session='alive' }
+    else { $row.session='mismatch' }
+    $matches = @(Get-ChildItem Cert:\CurrentUser\My | Where-Object {$_.Thumbprint -ieq $policy.certificate.sha1})
+    $row.expected_leaf = if ($matches.Count -eq 0) {'zero'} elseif ($matches.Count -eq 1) {'one'} else {'many'}
+    if ($matches.Count -eq 1) {
+        Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+public static class SelectionProperty {
+ [StructLayout(LayoutKind.Sequential)] public struct ProviderInfo {
+  public IntPtr container; public IntPtr provider; public uint type; public uint flags;
+  public uint count; public IntPtr parameters; public uint spec;
+ }
+ [DllImport("crypt32.dll", SetLastError=true)] public static extern bool CertGetCertificateContextProperty(IntPtr cert,uint property,IntPtr data,ref uint size);
+}
+'@
+        [uint32]$size=0
+        if (-not [SelectionProperty]::CertGetCertificateContextProperty($matches[0].Handle,2,[IntPtr]::Zero,[ref]$size)) {
+            if ([Runtime.InteropServices.Marshal]::GetLastWin32Error() -eq -2146885628) { $row.association='absent' }
+        } elseif ($size -ge [Runtime.InteropServices.Marshal]::SizeOf([type][SelectionProperty+ProviderInfo]) -and $size -le 1048576) {
+            $buffer=[Runtime.InteropServices.Marshal]::AllocHGlobal([int]$size)
+            try {
+                if ([SelectionProperty]::CertGetCertificateContextProperty($matches[0].Handle,2,$buffer,[ref]$size)) {
+                    $info=[Runtime.InteropServices.Marshal]::PtrToStructure($buffer,[type][SelectionProperty+ProviderInfo])
+                    $row.association='present'
+                    $row.provider=if ($info.type -eq 0) {'ksp'} elseif ($info.type -eq 1) {'csp'} else {'other'}
+                    $row.key_spec=if ($info.spec -eq 1) {'exchange'} elseif ($info.spec -eq 2) {'signature'} elseif ($info.spec -eq [uint32]::MaxValue) {'ncrypt'} else {'other'}
+                }
+            } finally { [Runtime.InteropServices.Marshal]::FreeHGlobal($buffer) }
+        }
+    }
+} catch { } # Public fixed unknowns retain query/guard uncertainty; no ErrorRecord output.
+$row | ConvertTo-Json -Compress
+'''
+
+
+def selection_metadata(expected):
+    unknown = dict(expected_leaf='unknown', association='unknown', provider='unknown', key_spec='unknown', session='unknown')
+    encoded = base64.b64encode(SELECTION_METADATA.encode('utf-16-le')).decode('ascii')
+    try:
+        output = run(['pwsh', '-NoProfile', '-NonInteractive', '-EncodedCommand', encoded], env=dict(os.environ,
+                     OA_SELECTION_AUTH=str(Path(__file__).with_name('certum_simplysign.ps1').resolve()),
+                     OA_SELECTION_POLICY=str(Path(__file__).with_name('certum_simplysign.json').resolve()),
+                     OA_SELECTION_SHA1=expected['sha1']))
+        row = json.loads(output)
+        allowed = {'expected_leaf': ('zero', 'one', 'many'), 'association': ('present', 'absent'),
+                   'provider': ('csp', 'ksp', 'other'), 'key_spec': ('exchange', 'signature', 'ncrypt', 'other'),
+                   'session': ('alive', 'absent', 'mismatch')}
+        return {key: row.get(key) if row.get(key) in values else 'unknown' for key, values in allowed.items()}
+    except (ValueError, TypeError, AttributeError, KeyError):
+        return unknown
+
+
+def selection_observation(counts, metadata):
+    allowed = {'eku': ('zero', 'one', 'many'), 'expiry': ('zero', 'one', 'many'),
+               'hash': ('zero', 'one', 'many'), 'private_key': ('zero', 'one', 'many'),
+               'first_reject': ('eku', 'expiry', 'hash', 'private_key', 'none'),
+               'expected_leaf': ('zero', 'one', 'many'), 'association': ('present', 'absent'),
+               'provider': ('csp', 'ksp', 'other'), 'key_spec': ('exchange', 'signature', 'ncrypt', 'other'),
+               'session': ('alive', 'absent', 'mismatch')}
+    row = dict(counts, **metadata)
+    return 'Windows signature selection observation; ' + '; '.join(
+        key + '=' + (row.get(key) if row.get(key) in values else 'unknown') for key, values in allowed.items()) + '.'
 
 
 def run(argv, *, env=None, operation='tool-operation', artifact='none'):
@@ -254,7 +361,10 @@ def run(argv, *, env=None, operation='tool-operation', artifact='none'):
                 detail = marker.group(1)
         elif operation in ('sign', 'verify'):
             detail = signtool_indicator((result.stdout or '') + '\n' + (result.stderr or ''))
-        raise native_failure(operation, artifact, 'native-exit', result.returncode, detail)
+        error = native_failure(operation, artifact, 'native-exit', result.returncode, detail)
+        if operation == 'sign':
+            error.selection = selection_counts((result.stdout or '') + '\n' + (result.stderr or ''))
+        raise error
     return result.stdout
 
 
@@ -306,8 +416,12 @@ def sign(path, policy, signtool):
     signature = inspect_signature(path, operation='inspect-before-sign')
     created = signature.get('status') == 'NotSigned'
     if created:
-        run([signtool, 'sign', '/sha1', expected['sha1'], '/u', CODE_SIGNING,
-             '/fd', 'SHA256', '/tr', TIMESTAMP_URL, '/td', 'SHA256', '/v', Path(path)], operation='sign', artifact=artifact_format(path))
+        try:
+            run([signtool, 'sign', '/debug', '/sha1', expected['sha1'], '/u', CODE_SIGNING,
+                 '/fd', 'SHA256', '/tr', TIMESTAMP_URL, '/td', 'SHA256', '/v', Path(path)], operation='sign', artifact=artifact_format(path))
+        except NativeSignatureFailure as error:
+            print(selection_observation(getattr(error, 'selection', {}), selection_metadata(expected)), file=sys.stderr)
+            raise
     elif signature.get('status') != 'Valid':
         raise ValueError('required Windows signature policy refused; operation=sign; format=' + artifact_format(path) + '; category=existing-invalid-signature')
     return dict(verify(path, policy, signtool), new_signature=created)
