@@ -1,0 +1,3 @@
+# Preserve raw bytes bound by Windows signing proofs.
+/windows/certum_simplysign.json text eol=lf
+/.github/workflows/candidate.yml text eol=lf
