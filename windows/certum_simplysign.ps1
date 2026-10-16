@@ -167,10 +167,66 @@ function New-CertumProcessInfo([string]$File, [string[]]$Arguments) {
     return $info
 }
 
+function Initialize-CertumHandleIsolation {
+    if ('CertumHandleIsolation' -as [type]) { return }
+    Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+public static class CertumHandleIsolation {
+ [DllImport("kernel32.dll")] public static extern IntPtr GetStdHandle(int id);
+ [DllImport("kernel32.dll")] public static extern bool GetHandleInformation(IntPtr handle,out uint flags);
+ [DllImport("kernel32.dll")] public static extern bool SetHandleInformation(IntPtr handle,uint mask,uint flags);
+}
+'@
+}
+
+function Get-CertumHostHandleState {
+    Initialize-CertumHandleIsolation
+    $seen = @{}
+    foreach ($id in @(-11,-12)) {
+        $handle = [CertumHandleIsolation]::GetStdHandle($id)
+        if ($handle -eq [IntPtr]::Zero -or $handle -eq [IntPtr](-1) -or $seen.ContainsKey($handle)) { continue }
+        $seen[$handle] = $true
+        [uint32]$flags = 0
+        if (-not [CertumHandleIsolation]::GetHandleInformation($handle,[ref]$flags)) { throw 'host handle isolation query failed' }
+        @{handle=$handle; inherit=($flags -band 1)}
+    }
+}
+
+function Set-CertumHandleInheritance($State, [uint32]$Inherit) {
+    if (-not [CertumHandleIsolation]::SetHandleInformation($State.handle,1,$Inherit)) { throw 'host handle isolation update failed' }
+}
+
 function Start-CertumChild([string]$File, [string[]]$Arguments) {
     $process = [Diagnostics.Process]::new()
     $process.StartInfo = New-CertumProcessInfo $File $Arguments
-    $null = $process.Start()
+    $changed = @(); $failure = $null; $restoreFailed = $false; $started = $false
+    try {
+        # .NET CreateProcess inherits unrelated inheritable handles even with its
+        # own redirected stdio. Hosted runner pipes must close when Connect exits.
+        # This adapter launches children serially; restore borrowed flags before
+        # returning and leave the child's dedicated, null-drained pipes intact.
+        foreach ($state in @(Get-CertumHostHandleState)) {
+            if ($state.inherit -eq 0) { continue }
+            $changed += $state
+            Set-CertumHandleInheritance $state 0
+        }
+        $started = $process.Start()
+        if (-not $started) { throw 'owned child did not start' }
+    } catch { $failure = $_ }
+    finally {
+        foreach ($state in $changed) {
+            try { Set-CertumHandleInheritance $state $state.inherit }
+            catch { $restoreFailed = $true; if ($null -eq $failure) { $failure = $_ } }
+        }
+    }
+    if ($null -ne $failure -or $restoreFailed) {
+        try {
+            if ($started) { $process.Kill(); $null = $process.WaitForExit(10000) }
+        } catch { } # Preserve the original setup/start/restoration failure.
+        finally { $process.Dispose() }
+        throw $failure
+    }
     # Drain without a log, preventing pipe backpressure and credential diagnostics.
     $null = $process.StandardOutput.BaseStream.CopyToAsync([IO.Stream]::Null)
     $null = $process.StandardError.BaseStream.CopyToAsync([IO.Stream]::Null)
