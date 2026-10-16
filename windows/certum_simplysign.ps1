@@ -21,6 +21,12 @@ $script:CertumObservationResult = 'not-checked'
 $script:CertumInitialCounts = $null
 $script:CertumRepeatedCounts = $null
 $script:CertumRoleObservation = $null
+$script:CertumSubmitStep = 'not-checked'
+$script:CertumSubmitFailureStep = $null
+$script:CertumSubmitField = 'none'
+$script:CertumSubmitClipboardCleanup = 'not-attempted'
+$script:CertumSubmitComCleanup = 'not-attempted'
+$script:CertumSubmitFailed = $false
 
 function ConvertTo-CertumCountBucket($Count) {
     if ($Count -cin @('zero','one','two','many')) { return $Count }
@@ -42,6 +48,17 @@ function Write-CertumFailure {
     $reason = if ($script:CertumSchemaReason -cin $reasons) { $script:CertumSchemaReason } else { 'unknown' }
     $count = if ($script:CertumEditCount -cin @('zero','one','two','many')) { $script:CertumEditCount } else { 'unknown' }
     [Console]::Error.WriteLine("SimplySign session operation failed; stage=$stage; category=operation-failed; cleanup=$cleanup; schema_reason=$reason; edit_count=$count; credential diagnostics are disabled.")
+    if ($script:CertumSubmitFailed) {
+        $steps = @('shell-create','field-discovery','deadline','focus-owner-before','field-set-focus',
+            'focus-owner-after','focused-element','focus-compare','clipboard-owner','clipboard-set',
+            'select-owner','select-all','paste-owner','paste','enter-owner','enter','clipboard-clear','com-release')
+        $rawStep = if ($script:CertumSubmitFailureStep) {$script:CertumSubmitFailureStep} else {$script:CertumSubmitStep}
+        $step = if ($rawStep -cin $steps) {$rawStep} else {'unknown'}
+        $field = if ($script:CertumSubmitField -cin @('username','token','none')) {$script:CertumSubmitField} else {'unknown'}
+        $clipboard = if ($script:CertumSubmitClipboardCleanup -cin @('not-attempted','cleared','failed')) {$script:CertumSubmitClipboardCleanup} else {'unknown'}
+        $com = if ($script:CertumSubmitComCleanup -cin @('not-attempted','released','not-com','failed')) {$script:CertumSubmitComCleanup} else {'unknown'}
+        [Console]::Error.WriteLine("SimplySign submit observation; step=$step; field=$field; clipboard_cleanup=$clipboard; com_cleanup=$com.")
+    }
     if ($null -ne $script:CertumRoleObservation) {
         $row = $script:CertumRoleObservation
         $result = if ($row.result -cin @('observed','guard-or-query-failed')) {$row.result} else {'unknown'}
@@ -487,39 +504,91 @@ function Assert-CertumInitialLoginSchema([IntPtr]$Handle, $Process, $Session, $C
     }
 }
 
+function Get-CertumFocusedField { return [Windows.Automation.AutomationElement]::FocusedElement }
+function Test-CertumSameField($Field, $Focused) { return [Windows.Automation.Automation]::Compare($Field, $Focused) }
+
 function Set-CertumFieldFocus($Field, [IntPtr]$Handle, $Process) {
+    $script:CertumSubmitStep = 'focus-owner-before'
     Assert-CertumFocus $Handle $Process
+    $script:CertumSubmitStep = 'field-set-focus'
     $Field.SetFocus()
+    $script:CertumSubmitStep = 'focus-owner-after'
     Assert-CertumFocus $Handle $Process
-    $focused = [Windows.Automation.AutomationElement]::FocusedElement
-    if ($focused.Current.ProcessId -ne $Process.Id -or -not [Windows.Automation.Automation]::Compare($Field, $focused)) {
+    $script:CertumSubmitStep = 'focused-element'
+    $focused = Get-CertumFocusedField
+    $script:CertumSubmitStep = 'focus-compare'
+    if ($focused.Current.ProcessId -ne $Process.Id -or -not (Test-CertumSameField $Field $focused)) {
         throw 'login field focus differs'
     }
 }
 
+function Release-CertumSubmitShell($Shell) {
+    if ([Runtime.InteropServices.Marshal]::IsComObject($Shell)) {
+        $null = [Runtime.InteropServices.Marshal]::FinalReleaseComObject($Shell)
+        return 'released'
+    }
+    return 'not-com'
+}
+
 function Submit-CertumCredential([IntPtr]$Handle, $Process, [string]$Username, [string]$Otp, $Clock) {
-    $shell = New-Object -ComObject WScript.Shell
+    $script:CertumSubmitFailed = $false
+    $script:CertumSubmitFailureStep = $null; $script:CertumSubmitField = 'none'
+    $script:CertumSubmitClipboardCleanup = 'not-attempted'; $script:CertumSubmitComCleanup = 'not-attempted'
+    $script:CertumSubmitStep = 'shell-create'
+    try { $shell = New-Object -ComObject WScript.Shell }
+    catch { $script:CertumSubmitFailed = $true; $script:CertumSubmitFailureStep = 'shell-create'; throw }
     try {
+        $script:CertumSubmitStep = 'field-discovery'
         $fields = @(Get-CertumLoginFields $Handle $Process)
         $values = @($Username, $Otp)
         for ($index = 0; $index -lt 2; $index++) {
+            $script:CertumSubmitField = @('username','token')[$index]
+            $script:CertumSubmitStep = 'deadline'
             Assert-CertumDeadline $Clock
             Set-CertumFieldFocus $fields[$index] $Handle $Process
+            $script:CertumSubmitStep = 'clipboard-owner'
             Assert-CertumFocus $Handle $Process
+            $script:CertumSubmitStep = 'clipboard-set'
             Set-Clipboard -Value $values[$index]
             Set-CertumFieldFocus $fields[$index] $Handle $Process
+            $script:CertumSubmitStep = 'select-owner'
             Assert-CertumFocus $Handle $Process
+            $script:CertumSubmitStep = 'select-all'
             $shell.SendKeys('^a')
             Set-CertumFieldFocus $fields[$index] $Handle $Process
+            $script:CertumSubmitStep = 'paste-owner'
             Assert-CertumFocus $Handle $Process
+            $script:CertumSubmitStep = 'paste'
             $shell.SendKeys('^v')
         }
+        $script:CertumSubmitField = 'none'; $script:CertumSubmitStep = 'deadline'
         Assert-CertumDeadline $Clock
+        $script:CertumSubmitStep = 'enter-owner'
         Assert-CertumFocus $Handle $Process
+        $script:CertumSubmitStep = 'enter'
         $shell.SendKeys('{ENTER}')
+    } catch {
+        $script:CertumSubmitFailed = $true
+        $script:CertumSubmitFailureStep = $script:CertumSubmitStep
+        throw
     } finally {
-        Set-Clipboard -Value ''
-        if ([Runtime.InteropServices.Marshal]::IsComObject($shell)) { $null = [Runtime.InteropServices.Marshal]::FinalReleaseComObject($shell) }
+        try {
+            Set-Clipboard -Value ''
+            $script:CertumSubmitClipboardCleanup = 'cleared'
+        } catch {
+            $script:CertumSubmitFailed = $true
+            $script:CertumSubmitClipboardCleanup = 'failed'
+            if (-not $script:CertumSubmitFailureStep) {$script:CertumSubmitFailureStep = 'clipboard-clear'}
+            throw
+        } finally {
+            try { $script:CertumSubmitComCleanup = Release-CertumSubmitShell $shell }
+            catch {
+                $script:CertumSubmitFailed = $true
+                $script:CertumSubmitComCleanup = 'failed'
+                if (-not $script:CertumSubmitFailureStep) {$script:CertumSubmitFailureStep = 'com-release'}
+                throw
+            }
+        }
     }
 }
 
@@ -540,6 +609,7 @@ function Stop-CertumSession($Session) {
 }
 
 function Connect-CertumSession($Policy, [string]$Msi, [string]$OutputPath) {
+    $script:CertumSubmitFailed = $false
     $script:CertumObservationResult = 'not-checked'; $script:CertumInitialCounts = $null; $script:CertumRepeatedCounts = $null
     $username = $env:CERTUM_USERNAME; $text = $env:CERTUM_OTP_URI
     Remove-Item Env:CERTUM_USERNAME, Env:CERTUM_OTP_URI -ErrorAction SilentlyContinue
