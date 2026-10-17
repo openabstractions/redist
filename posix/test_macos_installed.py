@@ -18,6 +18,18 @@ import sys
 import time
 from datetime import datetime, timezone
 
+AUTOMATED_ACCEPTANCE = {'profile': 'automated',
+    'reason': 'Owner directive 2026-10-17: manual product demonstrations are deferred from publication.'}
+
+
+def automated_acceptance(request):
+    if 'acceptance' not in request:
+        return False
+    if request['acceptance'] != AUTOMATED_ACCEPTANCE:
+        raise ValueError('unknown or changed installed acceptance profile/provenance')
+    return True
+
+
 RECEIPTS = tuple('com.openabstractions.abstraction' + suffix for suffix in
                  ('', '.localstores', '.modelhost', '.mcpgateway'))
 LABELS = ('com.openabstractions.runtime', 'com.openabstractions.panel', 'com.openabstractions.jobd')
@@ -127,6 +139,10 @@ def validate(request, request_path):
     if (actual != expected or any(not path.is_relative_to(pythonpath) for path in expected)
             or not required_python <= {path.relative_to(pythonpath).as_posix() for path in expected}):
         raise ValueError('Python source inventory differs from the exact probe inputs')
+    if automated_acceptance(request):
+        if 'core' in probe:
+            raise ValueError('automated installed request cannot carry a human core')
+        return root, home
     core = probe.get('core', {})
     if (core.get('schema') != 1 or core.get('directory') != str(root)
             or core.get('source_sha') != request['source_sha'] or core.get('tool_source') != request['tool_source']):
@@ -182,7 +198,8 @@ class Journey:
         console, _ = self.call('console-owner', ['/usr/bin/stat', '-f', '%Su', '/dev/console'])
         uid, _ = self.call('manageruid', ['/bin/launchctl', 'manageruid'])
         manager, _ = self.call('managername', ['/bin/launchctl', 'managername'])
-        if console.strip() != account.pw_name or uid.strip() != str(os.getuid()) or manager.strip() != 'Aqua':
+        if ((not automated_acceptance(self.request) and console.strip() != account.pw_name)
+                or uid.strip() != str(os.getuid()) or manager.strip() != 'Aqua'):
             raise ValueError('run from the intended user real Aqua session')
         self.call('gui-domain', ['/bin/launchctl', 'print', 'gui/' + str(os.getuid())], discard=True)
 
@@ -259,7 +276,7 @@ class Journey:
         self.call('go-xpc-' + phase, [probe['go']['path'], 'installed', 'unused', self.root / 'state', binary, probe['go']['path']])
         env = dict(os.environ, PYTHONPATH=probe['pythonpath'], PYTHONDONTWRITEBYTECODE='1')
         self.call('python-discovery-' + phase, [sys.executable, '-B', probe['python_script']['path'], probe['native_library']['path']], env=env)
-        if phase == 'fresh':
+        if phase == 'fresh' and not automated_acceptance(self.request):
             core = probe['core']
             specification = importlib.util.spec_from_file_location('oa_installed_native_core', core['helper']['path'])
             helper = importlib.util.module_from_spec(specification)
@@ -306,7 +323,11 @@ class Journey:
         return {'result': 'failed' if error or cleanup_error else 'pass', 'exit_code': 1 if error or cleanup_error else 0,
                 'failure': error, 'cleanup_failure': cleanup_error, 'cleanup_verified': True,
                 'retained_presence': {'before': before, 'after': after}, 'owned_runtime_PIDs_absent': True,
-                'core': getattr(self, 'core', None), 'private_evidence': True}
+                'core': getattr(self, 'core', None), 'private_evidence': True,
+                **({'acceptance': self.request['acceptance'],
+                    'manual': {'status': 'deferred', 'reason': self.request['acceptance']['reason']},
+                    'automated_checks': [row['operation'] for row in self.commands]}
+                   if automated_acceptance(self.request) else {})}
 
 
 def main():
