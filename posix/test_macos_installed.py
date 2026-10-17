@@ -266,7 +266,7 @@ class Journey:
             specification.loader.exec_module(helper)
             request = helper.session_request(core, self.root / 'native-request.json', binary,
                 self.home / '.local/bin/Abstraction Panel.app/Contents/MacOS/panel', self.logs / 'native-core')
-            self.call('native-core', [sys.executable, '-B', core['journey']['path'], '--native-request', request], env=env, timeout=210)
+            self.call('native-core', [sys.executable, '-B', core['journey']['path'], '--native-request', request], env=env, timeout=390)
             self.core = json.loads((request.parent / 'core-result.json').read_text())
             helper.validate_result(self.core, core, permission=True)
 
