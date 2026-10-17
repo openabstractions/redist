@@ -1140,7 +1140,10 @@ if ($Mode -eq 'LocalAccount') {
         $canRemoveFixtureData = $true
         if (Test-Path -LiteralPath $nativeRequest -PathType Leaf) {
             try { Assert-OrdinaryNativeClosure $nativeRequest }
-            catch { $canRemoveFixtureData = $false; $cleanup += $_.Exception.Message }
+            catch {
+                $canRemoveFixtureData = $false; $cleanup += $_.Exception.Message
+                Write-Warning ('Ordinary native closure UNKNOWN; retain installed runtime/data: ' + (Protect-DiagnosticText $_.Exception.Message)) -WarningAction Continue
+            }
         }
         if ($canRemoveFixtureData -and -not $dataExisted -and (Test-Path -LiteralPath $data)) {
             try { Remove-Item -LiteralPath $data -Recurse -Force } catch { $cleanup += "data folder $data`: $($_.Exception.Message)" }
@@ -1177,6 +1180,8 @@ if ($Mode -eq 'User') {
     $predecessorAttempted = $false
     $previousProcesses = @()
     $sentinel = $null
+    $failure = $null
+    $closureFailure = $null
     try {
         if ($PredecessorMsiPath) {
             Assert-PackageHash $PredecessorMsiPath $PredecessorSHA256
@@ -1299,14 +1304,18 @@ if ($Mode -eq 'User') {
             }
             "ok: uninstall removed processes, endpoints, shortcut and runtime binaries before fixture cleanup, with no reboot pending; $restartManager" | Set-Content 'removal.txt'
         }
-    } finally {
+    } catch { $failure = $_ } finally {
         foreach ($process in $previousProcesses) { $process.Dispose() }
-        Assert-OrdinaryNativeClosure $NativeCoreRequest
-        if ($installed -or $installAttempted) {
+        try { Assert-OrdinaryNativeClosure $NativeCoreRequest }
+        catch {
+            $closureFailure = $_
+            Write-Warning ('Ordinary native closure UNKNOWN; retain installed runtime/data: ' + (Protect-DiagnosticText $_.Exception.Message)) -WarningAction Continue
+        }
+        if (-not $closureFailure -and ($installed -or $installAttempted)) {
             # A post-InstallFinalize activation error can leave committed files.
             try { Invoke-Bounded msiexec.exe @('/x', "`"$MsiPath`"", '/qn', '/norestart', '/l*v', 'user-cleanup-uninstall.log') } catch { Write-Warning $_ }
         }
-        if ($predecessorAttempted) {
+        if (-not $closureFailure -and $predecessorAttempted) {
             $oldCode = Get-PackageProperty $PredecessorMsiPath ProductCode
             if (@(Get-InstalledProducts | Where-Object { $_.ProductCode -eq $oldCode }).Count) {
                 try { Invoke-Bounded msiexec.exe @('/x',"`"$PredecessorMsiPath`"",'/qn','/norestart','/l*v','predecessor-cleanup.log') } catch { Write-Warning $_ }
@@ -1317,6 +1326,8 @@ if ($Mode -eq 'User') {
         try { if (Test-Path -LiteralPath $installerActions) { Copy-Item -LiteralPath $installerActions -Destination 'installer-actions.txt' -Force } }
         catch { Write-Warning ('Installer action diagnostics failed: ' + (Protect-DiagnosticText $_.Exception.Message)) }
     }
+    if ($failure) { throw $failure }
+    if ($closureFailure) { throw $closureFailure }
     exit 0
 }
 
