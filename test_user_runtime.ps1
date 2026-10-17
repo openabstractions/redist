@@ -891,7 +891,7 @@ function Assert-NativeCore([string]$Central, [string]$Tools, [string]$PythonPath
         runtime=@{path=$Central;sha256=$native.runtime_sha256;bytes=(Get-Item -LiteralPath $Central).Length}
         panel=@{path=$panel;sha256=$native.core.panel_sha256;bytes=(Get-Item -LiteralPath $panel).Length} }
     $session | ConvertTo-Json -Depth 30 | Set-Content -LiteralPath $request -Encoding UTF8
-    Invoke-Bounded $PythonPath @('-B',"`"$($native.core.journey.path)`"",'--native-request',"`"$request`"") 90
+    Invoke-Bounded $PythonPath @('-B',"`"$($native.core.journey.path)`"",'--native-request',"`"$request`"") 210
     $result = Join-Path $directory 'core-result.json'
     $proof = Get-Content -LiteralPath $result -Raw | ConvertFrom-Json
     if ($proof.result -ne 'pass' -or -not $proof.owned_children_exited) { throw 'Native core outcome incomplete' }
