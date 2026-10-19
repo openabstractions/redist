@@ -253,7 +253,9 @@ def smoke_sdk(receipt, work_dir, base_env):
     replacement.write_bytes(target.read_bytes() + b"\n" + fixture)
     overlay = work / "overlay.json"
     overlay.write_bytes(json.dumps({"Replace": {str(target): str(replacement)}}).encode())
-    env.update(GOCACHE=str(work / "gocache"), GOMODCACHE=str(work / "gomod"), GOPROXY="off", GOSUMDB="off", CGO_ENABLED="1")
+    cache = Path(env.get("GOCACHE") or work / "gocache")
+    _private_root(cache, create=True)
+    env.update(GOCACHE=str(cache), GOMODCACHE=str(work / "gomod"), GOPROXY="off", GOSUMDB="off", CGO_ENABLED="1")
     argv = [receipt["go"], "test", "-overlay=" + str(overlay), "-race", "-count=1", "-timeout=60s",
             "-run=^TestNamedPipeConcurrentReadWrite$", "os"]
     start = time.monotonic()
