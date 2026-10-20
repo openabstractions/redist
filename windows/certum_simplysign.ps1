@@ -25,6 +25,7 @@ $script:CertumSubmitStep = 'not-checked'
 $script:CertumSubmitFailureStep = $null
 $script:CertumSubmitField = 'none'
 $script:CertumSubmitFailed = $false
+$script:CertumDiscoveryFailure = 'operation-failed'
 
 function ConvertTo-CertumCountBucket($Count) {
     if ($Count -cin @('zero','one','two','many')) { return $Count }
@@ -45,7 +46,13 @@ function Write-CertumFailure {
         'field-owner','field-state','label-absent','label-owner','label-state','label-role','accepted')
     $reason = if ($script:CertumSchemaReason -cin $reasons) { $script:CertumSchemaReason } else { 'unknown' }
     $count = if ($script:CertumEditCount -cin @('zero','one','two','many')) { $script:CertumEditCount } else { 'unknown' }
-    [Console]::Error.WriteLine("SimplySign session operation failed; stage=$stage; category=operation-failed; cleanup=$cleanup; schema_reason=$reason; edit_count=$count; credential diagnostics are disabled.")
+    if ($stage -ceq 'certificate-discovery') { $reason = 'not-checked'; $count = 'unknown' }
+    $discoveryCategories = @('process-query-failed','desktop-exited','window-query-failed',
+        'unexpected-modal','certificate-query-failed','ambiguous-pin','wait-failed','deadline')
+    $category = if ($stage -ceq 'certificate-discovery' -and $script:CertumDiscoveryFailure -cin $discoveryCategories) {
+        $script:CertumDiscoveryFailure
+    } else { 'operation-failed' }
+    [Console]::Error.WriteLine("SimplySign session operation failed; stage=$stage; category=$category; cleanup=$cleanup; schema_reason=$reason; edit_count=$count; credential diagnostics are disabled.")
     if ($script:CertumSubmitFailed) {
         $steps = @('target-discovery','pattern-preflight','target-revalidation','field-write','button-invoke')
         $rawStep = if ($script:CertumSubmitFailureStep) {$script:CertumSubmitFailureStep} else {$script:CertumSubmitStep}
@@ -53,7 +60,7 @@ function Write-CertumFailure {
         $field = if ($script:CertumSubmitField -cin @('username','token','none')) {$script:CertumSubmitField} else {'unknown'}
         [Console]::Error.WriteLine("SimplySign target submit observation; step=$step; field=$field.")
     }
-    if ($null -ne $script:CertumRoleObservation) {
+    if ($stage -cne 'certificate-discovery' -and $null -ne $script:CertumRoleObservation) {
         $row = $script:CertumRoleObservation
         $result = if ($row.result -cin @('observed','guard-or-query-failed')) {$row.result} else {'unknown'}
         $values = @()
@@ -68,7 +75,7 @@ function Write-CertumFailure {
         $duplicate = if ($row.duplicate_label -cin @('yes','no')) {$row.duplicate_label} else {'unknown'}
         [Console]::Error.WriteLine("SimplySign role observation; result=$result; $($values -join '; '); duplicate_label=$duplicate.")
     }
-    if ($script:CertumObservationResult -cne 'not-checked') {
+    if ($stage -cne 'certificate-discovery' -and $script:CertumObservationResult -cne 'not-checked') {
         $result = if ($script:CertumObservationResult -cin @('observed','guard-or-query-failed','deadline')) { $script:CertumObservationResult } else { 'unknown' }
         $initial = $script:CertumInitialCounts; $repeated = $script:CertumRepeatedCounts
         $it = ConvertTo-CertumCountBucket $initial.uia_total; $ie = ConvertTo-CertumCountBucket $initial.uia_edit
@@ -647,6 +654,26 @@ function Stop-CertumSession($Session) {
     return @{process_stopped=$true; cloud_session_revoked='unproven; hosted runner must be discarded'}
 }
 
+function Get-CertumDiscoveredCertificate($Process, $Policy, $Clock) {
+    while ($Clock.Elapsed.TotalSeconds -lt 120) {
+        $script:CertumDiscoveryFailure = 'process-query-failed'
+        $Process.Refresh()
+        if ($Process.HasExited) { $script:CertumDiscoveryFailure = 'desktop-exited'; throw 'Desktop exited during authentication' }
+        $script:CertumDiscoveryFailure = 'window-query-failed'
+        if (@([CertumWindow]::Owned($Process.Id)).Count -gt 1) {
+            $script:CertumDiscoveryFailure = 'unexpected-modal'; throw 'unexpected Desktop modal window'
+        }
+        $script:CertumDiscoveryFailure = 'certificate-query-failed'
+        $matches = @(Get-ChildItem Cert:\CurrentUser\My | Where-Object { $_.Thumbprint -ieq $Policy.certificate.sha1 })
+        if ($matches.Count -gt 1) { $script:CertumDiscoveryFailure = 'ambiguous-pin'; throw 'ambiguous pinned certificate' }
+        if ($matches.Count -eq 1) { return $matches[0] }
+        $script:CertumDiscoveryFailure = 'wait-failed'
+        Start-Sleep -Milliseconds 500
+    }
+    $script:CertumDiscoveryFailure = 'deadline'
+    throw 'authentication deadline exceeded'
+}
+
 function Connect-CertumSession($Policy, [string]$Msi, [string]$OutputPath) {
     $script:CertumSubmitFailed = $false
     $script:CertumObservationResult = 'not-checked'; $script:CertumInitialCounts = $null; $script:CertumRepeatedCounts = $null
@@ -719,28 +746,24 @@ function Connect-CertumSession($Policy, [string]$Msi, [string]$OutputPath) {
         Submit-CertumCredential $handle $process $username $otp $clock
         $otp = $null; $username = $null
         $script:CertumStage = 'certificate-discovery'
-        while ($clock.Elapsed.TotalSeconds -lt 120) {
-            $process.Refresh(); if ($process.HasExited) { throw 'Desktop exited during authentication' }
-            if (@([CertumWindow]::Owned($process.Id)).Count -gt 1) { throw 'unexpected Desktop modal window' }
-            $matches = @(Get-ChildItem Cert:\CurrentUser\My | Where-Object { $_.Thumbprint -ieq $Policy.certificate.sha1 })
-            if ($matches.Count -gt 1) { throw 'ambiguous pinned certificate' }
-            if ($matches.Count -eq 1) {
-                $script:CertumStage = 'certificate-validation'
-                $session.certificate = Get-CertumCertificateInfo $matches[0] $Policy.certificate
-                $script:CertumStage = 'certificate-chain'
-                Assert-CertumChain $matches[0]
-                Assert-CertumDeadline $clock
-                $script:CertumStage = 'session-persist'
-                $session.source_sha = $env:GITHUB_SHA
-                $session.policy_sha256 = (Get-FileHash -LiteralPath $PolicyPath -Algorithm SHA256).Hash
-                $session.runner_disposal_required = $true
-                $session | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $OutputPath -Encoding utf8
-                $success = $true
-                return $session
-            }
-            Start-Sleep -Milliseconds 500
-        }
-        throw 'authentication deadline exceeded'
+        # Login observations describe only the completed submission boundary.
+        $script:CertumSchemaReason = 'not-checked'; $script:CertumEditCount = 'unknown'
+        $script:CertumRoleObservation = $null
+        $script:CertumInitialCounts = $null; $script:CertumRepeatedCounts = $null
+        $script:CertumObservationResult = 'not-checked'
+        $certificate = Get-CertumDiscoveredCertificate $process $Policy $clock
+        $script:CertumStage = 'certificate-validation'
+        $session.certificate = Get-CertumCertificateInfo $certificate $Policy.certificate
+        $script:CertumStage = 'certificate-chain'
+        Assert-CertumChain $certificate
+        Assert-CertumDeadline $clock
+        $script:CertumStage = 'session-persist'
+        $session.source_sha = $env:GITHUB_SHA
+        $session.policy_sha256 = (Get-FileHash -LiteralPath $PolicyPath -Algorithm SHA256).Hash
+        $session.runner_disposal_required = $true
+        $session | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $OutputPath -Encoding utf8
+        $success = $true
+        return $session
     } finally {
         if ($null -ne $credential) { [Array]::Clear($credential.Key) }
         $text = $null; $username = $null; $otp = $null

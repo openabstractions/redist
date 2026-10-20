@@ -85,15 +85,40 @@ def same_files(first, second):
                 return True
 
 
+class ReadAPIError(ValueError):
+    """A read failed before any returned JSON could be validated."""
+    def __init__(self, path, category, raw=b'', *, status=None, exit_code=None):
+        endpoint = path.split('?', 1)[0]
+        if not re.fullmatch(r'[A-Za-z0-9_./-]{1,180}', endpoint):
+            endpoint = '<redacted>'
+        self.status = status
+        self.observation = dict(endpoint=endpoint, category=category, status=status,
+                                exit_code=exit_code, bytes=len(raw), sha256=hashlib.sha256(raw).hexdigest())
+        super().__init__('GitHub READ acquisition failed: ' + json.dumps(self.observation, sort_keys=True))
+
+
 def api(path):
-    return json.loads(command(['api', path]))
+    try:
+        result = subprocess.run(['gh', 'api', path], capture_output=True, timeout=120)
+    except subprocess.TimeoutExpired as exc:
+        raise ReadAPIError(path, 'timeout', exc.stdout or b'') from None
+    except OSError:
+        raise ReadAPIError(path, 'start-failed') from None
+    if result.returncode:
+        status = re.search(rb'\(HTTP (\d{3})\)', result.stderr)
+        raise ReadAPIError(path, 'nonzero', result.stdout,
+                           status=int(status[1]) if status else None, exit_code=result.returncode)
+    try:
+        return json.loads(result.stdout)
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        raise ReadAPIError(path, 'invalid-json', result.stdout) from None
 
 
 def optional_api(path):
     try:
         return api(path)
-    except ValueError as exc:
-        if '(HTTP 404)' in str(exc):
+    except ReadAPIError as exc:
+        if exc.status == 404:
             return None
         raise
 
