@@ -1658,6 +1658,8 @@ jobs:
     needs: candidate
     outputs:
       package-artifact: ${{ steps.artifact-names.outputs.package }}
+      package-artifact-id: ${{ steps.packages.outputs.artifact-id }}
+      package-artifact-digest: ${{ steps.packages.outputs.artifact-digest }}
     env:
       CANDIDATE_VERSION: ${{ needs.candidate.outputs.version }}
       GOTOOLCHAIN: local
@@ -1790,6 +1792,7 @@ jobs:
           (cd dist && sha256sum ./*.tar.gz | sed 's#\./##' | tee SHA256SUMS.linux)
 
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        id: packages
         with:
           name: ${{ steps.artifact-names.outputs.package }}
           path: dist/
@@ -1813,7 +1816,13 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
           PACKAGE_ARTIFACT: ${{ needs.linux.outputs.package-artifact }}
-        run: gh run download "$GITHUB_RUN_ID" -n "$PACKAGE_ARTIFACT" -D pkg
+          ARTIFACT_ID: ${{ needs.linux.outputs.package-artifact-id }}
+          ARTIFACT_DIGEST: ${{ needs.linux.outputs.package-artifact-digest }}
+          CANDIDATE_SHA: ${{ needs.candidate.outputs.sha }}
+        run: |
+          python3 windows/windows_signing.py consume --artifact-id "$ARTIFACT_ID" --digest "$ARTIFACT_DIGEST" \
+            --name "$PACKAGE_ARTIFACT" --source "$CANDIDATE_SHA" --run-id "$GITHUB_RUN_ID" \
+            --attempt "$GITHUB_RUN_ATTEMPT" --out pkg
 
       - name: the checksum file is true
         run: (cd pkg && sha256sum -c SHA256SUMS.linux)

@@ -4,7 +4,6 @@ Authentication and release orchestration have separate existing owners. This
 helper runs on fresh signing hosts, or without credentials on verification hosts.
 """
 import argparse
-import csv
 import base64
 import hashlib
 import json
@@ -17,6 +16,7 @@ import sys
 import shutil
 import tarfile
 import tempfile
+import time
 import zipfile
 import urllib.request
 import xml.etree.ElementTree as ET
@@ -487,9 +487,17 @@ def consume_artifact(artifact_id, digest, name, source, run_id, attempt, destina
     destination.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory() as temporary:
         archive_path = Path(temporary) / 'artifact.zip'
-        with archive_path.open('wb') as target:
-            result = subprocess.run(['gh', 'api', f'repos/{repo}/actions/artifacts/{artifact_id}/zip'],
-                                    stdout=target, stderr=subprocess.PIPE, timeout=1200)
+        for attempt_index in range(3):
+            # Retry only the immutable read whose backing storage reported 503.
+            # Opening wb discards every partial archive before the next GET.
+            with archive_path.open('wb') as target:
+                result = subprocess.run(['gh', 'api', f'repos/{repo}/actions/artifacts/{artifact_id}/zip'],
+                                        stdout=target, stderr=subprocess.PIPE, timeout=1200)
+            error = result.stderr.decode('utf-8', errors='replace') if isinstance(result.stderr, bytes) else str(result.stderr or '')
+            transient = result.returncode and bool(re.search(r'HTTP 503|ServerBusy', error, re.IGNORECASE))
+            if not transient or attempt_index == 2:
+                break
+            time.sleep(15 * (attempt_index + 1))
         with archive_path.open('rb') as source_file:
             actual_digest = hashlib.file_digest(source_file, 'sha256').hexdigest()
         if result.returncode or actual_digest != digest:
@@ -522,8 +530,10 @@ def consume_main(argv):
 
 
 def payload_rows(path):
-    with Path(path).open(encoding='utf-8') as source:
-        return list(csv.reader((line for line in source if line.strip() and not line.startswith(('#', '>'))), delimiter='\t'))
+    spec = importlib.util.spec_from_file_location('oa_installer_roster_owner', Path(__file__).with_name('validate.py'))
+    owner = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(owner)
+    return owner.rows(Path(path).resolve())
 
 
 def prepare_tools(root, github_env=None):
