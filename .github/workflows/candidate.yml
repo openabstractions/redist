@@ -545,7 +545,8 @@ jobs:
         run: |
           python3 windows/windows_signing.py check-native-source --pypi pypi.tsv --npm npm.tsv
           mkdir -p native/build-inputs
-          cp build/node-inputs/* native/build-inputs/
+          cp build/node-inputs/node-api-headers-1.9.0.tgz build/node-inputs/node-v22.23.3-win-x64.zip \
+            build/node-inputs/node-v22.23.3-win-x64.lib build/node-inputs/receipt.json native/build-inputs/
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         id: artifact
         with:
@@ -2551,7 +2552,8 @@ jobs:
         run: |
           printf 'IPC_LIBRARY=%s\nIPC_ADDON=%s\n' "$PWD/signed/native/abstraction_ipc.dll" "$PWD/signed/native/oa_ipc_node.node" >> "$GITHUB_ENV"
           mkdir -p build/node-inputs
-          cp signed/native/build-inputs/* build/node-inputs/
+          cp signed/native/build-inputs/node-api-headers-1.9.0.tgz signed/native/build-inputs/node-v22.23.3-win-x64.zip \
+            signed/native/build-inputs/node-v22.23.3-win-x64.lib signed/native/build-inputs/receipt.json build/node-inputs/
 
       # One script for this job and for a workstation, because two assemblers
       # cannot be kept agreeing about what a package contains. It refuses a
