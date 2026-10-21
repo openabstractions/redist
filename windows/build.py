@@ -98,8 +98,12 @@ def stage(src, out, arch, binaries=None):
         if has_engine:
             verify_bundle(engine_bundle, engine_receipt, modelhost_pin(engine_pin))
             notice = HERE / "engines/BoringSSL-LICENSE.txt"
-            if hashlib.sha256(notice.read_bytes()).hexdigest() != BORINGSSL_NOTICE_SHA256:
-                raise ValueError("bundled ModelHost BoringSSL notice differs from reviewed text")
+            notice_bytes = notice.read_bytes()
+            notice_hash = hashlib.sha256(notice_bytes).hexdigest()
+            if notice_hash != BORINGSSL_NOTICE_SHA256:
+                raise ValueError("source checkout ModelHost BoringSSL notice differs from reviewed text: "
+                                 f"sha256={notice_hash} bytes={len(notice_bytes)} "
+                                 f"crlf={notice_bytes.count(bytes([13, 10]))} lf={notice_bytes.count(bytes([10]))}")
     dropped = []
     for feature, path, kind, source, frm, _, subsystem in rows("payload.tsv"):
         if path in PYTORCH_PAYLOAD and (arch != "x64" or not pytorch_program):

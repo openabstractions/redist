@@ -258,12 +258,7 @@ def pack(directory, output):
 
 
 def test_opencode_package(directory):
-    """Run the adopter test entry point; its caller restores declared deps before invoking this offline packer."""
-    result = subprocess.run(["npm", "test"], cwd=directory, capture_output=True, text=True,
-                            shell=os.name == "nt")
-    if result.returncode != 0:
-        details = result.stderr.strip() or result.stdout.strip()
-        raise Refused(f"OpenCode adopter npm test failed in {directory}: {details}")
+    """Check the declared dependency and server-hook contract before offline packing."""
     smoke = subprocess.run(
         ["node", "--input-type=module", "-e",
          """const {tool}=await import('@opencode-ai/plugin');

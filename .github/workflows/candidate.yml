@@ -855,7 +855,7 @@ jobs:
           COMFYUI_SOURCE_COMMIT: ${{ needs.app_comfyui.outputs.source_commit }}
           CANDIDATE_SHA: ${{ needs.candidate.outputs.sha }}
         run: |
-          mkdir -p app-inputs
+          mkdir -p app-inputs dist
           python3 - <<'PY'
           import json, os, pathlib, subprocess, sys
           sys.path.insert(0, 'scripts')
@@ -3082,7 +3082,7 @@ jobs:
           COMFYUI_SOURCE_COMMIT: ${{ needs.app_comfyui.outputs.source_commit }}
           CANDIDATE_SHA: ${{ needs.candidate.outputs.sha }}
         run: |
-          mkdir -p app-inputs
+          mkdir -p app-inputs dist
           python3 - <<'PY'
           import json, os, pathlib, subprocess, sys
           sys.path.insert(0, 'scripts')
