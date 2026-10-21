@@ -1220,10 +1220,10 @@ if ($Mode -eq 'User') {
             $failingPackage = Join-Path (Split-Path -Parent $MsiPath) 'failing-upgrade.msi'
             if (-not (Test-Path -LiteralPath $failingPackage -PathType Leaf)) { throw 'Forced-failure candidate was not prepared' }
             $failedAt = Get-Date
-            $failure = ''
+            $expectedUpgradeFailure = ''
             try { Invoke-Bounded msiexec.exe (Get-CandidateInstallArguments $failingPackage $false 'failed-upgrade.log') 300 }
-            catch { $failure = $_.Exception.Message }
-            if ($failure -notmatch 'msiexec\.exe exited 1603') { throw "The forced upgrade failure did not end with 1603: $failure" }
+            catch { $expectedUpgradeFailure = $_.Exception.Message }
+            if ($expectedUpgradeFailure -notmatch 'msiexec\.exe exited 1603') { throw "The forced upgrade failure did not end with 1603: $expectedUpgradeFailure" }
             Assert-PreviousProcessesExited $previousProcesses
             Assert-RolledBackUpgrade ([IO.File]::ReadAllText((Join-Path (Get-Location) 'failed-upgrade.log'))) $predecessorTools $ExpectedSid $failedAt (Get-PackageProperty $PredecessorMsiPath ProductCode) $PredecessorVersion $sentinel $sentinelValue
             "ok: failed upgrade left $PredecessorVersion installed, registered and running again, and released its exclusion" | Set-Content 'failed-upgrade.txt'
