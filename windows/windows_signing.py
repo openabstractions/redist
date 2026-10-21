@@ -9,7 +9,7 @@ import hashlib
 import json
 import importlib.util
 import os
-from pathlib import Path, PurePosixPath
+from pathlib import Path, PurePosixPath, PureWindowsPath
 import re
 import subprocess
 import sys
@@ -670,23 +670,51 @@ def verify_msi_payload(path, policy, signtool, canonical_dll=None, *, signed_con
         allowed = {PurePosixPath(row[1]).name for row in payload_rows(Path(__file__).with_name('payload.tsv'))
                    if row[5] == 'yes'}
         files = []
+        names, sources = set(), set()
+        extracted = (destination / 'files').resolve()
         for element in ET.parse(destination / 'package.wxs').iter():
             if element.tag.rsplit('}', 1)[-1] != 'File':
                 continue
-            name = element.get('Name') or Path(element.get('Source', '')).name
-            if Path(name).suffix.lower() not in ('.exe', '.dll'):
-                continue
-            if name not in allowed:
+            name = element.get('Name', '')
+            if (not name or any(value in name for value in ('/', '\\', ':', '\0', '*', '?', '"', '<', '>', '|'))
+                    or name.rstrip(' .') != name or name in ('.', '..')):
+                raise ValueError('MSI installed file name is not canonical')
+            executable = PureWindowsPath(name).suffix.lower() in ('.exe', '.dll')
+            if executable and name not in allowed:
                 raise ValueError('MSI installs an executable outside payload signing authority')
-            matches = list((destination / 'files').rglob(name))
-            if len(matches) != 1:
-                raise ValueError('MSI payload executable extraction is absent or ambiguous')
-            files.append(matches[0])
+            source = element.get('Source', '')
+            relative = PureWindowsPath(source)
+            parts = relative.parts
+            if (relative.drive or relative.root or len(parts) < 2 or parts[0] != 'SourceDir'
+                    or source != '\\'.join(parts)
+                    or any(part in ('.', '..') or part.rstrip(' .') != part
+                           or any(char in part for char in '\0/:*?"<>|') for part in parts)):
+                raise ValueError('MSI extraction source is not canonical SourceDir-relative')
+            target = extracted.joinpath(*parts[1:])
+            current = target
+            while current != extracted:
+                if current.is_symlink() or current.is_junction():
+                    raise ValueError('MSI extraction source cannot use a linked member')
+                current = current.parent
+            if (not target.is_file() or not target.resolve().is_relative_to(extracted)
+                    or target.stat().st_nlink != 1
+                    or getattr(target.lstat(), 'st_file_attributes', 0) & 0x400):
+                raise ValueError('MSI extraction source is missing, linked or outside its owned extraction')
+            identity = str(target.resolve()).casefold()
+            if identity in sources:
+                raise ValueError('MSI extraction source is mapped more than once')
+            sources.add(identity)
+            if not executable:
+                continue
+            if name.casefold() in names:
+                raise ValueError('MSI installed executable name is mapped more than once')
+            names.add(name.casefold())
+            files.append((name, target))
         if not files:
             raise ValueError('core MSI has no signed executable payload')
-        for file in files:
+        for _, file in files:
             verify(file, policy, signtool)
-        libraries = [file for file in files if file.name == 'abstraction_ipc.dll']
+        libraries = [file for name, file in files if name == 'abstraction_ipc.dll']
         if Path(path).name == 'abstraction-x64.msi':
             if len(libraries) != 1 or canonical_dll is None or libraries[0].read_bytes() != Path(canonical_dll).read_bytes():
                 raise ValueError('x64 MSI canonical signed DLL differs from language packages')
