@@ -501,6 +501,8 @@
              else removes it, and while it exists this directory cannot be
              removed either: hosted run 35084640715 left
              %ProgramData%\abstraction\upgrade-v1 behind after uninstall. -->
+        <RemoveFile Id="RemoveMachineInstallerActionLog" Name="installer-actions.txt"
+                    Directory="MachineUpgradeFolder" On="uninstall" />
         <RemoveFolder Id="RemoveMachineUpgradeFolder" Directory="MachineUpgradeFolder" On="uninstall" />
       </Component>
     </ComponentGroup>

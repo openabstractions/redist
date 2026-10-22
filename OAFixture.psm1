@@ -292,7 +292,96 @@ function Assert-RealProfileView {
     }
 }
 
+# Inventory names/attributes only, never follow reparse points or read arbitrary
+# configuration. The one known action log is capped and closed before uninstall.
+function Save-MachineRemovalEvidence {
+    param([Parameter(Mandatory)][string]$Root, [Parameter(Mandatory)][string]$Prefix,
+          [switch]$SeedOwnedLogIfAbsent)
+    $rows = New-Object 'System.Collections.Generic.List[object]'
+    $seeded = $false
+    $seedHash = $null
+    $capturedBytes = 0
+    $count = 0
+    $logLength = $null
+    $ownedLogPresent = $false
+    $rootItem = Get-Item -LiteralPath $Root -Force -ErrorAction SilentlyContinue
+    $reparse = [IO.FileAttributes]::ReparsePoint
+    if ($rootItem -and $rootItem.PSIsContainer -and -not ($rootItem.Attributes -band $reparse)) {
+        $upgrade = Join-Path $Root 'upgrade-v1'
+        if ($SeedOwnedLogIfAbsent) {
+            Assert-DisposableRunner
+            $upgradeItem = Get-Item -LiteralPath $upgrade -Force -ErrorAction SilentlyContinue
+            if (-not $upgradeItem) { $upgradeItem = New-Item -ItemType Directory -Path $upgrade -ErrorAction Stop }
+            if (-not ($upgradeItem.Attributes -band $reparse)) {
+                $log = Join-Path $upgrade 'installer-actions.txt'
+                if (-not (Test-Path -LiteralPath $log)) {
+                    $bytes = [Text.Encoding]::UTF8.GetBytes("OA disposable removal seed`n")
+                    $stream = [IO.File]::Open($log, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
+                    try { $stream.Write($bytes, 0, $bytes.Length) } finally { $stream.Dispose() }
+                    $seeded = $true
+                    $sha = [Security.Cryptography.SHA256]::Create()
+                    try { $seedHash = ([BitConverter]::ToString($sha.ComputeHash($bytes))).Replace('-', '').ToLowerInvariant() }
+                    finally { $sha.Dispose() }
+                }
+            }
+        }
+        $queue = New-Object 'System.Collections.Generic.Queue[object]'
+        $queue.Enqueue(@($rootItem, 0))
+        while ($queue.Count -and $rows.Count -lt 64) {
+            $entry = $queue.Dequeue(); $item = $entry[0]; $depth = $entry[1]
+            $rows.Add([pscustomobject]@{ Path=$item.FullName.Substring($Root.TrimEnd('\').Length); Attributes=[string]$item.Attributes })
+            if ($item.PSIsContainer -and $depth -lt 2 -and -not ($item.Attributes -band $reparse)) {
+                foreach ($child in @(Get-ChildItem -LiteralPath $item.FullName -Force -ErrorAction Stop | Select-Object -First 64)) {
+                    $queue.Enqueue(@($child, ($depth + 1)))
+                }
+            }
+        }
+        $upgradeItem = Get-Item -LiteralPath $upgrade -Force -ErrorAction SilentlyContinue
+        $log = Join-Path $upgrade 'installer-actions.txt'
+        $logItem = $null
+        if ($upgradeItem -and $upgradeItem.PSIsContainer -and -not ($upgradeItem.Attributes -band $reparse)) {
+            $logItem = Get-Item -LiteralPath $log -Force -ErrorAction SilentlyContinue
+        }
+        if ($logItem -and -not $logItem.PSIsContainer -and -not ($logItem.Attributes -band $reparse)) {
+            $ownedLogPresent = $true
+            $stream = [IO.File]::Open($log, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::ReadWrite)
+            try {
+                $bytes = New-Object byte[] 65536
+                $count = $stream.Read($bytes, 0, $bytes.Length)
+                $copy = New-Object byte[] $count
+                [Array]::Copy($bytes, $copy, $count)
+                $safe = [Text.Encoding]::UTF8.GetBytes((Protect-DiagnosticText ([Text.Encoding]::UTF8.GetString($copy))))
+                [IO.File]::WriteAllBytes($Prefix + '-installer-actions.log', $safe)
+                $capturedBytes = $safe.Length
+                $logLength = $stream.Length
+            } finally { $stream.Dispose() }
+        }
+    } elseif ($rootItem) {
+        $rows.Add([pscustomobject]@{ Path=''; Attributes=[string]$rootItem.Attributes })
+    }
+    $evidence = [pscustomobject]@{ RootPresent=[bool]$rootItem; Entries=@($rows.ToArray()); Limit=64;
+        SeededOwnedLog=$seeded; SeedSHA256=$seedHash; CaptureLimit=65536; ReadBytes=$count; CapturedBytes=$capturedBytes; LogLength=$logLength;
+        OwnedLogPresentBefore=$ownedLogPresent;
+        Note='Pre-capture does not retain bytes newly written during uninstall.' }
+    $evidence | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath ($Prefix + '.json') -Encoding UTF8 -ErrorAction Stop
+    return $evidence
+}
+
+function Invoke-MachineRemovalChecks {
+    param([Parameter(Mandatory)][System.Collections.IDictionary]$Checks)
+    $failures = New-Object 'System.Collections.Generic.List[string]'
+    foreach ($name in $Checks.Keys) {
+        try { & $Checks[$name] } catch {
+            $message = $name + ': ' + $_.Exception.Message
+            $failures.Add($message)
+            Write-Output ('FAIL ' + $message)
+        }
+    }
+    if ($failures.Count) { throw ('Machine removal checks failed: ' + ($failures -join "`n")) }
+}
+
 Export-ModuleMember -Function Assert-DisposableRunner, Invoke-FixtureProcess, Invoke-Bounded, Protect-DiagnosticText,
     New-DisposableAccount, Grant-AccountAccess, Invoke-AccountProcess, Test-CimNotFound, Test-ProcessGone,
     Get-ProcessOwnerSid, Remove-DisposableAccount, Get-RuntimeProcesses, Get-PipeNames, Get-CapabilityPipes,
-    Assert-NoRuntime, Get-InstalledProducts, Test-PathNames, Get-ProfileView, Assert-RealProfileView
+    Assert-NoRuntime, Get-InstalledProducts, Test-PathNames, Get-ProfileView, Assert-RealProfileView,
+    Save-MachineRemovalEvidence, Invoke-MachineRemovalChecks

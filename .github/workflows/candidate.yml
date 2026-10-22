@@ -1586,28 +1586,50 @@ jobs:
         if: always() && steps.machine-install.outcome == 'success'
         shell: pwsh
         run: |
+          Import-Module .\user-fixture\OAFixture.psm1 -Force
+          $configRoot = Join-Path $env:ProgramData 'abstraction'
+          $beforeEvidence = $null
+          try { $beforeEvidence = Save-MachineRemovalEvidence -Root $configRoot -Prefix machine-removal-before -SeedOwnedLogIfAbsent }
+          catch { Write-Warning "Pre-removal evidence unavailable: $_" }
           $msi = (Resolve-Path pkg\abstraction-x64.msi).Path
-          $p = Start-Process msiexec -Wait -PassThru -ArgumentList @('/x', $msi, '/qn', '/norestart', '/l*v', 'machine-uninstall.log')
-          if ($p.ExitCode -ne 0) { Get-Content machine-uninstall.log -Tail 60; throw "msiexec /x exited $($p.ExitCode)" }
-          & powershell.exe -NoProfile -ExecutionPolicy Bypass -File user-fixture/test_user_runtime.ps1 -Mode CheckLogs -RemovalLogs machine-uninstall.log
-          if ($LASTEXITCODE -ne 0) { throw "Machine removal log check exited $LASTEXITCODE" }
-          & sc.exe qc OpenAbstractionsSupervisor | Out-Null
-          if ($LASTEXITCODE -eq 0) { throw 'the service template survived uninstall' }
-          if ($LASTEXITCODE -ne 1060) { throw "sc qc could not establish service absence: exit $LASTEXITCODE" }
-
-          # Deleting the template does not delete the instances the service
-          # manager cloned from it: the owner's own probe outlived sc delete and
-          # stayed AUTO_START. An uninstall that leaves one leaks a service per
-          # account that has ever signed in.
-          $left = @(Get-Service -Name 'OpenAbstractionsSupervisor_*' -ErrorAction SilentlyContinue)
-          if ($left.Count -ne 0) { $left | Format-List Name, Status; throw 'a per-session instance survived uninstall' }
-          if (Test-Path (Join-Path $env:ProgramFiles 'OpenAbstractions')) { throw 'the install folder survived uninstall' }
-          if (Test-Path 'HKLM:\Software\OpenAbstractions') { throw 'the machine registry key survived uninstall' }
-          if (Test-Path (Join-Path $env:ProgramData 'abstraction')) { throw 'the machine config folder survived uninstall' }
-          $key = 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Environment'
-          if ((Get-ItemProperty $key -Name Path).Path -like '*OpenAbstractions*') { throw 'the machine PATH entry survived uninstall' }
-          & powershell.exe -NoProfile -ExecutionPolicy Bypass -STA -File session-fixture/test_service_session.ps1 -Mode VerifyRemoved -StatePath "$env:RUNNER_TEMP/oa-service-session.json"
-          if ($LASTEXITCODE -ne 0) { throw "Runtime removal verification exited $LASTEXITCODE" }
+          $checks = [ordered]@{
+            MSI = {
+              $p = Start-Process msiexec -Wait -PassThru -ArgumentList @('/x', $msi, '/qn', '/norestart', '/l*v', 'machine-uninstall.log')
+              if ($p.ExitCode -ne 0) { Get-Content machine-uninstall.log -Tail 60; throw "msiexec /x exited $($p.ExitCode)" }
+            }
+            RemovalLog = {
+              & powershell.exe -NoProfile -ExecutionPolicy Bypass -File user-fixture/test_user_runtime.ps1 -Mode CheckLogs -RemovalLogs machine-uninstall.log
+              if ($LASTEXITCODE -ne 0) { throw "Machine removal log check exited $LASTEXITCODE" }
+            }
+            Template = {
+              & sc.exe qc OpenAbstractionsSupervisor | Out-Null
+              if ($LASTEXITCODE -eq 0) { throw 'the service template survived uninstall' }
+              if ($LASTEXITCODE -ne 1060) { throw "sc qc could not establish service absence: exit $LASTEXITCODE" }
+            }
+            Instances = {
+              $left = @(Get-Service -Name 'OpenAbstractionsSupervisor_*' -ErrorAction SilentlyContinue)
+              if ($left.Count -ne 0) { $left | Format-List Name, Status; throw 'a per-session instance survived uninstall' }
+            }
+            InstallFolder = { if (Test-Path (Join-Path $env:ProgramFiles 'OpenAbstractions')) { throw 'the install folder survived uninstall' } }
+            Registry = { if (Test-Path 'HKLM:\Software\OpenAbstractions') { throw 'the machine registry key survived uninstall' } }
+            ConfigFolder = { if (Test-Path $configRoot) { throw 'the machine config folder survived uninstall' } }
+            PATH = {
+              $key = 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Environment'
+              if ((Get-ItemProperty $key -Name Path).Path -like '*OpenAbstractions*') { throw 'the machine PATH entry survived uninstall' }
+            }
+            VerifyRemoved = {
+              & powershell.exe -NoProfile -ExecutionPolicy Bypass -STA -File session-fixture/test_service_session.ps1 -Mode VerifyRemoved -StatePath "$env:RUNNER_TEMP/oa-service-session.json"
+              if ($LASTEXITCODE -ne 0) { throw "Runtime removal verification exited $LASTEXITCODE" }
+            }
+            OwnedLogFixture = { if (-not $beforeEvidence -or -not $beforeEvidence.OwnedLogPresentBefore) { throw 'the owned action-log removal fixture was not established' } }
+          }
+          try { Invoke-MachineRemovalChecks -Checks $checks }
+          catch {
+            $primary = $_
+            try { Save-MachineRemovalEvidence -Root $configRoot -Prefix machine-removal-after-failure }
+            catch { Write-Warning "Post-removal evidence unavailable: $_" }
+            throw $primary
+          }
           'ok    uninstall reversed it: no template, no instance, no folder, no key, no config folder, no PATH entry'
           exit 0
 
@@ -1648,6 +1670,10 @@ jobs:
             predecessor-session-cleanup.log
             machine-host.log
             machine-uninstall.log
+            machine-removal-before.json
+            machine-removal-before-installer-actions.log
+            machine-removal-after-failure.json
+            machine-removal-after-failure-installer-actions.log
             service-session.log
             service-session-cleanup.log
             elevated-unscoped.log
