@@ -606,6 +606,69 @@ def prepare_chain(root, release, out, policy, policy_sha256):
     (out / 'chain.json').write_text(json.dumps({'version': metadata['version'], 'core': pin(core), 'apps': apps}, indent=2) + '\n')
 
 
+def restore_bundle_engine(engine, expected):
+    """Restore WiX 5 CopyEngineWithSignatureFixup on a fresh detached copy."""
+    import struct
+    path = Path(engine)
+    data = bytearray(path.read_bytes())
+    def read(fmt, offset):
+        if offset < 0 or offset + struct.calcsize(fmt) > len(data):
+            raise ValueError('truncated Setup PE/Burn metadata')
+        return struct.unpack_from(fmt, data, offset)
+    if data[:2] != b'MZ':
+        raise ValueError('Setup engine lacks supported PE header')
+    pe, = read('<I', 60)
+    if pe < 64 or data[pe:pe + 4] != b'PE\0\0':
+        raise ValueError('Setup engine lacks supported PE signature')
+    machine, count = read('<HH', pe + 4)
+    optional_size, = read('<H', pe + 20)
+    optional = pe + 24
+    magic, = read('<H', optional)
+    directory = {0x10b: 96, 0x20b: 112}.get(magic)
+    if (directory is None or (machine, magic) not in ((0x14c, 0x10b), (0x8664, 0x20b), (0xaa64, 0x20b))
+            or optional_size < directory + 40 or not 1 <= count <= 96):
+        raise ValueError('unsupported Setup PE layout')
+    directories, = read('<I', optional + directory - 4)
+    if directories < 5:
+        raise ValueError('Setup PE lacks security directory')
+    section_table = optional + optional_size
+    headers_end = section_table + count * 40
+    read('<B', headers_end - 1)
+    ranges, burn = [], []
+    for index in range(count):
+        section = section_table + index * 40
+        size, offset = read('<II', section + 16)
+        if size:
+            if offset < headers_end or offset + size > len(data):
+                raise ValueError('Setup section outside detached engine')
+            if any(offset < end and start < offset + size for start, end in ranges):
+                raise ValueError('overlapping Setup sections')
+            ranges.append((offset, offset + size))
+        if data[section:section + 8] == b'.wixburn':
+            burn.append((offset, size))
+    if len(burn) != 1 or burn[0][1] < 52:
+        raise ValueError('Setup needs one complete .wixburn section')
+    offset, size = burn[0]
+    signature, version = read('<II', offset)
+    stub, checksum, certificate, certificate_size, container_format, containers, ux = read('<IIIIIII', offset + 24)
+    if (signature != 0x00f14300 or version != 2 or container_format != 1
+            or not 1 <= containers <= (size - 48) // 4
+            or stub < max(end for _, end in ranges) or stub + ux > certificate
+            or certificate % 8 or certificate_size < 8 or certificate + certificate_size != len(data)
+            or any(end > certificate for _, end in ranges)):
+        raise ValueError('invalid Setup Burn engine/certificate bounds')
+    length, revision, kind = read('<IHH', certificate)
+    if length < 8 or length > certificate_size or (revision, kind) != (0x200, 2):
+        raise ValueError('invalid Setup engine certificate table')
+    struct.pack_into('<I', data, optional + 64, checksum)
+    struct.pack_into('<II', data, optional + directory + 32, certificate, certificate_size)
+    data[offset + 28:offset + 40] = b'\0' * 12
+    if (expected.get('bytes') != len(data)
+            or expected.get('sha256') != hashlib.sha256(data).hexdigest()):
+        raise ValueError('restored Setup engine differs from its signed receipt')
+    path.write_bytes(data)
+
+
 def check_bundle(root, policy, signtool, *, signing, policy_sha256):
     root = Path(root)
     owner = bundle_owner()
@@ -625,6 +688,8 @@ def check_bundle(root, policy, signtool, *, signing, policy_sha256):
     with tempfile.TemporaryDirectory() as temporary:
         engine = Path(temporary) / 'engine.exe'
         run(['wix', 'burn', 'detach', bundle, '-engine', engine])
+        if not signing:
+            restore_bundle_engine(engine, receipt.get('signatures', {}).get('engine', {}))
         engine_proof = sign(engine, policy, signtool) if signing else verify(engine, policy, signtool)
         if signing:
             attached = Path(temporary) / bundle.name
