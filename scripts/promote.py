@@ -21,7 +21,14 @@ import sys
 import tempfile
 import zipfile
 
-from app_assets import MAX_RELEASE_ASSET_BYTES, measured, roster, validate_release
+# Both the private source and public projection keep this dependency beside us.
+# Load that exact file even when this module is loaded through oa's file loader.
+_app_assets_spec = importlib.util.spec_from_file_location(
+    'oa_promotion_app_assets', Path(__file__).resolve().with_name('app_assets.py'))
+_app_assets = importlib.util.module_from_spec(_app_assets_spec)
+_app_assets_spec.loader.exec_module(_app_assets)
+MAX_RELEASE_ASSET_BYTES = _app_assets.MAX_RELEASE_ASSET_BYTES
+measured, roster, validate_release = _app_assets.measured, _app_assets.roster, _app_assets.validate_release
 
 REQUIRED_JOBS = {'candidate', 'windows-build', 'windows-native-build', 'windows-pe-sign',
                  'windows', 'windows-app-msi', 'windows-msi-sign', 'verify', 'linux',
@@ -121,6 +128,27 @@ def optional_api(path):
         if exc.status == 404:
             return None
         raise
+
+
+def release_by_tag(repo, version):
+    """Find authenticated drafts too; the by-tag endpoint returns published releases."""
+    release = optional_api(f'repos/{repo}/releases/tags/{version}')
+    if release is not None:
+        if release.get('tag_name') != version:
+            raise ValueError('release tag lookup differs')
+        return release
+    matches = []
+    # https://docs.github.com/en/rest/releases/releases#list-releases
+    for page in range(1, 101):
+        rows = api(f'repos/{repo}/releases?per_page=100&page={page}')
+        if not isinstance(rows, list) or any(not isinstance(row, dict) for row in rows):
+            raise ValueError('release listing shape differs')
+        matches.extend(row for row in rows if row.get('tag_name') == version)
+        if len(matches) > 1:
+            raise ValueError('release tag lookup is ambiguous')
+        if len(rows) < 100:
+            return matches[0] if matches else None
+    raise ValueError('release listing exceeded 100 pages')
 
 
 def pages(path, key, fetch=api):
@@ -314,7 +342,7 @@ def unpack_verified(blob, digest, destination, run, version):
                     f'abstraction-{number}-linux-amd64.tar.gz', f'abstraction-{number}-linux-arm64.tar.gz'}
         if metadata['macos'] == 'signed':
             packages.add(f'abstraction-{number}-macos-universal.pkg')
-        app_pins = Path(__file__).with_name('apps.json')
+        app_pins = Path(__file__).resolve().parent.parent / 'apps.json'
         if not app_pins.exists():  # private monorepo tests use the authored file before splitting
             app_pins = Path(__file__).resolve().parents[3] / 'monitor/internal/setup/adopter_assets.json'
         app_rows = roster(app_pins)
@@ -406,6 +434,41 @@ def pytorch_inputs_module():
     return module
 
 
+def owned_input_draft(repository, tag, source, identity, title, *, fetch=api, mutate=command, allow_create=True):
+    """Find/create one exact owned staging draft; creates no Git ref or asset."""
+    prefix = f"repos/{repository}"
+    body = json.dumps(identity, sort_keys=True) + "\n"
+    found = []
+    for page in range(1, 101):
+        batch = fetch(prefix + f"/releases?per_page=100&page={page}")
+        if not isinstance(batch, list):
+            raise ValueError("malformed input draft lookup")
+        found.extend(item for item in batch if item.get("tag_name") == tag)
+        if len(batch) < 100:
+            break
+    else:
+        raise ValueError("input draft lookup exceeds bounded pagination")
+    if len(found) > 1:
+        raise ValueError("input draft identity is ambiguous")
+    if found:
+        release = found[0]
+    else:
+        if not allow_create:
+            raise ValueError("PyTorch input tag exists without its owned draft")
+        payload = {"tag_name": tag, "target_commitish": source, "name": title,
+                   "draft": True, "prerelease": True, "make_latest": "false", "body": body}
+        with tempfile.TemporaryDirectory(prefix="oa-input-seed-") as temporary:
+            request = Path(temporary) / "request.json"
+            request.write_text(json.dumps(payload) + "\n", encoding="utf-8")
+            release = json.loads(mutate(["api", "--method", "POST", prefix + "/releases", "--input", str(request)]))
+    if (not isinstance(release, dict) or type(release.get("id")) is not int or release["id"] < 1
+            or release.get("draft") is not True
+            or release.get("tag_name") != tag or release.get("target_commitish") != source
+            or release.get("body", "").replace("\r\n", "\n") != body):
+        raise ValueError("input origin differs from its owned staging draft")
+    return release
+
+
 def seed_pytorch_inputs(directory, sources, source, version, *, fetch=api,
                         optional_fetch=optional_api, mutate=command, engine=None):
     """Create or resume one owned draft containing only the retained native input pair."""
@@ -426,32 +489,9 @@ def seed_pytorch_inputs(directory, sources, source, version, *, fetch=api,
     prefix = f"repos/{engine.INPUT_REPOSITORY}"
     tag_state = optional_fetch(prefix + "/git/ref/tags/" + tag)
     engine.input_tag(tag_state, source, required=False)
-    found = []
-    for page in range(1, 101):
-        batch = fetch(prefix + f"/releases?per_page=100&page={page}")
-        if not isinstance(batch, list):
-            raise ValueError("malformed PyTorch input draft lookup")
-        found.extend(item for item in batch if item.get("tag_name") == tag)
-        if len(batch) < 100:
-            break
-    else:
-        raise ValueError("PyTorch input draft lookup exceeds bounded pagination")
-    if len(found) > 1:
-        raise ValueError("PyTorch input draft identity is ambiguous")
-    if not found:
-        if tag_state is not None:
-            raise ValueError("PyTorch input tag exists without its owned draft")
-        payload = {"tag_name": tag, "target_commitish": source,
-                   "name": "Reviewed PyTorch input transport " + source[:12],
-                   "draft": True, "prerelease": True, "make_latest": "false",
-                   "body": json.dumps(identity, sort_keys=True) + "\n"}
-        with tempfile.TemporaryDirectory(prefix="oa-pytorch-input-seed-") as temporary:
-            request = Path(temporary) / "request.json"
-            request.write_text(json.dumps(payload) + "\n", encoding="utf-8")
-            release = json.loads(mutate(["api", "--method", "POST", prefix + "/releases",
-                                         "--input", str(request)]))
-    else:
-        release = found[0]
+    release = owned_input_draft(engine.INPUT_REPOSITORY, tag, source, identity,
+                               "Reviewed PyTorch input transport " + source[:12], fetch=fetch, mutate=mutate,
+                               allow_create=tag_state is None)
     assets = engine.input_assets(release, source, version, owner, complete=False)
     # The owned draft is created first so an interrupted direct-ref creation can
     # be retried against its exact identity, with no tag or asset replacement.
@@ -521,7 +561,19 @@ def main(argv=None):
     parser.add_argument('--version', help='vMAJOR.MINOR.PATCH of the verified packages')
     parser.add_argument('--source', help='exact redist commit running the promotion workflow')
     parser.add_argument('--resume', action='store_true', help='recover a partial promotion at the same tag/commit; verify existing draft assets and upload only missing files')
+    parser.add_argument('--expected-attempt', type=int, help='bind local accepted artifacts to this candidate attempt')
+    parser.add_argument('--verified-artifact-id', type=int)
+    parser.add_argument('--verified-artifact-digest')
+    parser.add_argument('--setup-artifact-id', type=int)
+    parser.add_argument('--setup-artifact-digest')
     args = parser.parse_args(argv)
+    accepted = (args.expected_attempt, args.verified_artifact_id, args.verified_artifact_digest,
+                args.setup_artifact_id, args.setup_artifact_digest)
+    if any(value is not None for value in accepted) and (any(value is None for value in accepted)
+            or min(args.expected_attempt, args.verified_artifact_id, args.setup_artifact_id) < 1
+            or any(not re.fullmatch(r'sha256:[0-9a-f]{64}', value) for value in
+                   (args.verified_artifact_digest, args.setup_artifact_digest))):
+        parser.error('accepted candidate requires exact attempt, artifact IDs and SHA256 digests together')
     if not re.fullmatch(r'[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+', args.repo) or args.run < 1:
         parser.error('expected owner/repository and a positive run ID')
     if not args.status and (not re.fullmatch(r'v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)', args.version or '')
@@ -533,6 +585,8 @@ def main(argv=None):
         return 0
     artifact = verified_artifact(args.repo, args.run, args.source, run, jobs, artifacts)
     setup = setup_artifact(args.repo, args.run, args.source, run, jobs, artifacts)
+    if accepted[0] is not None and accepted != (run.get('run_attempt'), artifact['id'], artifact['digest'], setup['id'], setup['digest']):
+        raise ValueError('candidate artifacts differ from the exact installed acceptance identities')
     with tempfile.TemporaryDirectory(prefix='oa-promotion-') as tmp:
         directory = Path(tmp)
         retained = directory / 'candidate-artifact.zip'
@@ -561,7 +615,7 @@ def main(argv=None):
             tag = api(f'repos/{args.repo}/git/ref/tags/{args.version}')
             if tag.get('object', {}).get('type') != 'commit' or tag['object'].get('sha') != args.source:
                 raise ValueError('resume requires the existing tag to point directly to the verified commit')
-            release = optional_api(f'repos/{args.repo}/releases/tags/{args.version}')
+            release = release_by_tag(args.repo, args.version)
         else:
             command(['api', '--method', 'POST', f'repos/{args.repo}/git/refs',
                      '-f', 'ref=refs/tags/' + args.version, '-f', 'sha=' + args.source])

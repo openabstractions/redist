@@ -1,0 +1,101 @@
+name: public staging transport canary
+on:
+  workflow_dispatch:
+    inputs:
+      source:
+        description: Exact reviewed public commit of this trusted staging branch
+        type: string
+        required: true
+      release_id:
+        description: Exact owned public-safe draft ID
+        type: string
+        required: true
+      capsule_id:
+        description: Exact 215-byte capsule asset ID
+        type: string
+        required: true
+      manifest_id:
+        description: Exact 182-byte manifest asset ID
+        type: string
+        required: true
+
+permissions:
+  contents: read
+  actions: read
+concurrency:
+  group: transport-canary-962
+  cancel-in-progress: false
+defaults:
+  run:
+    shell: bash
+jobs:
+  intake:
+    name: intake
+    if: github.repository == 'openabstractions/redist' && github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/release/transport-canary-962' && github.actor == 'ReinisLusis' && github.triggering_actor == 'ReinisLusis'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      artifact-id: ${{ steps.upload.outputs.artifact-id }}
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-python@e797f83bcb11b83ae66e0230d6156d7c80228e7c # v6.0.0
+        with:
+          python-version: '3.12'
+      - name: intake exact public canary assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CANARY_SOURCE: ${{ inputs.source }}
+          RELEASE_ID: ${{ inputs.release_id }}
+          CAPSULE_ID: ${{ inputs.capsule_id }}
+          MANIFEST_ID: ${{ inputs.manifest_id }}
+        run: |
+          [ "$CANARY_SOURCE" = "$GITHUB_SHA" ] || { echo 'source differs from dispatch'; exit 1; }
+          python scripts/transport_canary.py intake --source "$CANARY_SOURCE" \
+            --release-id "$RELEASE_ID" --capsule-id "$CAPSULE_ID" --manifest-id "$MANIFEST_ID" \
+            --run-id "$GITHUB_RUN_ID" --attempt "$GITHUB_RUN_ATTEMPT" --output transport962-intake
+      - name: upload exact canary bytes
+        id: upload
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: transport962-${{ github.run_attempt }}
+          path: transport962-intake/
+          compression-level: 0
+          retention-days: 1
+          if-no-files-found: error
+  readback:
+    needs: intake
+    if: github.repository == 'openabstractions/redist' && github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/release/transport-canary-962' && github.actor == 'ReinisLusis' && github.triggering_actor == 'ReinisLusis'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-python@e797f83bcb11b83ae66e0230d6156d7c80228e7c # v6.0.0
+        with:
+          python-version: '3.12'
+      - name: read back exact uploaded canary bytes
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CANARY_SOURCE: ${{ inputs.source }}
+          RELEASE_ID: ${{ inputs.release_id }}
+          CAPSULE_ID: ${{ inputs.capsule_id }}
+          MANIFEST_ID: ${{ inputs.manifest_id }}
+          ARTIFACT_ID: ${{ needs.intake.outputs.artifact-id }}
+        run: |
+          [ "$CANARY_SOURCE" = "$GITHUB_SHA" ] || { echo 'source differs from dispatch'; exit 1; }
+          python scripts/transport_canary.py readback --source "$CANARY_SOURCE" \
+            --release-id "$RELEASE_ID" --capsule-id "$CAPSULE_ID" --manifest-id "$MANIFEST_ID" \
+            --run-id "$GITHUB_RUN_ID" --attempt "$GITHUB_RUN_ATTEMPT" \
+            --artifact-id "$ARTIFACT_ID" --output transport962-readback
+      - name: retain transport-only readback receipt
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: transport962-readback-${{ github.run_attempt }}
+          path: transport962-readback/transport962-readback.json
+          retention-days: 1
+          if-no-files-found: error

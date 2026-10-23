@@ -300,6 +300,35 @@ def input_receipt(source, version, owner, run_id, attempt, release_id, assets, m
             "verification": "canonical complete roster and every member size/SHA256 PASS"}
 
 
+def receive_assets(output: Path, repository: str, assets: dict, *, fetch, download, created: list) -> None:
+    """Receive exact release-asset bytes; the caller owns origin and output cleanup."""
+    if not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repository) or not assets:
+        raise ValueError("invalid input repository or empty asset selection")
+    ids = set()
+    for name, pin in assets.items():
+        if (not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", name) or name in (".", "..")
+                or type(pin.get("id")) is not int or pin["id"] < 1 or pin["id"] in ids
+                or pin.get("name") != name or type(pin.get("size_bytes")) is not int
+                or pin["size_bytes"] < 0 or not SHA.fullmatch(pin.get("sha256", ""))):
+            raise ValueError("invalid input asset identity")
+        ids.add(pin["id"])
+        direct = fetch(f"repos/{repository}/releases/assets/{pin['id']}")
+        if (not isinstance(direct, dict) or direct.get("id") != pin["id"]
+                or direct.get("name") != name or direct.get("state") != "uploaded"
+                or direct.get("size") != pin["size_bytes"]
+                or direct.get("digest") != "sha256:" + pin["sha256"]):
+            raise ValueError("direct input asset differs from selected identity")
+    for name, pin in assets.items():
+        target = Path(output) / name
+        with target.open('xb'):
+            pass
+        created.append(target)
+        download(["api", "-H", "Accept: application/octet-stream",
+                  f"repos/{repository}/releases/assets/{pin['id']}"], target)
+        if measured(target) != (pin["size_bytes"], pin["sha256"]):
+            raise ValueError("downloaded input bytes differ from selected identity")
+
+
 def intake_inputs(output: Path, sources: Path, source: str, version: str,
                   release_id: int, bundle_id: int, manifest_id: int,
                   run_id: int, attempt: int, *, fetch, optional_fetch, download,
@@ -316,25 +345,13 @@ def intake_inputs(output: Path, sources: Path, source: str, version: str,
     if release["id"] != release_id or (assets[BUNDLE_NAME]["id"], assets[MANIFEST_NAME]["id"]) != (bundle_id, manifest_id):
         raise ValueError("PyTorch input asset IDs differ from the reviewed seed")
     input_tag(optional_fetch(f"repos/{INPUT_REPOSITORY}/git/ref/tags/{tag}"), source)
-    # Check direct asset metadata too; downloads always use the fixed repository API.
-    for name, selected in assets.items():
-        direct = fetch(f"repos/{INPUT_REPOSITORY}/releases/assets/{selected['id']}")
-        probe = dict(release, assets=[direct])
-        if input_assets(probe, source, version, owner, complete=False) != {name: selected}:
-            raise ValueError("PyTorch direct asset identity differs from its owned draft")
     output = Path(output)
     if output.exists():
         raise FileExistsError("PyTorch intake output already exists")
     output.mkdir(parents=True)
     created = []
     try:
-        for name in (BUNDLE_NAME, MANIFEST_NAME):
-            target = output / name
-            created.append(target)
-            download(["api", "-H", "Accept: application/octet-stream",
-                      f"repos/{INPUT_REPOSITORY}/releases/assets/{assets[name]['id']}"], target)
-            if target.stat().st_size != INPUT_PINS[name]["size_bytes"]:
-                raise ValueError("PyTorch downloaded input size differs")
+        receive_assets(output, INPUT_REPOSITORY, assets, fetch=fetch, download=download, created=created)
         if measured(output / MANIFEST_NAME) != (INPUT_PINS[MANIFEST_NAME]["size_bytes"],
                                                INPUT_PINS[MANIFEST_NAME]["sha256"]):
             raise ValueError("PyTorch downloaded owner manifest differs")

@@ -237,14 +237,62 @@ def required_entries(directory):
     required = ["package.json", "LICENSE"]
     if (directory / "README.md").exists():
         required.append("README.md")
+    excluded = set()
     for entry in data.get("files", []):
-        if (directory / entry).is_dir():
-            required.append(entry.rstrip("/") + "/")
-        elif (directory / entry).exists():
-            required.append(entry)
-        else:
+        unsupported = _unsupported_files_syntax(entry)
+        if unsupported:
+            raise Refused(f"{data['name']}: package.json files entry {entry} uses {unsupported}, which npm_packages does not expand")
+    for entry in data.get("files", []):
+        if entry.startswith("!"):
+            # npm: a negated entry removes the files it matches from the package.
+            excluded.update(_files_entry_matches(directory, entry[1:]))
+    for entry in data.get("files", []):
+        if entry.startswith("!"):
+            continue
+        matches = [path for path in _files_entry_matches(directory, entry) if path not in excluded]
+        if not matches:
             raise Refused(f"{data['name']}: package.json names {entry}, which the staged package does not have")
+        if any(ch in entry for ch in "*?["):
+            required.extend(matches)
+        elif (directory / _files_entry_pattern(entry)).is_dir():
+            required.append(_files_entry_pattern(entry) + "/")
+        else:
+            required.append(_files_entry_pattern(entry))
     return data["name"], required
+
+
+def _files_entry_pattern(entry):
+    """npm anchors a leading "/" and strips a leading "./" at the package root; a dotfile keeps its name."""
+    pattern = entry.strip()
+    while pattern.startswith("./") or pattern.startswith("/"):
+        pattern = pattern[2:] if pattern.startswith("./") else pattern[1:]
+    return pattern.rstrip("/")
+
+
+_UNSUPPORTED_FILES_SYNTAX = (("{", "a brace pattern"), ("?(", "an extglob"), ("*(", "an extglob"),
+                             ("+(", "an extglob"), ("@(", "an extglob"), ("!(", "an extglob"),
+                             ("[^", "a negated class"), ("\\", "an escape"))
+
+
+def _unsupported_files_syntax(entry):
+    """The minimatch syntax a files entry uses that _files_entry_matches does not implement, or None."""
+    body = entry[1:] if entry.startswith("!") else entry
+    for token, name in _UNSUPPORTED_FILES_SYNTAX:
+        if token in body:
+            return name
+    return None
+
+
+def _files_entry_matches(directory, entry):
+    """Files one package.json `files` entry selects, as npm does: a glob matches files, a directory its contents."""
+    pattern = _files_entry_pattern(entry)
+    found = set()
+    for path in directory.glob(pattern):
+        if path.is_dir():
+            found.update(p.relative_to(directory).as_posix() for p in path.rglob("*") if p.is_file())
+        elif path.is_file():
+            found.add(path.relative_to(directory).as_posix())
+    return sorted(found)
 
 
 def pack(directory, output):
