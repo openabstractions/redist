@@ -14,7 +14,9 @@ import zipfile
 import promote
 
 REPOSITORY = 'openabstractions/redist'
-WORKFLOW = '.github/workflows/transport-canary.yml'
+# Diagnostic-only overlay: reuse an already registered manual workflow path.
+# Keep this path override out of the product composition.
+WORKFLOW = '.github/workflows/service-check.yml'
 BRANCH = 'release/transport-canary-962'
 CAPSULE = 'transport962-capsule.zip'
 MANIFEST = 'transport962-manifest.json'
@@ -35,6 +37,16 @@ def identity(source):
         raise ValueError('canary source must be an exact public commit')
     return {'schema': 1, 'purpose': 'public-staging-transport-canary',
             'source': source, 'files': PINS}
+
+
+def registration(*, fetch=promote.api):
+    """Refuse a known undispatchable workflow before generating or seeding bytes."""
+    workflow = fetch(f'repos/{REPOSITORY}/actions/workflows/{Path(WORKFLOW).name}')
+    if (not isinstance(workflow, dict) or type(workflow.get('id')) is not int
+            or workflow['id'] < 1 or workflow.get('path') != WORKFLOW
+            or workflow.get('state') != 'active'):
+        raise ValueError('canary workflow must be active and registered on the default branch')
+    return {'workflow_id': workflow['id'], 'workflow': WORKFLOW, 'state': 'active'}
 
 
 def tag(source):
@@ -89,6 +101,7 @@ def assets(release, source, release_id=None):
 
 
 def seed(directory, source, *, fetch=promote.api, optional_fetch=promote.optional_api, mutate=promote.command):
+    registration(fetch=fetch)
     verify_bytes(directory)
     prefix = 'repos/' + REPOSITORY
     if optional_fetch(prefix + '/git/ref/tags/' + tag(source)) is not None:
@@ -215,13 +228,14 @@ def readback(output, source, release_id, capsule_id, manifest_id, run_id, attemp
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('operation', choices=['prepare', 'seed', 'intake', 'readback'])
+    parser.add_argument('operation', choices=['preflight', 'prepare', 'seed', 'intake', 'readback'])
     parser.add_argument('--output', type=Path, required=True)
     parser.add_argument('--source')
     for name in ('release-id', 'capsule-id', 'manifest-id', 'run-id', 'attempt', 'artifact-id'):
         parser.add_argument('--' + name, type=int)
     args = parser.parse_args(argv)
-    if args.operation == 'prepare': prepare(args.output); return 0
+    if args.operation == 'preflight': print(json.dumps(registration(), sort_keys=True)); return 0
+    if args.operation == 'prepare': registration(); prepare(args.output); return 0
     if args.operation == 'seed': result = seed(args.output, args.source)
     else:
         values = [args.output, args.source, args.release_id, args.capsule_id, args.manifest_id, args.run_id, args.attempt]

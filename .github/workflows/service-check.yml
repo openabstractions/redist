@@ -1,224 +1,101 @@
-name: Windows service verification
+name: public staging transport canary
 on:
   workflow_dispatch:
     inputs:
-      artifact_run:
-        description: Completed release or Windows candidate run with successful Windows packaging
-        required: true
+      source:
+        description: Exact reviewed public commit of this trusted staging branch
         type: string
-      artifact_attempt:
-        description: Exact successful signing and verification attempt
         required: true
+      release_id:
+        description: Exact owned public-safe draft ID
         type: string
-      package_sha:
-        description: Exact lowercase 40-hex source commit of the package run
         required: true
+      capsule_id:
+        description: Exact 215-byte capsule asset ID
         type: string
-      windows_image:
-        description: Windows image for the same fresh-session assertions
-        type: choice
-        options:
-          - windows-latest
-          - windows-2022
-        default: windows-latest
+        required: true
+      manifest_id:
+        description: Exact 182-byte manifest asset ID
+        type: string
+        required: true
+
 permissions:
   contents: read
   actions: read
+concurrency:
+  group: transport-canary-962
+  cancel-in-progress: false
+defaults:
+  run:
+    shell: bash
 jobs:
-  package:
-    runs-on: ${{ inputs.windows_image == 'windows-2022' && 'windows-2022' || 'windows-latest' }}
-    timeout-minutes: 12
+  intake:
+    name: intake
+    if: github.repository == 'openabstractions/redist' && github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/release/transport-canary-962' && github.actor == 'ReinisLusis' && github.triggering_actor == 'ReinisLusis'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      artifact-id: ${{ steps.upload.outputs.artifact-id }}
     steps:
-      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
-      - name: identify the existing package
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-python@e797f83bcb11b83ae66e0230d6156d7c80228e7c # v6.0.0
+        with:
+          python-version: '3.12'
+      - name: intake exact public canary assets
         env:
           GH_TOKEN: ${{ github.token }}
-          GH_REPO: ${{ github.repository }}
-          RUN_ID: ${{ inputs.artifact_run }}
-          ATTEMPT: ${{ inputs.artifact_attempt }}
-          PACKAGE_SHA: ${{ inputs.package_sha }}
-        shell: pwsh
+          CANARY_SOURCE: ${{ inputs.source }}
+          RELEASE_ID: ${{ inputs.release_id }}
+          CAPSULE_ID: ${{ inputs.capsule_id }}
+          MANIFEST_ID: ${{ inputs.manifest_id }}
         run: |
-          $run = gh api "repos/$env:GITHUB_REPOSITORY/actions/runs/$env:RUN_ID" | ConvertFrom-Json
-          if ($LASTEXITCODE -ne 0) { throw 'Cannot read package run' }
-          if ($env:RUN_ID -notmatch '^[1-9][0-9]*$' -or $env:ATTEMPT -notmatch '^[1-9][0-9]*$' -or $env:PACKAGE_SHA -cnotmatch '^[0-9a-f]{40}$') { throw 'Expected exact run, attempt and source SHA' }
-          if ($run.repository.full_name -ne $env:GITHUB_REPOSITORY -or $run.head_sha -cne $env:PACKAGE_SHA -or $run.status -ne 'completed' -or $run.run_attempt -lt [int]$env:ATTEMPT -or $run.path -notin @('.github/workflows/candidate.yml','.github/workflows/release.yml')) { throw 'Package run provenance mismatch' }
-          if ($run.path -eq '.github/workflows/candidate.yml' -and $run.event -ne 'workflow_dispatch') { throw 'Candidate package must come from workflow_dispatch' }
-          $jobs = gh api --paginate --slurp "repos/$env:GITHUB_REPOSITORY/actions/runs/$env:RUN_ID/attempts/$env:ATTEMPT/jobs?per_page=100" | ConvertFrom-Json
-          if ($LASTEXITCODE -ne 0) { throw 'Cannot read package attempt jobs' }
-          foreach ($name in @('windows-msi-sign','verify')) {
-            if (@($jobs.jobs | Where-Object { $_.name -eq $name -and $_.head_sha -ceq $env:PACKAGE_SHA -and $_.run_attempt -eq [int]$env:ATTEMPT -and $_.status -eq 'completed' -and $_.conclusion -eq 'success' }).Count -ne 1) { throw "Package attempt lacks successful $name" }
-          }
-          $name = "abstraction-windows-$env:ATTEMPT"
-          $artifacts = gh api --paginate --slurp "repos/$env:GITHUB_REPOSITORY/actions/runs/$env:RUN_ID/artifacts?per_page=100" | ConvertFrom-Json
-          if ($LASTEXITCODE -ne 0) { throw 'Cannot read package artifacts' }
-          $selected = @($artifacts.artifacts | Where-Object { $_.name -ceq $name -and -not $_.expired -and $_.workflow_run.id -eq [long]$env:RUN_ID -and $_.workflow_run.head_sha -ceq $env:PACKAGE_SHA })
-          if ($selected.Count -ne 1 -or $selected[0].id -le 0 -or $selected[0].digest -cnotmatch '^sha256:[0-9a-f]{64}$') { throw 'Expected one exact package artifact with digest' }
-          $artifact = $selected[0]
-          if ($PSVersionTable.PSVersion -lt [version]'7.4') { throw 'Binary artifact download requires PowerShell 7.4' }
-          gh api "repos/$env:GITHUB_REPOSITORY/actions/artifacts/$($artifact.id)/zip" > package.zip
-          if ($LASTEXITCODE -ne 0) { throw 'Package artifact download failed' }
-          if ('sha256:' + (Get-FileHash package.zip -Algorithm SHA256).Hash.ToLowerInvariant() -cne $artifact.digest) { throw 'Package artifact digest mismatch' }
-          Expand-Archive -LiteralPath package.zip -DestinationPath pkg
-          "Package source: $env:PACKAGE_SHA; fixture source: $env:GITHUB_SHA; source run: $env:RUN_ID; attempt: $env:ATTEMPT; artifact: $($artifact.id); digest: $($artifact.digest)" | Tee-Object package-source.txt
-          $checked = @{}
-          foreach ($line in Get-Content pkg/SHA256SUMS.windows) {
-            if ($line -notmatch '^([a-f0-9]{64})\s+\*?(abstraction-(?:x64|arm64)\.msi)$') { throw 'Unexpected checksum entry' }
-            $expected = $Matches[1]; $file = $Matches[2]
-            if ((Get-FileHash "pkg/$file" -Algorithm SHA256).Hash.ToLower() -ne $expected) { throw "Checksum mismatch: $file" }
-            if ($checked.ContainsKey($file)) { throw 'Duplicate checksum entry' }
-            $checked[$file] = $true
-          }
-          if ($checked.Count -ne 2) { throw 'Expected checksums for both Windows packages' }
-          exit 0
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+          [ "$CANARY_SOURCE" = "$GITHUB_SHA" ] || { echo 'source differs from dispatch'; exit 1; }
+          python scripts/transport_canary.py intake --source "$CANARY_SOURCE" \
+            --release-id "$RELEASE_ID" --capsule-id "$CAPSULE_ID" --manifest-id "$MANIFEST_ID" \
+            --run-id "$GITHUB_RUN_ID" --attempt "$GITHUB_RUN_ATTEMPT" --output transport962-intake
+      - name: upload exact canary bytes
+        id: upload
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: verified-windows-package
-          path: |
-            pkg/
-            package-source.txt
-  service:
-    needs: package
-    runs-on: ${{ inputs.windows_image == 'windows-2022' && 'windows-2022' || 'windows-latest' }}
-    timeout-minutes: 20
+          name: transport962-${{ github.run_attempt }}
+          path: transport962-intake/
+          compression-level: 0
+          retention-days: 1
+          if-no-files-found: error
+  readback:
+    needs: intake
+    if: github.repository == 'openabstractions/redist' && github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/release/transport-canary-962' && github.actor == 'ReinisLusis' && github.triggering_actor == 'ReinisLusis'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
     steps:
-      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
-      - name: download verified package
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-python@e797f83bcb11b83ae66e0230d6156d7c80228e7c # v6.0.0
+        with:
+          python-version: '3.12'
+      - name: read back exact uploaded canary bytes
         env:
           GH_TOKEN: ${{ github.token }}
-        shell: pwsh
+          CANARY_SOURCE: ${{ inputs.source }}
+          RELEASE_ID: ${{ inputs.release_id }}
+          CAPSULE_ID: ${{ inputs.capsule_id }}
+          MANIFEST_ID: ${{ inputs.manifest_id }}
+          ARTIFACT_ID: ${{ needs.intake.outputs.artifact-id }}
         run: |
-          gh run download $env:GITHUB_RUN_ID -n verified-windows-package -D .
-          if ($LASTEXITCODE -ne 0) { throw 'Verified package download failed' }
-      - name: install machine scope
-        id: install
-        shell: pwsh
-        run: |
-          $msi = (Resolve-Path pkg/abstraction-x64.msi).Path
-          $p = Start-Process msiexec -Wait -PassThru -ArgumentList @('/i',$msi,'/qn','/norestart','ALLUSERS=1','MSIINSTALLPERUSER=','/l*v','machine-install.log')
-          if ($p.ExitCode -ne 0) { Get-Content machine-install.log -Tail 120; throw "Install exited $($p.ExitCode)" }
-      - name: fresh sign-in and recovery
-        timeout-minutes: 10
-        shell: pwsh
-        run: |
-          & powershell.exe -NoProfile -ExecutionPolicy Bypass -STA -File test_service_session.ps1 -Mode Verify -StatePath "$env:RUNNER_TEMP/oa-service-session.json"
-          if ($LASTEXITCODE -ne 0) { throw "Session verification exited $LASTEXITCODE" }
-          exit 0
-      - name: remove installed package
-        if: always() && steps.install.outcome == 'success'
-        shell: pwsh
-        run: |
-          $msi = (Resolve-Path pkg/abstraction-x64.msi).Path
-          $p = Start-Process msiexec -Wait -PassThru -ArgumentList @('/x',$msi,'/qn','/norestart','/l*v','machine-uninstall.log')
-          if ($p.ExitCode -ne 0) { throw "Uninstall exited $($p.ExitCode)" }
-          if (@(Get-Service -Name 'OpenAbstractionsSupervisor*' -ErrorAction SilentlyContinue).Count) { throw 'Service survived uninstall' }
-          & powershell.exe -NoProfile -ExecutionPolicy Bypass -STA -File test_service_session.ps1 -Mode VerifyRemoved -StatePath "$env:RUNNER_TEMP/oa-service-session.json"
-          if ($LASTEXITCODE -ne 0) { throw "Runtime removal verification exited $LASTEXITCODE" }
-      - name: remove disposable session
-        if: always()
-        shell: pwsh
-        run: |
-          & powershell.exe -NoProfile -ExecutionPolicy Bypass -STA -File test_service_session.ps1 -Mode Cleanup -StatePath "$env:RUNNER_TEMP/oa-service-session.json" 2>&1 | Tee-Object service-session-cleanup.log
-          if ($LASTEXITCODE -ne 0) { throw "Session cleanup exited $LASTEXITCODE" }
-          exit 0
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
-        if: always()
+          [ "$CANARY_SOURCE" = "$GITHUB_SHA" ] || { echo 'source differs from dispatch'; exit 1; }
+          python scripts/transport_canary.py readback --source "$CANARY_SOURCE" \
+            --release-id "$RELEASE_ID" --capsule-id "$CAPSULE_ID" --manifest-id "$MANIFEST_ID" \
+            --run-id "$GITHUB_RUN_ID" --attempt "$GITHUB_RUN_ATTEMPT" \
+            --artifact-id "$ARTIFACT_ID" --output transport962-readback
+      - name: retain transport-only readback receipt
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: service-diagnostics
-          path: |
-            package-source.txt
-            machine-install.log
-            machine-uninstall.log
-            service-session.log
-            service-session-cleanup.log
-  per-user:
-    needs: package
-    runs-on: ${{ inputs.windows_image == 'windows-2022' && 'windows-2022' || 'windows-latest' }}
-    timeout-minutes: 10
-    steps:
-      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
-      - name: download verified package
-        env:
-          GH_TOKEN: ${{ github.token }}
-        shell: pwsh
-        run: |
-          gh run download $env:GITHUB_RUN_ID -n verified-windows-package -D .
-          if ($LASTEXITCODE -ne 0) { throw 'Verified package download failed' }
-      - name: configure disposable consumer MSI policy
-        shell: pwsh
-        run: |
-          if ($env:GITHUB_ACTIONS -ne 'true' -or $env:RUNNER_ENVIRONMENT -ne 'github-hosted' -or $env:RUNNER_OS -ne 'Windows') { throw 'MSI policy fixture requires a disposable GitHub Windows runner' }
-          if ((Get-CimInstance Win32_OperatingSystem -ErrorAction Stop).ProductType -ne 3) { throw 'MSI policy fixture requires Windows Server' }
-          $policy = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\Installer'
-          $statePath = Join-Path $env:RUNNER_TEMP 'oa-msi-policy.json'
-          if (Test-Path -LiteralPath $statePath -ErrorAction Stop) { throw 'MSI policy baseline already exists' }
-          $keyExists = Test-Path -LiteralPath $policy -ErrorAction Stop
-          $state = @{ KeyExisted=$keyExists; ValueExisted=$false; Value=$null; Restored=$false }
-          if ($keyExists) {
-              $key = Get-Item -LiteralPath $policy -ErrorAction Stop
-              try {
-                  $state.ValueExisted = $key.GetValueNames() -contains 'DisableMSI'
-                  if ($state.ValueExisted) {
-                      if ($key.GetValueKind('DisableMSI') -ne [Microsoft.Win32.RegistryValueKind]::DWord) { throw 'Unexpected DisableMSI registry type' }
-                      $state.Value = $key.GetValue('DisableMSI')
-                      if ($state.Value -notin @(0,1,2)) { throw 'Unexpected DisableMSI registry value' }
-                  }
-              } finally { $key.Close() }
-          }
-          # Persist the original state before the first mutation, including setup failures.
-          $state | ConvertTo-Json | Set-Content -LiteralPath $statePath -Encoding utf8 -ErrorAction Stop
-          "DisableMSI baseline: key=$keyExists present=$($state.ValueExisted) value=$($state.Value)" | Tee-Object msi-policy.log
-          if (-not $keyExists) { New-Item -Path $policy -Force -ErrorAction Stop | Out-Null }
-          New-ItemProperty -LiteralPath $policy -Name DisableMSI -Value 0 -PropertyType DWord -Force -ErrorAction Stop | Out-Null
-          if ((Get-ItemPropertyValue -LiteralPath $policy -Name DisableMSI -ErrorAction Stop) -ne 0) { throw 'DisableMSI test configuration did not take effect' }
-          'Disposable test environment: DisableMSI=0 permits standard-user unmanaged installation' | Tee-Object -Append msi-policy.log
-          exit 0
-      - name: private non-admin shortcut activation and removal
-        shell: pwsh
-        run: |
-          & powershell.exe -NoProfile -ExecutionPolicy Bypass -File test_user_runtime.ps1 -Mode Verify -MsiPath (Resolve-Path pkg/abstraction-x64.msi).Path
-          if ($LASTEXITCODE -ne 0) { throw "Per-user runtime verification exited $LASTEXITCODE" }
-      - name: restore disposable consumer MSI policy
-        if: always()
-        shell: pwsh
-        run: |
-          if ($env:GITHUB_ACTIONS -ne 'true' -or $env:RUNNER_ENVIRONMENT -ne 'github-hosted' -or $env:RUNNER_OS -ne 'Windows') { throw 'MSI policy fixture requires a disposable GitHub Windows runner' }
-          if ((Get-CimInstance Win32_OperatingSystem -ErrorAction Stop).ProductType -ne 3) { throw 'MSI policy fixture requires Windows Server' }
-          $policy = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\Installer'
-          $statePath = Join-Path $env:RUNNER_TEMP 'oa-msi-policy.json'
-          if (-not (Test-Path -LiteralPath $statePath -ErrorAction Stop)) { 'No MSI policy mutation was recorded'; exit 0 }
-          $state = Get-Content -LiteralPath $statePath -Raw -ErrorAction Stop | ConvertFrom-Json
-          if ($state.KeyExisted -isnot [bool] -or $state.ValueExisted -isnot [bool] -or ($state.ValueExisted -and (-not $state.KeyExisted -or $state.Value -notin @(0,1,2)))) { throw 'Invalid MSI policy baseline' }
-          if ($state.ValueExisted) {
-              New-ItemProperty -LiteralPath $policy -Name DisableMSI -Value $state.Value -PropertyType DWord -Force -ErrorAction Stop | Out-Null
-          } elseif (Test-Path -LiteralPath $policy -ErrorAction Stop) {
-              $key = Get-Item -LiteralPath $policy -ErrorAction Stop
-              try { $present = $key.GetValueNames() -contains 'DisableMSI' } finally { $key.Close() }
-              if ($present) { Remove-ItemProperty -LiteralPath $policy -Name DisableMSI -ErrorAction Stop }
-          }
-          if (Test-Path -LiteralPath $policy -ErrorAction Stop) {
-              $key = Get-Item -LiteralPath $policy -ErrorAction Stop
-              try {
-                  $present = $key.GetValueNames() -contains 'DisableMSI'
-                  if ($present -ne $state.ValueExisted) { throw 'DisableMSI presence was not restored' }
-                  if ($present -and ($key.GetValueKind('DisableMSI') -ne [Microsoft.Win32.RegistryValueKind]::DWord -or $key.GetValue('DisableMSI') -ne $state.Value)) { throw 'DisableMSI value was not restored' }
-                  $empty = $key.GetValueNames().Count -eq 0 -and $key.GetSubKeyNames().Count -eq 0
-              } finally { $key.Close() }
-              if (-not $state.KeyExisted) {
-                  if (-not $empty) { throw 'Refusing to remove a policy key with unrelated values' }
-                  Remove-Item -LiteralPath $policy -ErrorAction Stop
-              }
-          } elseif ($state.KeyExisted) { throw 'Original MSI policy key disappeared' }
-          $state.Restored = $true
-          $state | ConvertTo-Json | Set-Content -LiteralPath $statePath -Encoding utf8 -ErrorAction Stop
-          'DisableMSI baseline restored and verified' | Tee-Object -Append msi-policy.log
-          exit 0
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
-        if: always()
-        with:
-          name: per-user-runtime-diagnostics
-          path: |
-            package-source.txt
-            user-runtime-diagnostics/
-            msi-policy.log
-            ${{ runner.temp }}/oa-msi-policy.json
+          name: transport962-readback-${{ github.run_attempt }}
+          path: transport962-readback/transport962-readback.json
+          retention-days: 1
+          if-no-files-found: error
