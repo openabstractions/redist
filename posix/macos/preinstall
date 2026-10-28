@@ -85,7 +85,7 @@ agent_state() {
 # All three labels are booted out and verified absent before any file is
 # replaced: a running Panel holds its own executable open, the same reason
 # the runtime is booted out before its payload is replaced.
-for label in com.openabstractions.jobd com.openabstractions.runtime com.openabstractions.panel; do
+for label in com.openabstractions.jobd com.openabstractions.runtime com.openabstractions.runtime-login com.openabstractions.panel; do
     state=$(agent_state "$label")
     booted=no
     if [ "$state" = present ]; then

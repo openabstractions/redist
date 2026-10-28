@@ -36,6 +36,7 @@ check_existing_dir() {
     dir=$1
     [ -e "$dir" ] || return 0
     [ -d "$dir" ] && [ ! -L "$dir" ] || { echo "postinstall: unsafe payload directory: $dir" >&2; exit 1; }
+    [ "$(stat -f %u "$dir")" = "$uid" ] || { echo "postinstall: foreign payload directory: $dir" >&2; exit 1; }
     permissions=$(stat -f %Lp "$dir")
     case "$permissions" in *[!0-7]*|'') echo "postinstall: cannot inspect directory permissions: $dir" >&2; exit 1;; esac
     [ $((0$permissions & 0022)) -eq 0 ] || {
@@ -48,6 +49,9 @@ for dir in "$home" "$home/.local" "$bin" "$home/.local/share" "$share" "$home/Li
 done
 . "$share/lifecycle.sh"
 mkdir -p -- "$agents"
+for label in com.openabstractions.runtime-login com.openabstractions.panel; do
+    login_trigger_check "$label" || { echo "postinstall: login trigger ownership refused" >&2; exit 1; }
+done
 tmp=$(mktemp "$share/.com.openabstractions.runtime.plist.XXXXXX")
 trap 'rm -f -- "$tmp"' EXIT
 # Escape XML text first, then escape sed replacement metacharacters.
@@ -58,28 +62,23 @@ chmod 644 "$tmp"
 mv -f -- "$tmp" "$plist"
 trap - EXIT
 
-# The Panel's own LaunchAgent, the analogue of the Windows Startup-folder
-# shortcut PanelTrayLogonStart: RunAtLoad with no KeepAlive, so it opens once
-# at login and quitting it stays quit until the next one. Its template ships
-# with the base package; the app bundle is present only when it built, the
-# way the Windows package's Tools feature bundles the Panel when it built and
-# not as a person's choice. Rendered here, before MANIFEST is written, so its
-# path is in the ledger uninstall.sh removes; registered near the runtime's
-# own registration below, once $domain is known.
-panel_template=$share/com.openabstractions.panel.plist
+# Login triggers are created only by the runtime's confirmed-Applications
+# coordinator. The package records their fixed paths before that first start.
+# Existing owned triggers can survive a quiescent upgrade; foreign bytes refuse.
 panel_plist=$agents/com.openabstractions.panel.plist
-panel_exe="$bin/Abstraction Panel.app/Contents/MacOS/Abstraction Panel"
-panel_registered=
-if [ -f "$panel_template" ] && [ -x "$panel_exe" ]; then
-    ptmp=$(mktemp "$share/.com.openabstractions.panel.plist.XXXXXX")
-    trap 'rm -f -- "$ptmp"' EXIT
-    sed "s|@BIN@|$replacement|g" "$panel_template" > "$ptmp"
-    if grep -q '@BIN@' "$ptmp"; then echo "postinstall: Panel LaunchAgent placeholder left unsubstituted" >&2; exit 1; fi
-    chmod 644 "$ptmp"
-    mv -f -- "$ptmp" "$panel_plist"
-    trap - EXIT
-    panel_registered=$panel_plist
-fi
+login_plist=$agents/com.openabstractions.runtime-login.plist
+
+# Exact predecessor package bytes only, including its LF and CRLF forms.
+# Changed endpoint records belong to the person and remain untouched.
+retired_default_host() {
+    case "$1:$2" in
+        comfyui.json:3ea792ffa92b857fd72560562894b080e9d63cfd48d3bb0a489adba9d7ec48c6|comfyui.json:5e2b293cad42b4f1df5c30b39a5f19d56a868eb29ba0bbea3d0e47c2cfdb43d2) return 0;;
+        lemonade.json:beb97c82132d806cd9ce18381a8590399ea283a75e5b0ebffb129303e4a0ca2c|lemonade.json:28ea4da85a22e35932b1a18d60b1157a8df1ca6fcec1cd832ed6f2de93058e6d) return 0;;
+        lmstudio.json:b4e0808006e2494577db016219f02d302096f7c22ec4ed5afb53792c2650a885|lmstudio.json:8ab6e76b9a52bd6d9418a2d5e8fb702707f4ef5e44c1f608b16f0b9ac44f80ce) return 0;;
+        ollama.json:37890f65cdd55fb0162104ebc718d5fafd5995afe13a4d5d5cc7bbc81068628b|ollama.json:80b9f420b68f5c4feb72a46ed73b04754cd266c979190a274a6ae884af4e1594) return 0;;
+    esac
+    return 1
+}
 
 # 0.1.7 and earlier installed jobd, dl and jobctl and registered the runtime as
 # com.openabstractions.jobd (docs/REMOVED.md). preinstall booted that label out.
@@ -90,6 +89,20 @@ fi
 # endpoint), and a declaration left behind would name a provider that stops at
 # startup.
 if [ -f "$share/MANIFEST" ]; then
+    check_existing_dir "$bin/declarations"
+    for name in comfyui lemonade lmstudio ollama; do
+        retired=$bin/declarations/$name.json
+        rel=.local/bin/declarations/$name.json
+        if grep -F -x -- "$retired" "$share/MANIFEST" >/dev/null &&
+            ! grep -F -x -- "$rel" "$share/FILES" >/dev/null &&
+            [ -f "$retired" ] && [ ! -L "$retired" ]; then
+            digest=$(shasum -a 256 < "$retired")
+            if retired_default_host "$name.json" "${digest%% *}"; then
+                rm -f -- "$retired"
+                echo "ok    removed retired default $retired"
+            fi
+        fi
+    done
     for retired in "$agents/com.openabstractions.jobd.plist" "$share/com.openabstractions.jobd.plist" \
         "$bin/jobd" "$bin/dl" "$bin/jobctl" \
         "$bin/inventoryd" "$bin/declarations/local-stores.json" "$bin/modelhostd"; do
@@ -112,7 +125,10 @@ while read -r rel; do
 	echo "$home/$rel" >> "$manifest_tmp"
 done < "$share/FILES"
 echo "$plist" >> "$manifest_tmp"
-[ -z "$panel_registered" ] || echo "$panel_registered" >> "$manifest_tmp"
+echo "$login_plist" >> "$manifest_tmp"
+echo "$login_plist.lock" >> "$manifest_tmp"
+echo "$panel_plist" >> "$manifest_tmp"
+echo "$panel_plist.lock" >> "$manifest_tmp"
 mv -f -- "$manifest_tmp" "$share/MANIFEST"
 
 # Restore ownership along each installed path. This walks
@@ -134,7 +150,10 @@ own_path() {
         dir=${dir%/*}
     done
 }
-while IFS= read -r installed; do own_path "$installed"; done < "$share/MANIFEST"
+while IFS= read -r installed; do
+    case "$installed" in "$login_plist"|"$panel_plist"|"$login_plist.lock"|"$panel_plist.lock") [ -e "$installed" ] || continue;; esac
+    own_path "$installed"
+done < "$share/MANIFEST"
 own_path "$share/MANIFEST"
 
 domain=gui/$uid
@@ -150,16 +169,16 @@ manager bootstrap "$domain" "$plist"
 manager print "$service" >/dev/null
 echo "ok    shared runtime LaunchAgent registered for this user; capability identity proof remains separately required"
 
-if [ -n "$panel_registered" ]; then
-    panel_service=$domain/com.openabstractions.panel
-    if manager print "$panel_service" >/dev/null 2>&1; then
-        manager bootout "$panel_service"
-    fi
-    manager enable "$panel_service"
-    manager bootstrap "$domain" "$panel_plist"
-    manager print "$panel_service" >/dev/null
-    echo "ok    Panel LaunchAgent registered for this user"
+# One package-owned activation initializes the existing Applications watcher.
+# start owns the selected-installation and GUI-session checks and its deadline.
+# No installer reads application state or creates unconditional login triggers.
+if [ "$(id -u)" = "$uid" ]; then
+    "$bin/openabstractions" start --timeout 20s
 else
-    echo "note  Panel app not installed; its LaunchAgent is not registered"
+    sudo -n -u "#$uid" "$bin/openabstractions" start --timeout 20s
 fi
+for label in com.openabstractions.runtime-login com.openabstractions.panel; do
+    login_trigger_check "$label" || { echo "postinstall: reconciled login trigger ownership refused" >&2; exit 1; }
+done
+echo "ok    Applications login policy initialized; next-login behavior requires installed receiving"
 exit 0

@@ -6,7 +6,7 @@
   preprocessor variable build_app.py passes.
 
   Install places the ZIP's files under
-  %LOCALAPPDATA%\OpenAbstractions\apps\<AppId> and, last, starts the
+  %LOCALAPPDATA%\Programs\OpenAbstractions\apps\<AppId> and, last, starts the
   OpenAbstractions Panel with the application manifest the package carries:
   the person confirms the registration in the Panel, which registers it with
   its own application.manage. Uninstall starts the Panel to remove the entry,
@@ -49,9 +49,12 @@
     <Launch Condition="OaPanel OR Installed" Message="$(var.AppTitle) needs OpenAbstractions, which is not installed. Download it from https://github.com/openabstractions/redist/releases/latest, install it, then run this installer again." />
 
     <StandardDirectory Id="LocalAppDataFolder">
-      <Directory Id="OAFolder" Name="OpenAbstractions">
-        <Directory Id="OAAppsFolder" Name="apps">
-          <Directory Id="INSTALLFOLDER" Name="$(var.AppId)" />
+      <!-- Programs have their own MSI lifetime, outside OA's resettable state. -->
+      <Directory Id="AppProgramsFolder" Name="Programs">
+        <Directory Id="OAFolder" Name="OpenAbstractions">
+          <Directory Id="OAAppsFolder" Name="apps">
+            <Directory Id="INSTALLFOLDER" Name="$(var.AppId)" />
+          </Directory>
         </Directory>
       </Directory>
     </StandardDirectory>

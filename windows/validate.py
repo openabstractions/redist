@@ -8,7 +8,7 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
-from feature_invariants import FEATURE_NAMES, check_installed_declarations  # noqa: E402
+from feature_invariants import FEATURE_NAMES, check_installed_declarations, check_login_source  # noqa: E402
 
 # The vocabulary payload.tsv's "feature" column draws from; shared with
 # installer/posix/payload.tsv through feature_invariants.py. Windows never
@@ -40,9 +40,9 @@ DECLARATIONS = "tools/declarations/"
 
 MACHINE, USER = "ALLUSERS", "NOT ALLUSERS"
 SCOPES = {"for everyone": True, "just for me": False}
-# What starts the runtime host, in each scope. Both arms exist or one scope
-# installs the programs and nothing that ever runs them.
-ARMS = {True: "SupervisorServiceMarker", False: "LogonStartShortcut"}
+# The machine installation owns its service registration. Per-user activation
+# is checked through StartUserRuntime; confirmed applications own account login.
+ARMS = {True: "SupervisorServiceMarker"}
 SUPERVISOR_ACTIONS = ("RegisterSupervisor", "RollbackSupervisor", "UnregisterSupervisor",
                       "BeginMachineUpgradeExclusion", "EndMachineUpgradeExclusion", "RestartPreviousSupervisor")
 UPGRADE_CONDITIONS = {"machine": "ALLUSERS AND WIX_UPGRADE_DETECTED AND NOT REMOVE",
@@ -51,7 +51,8 @@ UPGRADE_CONDITIONS = {"machine": "ALLUSERS AND WIX_UPGRADE_DETECTED AND NOT REMO
 # register its release on commit, then register the rollback activation.
 # InstallExecute flushes all six before any file is replaced, and rollback runs
 # them in reverse: release and activate after the files are restored. The
-# package stops nothing: Restart Manager ends the running host at
+# begin-upgrade closes remaining identified OA processes after holding the
+# exclusion. Restart Manager gets its earlier opportunistic pass at
 # InstallValidate. (action, scope, ExeCommand, Execute, Impersonate, Return)
 UPGRADE_CHAIN = (
     ("BeginMachineUpgradeExclusion", "machine",
@@ -77,16 +78,14 @@ LATE_REMOVAL = (
      'NOT ALLUSERS AND NOT (REMOVE="ALL") AND NOT UPGRADINGPRODUCTCODE', "openabstractionsw.exe",
      "start --require-unelevated"),
 )
-# The per-user Startup shortcut runs the windowless host.
-LOGON_SHORTCUT = {"Target": "[#openabstractionsw.exe]", "Arguments": "serve supervisor"}
 UPGRADE_MESSAGES = {
     "binary": "abstraction.wxs: the upgrade actions must run the embedded incoming openabstractions.exe "
               f"(Binary UpgradeSupervisorCode = {UPGRADE_BINARY}), and the old product must be removed only "
               "after InstallFinalize",
     "flush": "abstraction.wxs: the early InstallExecute must follow the last exclusion action, "
              "RestartPreviousUserSupervisor, so the exclusion is held before RemoveFiles and InstallFiles",
-    "stop": "abstraction.wxs: the package stops nothing; Restart Manager ends the running host at "
-            "InstallValidate and every restart path is an idempotent activation",
+    "stop": "abstraction.wxs: use the bounded begin-upgrade exclusion/stop owner; "
+            "separate unscoped stop commands are refused and restart paths remain idempotent activations",
     "RestartPreviousUserSupervisor": "abstraction.wxs: a failed per-user upgrade must activate the previous runtime "
                                      "from an impersonated rollback action in the early script",
 }
@@ -283,10 +282,6 @@ def check_upgrade_shutdown(root):
             bad.append(f"abstraction.wxs: {action} must be an {execute} action running installed {file} "
                        f"`{command}` with return={returns}, scheduled after {after} under exactly {condition!r}, "
                        "so the predecessor's own uninstall cannot delete the shared host service this version registered")
-    shortcut = find("Shortcut", "Id", "LogonStartFile")
-    if shortcut is None or any(shortcut.get(k) != v for k, v in LOGON_SHORTCUT.items()):
-        bad.append("abstraction.wxs: the per-user Startup shortcut must run "
-                   f"{LOGON_SHORTCUT['Target']} {LOGON_SHORTCUT['Arguments']}")
     return bad
 
 
@@ -532,7 +527,10 @@ def main():
             bad.append(f"payload.tsv: {path} claims kind {kind!r}")
         if source not in sources:
             bad.append(f"payload.tsv: {path} names source {source!r}, absent from sources.tsv")
-        oa_pe = kind == "gobuild" or (source == "ipclibrary" and path == "tools/abstraction_ipc.dll")
+        oa_pe = kind == "gobuild" or (source, path) in {
+            ("ipclibrary", "tools/abstraction_ipc.dll"),
+            ("appmodellibrary", "tools/abstraction_facade_appmodel.dll"),
+        }
         if sign not in {"yes", "no"} or ((sign == "yes") != (oa_pe and path.endswith((".exe", ".dll")))):
             bad.append(f"payload.tsv: {path} sign={sign} — only a PE file can be an Authenticode target")
         if path in payload:
@@ -597,6 +595,10 @@ def main():
     bad.extend(check_engine_unlock(root, text))
     bad.extend(check_upgrade_shutdown(root))
     bad.extend(check_elevated_scope(root))
+    try:
+        check_login_source(text)
+    except ValueError as err:
+        bad.append("abstraction.wxs: " + str(err))
     for action in SUPERVISOR_ACTIONS:
         if action not in sequenced:
             bad.append(f"abstraction.wxs: {action} is sequenced nowhere")

@@ -1,4 +1,4 @@
-param(
+﻿param(
     [ValidateSet('ValidateOnly','Verify','User','FailingCandidate','CheckLogs','LocalAccount')][string]$Mode = 'ValidateOnly',
     [switch]$Help,
     [string]$MsiPath,
@@ -14,6 +14,10 @@ param(
     [string]$NodePath,
     [string]$SdkSmokes,
     [string]$NativeCoreRequest,
+    [ValidateSet(0,3600)][int]$SoakSeconds = 0,
+    [string]$ExpectedRuntimeSha256,
+    [string]$ExpectedSupervisorSha256,
+    [string]$SoakRequestPath,
     [string]$PredecessorMsiPath,
     [string]$PredecessorSHA256,
     [string]$PredecessorVersion,
@@ -47,6 +51,8 @@ Case options (Verify and LocalAccount)
   -PredecessorMsiPath PATH -PredecessorSHA256 HEX -PredecessorVersion X.Y.Z -ExpectedVersion X.Y.Z
   -PredecessorElsewhere  -FailUpgrade  -FailSameVersion
   -ResultDirectory DIR   logs and evidence (default .\user-runtime-diagnostics)
+  -SoakSeconds 3600 -ExpectedRuntimeSha256 HEX -ExpectedSupervisorSha256 HEX -SoakRequestPath PATH
+                    rehearsal-only installed hour; default0 preserves ordinary lifetime
 '@
     exit 0
 }
@@ -54,6 +60,11 @@ Case options (Verify and LocalAccount)
 # product enumeration and diagnostic redaction. The parent copies the module
 # beside the account's copy of this fixture.
 Import-Module (Join-Path $PSScriptRoot 'OAFixture.psm1') -Force
+if ($SoakSeconds -and ($Mode -notin @('User','Verify','LocalAccount') -or $FailUpgrade -or $FailSameVersion -or
+    $ExpectedRuntimeSha256 -cnotmatch '^[0-9a-f]{64}$' -or $ExpectedSupervisorSha256 -cnotmatch '^[0-9a-f]{64}$' -or
+    -not [IO.Path]::IsPathRooted($SoakRequestPath) -or -not (Test-Path -LiteralPath $SoakRequestPath -PathType Leaf))) {
+    throw 'Rehearsal soak requires the ordinary lifecycle and exact runtime/supervisor/request inputs'
+}
 if ($Mode -eq 'ValidateOnly') {
     'Per-user fixture parsed; no accounts, processes, installations or registrations changed.'
     exit 0
@@ -275,6 +286,7 @@ function Assert-RuntimeReady([string]$central, [string]$Evidence) {
     $probe = Invoke-FixtureProcess $probeInfo 10
     $probe.Output | Set-Content -Encoding UTF8 "$Evidence.json"
     $probe.Diagnostics | Set-Content -Encoding UTF8 "$Evidence.err"
+    $health = [ordered]@{ status_exit=$probe.ExitCode; describes=@() }
     if ($probe.ExitCode -ne 0) { throw "Runtime status exited $($probe.ExitCode)" }
     $status = Get-Content "$Evidence.json" -Raw | ConvertFrom-Json
     if ($null -eq $status -or $status -is [array] -or $status -isnot [Management.Automation.PSCustomObject]) {
@@ -296,11 +308,15 @@ function Assert-RuntimeReady([string]$central, [string]$Evidence) {
     }
     # Resolve proves the binding; Describe supplies the endpoint's current
     # readiness facts. Its self-reported metadata grants no authority.
-    foreach ($endpoint in $endpoints.Keys) {
+    foreach ($endpoint in @($endpoints.Keys | Sort-Object)) {
         $describeInfo = New-Object Diagnostics.ProcessStartInfo
         $describeInfo.FileName = $central
         $describeInfo.Arguments = 'status describe "' + $endpoint + '" --json --timeout 5s'
         $described = Invoke-FixtureProcess $describeInfo 10
+        $prefix = $Evidence + '.describe-' + $health.describes.Count
+        $described.Output | Set-Content -Encoding UTF8 ($prefix + '.json')
+        $described.Diagnostics | Set-Content -Encoding UTF8 ($prefix + '.err')
+        $health.describes += [ordered]@{ endpoint=$endpoint; exit_code=$described.ExitCode; output=($prefix+'.json'); diagnostics=($prefix+'.err') }
         if ($described.ExitCode -ne 0) { throw "Endpoint Describe failed for $endpoint" }
         try { $description = ConvertFrom-Json -InputObject $described.Output -ErrorAction Stop }
         catch { throw "Endpoint Describe returned invalid JSON for $endpoint" }
@@ -314,6 +330,189 @@ function Assert-RuntimeReady([string]$central, [string]$Evidence) {
             }
         }
     }
+    [IO.File]::WriteAllText(($Evidence+'.checks.json'),($health | ConvertTo-Json -Depth 8),[Text.UTF8Encoding]::new($false))
+}
+function Get-InstalledSoakClock {
+    # Microsoft realtimeapiset.h: VOID QueryInterruptTime(PULONGLONG), BOOL
+    # QueryUnbiasedInterruptTime(PULONGLONG), Kernel32.dll, 100ns units.
+    # https://learn.microsoft.com/windows/win32/api/realtimeapiset/nf-realtimeapiset-queryinterrupttime
+    # https://learn.microsoft.com/windows/win32/api/realtimeapiset/nf-realtimeapiset-queryunbiasedinterrupttime
+    # QueryInterruptTime's API-set binding is documented at:
+    # https://learn.microsoft.com/uwp/win32-and-com/win32-apis#apis-from-api-ms-win-core-realtime-l1-1-1dll
+    # Biased time includes suspend; unbiased time counts the working state.
+    if (-not ('OAInstalledSoakClock' -as [type])) {
+        Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+public static class OAInstalledSoakClock {
+    [DllImport("api-ms-win-core-realtime-l1-1-1.dll")] static extern void QueryInterruptTime(out ulong value);
+    [DllImport("kernel32.dll")]
+    [return: MarshalAs(UnmanagedType.Bool)] static extern bool QueryUnbiasedInterruptTime(out ulong value);
+    public static ulong[] Sample() {
+        ulong before, awake, after;
+        QueryInterruptTime(out before);
+        if (!QueryUnbiasedInterruptTime(out awake)) throw new InvalidOperationException("Unbiased clock unavailable");
+        QueryInterruptTime(out after);
+        return new ulong[] { before, awake, after };
+    }
+}
+'@
+    }
+    $ticks = [OAInstalledSoakClock]::Sample()
+    return [pscustomobject]@{ before=[decimal]$ticks[0]; awake=[decimal]$ticks[1]; after=[decimal]$ticks[2] }
+}
+function Assert-InstalledSoakClock($Sample, $Previous) {
+    foreach ($name in @('before','awake','after')) {
+        if ($null -eq $Sample -or -not $Sample.PSObject.Properties[$name] -or $Sample.$name -isnot [decimal]) { throw 'Soak clock fields are unavailable' }
+    }
+    if ($null -eq $Sample -or $Sample.before -lt 0 -or $Sample.awake -lt 0 -or
+        $Sample.after -lt $Sample.before -or ($Sample.after-$Sample.before) -gt 500000) {
+        throw 'Soak clock sample unknown or wider than 50ms'
+    }
+    $low = $Sample.before-$Sample.awake
+    $high = $Sample.after-$Sample.awake
+    if ($Previous) {
+        if ($Sample.awake -lt $Previous.awake -or $Sample.before -lt $Previous.before -or
+            ($Sample.after-$Previous.before) -gt 1850000000) { throw 'Soak monotonic clock reversal or observation gap exceeded 185s' }
+        $low = [Math]::Max([decimal]$low,[decimal]$Previous.low)
+        $high = [Math]::Min([decimal]$high,[decimal]$Previous.high)
+        if ($low -gt $high) { throw 'Soak suspend bias changed or clock continuity is unknown' }
+    }
+    return [pscustomobject]@{ before=$Sample.before; awake=$Sample.awake; after=$Sample.after; low=$low; high=$high }
+}
+function Get-InstalledSoakInputs([string[]]$Paths) {
+    $result = @()
+    foreach ($path in $Paths) {
+        $item=Get-Item -LiteralPath $path -Force
+        if ($item.PSIsContainer -or ($item.Attributes -band [IO.FileAttributes]::ReparsePoint)) { throw 'Soak input is not a regular file' }
+        $result += [ordered]@{ path=$item.FullName; bytes=$item.Length; sha256=(Get-FileHash -LiteralPath $item.FullName -Algorithm SHA256).Hash.ToLowerInvariant() }
+    }
+    return ,$result
+}
+function Get-InstalledSoakProcesses([string]$Central,[string]$RuntimeHash,[string]$SupervisorHash,[string]$Sid) {
+    $held=@()
+    try {
+        $supervisor=Join-Path (Split-Path -Parent $Central) 'openabstractionsw.exe'
+        $processes=@(Get-RuntimeProcesses $Sid)
+        foreach ($role in @(@('runtime',$Central,$RuntimeHash,'serve runtime --supervised'),
+                            @('supervisor',$supervisor,$SupervisorHash,'serve supervisor(?: --service)?'))) {
+            $matches=@($processes | Where-Object { $_.ExecutablePath -ceq $role[1] -and
+                $_.CommandLine -cmatch ('^"?' + [regex]::Escape($role[1]) + '"?\s+' + $role[3] + '$') })
+            if ($matches.Count -ne 1) { throw "Exact installed soak $($role[0]) process missing or ambiguous" }
+            $row=$matches[0]
+            $handle=Get-Process -Id $row.ProcessId
+            try {
+                $null=$handle.Handle # retain the native process handle, including after exit/PID reuse
+                $entry=[pscustomobject]@{ role=$role[0]; pid=[int]$row.ProcessId; parent=[int]$row.ParentProcessId;
+                    birth=$row.CreationDate.ToUniversalTime().ToString('o'); handle_birth=$handle.StartTime.ToUniversalTime().ToString('o');
+                    session=[int]$row.SessionId; sid=$Sid; path=$role[1]; command=[string]$row.CommandLine; sha256=$role[2]; handle=$handle }
+            } catch { $handle.Dispose(); throw }
+            $held += $entry
+        }
+        if ($held[0].parent -ne $held[1].pid -or $held[0].session -ne $held[1].session -or
+            $held[1].handle.StartTime -gt $held[0].handle.StartTime) { throw 'Soak runtime is not the exact supervisor child; parent PID may be reused' }
+        Assert-InstalledSoakProcesses $held $Sid
+        return ,$held
+    } catch { foreach ($entry in $held) { $entry.handle.Dispose() }; throw }
+}
+function Assert-InstalledSoakProcesses($Held,[string]$Sid) {
+    $current=@(Get-RuntimeProcesses $Sid)
+    foreach ($entry in $Held) {
+        if ($entry.handle.HasExited -or $entry.handle.StartTime.ToUniversalTime().ToString('o') -cne $entry.handle_birth) { throw 'Soak retained process exited or birth changed' }
+        $rows=@($current | Where-Object { $_.ProcessId -eq $entry.pid })
+        if ($rows.Count -ne 1 -or $rows[0].CreationDate.ToUniversalTime().ToString('o') -cne $entry.birth -or
+            $rows[0].ExecutablePath -cne $entry.path -or $rows[0].CommandLine -cne $entry.command -or
+            [int]$rows[0].ParentProcessId -ne $entry.parent -or [int]$rows[0].SessionId -ne $entry.session) { throw 'Soak process identity changed' }
+        if ((Get-FileHash -LiteralPath $entry.path -Algorithm SHA256).Hash.ToLowerInvariant() -cne $entry.sha256) { throw 'Soak installed image bytes changed' }
+        if ($entry.handle.HasExited) { throw 'Soak process exited during observation' }
+    }
+}
+function Get-InstalledRuntimeIntervalRows($Held) {
+    return ,@(foreach ($entry in $Held) {
+        [ordered]@{ role=$entry.role;pid=$entry.pid;parent=$entry.parent;birth=$entry.birth;
+            handle_birth=$entry.handle_birth;session=$entry.session;sid=$entry.sid;path=$entry.path;
+            command=$entry.command;sha256=$entry.sha256 }
+    })
+}
+function Assert-InstalledJ1Runtime([string]$Central,[string]$Tools,[string]$PythonPath,
+    [string]$RequestPath,[string]$Evidence,[string]$Sid) {
+    $native=Get-Content -LiteralPath $RequestPath -Raw|ConvertFrom-Json
+    if (-not $native.core.adopter_journey -or $native.runtime_sha256 -cnotmatch '^[0-9a-f]{64}$' -or
+        $native.supervisor_sha256 -cnotmatch '^[0-9a-f]{64}$') { throw 'J1 runtime interval requires original selected runtime and supervisor pins' }
+    $journal=Get-Content -LiteralPath $Evidence -Raw|ConvertFrom-Json
+    if ($journal.runtime_interval -or $journal.state -cne 'installed' -or
+        $journal.source_sha -cne $native.source_sha -or $journal.tool_source -cne $native.tool_source -or $journal.runtime_sha256 -cne $native.runtime_sha256 -or
+        $journal.native_request.path -cne $RequestPath -or
+        $journal.native_request.bytes -ne (Get-Item -LiteralPath $RequestPath).Length -or
+        $journal.native_request.sha256 -cne (Get-FileHash -LiteralPath $RequestPath -Algorithm SHA256).Hash.ToLowerInvariant()) {
+        throw 'J1 runtime interval differs from the original installed lifecycle'
+    }
+    $report=[ordered]@{state='running';sid=$Sid;started_at=[DateTime]::UtcNow.ToString('o');ended_at=$null;
+        runtime_sha256=$native.runtime_sha256;supervisor_sha256=$native.supervisor_sha256;before=@();after=@();failure=$null}
+    $journal|Add-Member NoteProperty runtime_interval $report
+    $held=@();$failure=$null
+    try {
+        $held=Get-InstalledSoakProcesses $Central $native.runtime_sha256 $native.supervisor_sha256 $Sid
+        Assert-InstalledSoakProcesses $held $Sid
+        $report.before=Get-InstalledRuntimeIntervalRows $held
+        $journal|ConvertTo-Json -Depth 40|Set-Content -LiteralPath $Evidence -Encoding UTF8
+        Assert-NativeCore $Central $Tools $PythonPath $RequestPath
+        Assert-InstalledSoakProcesses $held $Sid
+        $report.after=Get-InstalledRuntimeIntervalRows $held
+        $report.state='stable'
+    } catch {
+        $failure=$_;$report.state='failed';$report.failure=[string]$_.Exception.Message
+    } finally {
+        $report.ended_at=[DateTime]::UtcNow.ToString('o')
+        try { $journal|ConvertTo-Json -Depth 40|Set-Content -LiteralPath $Evidence -Encoding UTF8 }
+        finally { foreach ($entry in $held) { $entry.handle.Dispose() } }
+    }
+    if ($failure) { throw $failure }
+}
+function Assert-InstalledRuntimeSoak([string]$Central,[string]$RuntimeHash,[string]$SupervisorHash,
+    [string]$Sid,[int]$Seconds,[string]$Evidence,[string[]]$InputPaths) {
+    if ($Seconds -eq 0) { return }
+    if ($Seconds -ne 3600 -or $RuntimeHash -cnotmatch '^[0-9a-f]{64}$' -or $SupervisorHash -cnotmatch '^[0-9a-f]{64}$' -or -not $InputPaths.Count) { throw 'Soak needs exactly 3600s and exact payload/input pins' }
+    if (Test-Path -LiteralPath $Evidence) { throw 'Soak attempt already exists; partial evidence cannot resume' }
+    if (Test-Path -LiteralPath ($Evidence+'.health-0.json')) { throw 'Soak partial health evidence already exists; cannot resume' }
+    $report=[ordered]@{ result='fail'; required_seconds=3600; cadence_seconds=60; cycle_budget_seconds=125;
+        max_gap_seconds=185; samples=@(); processes=@(); inputs=$null; observed_awake_seconds=0 }
+    $held=@(); $failure=$null
+    try {
+        # One status plus <=5 Describe processes. Each existing process bound is
+        # 10s plus two 5s output-drain bounds: <=120s, with 5s observation allowance.
+        # Aim for one cycle per60s; a slow cycle gets no additional pause.
+        # Retained handles witness lifetime during the bounded wait between cycles.
+        $inputs=Get-InstalledSoakInputs $InputPaths
+        $report.inputs=$inputs
+        $held=Get-InstalledSoakProcesses $Central $RuntimeHash $SupervisorHash $Sid
+        $report.processes=@($held | Select-Object role,pid,parent,birth,handle_birth,session,sid,path,command,sha256)
+        $previous=Assert-InstalledSoakClock (Get-InstalledSoakClock) $null
+        $report.start_clock=$previous
+        $start=$previous.awake
+        for ($sample=0; $sample -lt 64; $sample++) {
+            $before=Assert-InstalledSoakClock (Get-InstalledSoakClock) $previous
+            Assert-InstalledSoakProcesses $held $Sid
+            Assert-RuntimeReady $Central ($Evidence + '.health-' + $sample)
+            Assert-InstalledSoakProcesses $held $Sid
+            if ((ConvertTo-Json -InputObject (Get-InstalledSoakInputs $InputPaths) -Depth 5 -Compress) -cne
+                (ConvertTo-Json -InputObject $inputs -Depth 5 -Compress)) { throw 'Soak candidate or declared input bytes changed' }
+            $after=Assert-InstalledSoakClock (Get-InstalledSoakClock) $before
+            Assert-InstalledSoakProcesses $held $Sid
+            if (($after.after-$before.before) -gt 1250000000) { throw 'Soak readiness cycle exceeded 125s' }
+            $report.samples += [ordered]@{ index=$sample; begin=$before; end=$after; health=($Evidence+'.health-'+$sample+'.json') }
+            $report.observed_awake_seconds=($after.awake-$start)/10000000
+            if ($report.observed_awake_seconds -ge 3600) { $report.result='pass'; break }
+            $previous=$after
+            $pause=[Math]::Max([decimal]0,[decimal]60000-($after.awake-$before.awake)/10000)
+            if ($pause -gt 0) { Start-Sleep -Milliseconds ([int][Math]::Ceiling($pause)) }
+        }
+        if ($report.result -cne 'pass') { throw 'Soak sample bound exhausted without a full observed hour' }
+    } catch { $failure=$_; $report.failure=$_.Exception.Message } finally {
+        foreach ($entry in $held) { $entry.handle.Dispose() }
+        [IO.File]::WriteAllText($Evidence,($report | ConvertTo-Json -Depth 10),[Text.UTF8Encoding]::new($false))
+    }
+    if ($failure) { throw $failure }
 }
 function Save-ActivationFailure([string]$Tools) {
     $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
@@ -386,9 +585,9 @@ function Get-PackageProperty([string]$Path, [ValidateSet('ProductVersion','Produ
 function Assert-InstalledVersion([string]$Version, [string]$ProductCode) {
     # MSIINSTALLCONTEXT_USERUNMANAGED for the invoking fresh user only.
     $observed = @(Get-InstalledProducts)
-    $products = @($observed | Where-Object { $_.ProductName -eq 'Abstraction' -or $_.ProductCode -eq $ProductCode })
+    $products = @($observed | Where-Object { $_.ProductName -in @('OpenAbstractions', 'Abstraction') -or $_.ProductCode -eq $ProductCode })
     if ($products.Count -ne 1 -or $products[0].VersionString -ne $Version -or $products[0].ProductCode -ne $ProductCode -or
-        $products[0].ProductName -ne 'Abstraction' -or $products[0].State -ne '5' -or $products[0].Context -ne 2 -or
+        $products[0].ProductName -notin @('OpenAbstractions', 'Abstraction') -or $products[0].State -ne '5' -or $products[0].Context -ne 2 -or
         $products[0].UserSid -ne [Security.Principal.WindowsIdentity]::GetCurrent().User.Value) {
         throw "Expected installed per-user product $ProductCode version $Version; observed: $($observed | ConvertTo-Json -Depth 3 -Compress)"
     }
@@ -397,7 +596,7 @@ function Assert-RetainedSentinel([string]$Path, [string]$Value) {
     if (-not (Test-Path -LiteralPath $Path -PathType Leaf) -or [IO.File]::ReadAllText($Path) -ne $Value) { throw 'User-data sentinel changed or disappeared' }
 }
 function Assert-RemovedRegistration {
-    $products = @(Get-InstalledProducts | Where-Object { $_.ProductName -eq 'Abstraction' })
+    $products = @(Get-InstalledProducts | Where-Object { $_.ProductName -in @('OpenAbstractions', 'Abstraction') })
     if ($products.Count) {
         throw "Per-user product registration survived removal: $($products | ConvertTo-Json -Depth 3 -Compress)"
     }
@@ -727,7 +926,7 @@ function Assert-SingleUserScope([string]$MachineFolder = (Join-Path $env:Program
     if (Test-Path -LiteralPath $MachineKey) { throw 'an unscoped install also wrote the machine registry key' }
     if (@(Get-Service | Where-Object { $_.Name -like 'OpenAbstractionsSupervisor*' }).Count) { throw 'an unscoped install also registered the machine supervisor service' }
     $sid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
-    $products = @(Get-InstalledProducts | Where-Object { $_.ProductName -eq 'Abstraction' })
+    $products = @(Get-InstalledProducts | Where-Object { $_.ProductName -in @('OpenAbstractions', 'Abstraction') })
     if ($products.Count -ne 1 -or $products[0].Context -ne 2 -or $products[0].UserSid -ne $sid -or $products[0].State -ne '5') {
         throw "an unscoped install did not register exactly one per-user product for this account; observed: $($products | ConvertTo-Json -Depth 3 -Compress)"
     }
@@ -764,7 +963,7 @@ foreach ($t in 'jobd','jobd-logon') {
     throw "a scheduled task named $t exists. This package registered one until it was replaced by the service and the Startup shortcut; a task coming back is that mechanism returning unannounced."
   }
 }
-'ok    programs, a user PATH entry, a Startup shortcut — and no service, no machine key, no task'
+'ok    programs, a user PATH entry, a Startup shortcut â€” and no service, no machine key, no task'
 }
 function Assert-InstalledPanelWebView2([string]$Tools, [string]$EvidencePath = 'webview2-availability.txt') {
     $panel = Join-Path $Tools 'Abstraction Panel.exe'
@@ -784,6 +983,49 @@ function Assert-InstalledPanelWebView2([string]$Tools, [string]$EvidencePath = '
     }
     throw "Installed Panel WebView2 diagnostic returned exit $($result.ExitCode): $(Protect-DiagnosticText ($result.Output + $result.Diagnostics))"
 }
+function Assert-InstalledPanelShortcuts([string]$Tools, [string]$Package) {
+    $target = [IO.Path]::GetFullPath((Join-Path $Tools 'Abstraction Panel.exe'))
+    $shell = New-Object -ComObject WScript.Shell
+    # The exact candidate package declares entry names and routes. Keep the
+    # legacy --page setup route testable while product naming evolves.
+    $installer = New-Object -ComObject WindowsInstaller.Installer
+    $database = $installer.OpenDatabase($Package, 0)
+    $directoryView = $database.OpenView('SELECT `DefaultDir` FROM `Directory` WHERE `Directory`=''AbstractionMenuFolder''')
+    $directoryView.Execute()
+    $directoryRow = $directoryView.Fetch()
+    if (-not $directoryRow) { throw 'Package Panel menu directory is absent' }
+    $directoryName = $directoryRow.StringData(1).Split('|')[-1]
+    [void]$directoryView.Close()
+    if ($directoryName -notin @('OpenAbstractions', 'Abstraction')) { throw 'Unknown package Panel menu directory' }
+    $menu = Join-Path (Get-ProfileFolder Programs) $directoryName
+    $view = $database.OpenView('SELECT `Name`, `Arguments` FROM `Shortcut` WHERE `Target`=''[#panel.exe]'' AND `Directory`=''AbstractionMenuFolder''')
+    $view.Execute()
+    $cases = @()
+    while ($row = $view.Fetch()) {
+        $name = $row.StringData(1).Split('|')[-1]
+        $arguments = $row.StringData(2)
+        $page = if ($arguments -ceq '') { 'apps' } elseif ($arguments -ceq '--page setup') { 'setup' } else { throw 'Unknown package-declared Panel entry route' }
+        $cases += @{name=$name; args=$arguments; page=$page}
+    }
+    $view.Close()
+    if (-not @($cases | Where-Object { $_.page -eq 'apps' }).Count) { throw 'Package lacks ordinary Panel entry' }
+    $proofs = @()
+    foreach ($case in $cases) {
+        $path = Join-Path $menu ($case.name + '.lnk')
+        if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { throw 'Installed Panel/Setup Start-menu shortcut missing' }
+        $shortcut = $shell.CreateShortcut($path)
+        if ([IO.Path]::GetFullPath($shortcut.TargetPath) -ne $target -or
+            $shortcut.Arguments -cne $case.args -or
+            [IO.Path]::GetFullPath($shortcut.WorkingDirectory).TrimEnd([char[]]'\/') -ne [IO.Path]::GetFullPath($Tools).TrimEnd([char[]]'\/')) {
+            throw 'Installed Panel/Setup shortcut target, arguments or working directory differ'
+        }
+        # Use actual installed shortcut values. The native launch owner invalidates
+        # standard handles regardless of the fixture's own console/capture mode.
+        $proofs += Invoke-InstalledPanelShortcutSmoke $shortcut.TargetPath $shortcut.Arguments $shortcut.WorkingDirectory $case.page
+    }
+    $proofs | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath 'installed-panel-shortcuts.json' -Encoding UTF8
+}
+
 # A download through the installed runtime, with no store named anywhere: the
 # runtime fetches and verifies, the command copies the result out, jobs show and
 # jobs list observe the operation this program submitted, an equal submission
@@ -861,6 +1103,557 @@ function Assert-InstalledNativePresenter([string]$Panel, [int]$Seconds = 10) {
     } while ([DateTime]::UtcNow -lt $deadline)
     throw 'Installed background native presenter missing or exited before the action window; preserve installation evidence'
 }
+function Assert-SelectedAppFile($Binding, [switch]$AllowEmpty) {
+    $path = if ($Binding.file) { $Binding.file } else { $Binding.path }
+    if (-not [IO.Path]::IsPathRooted($path) -or $Binding.sha256 -cnotmatch '^[0-9a-f]{64}$' -or
+        ($Binding.bytes -isnot [int] -and $Binding.bytes -isnot [long]) -or $Binding.bytes -lt 0 -or
+        ($Binding.bytes -eq 0 -and -not $AllowEmpty)) {
+        throw 'Selected application file needs an absolute path and exact bytes'
+    }
+    $item = Get-Item -LiteralPath $path -ErrorAction Stop
+    if ($item.PSIsContainer -or ($item.Attributes -band [IO.FileAttributes]::ReparsePoint)) { throw 'Selected application file is not plain' }
+    $parent = $item.Directory
+    while ($parent) {
+        if ($parent.Attributes -band [IO.FileAttributes]::ReparsePoint) { throw 'Selected application ancestor is redirected' }
+        $parent = $parent.Parent
+    }
+    if ($item.Length -ne $Binding.bytes -or (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash.ToLowerInvariant() -cne $Binding.sha256) {
+        throw 'Selected application bytes changed'
+    }
+    return $item.FullName
+}
+function Get-SelectedAppPlan($Native) {
+    if (-not $Native.core.adopter_journey) { return @() }
+    $script:SelectedFileIdentityProbe=Get-SelectedIdentityProbe $Native
+    $chain = $Native.selected_app_chain
+    $readback = $Native.selected_app_readback
+    if (-not $chain -or $chain.version -cne $Native.version -or -not $readback) {
+        throw 'Automated adopter execution needs the authenticated selected application chain and compiled readback'
+    }
+    $required = @($Native.core.adopter_journey.scope.adopters | Where-Object { 'windows-x64' -in $_.targets } | ForEach-Object { $_.id } | Sort-Object)
+    if ($Native.adopter_case -ceq 'opencode') { $required = @($required | Where-Object { $_ -ceq 'opencode' }) }
+    $ids = @($chain.apps | ForEach-Object { $_.id } | Sort-Object)
+    if (-not $required.Count -or ($required -join ',') -cne ($ids -join ',') -or @($ids | Select-Object -Unique).Count -ne $ids.Count -or
+        (@($readback.PSObject.Properties.Name | Sort-Object) -join ',') -cne ($ids -join ',')) { throw 'Selected application chain differs from accepted adopter membership' }
+    $plans = @()
+    foreach ($app in $chain.apps) {
+        $package = Assert-SelectedAppFile $app
+        if ([IO.Path]::GetExtension($package) -ine '.msi') { throw 'Selected application integration is not an MSI' }
+        $compiled = $readback.PSObject.Properties[$app.id].Value
+        if ($compiled.scope -cne 'perUser' -or $compiled.expected_payload.schema -ne 1 -or
+            $compiled.expected_payload.msi.sha256 -cne $app.sha256 -or $compiled.expected_payload.msi.bytes -ne $app.bytes -or
+            -not @($compiled.expected_payload.files).Count) { throw 'Selected application compiled identity/payload missing' }
+        $productCode=Get-PackageProperty $package ProductCode
+        $upgradeCode=Get-PackageProperty $package UpgradeCode
+        if ($productCode -cnotmatch '^\{[0-9A-Fa-f-]{36}\}$' -or
+            ($compiled.product_code -and $compiled.product_code -cne $productCode) -or
+            ($compiled.upgrade_code -and $compiled.upgrade_code -cne $upgradeCode)) { throw 'Selected MSI compiled product identity changed' }
+        $compiled|Add-Member -NotePropertyName product_code -NotePropertyValue $productCode -Force
+        $compiled|Add-Member -NotePropertyName upgrade_code -NotePropertyValue $upgradeCode -Force
+        $files = @(Get-SelectedAppComponents $package $compiled.expected_payload)
+        if ($app.host) {
+            foreach ($binding in @($app.host,$app.host.preflight,$app.host.preparation) | Where-Object { $_ }) { $null = Assert-SelectedAppFile $binding }
+            if (-not $compiled.host) { throw 'Selected official host lifecycle readback missing' }
+            if($app.id -ceq 'opencode' -and -not $app.host.preflight){throw 'OpenCode needs its selected canonical-destination preflight before the official host'}
+            $hostReadback=$compiled.host
+            if (($hostReadback.executable.basename -and ($hostReadback.executable.basename -match '[/\\:]' -or [IO.Path]::GetExtension($hostReadback.executable.basename) -ine '.exe')) -or
+                $hostReadback.executable.sha256 -cnotmatch '^[0-9a-f]{64}$') { throw 'Selected official host source executable identity missing' }
+            $null=Get-SelectedHostRemoval @{app=$app;compiled=$compiled}
+        }
+        $related=@($upgradeCode)
+        $installer=New-Object -ComObject WindowsInstaller.Installer
+        $database=$installer.OpenDatabase($package,0)
+        $view=$database.OpenView('SELECT `Name` FROM `_Tables` WHERE `Name`=''Upgrade''');$view.Execute()
+        $hasUpgrade=$null -ne $view.Fetch();$view.Close()
+        if($hasUpgrade){
+            $view=$database.OpenView('SELECT `UpgradeCode` FROM `Upgrade`');$view.Execute()
+            while($row=$view.Fetch()){$related+= $row.StringData(1)};$view.Close()
+        }
+        $related=@($related|Where-Object{$_}|Sort-Object -Unique)
+        if(@($related|Where-Object{$_ -cnotmatch '^\{[0-9A-Fa-f-]{36}\}$'}).Count){throw 'Selected MSI related-product identity malformed'}
+        $plans += @{app=$app;compiled=$compiled;package=$package;files=$files;related_upgrade_codes=$related}
+    }
+    Assert-SelectedAppProductsAbsent $plans
+    return $plans
+}
+function Assert-SelectedAppProductsAbsent($Plans) {
+    $installer=New-Object -ComObject WindowsInstaller.Installer
+    foreach($plan in $Plans){
+        if(@($installer.ProductsEx($plan.compiled.product_code,'',7)).Count){throw 'Preexisting application integration is protected'}
+        foreach($code in @($plan.related_upgrade_codes)){
+            # RelatedProducts includes installed/advertised current-user and
+            # machine products, the contexts this ordinary per-user MSI can affect.
+            if(@($installer.RelatedProducts($code)).Count){throw 'Preexisting related application integration is protected'}
+        }
+    }
+}
+function Get-SelectedAppComponents([string]$Package, $Expected) {
+    # Measure File/Component from the same authenticated MSI. Dynamic HostFolder
+    # destinations are resolved by Windows Installer after installation.
+    $installer = New-Object -ComObject WindowsInstaller.Installer
+    $database = $installer.OpenDatabase($Package,0)
+    $components = @{}
+    $view = $database.OpenView('SELECT `Component`, `ComponentId`, `KeyPath`, `Attributes` FROM `Component`');$view.Execute()
+    while ($row = $view.Fetch()) {
+        $components[$row.StringData(1)] = @{guid=$row.StringData(2);key=$row.StringData(3);attributes=[int]$row.StringData(4)}
+    }
+    $view.Close()
+    $found = @{}
+    $view = $database.OpenView('SELECT `File`, `Component_`, `FileName` FROM `File`');$view.Execute()
+    while ($row = $view.Fetch()) {
+        $id=$row.StringData(1);$name=($row.StringData(3) -split '\|')[-1]
+        if ($found.ContainsKey($id) -or $name -match '[/\\:]' -or $name -in @('','..','.')) { throw 'Ambiguous selected MSI File identity' }
+        $found[$id]=@{id=$id;component=$row.StringData(2);name=$name}
+    }
+    $view.Close()
+    if ((@($found.Keys|Sort-Object)-join ',') -cne (@($Expected.files|ForEach-Object{$_.id}|Sort-Object)-join ',')) { throw 'Selected MSI File table differs from original compiled readback' }
+    foreach ($file in $Expected.files) {
+        $measured=$found[$file.id];$component=$components[$measured.component]
+        if (-not $component -or $component.guid -notmatch '^\{[0-9A-Fa-f-]{36}\}$' -or ($component.attributes -band 4) -or
+            -not $found.ContainsKey($component.key) -or $found[$component.key].component -cne $measured.component) {
+            throw 'Selected MSI component has no unambiguous file key path'
+        }
+        @{id=$file.id;component=$component.guid;key_name=$found[$component.key].name;name=$measured.name;sha256=$file.sha256;bytes=$file.bytes;declared_path=$file.path}
+    }
+}
+function Get-SelectedAppInstalledFiles($Plan) {
+    $installer = New-Object -ComObject WindowsInstaller.Installer
+    $actual = @()
+    foreach ($file in $Plan.files) {
+        $key = $installer.ComponentPath($Plan.compiled.product_code,$file.component)
+        if (-not [IO.Path]::IsPathRooted($key) -or [IO.Path]::GetFileName($key) -cne $file.key_name) { throw 'Installed MSI component path differs from its measured File key' }
+        $binding=@{path=(Join-Path ([IO.Path]::GetDirectoryName($key)) $file.name);sha256=$file.sha256;bytes=$file.bytes}
+        $null=Assert-SelectedAppFile $binding -AllowEmpty
+        $actual += @{id=$file.id;component=$file.component;component_path=$key;path=$binding.path;sha256=$binding.sha256;bytes=$binding.bytes;identity=(Get-SelectedFileIdentity $binding.path)}
+    }
+    if (@($actual.path|Select-Object -Unique).Count -ne $actual.Count) { throw 'Installed selected MSI files overlap' }
+    return $actual
+}
+function Get-SelectedHostRegistry($Plan) {
+    $rows=@()
+    foreach ($hive in @([Microsoft.Win32.RegistryHive]::CurrentUser,[Microsoft.Win32.RegistryHive]::LocalMachine)) {
+        foreach ($view in @([Microsoft.Win32.RegistryView]::Registry32,[Microsoft.Win32.RegistryView]::Registry64)) {
+            $base=[Microsoft.Win32.RegistryKey]::OpenBaseKey($hive,$view)
+            try {
+                $key=$base.OpenSubKey('Software\Microsoft\Windows\CurrentVersion\Uninstall\'+$Plan.app.host.arp_id)
+                if ($key) {
+                    try { $rows+=@{hive=$hive.ToString();view=$view.ToString();version=$key.GetValue('DisplayVersion');icon=$key.GetValue('DisplayIcon')} }
+                    finally { $key.Dispose() }
+                }
+            } finally { $base.Dispose() }
+        }
+    }
+    return $rows
+}
+function Get-SelectedAppRegistryBaseline {
+    $rows=@()
+    foreach($hive in @([Microsoft.Win32.RegistryHive]::CurrentUser,[Microsoft.Win32.RegistryHive]::LocalMachine)) {
+        foreach($view in @([Microsoft.Win32.RegistryView]::Registry32,[Microsoft.Win32.RegistryView]::Registry64)) {
+            $base=[Microsoft.Win32.RegistryKey]::OpenBaseKey($hive,$view)
+            try {
+                $root=$base.OpenSubKey('Software\Microsoft\Windows\CurrentVersion\Uninstall')
+                if($root) {
+                    try {
+                        $names=@($root.GetSubKeyNames()|Sort-Object)
+                        if($names.Count -gt 4096){throw 'Installed product baseline exceeds fixture bound'}
+                        foreach($name in $names) {
+                            $key=$root.OpenSubKey($name)
+                            if(-not $key){throw 'Installed product baseline changed during read'}
+                            try {
+                                $row=[ordered]@{hive=$hive.ToString();view=$view.ToString();key=$name}
+                                foreach($field in @('DisplayName','DisplayVersion','Publisher','InstallLocation','DisplayIcon','UninstallString','QuietUninstallString')){$row[$field]=$key.GetValue($field)}
+                                $rows+=$row
+                            } finally {$key.Dispose()}
+                        }
+                    } finally {$root.Dispose()}
+                }
+            } finally {$base.Dispose()}
+        }
+    }
+    return ,$rows
+}
+function Assert-SelectedHost($Plan) {
+    $expected=$Plan.host_observed
+    if(-not $expected){$expected=$Plan.compiled.host.prior}
+    if(-not $expected){throw 'Preexisting official host needs independently authenticated prior installed readback'}
+    $rows=@(Get-SelectedHostRegistry $Plan)
+    $view=if($Plan.app.host.arp_win64){'Registry64'}else{'Registry32'}
+    if (-not @($rows|Where-Object{$_.view -ceq $view}).Count -or
+        @($rows|Where-Object{$_.hive -cne 'CurrentUser' -or $_.version -cne $Plan.app.host.arp_version -or $_.icon -cne $expected.display_icon}).Count) { throw 'Official host registration differs or is ambiguous' }
+    if (-not [IO.Path]::IsPathRooted($expected.root) -or -not @($expected.files).Count) { throw 'Official host installed closure missing' }
+    $root=[IO.Path]::GetFullPath($expected.root).TrimEnd('\')
+    foreach($file in $expected.files) {
+        $path=Assert-SelectedAppFile $file
+        if(-not $path.StartsWith($root+'\',[StringComparison]::OrdinalIgnoreCase)){throw 'Official host file escaped its selected root'}
+    }
+    $inventory=@(Get-SelectedHostInventory $root)
+    if((@($inventory.path|Sort-Object)-join '|') -cne (@($expected.files.path|Sort-Object)-join '|')){throw 'Official host has unexplained added or missing content'}
+    foreach($file in $expected.files) {
+        $actual=@($inventory|Where-Object{$_.path -ieq $file.path})
+        if($actual.Count -ne 1 -or ($file.identity -and $actual[0].identity -cne $file.identity)){throw 'Official host file identity changed'}
+    }
+    $program=Assert-SelectedAppFile $expected.executable
+    if([IO.Path]::GetDirectoryName($program) -ine $root){throw 'Official host executable outside selected root'}
+    $signature=Get-AuthenticodeSignature -LiteralPath $program
+    if($signature.Status -ne 'Valid' -or $signature.SignerCertificate.Thumbprint -cne $expected.signer_thumbprint){throw 'Official host publisher differs'}
+    return @{root=$root;registry=$rows;executable=$expected.executable;files=$expected.files}
+}
+function Get-SelectedHostInventory([string]$Root) {
+    $files=@();$pending=New-Object 'Collections.Generic.Queue[string]';$pending.Enqueue($Root);$count=0
+    while($pending.Count) {
+        foreach($item in @(Get-ChildItem -LiteralPath $pending.Dequeue() -Force)) {
+            if(++$count -gt 20000 -or ($item.Attributes -band [IO.FileAttributes]::ReparsePoint)){throw 'Official host installed tree exceeds bound or contains redirection'}
+            if($item.PSIsContainer){$pending.Enqueue($item.FullName)}else{
+                $files+=@{path=$item.FullName;sha256=(Get-FileHash -LiteralPath $item.FullName -Algorithm SHA256).Hash.ToLowerInvariant();bytes=$item.Length;identity=(Get-SelectedFileIdentity $item.FullName)}
+            }
+        }
+    }
+    return $files
+}
+function Assert-SelectedHostStopped([string]$Root) {
+    $prefix=[IO.Path]::GetFullPath($Root).TrimEnd('\')+'\'
+    foreach($process in @(Get-CimInstance Win32_Process)) {
+        if($process.ExecutablePath -and $process.ExecutablePath.StartsWith($prefix,[StringComparison]::OrdinalIgnoreCase)) {
+            throw 'Selected official host still has a process; retain it without termination'
+        }
+    }
+}
+function Get-SelectedHostRemoval($Plan) {
+    $policy=$Plan.compiled.host.fixture_removal
+    $names=@{opencode='Uninstall OpenCode.exe';comfyui='Uninstall Comfy Desktop.exe'}
+    if(-not $policy -or (@($policy.PSObject.Properties.Name|Sort-Object)-join ',') -cne 'basename,profile' -or
+        $policy.profile -cne 'nsis-current-user' -or -not $names.ContainsKey($Plan.app.id) -or $policy.basename -cne $names[$Plan.app.id]) {
+        throw 'Unknown source-owned official host fixture removal policy'
+    }
+    # The arguments are source-owned. Registry command text is never evaluated.
+    $root=if($Plan.host_observed){$Plan.host_observed.root}elseif($Plan.compiled.host.prior){$Plan.compiled.host.prior.root}else{$null}
+    return @{path=$(if($root){Join-Path $root $policy.basename}else{$null});basename=$policy.basename;arguments=@('/currentuser','/S')}
+}
+function Get-NewSelectedHost($Plan,$BeforeRoots,[DateTime]$Started,[string]$SupplierThumbprint) {
+    $rows=@(Get-SelectedHostRegistry $Plan)
+    $view=if($Plan.app.host.arp_win64){'Registry64'}else{'Registry32'}
+    if(-not $rows.Count -or @($rows|Where-Object{$_.hive -cne 'CurrentUser' -or $_.version -cne $Plan.app.host.arp_version}).Count -or
+        -not @($rows|Where-Object{$_.view -ceq $view}).Count -or @($rows.icon|Select-Object -Unique).Count -ne 1){throw 'New official host registration is absent or conflicting'}
+    $icon=[string]$rows[0].icon
+    if($icon.EndsWith(',0')){$icon=$icon.Substring(0,$icon.Length-2)}
+    $icon=$icon.Trim('"')
+    if(-not[IO.Path]::IsPathRooted($icon) -or [IO.Path]::GetExtension($icon) -ine '.exe' -or
+        ($Plan.compiled.host.executable.basename -and [IO.Path]::GetFileName($icon) -cne $Plan.compiled.host.executable.basename)){throw 'Official host DisplayIcon differs from source executable'}
+    $root=[IO.Path]::GetDirectoryName([IO.Path]::GetFullPath($icon))
+    if($Plan.requested_host_root) {
+        if($root -ine $Plan.requested_host_root){throw 'Official host ignored or truncated the controlled fixture destination'}
+    } else {
+        $parent=Join-Path (Get-ProfileFolder LocalApplicationData) 'Programs'
+        if([IO.Path]::GetDirectoryName($root) -ine [IO.Path]::GetFullPath($parent) -or $root -iin $BeforeRoots){throw 'Official host root was not absent in the native Programs baseline'}
+    }
+    $directory=Get-Item -LiteralPath $root
+    if($directory.CreationTimeUtc -lt $Started.ToUniversalTime() -or ($directory.Attributes -band [IO.FileAttributes]::ReparsePoint)){throw 'Official host root predates install or is redirected'}
+    $files=@(Get-SelectedHostInventory $root)
+    $program=@($files|Where-Object{$_.path -ieq $icon})
+    $removal=Get-SelectedHostRemoval $Plan
+    $remover=@($files|Where-Object{$_.path -ieq (Join-Path $root $removal.basename)})
+    if($program.Count -ne 1 -or $remover.Count -ne 1){throw 'New official host executable/remover missing'}
+    $signatures=@()
+    foreach($binding in @($program[0],$remover[0])) {
+        $signature=Get-AuthenticodeSignature -LiteralPath $binding.path
+        if($signature.Status -ne 'Valid' -or $signature.SignerCertificate.Thumbprint -cne $SupplierThumbprint){throw 'Installed host/remover publisher differs from selected supplier installer'}
+        $signatures+=@{path=$binding.path;status=[string]$signature.Status;thumbprint=$signature.SignerCertificate.Thumbprint;subject=$signature.SignerCertificate.Subject;observed_at=[DateTime]::UtcNow.ToString('o')}
+    }
+    $pin=$Plan.compiled.host.executable
+    if(($pin.sha256 -and $pin.sha256 -cne $program[0].sha256) -or ($pin.bytes -and $pin.bytes -ne $program[0].bytes)){throw 'Installed host differs from declared source executable pin'}
+    return @{root=$root;display_icon=$rows[0].icon;files=$files;executable=$program[0];remover=$remover[0];signer_thumbprint=$SupplierThumbprint;signatures=$signatures;registry=$rows;root_identity=(Get-SelectedFileIdentity $root);observed_at=[DateTime]::UtcNow.ToString('o')}
+}
+function Get-SelectedIdentityProbe($Native) {
+    $sdk=$Native.sdk_smokes
+    if(-not $sdk -or -not [IO.Path]::IsPathRooted($sdk.directory) -or -not $sdk.manifest -or -not $sdk.sources){throw 'Authenticated current SDK manifest and selected source graph required before mutation'}
+    $manifestPath=Assert-SelectedAppFile $sdk.manifest
+    if($manifestPath -ine (Join-Path ([IO.Path]::GetFullPath($sdk.directory)) 'manifest.json')){throw 'SDK manifest differs from the selected preparation root'}
+    $manifest=Get-Content -LiteralPath $manifestPath -Raw|ConvertFrom-Json
+    if($manifest.schema -ne 1 -or -not $manifest.files -or -not $manifest.sources -or
+        (@($manifest.sources.PSObject.Properties.Name|Sort-Object)-join ',') -cne (@($sdk.sources.PSObject.Properties.Name|Sort-Object)-join ',') -or
+        -not $sdk.sources.PSObject.Properties['abstraction-identity']){throw 'SDK selected identity graph missing or changed'}
+    foreach($name in $sdk.sources.PSObject.Properties.Name){
+        $actual=$manifest.sources.PSObject.Properties[$name].Value;$expected=$sdk.sources.PSObject.Properties[$name].Value
+        if((@($actual.PSObject.Properties.Name|Sort-Object)-join ',') -cne 'commit,module,version' -or
+            $actual.module -cne $expected.module -or $actual.version -cne $expected.version -or $actual.commit -cne $expected.commit -or
+            $expected.commit -cnotmatch '^[0-9a-f]{40}$'){throw 'SDK manifest differs from independently selected source graph'}
+    }
+    $pin=$manifest.files.PSObject.Properties['go_probe.exe']
+    if(-not $pin -or $pin.Value -cnotmatch '^[0-9a-f]{64}$'){throw 'Selected SDK has no canonical identity probe pin'}
+    $path=Join-Path ([IO.Path]::GetFullPath($sdk.directory)) 'go_probe.exe'
+    $helper=@{path=$path;sha256=$pin.Value;bytes=(Get-Item -LiteralPath $path -ErrorAction Stop).Length}
+    $null=Assert-SelectedAppFile $helper
+    return @{helper=$helper;manifest=$sdk.manifest;sources=$sdk.sources}
+}
+function Assert-J1SelectionInputs($Native) {
+    if(-not $Native.core.adopter_journey){return}
+    $spec=$Native.j1_selection
+    if(-not $spec -or $spec.schema -ne 1 -or $spec.source_sha -cne $Native.core.source_sha -or
+        (@($spec.PSObject.Properties.Name|Sort-Object)-join ',') -cne 'node,schema,sdk,source_sha') {throw 'J1 explicit current SDK and pinned Node test tool required before installation'}
+    $null=Assert-SelectedAppFile $spec.node
+    $sdk=$spec.sdk
+    $null=Get-SelectedIdentityProbe ([pscustomobject]@{sdk_smokes=$sdk})
+    $manifest=Get-Content -LiteralPath $sdk.manifest.path -Raw|ConvertFrom-Json
+    $root=[IO.Path]::GetFullPath($sdk.directory).TrimEnd('\')
+    $pending=[Collections.Generic.Stack[string]]::new();$pending.Push($root)
+    $seen=@{};$total=0L
+    while($pending.Count){
+        foreach($item in @(Get-ChildItem -LiteralPath $pending.Pop() -Force)){
+            if($item.Attributes -band [IO.FileAttributes]::ReparsePoint){throw 'J1 SDK redirected member'}
+            if($item.PSIsContainer){$pending.Push($item.FullName);continue}
+            if($item.FullName -ieq $sdk.manifest.path){continue}
+            $name=$item.FullName.Substring($root.Length+1).Replace('\','/')
+            $total+=$item.Length
+            $pin=$manifest.files.PSObject.Properties[$name]
+            if($total -gt 536870912 -or $seen.Count -ge 40000 -or -not $pin -or $pin.Value -cnotmatch '^[0-9a-f]{64}$'){throw 'J1 SDK closure missing or exceeds bound'}
+            $null=Assert-SelectedAppFile @{path=$item.FullName;sha256=$pin.Value;bytes=$item.Length} -AllowEmpty
+            $seen[$name]=$true
+        }
+    }
+    if($seen.Count -ne @($manifest.files.PSObject.Properties).Count -or -not $seen.ContainsKey('j1_selection_probe.mjs')){throw 'J1 SDK closure differs'}
+    return $spec
+}
+function Invoke-J1SelectionCollection($Native,$Program,$Runtime,[string]$Account,[string]$Directory) {
+    $spec=Assert-J1SelectionInputs $Native
+    $request=Join-Path $Directory 'j1-selection-request.json';$result=Join-Path $Directory 'j1-selection-result.json';$process=Join-Path $Directory 'j1-selection-process.json'
+    foreach($path in @($request,$result,$process)){if(Test-Path -LiteralPath $path){throw 'J1 selection observation already exists'}}
+    [IO.File]::WriteAllText($request,(@{schema=1;account=$Account;program=$Program;runtime=$Runtime}|ConvertTo-Json -Depth 8),[Text.UTF8Encoding]::new($false))
+    $probe=Join-Path $spec.sdk.directory 'j1_selection_probe.mjs'
+    $info=[Diagnostics.ProcessStartInfo]::new();$info.FileName=$spec.node.path
+    $info.Arguments='"'+$probe+'" "'+$request+'" "'+$result+'"';$info.WorkingDirectory=$Directory
+    # Explicit test-tool environment, with no endpoint/addon override or Node preload.
+    $keep=@{};foreach($key in @('SystemRoot','WINDIR','COMSPEC','PATHEXT','PROCESSOR_ARCHITECTURE','TEMP','TMP','USERPROFILE','LOCALAPPDATA','APPDATA')){if($info.EnvironmentVariables[$key]){$keep[$key]=$info.EnvironmentVariables[$key]}}
+    $info.EnvironmentVariables.Clear();foreach($key in $keep.Keys){$info.EnvironmentVariables[$key]=$keep[$key]}
+    $held=Invoke-FixtureProcess $info 45 -ObservationPath $process
+    if($held.ExitCode -ne 0){throw 'J1 current SDK selection collector failed; inspect retained process observation'}
+    $null=Assert-J1SelectionInputs $Native
+    return @{request=@{path=$request;sha256=(Get-FileHash -LiteralPath $request -Algorithm SHA256).Hash.ToLowerInvariant();bytes=(Get-Item -LiteralPath $request).Length}
+        result=@{path=$result;sha256=(Get-FileHash -LiteralPath $result -Algorithm SHA256).Hash.ToLowerInvariant();bytes=(Get-Item -LiteralPath $result).Length}
+        process=@{path=$process;sha256=(Get-FileHash -LiteralPath $process -Algorithm SHA256).Hash.ToLowerInvariant();bytes=(Get-Item -LiteralPath $process).Length}}
+}
+function Get-SelectedFileIdentity([string]$Path) {
+    if(-not $script:SelectedFileIdentityProbe -or -not [IO.Path]::IsPathRooted($Path) -or $Path.Contains('"') -or $Path -match '[\r\n]'){throw 'Selected canonical SDK identity probe and absolute safe path required'}
+    $probe=$script:SelectedFileIdentityProbe
+    $null=Assert-SelectedAppFile $probe.helper;$null=Assert-SelectedAppFile $probe.manifest
+    $info=New-Object Diagnostics.ProcessStartInfo
+    $info.FileName=$probe.helper.path;$info.Arguments='--file-identity "'+$Path+'"'
+    $result=Invoke-FixtureProcess $info 10
+    $null=Assert-SelectedAppFile $probe.helper;$null=Assert-SelectedAppFile $probe.manifest
+    if($result.ExitCode -ne 0 -or $result.Output.Length -gt 4096 -or $result.Diagnostics){throw 'Canonical SDK file identity probe refused or exceeded its output bound'}
+    $value=$result.Output|ConvertFrom-Json
+    if((@($value.PSObject.Properties.Name|Sort-Object)-join ',') -cne 'key,schema' -or
+        ($value.schema -isnot [int] -and $value.schema -isnot [long]) -or $value.schema -ne 1 -or
+        $value.key -isnot [string] -or [string]::IsNullOrWhiteSpace($value.key) -or $value.key.Length -gt 256 -or
+        [regex]::Matches($result.Output,'"(?:schema|key)"\s*:').Count -ne 2){throw 'Canonical SDK file identity reply shape differs'}
+    # Opaque canonical owner key. This path observation does not make later deletion atomic.
+    return $value.key
+}
+function Assert-SelectedAppMutationSafe([string]$Evidence) {
+    Assert-FixtureMutationSafe
+    if($Evidence -and (Test-Path -LiteralPath $Evidence -PathType Leaf)){
+        $journal=Get-Content -LiteralPath $Evidence -Raw|ConvertFrom-Json
+        if($journal.process_closure -cne 'known' -or @($journal.apps|ForEach-Object{$_.steps}|Where-Object{$_.closure -cne 'known'}).Count){throw 'Selected installer transaction closure unknown; retain all installed state'}
+    }
+}
+function Write-NativeFixtureClosure([string]$Directory) {
+    $value=Get-FixtureProcessClosure
+    foreach($path in @((Join-Path $Directory 'selected-app-chain.json'),(Join-Path $Directory 'native-core\adopter-process.json'))){
+        if(Test-Path -LiteralPath $path -PathType Leaf){
+            try{
+                $proof=Get-Content -LiteralPath $path -Raw|ConvertFrom-Json
+                if(($proof.PSObject.Properties['process_closure'] -and $proof.process_closure -cne 'known') -or
+                    ($proof.PSObject.Properties['Closure'] -and $proof.Closure -cne 'known')){$value.closure='unknown'}
+            }catch{$value.closure='unknown'}
+        }
+    }
+    [IO.File]::WriteAllText((Join-Path $Directory 'fixture-process-closure.json'),($value|ConvertTo-Json -Depth 8),[Text.UTF8Encoding]::new($false))
+}
+function Assert-NativeFixtureMutationSafe([string]$Directory,[switch]$RequireTerminal) {
+    Assert-FixtureMutationSafe
+    $path=Join-Path $Directory 'fixture-process-closure.json'
+    if($RequireTerminal -and -not(Test-Path -LiteralPath $path -PathType Leaf)){throw 'Native child transaction closure terminal missing; retain installed state'}
+    if(Test-Path -LiteralPath $path -PathType Leaf){
+        $value=Get-Content -LiteralPath $path -Raw|ConvertFrom-Json
+        if($value.closure -cne 'known'){throw 'Native child transaction closure unknown; retain installed state'}
+    }
+    Assert-SelectedAppMutationSafe (Join-Path $Directory 'selected-app-chain.json')
+    $path=Join-Path $Directory 'native-core\adopter-process.json'
+    if(Test-Path -LiteralPath $path -PathType Leaf){
+        $value=Get-Content -LiteralPath $path -Raw|ConvertFrom-Json
+        if($value.Closure -cne 'known'){throw 'Native scene process closure unknown; retain installed state'}
+    }
+}
+function Invoke-SelectedAppStep($Row,[string]$Program,[string[]]$Arguments,[int]$Seconds,$Journal,[string]$Evidence) {
+    Assert-SelectedAppMutationSafe $Evidence
+    $path=$Evidence+'.process-'+[Guid]::NewGuid().ToString('N')+'.json'
+    $step=@{state='intent';closure='unknown';observation_path=$path;requested_file_name=$Program;requested_arguments=($Arguments -join ' ')}
+    $Row.steps+=$step;$Journal.process_closure='unknown'
+    $Journal|ConvertTo-Json -Depth 40|Set-Content -LiteralPath $Evidence -Encoding UTF8
+    $info=New-Object Diagnostics.ProcessStartInfo;$info.FileName=$Program;$info.Arguments=$Arguments -join ' '
+    $held=$null;$failure=$null
+    try {$held=Invoke-FixtureProcess $info $Seconds -ObservationPath $path}
+    catch {$failure=$_}
+    finally {
+        if(Test-Path -LiteralPath $path -PathType Leaf){
+            try {
+                $held=Get-Content -LiteralPath $path -Raw|ConvertFrom-Json
+                $step.observation=@{path=$path;sha256=(Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash.ToLowerInvariant();bytes=(Get-Item -LiteralPath $path).Length}
+            }catch{$held=$null}
+        }
+        if($held){
+            $step.state=$held.State;$step.process_id=$held.ProcessId;$step.creation_utc=$held.CreationUtc
+            $step.started_at=$held.StartedUtc;$step.ended_at=$held.FinishedUtc;$step.exit_code=$held.ExitCode
+            $step.use_shell_execute=$held.UseShellExecute;$step.actual_image=$held.ActualImage;$step.actual_image_status=$held.ActualImageStatus
+            $step.direct_exited=$held.DirectExited;$step.output_closed=$held.OutputClosed;$step.failure=$held.Failure
+            if($held.State -ceq 'completed' -and $held.Closure -ceq 'known' -and $held.DirectExited -and $held.OutputClosed -and
+                $held.ProcessId -gt 0 -and $held.CreationUtc -and -not $held.CreationError -and $held.UseShellExecute -eq $false -and
+                $held.RequestedFileName -ceq $Program -and $held.RequestedArguments -ceq ($Arguments -join ' ')){$step.closure='known'}
+        }
+        $Journal.process_closure=if(@($Journal.apps|ForEach-Object{$_.steps}|Where-Object{$_.closure -cne 'known'}).Count){'unknown'}else{'known'}
+        if($Journal.process_closure -cne 'known'){$global:OAFixtureProcessClosureUnknown=$true}
+        $Journal|ConvertTo-Json -Depth 40|Set-Content -LiteralPath $Evidence -Encoding UTF8
+    }
+    if($failure){throw $failure}
+    Assert-SelectedAppMutationSafe $Evidence
+    if($held.ExitCode -ne 0){throw ('Selected process completed with failure '+$held.ExitCode)}
+}
+function Install-SelectedAppChain($Plans,[string]$Evidence,[string]$RequestPath) {
+    if(Test-Path -LiteralPath $Evidence){throw 'Selected app attempt already exists; reconcile its exact ownership journal'}
+    Assert-SelectedAppProductsAbsent $Plans
+    if(-not[IO.Path]::IsPathRooted($RequestPath)){throw 'Original canonical native request required for selected installation'}
+    $native=Get-Content -LiteralPath $RequestPath -Raw|ConvertFrom-Json
+    $journal=@{state='installing';process_closure='known';apps=@();private_evidence=$true;registry_baseline=(Get-SelectedAppRegistryBaseline);fixture_owner=$script:fixtureOwner
+        source_sha=$native.source_sha;tool_source=$native.tool_source;runtime_sha256=$native.runtime_sha256
+        native_request=@{path=$RequestPath;sha256=(Get-FileHash -LiteralPath $RequestPath -Algorithm SHA256).Hash.ToLowerInvariant();bytes=(Get-Item -LiteralPath $RequestPath).Length}}
+    foreach($plan in $Plans) {
+        $installer=New-Object -ComObject WindowsInstaller.Installer
+        if(@($installer.ProductsEx($plan.compiled.product_code,'',7)).Count){throw 'Preexisting application integration is protected'}
+        $row=@{id=$plan.app.id;product_code=$plan.compiled.product_code;upgrade_code=$plan.compiled.upgrade_code;package=$plan.app;measured_components=$plan.files;install_attempted=$false;installed=$false;host_owned=$false;steps=@()}
+        $journal.apps+= $row
+        $journal|ConvertTo-Json -Depth 40|Set-Content -LiteralPath $Evidence -Encoding UTF8
+        if($plan.app.host) {
+            $null=Get-SelectedHostRemoval $plan
+            $before=@(Get-SelectedHostRegistry $plan)
+            if($before.Count) {
+                $row.host=Assert-SelectedHost $plan;$row.host_reused=$true
+            } else {
+                $parent=Join-Path (Get-ProfileFolder LocalApplicationData) 'Programs'
+                $beforeRoots=if(Test-Path -LiteralPath $parent){@(Get-ChildItem -LiteralPath $parent -Directory -Force -ErrorAction Stop|ForEach-Object{$_.FullName})}else{@()}
+                $beforeRootIdentities=@(foreach($path in $beforeRoots){@{path=$path;identity=(Get-SelectedFileIdentity $path)}})
+                $signature=Get-AuthenticodeSignature -LiteralPath $plan.app.host.file
+                if($signature.Status -ne 'Valid'){throw 'Selected supplier installer has no valid publisher signature'}
+                $supplierThumbprint=$signature.SignerCertificate.Thumbprint
+                $row.supplier_signature=@{status=[string]$signature.Status;thumbprint=$supplierThumbprint;subject=$signature.SignerCertificate.Subject;sha256=$plan.app.host.sha256;observed_at=[DateTime]::UtcNow.ToString('o')}
+                if($plan.compiled.host.signer_thumbprint -and $plan.compiled.host.signer_thumbprint -cne $supplierThumbprint){throw 'Selected supplier installer publisher differs from source policy'}
+                # Record attempted ownership before starting the selected host.
+                $row.host_owned=$true;$row.host_install_attempted=$true;$row.host_before_roots=$beforeRoots;$row.host_parent_baseline=$beforeRootIdentities;$row.host_started=[DateTime]::UtcNow
+                if($plan.app.id -ceq 'comfyui') {
+                    $temporary=[IO.Path]::GetFullPath([IO.Path]::GetTempPath())
+                    if($temporary -match '\s'){throw 'Controlled NSIS destination needs the existing native no-space temporary path'}
+                    $ancestor=Get-Item -LiteralPath $temporary -ErrorAction Stop
+                    while($ancestor){
+                        if(-not ($ancestor.Attributes -band [IO.FileAttributes]::Directory) -or ($ancestor.Attributes -band [IO.FileAttributes]::ReparsePoint)){throw 'Controlled fixture temporary parent is redirected'}
+                        $ancestor=$ancestor.Parent
+                    }
+                    $fixtureParent=Join-Path $temporary ('oa-host-'+[Guid]::NewGuid().ToString('N'))
+                    if(Test-Path -LiteralPath $fixtureParent){throw 'Fixture host parent already exists'}
+                    New-Item -ItemType Directory -Path $fixtureParent|Out-Null
+                    if((Get-Acl -LiteralPath $fixtureParent).GetOwner([Security.Principal.SecurityIdentifier]).Value -cne
+                        [Security.Principal.WindowsIdentity]::GetCurrent().User.Value){throw 'Controlled fixture parent is not owned by this user'}
+                    $plan.requested_host_root=Join-Path $fixtureParent 'host'
+                    $row.fixture_parent=$fixtureParent;$row.fixture_parent_identity=Get-SelectedFileIdentity $fixtureParent
+                    $row.requested_host_root=$plan.requested_host_root
+                    if(Test-Path -LiteralPath $plan.requested_host_root){throw 'Controlled fixture host destination already exists'}
+                }
+                $journal|ConvertTo-Json -Depth 40|Set-Content -LiteralPath $Evidence -Encoding UTF8
+                if($plan.app.host.preflight){$null=Assert-SelectedAppFile $plan.app.host.preflight;Invoke-SelectedAppStep $row $plan.app.host.preflight.file @() 60 $journal $Evidence;$null=Assert-SelectedAppFile $plan.app.host.preflight}
+                $journal|ConvertTo-Json -Depth 40|Set-Content -LiteralPath $Evidence -Encoding UTF8
+                $null=Assert-SelectedAppFile $plan.app.host
+                $hostArguments=@('/S','/currentuser')
+                if($plan.requested_host_root){$hostArguments+=('/D='+$plan.requested_host_root)} # NSIS override LAST, with no spaces.
+                Invoke-SelectedAppStep $row $plan.app.host.file $hostArguments 300 $journal $Evidence
+                $null=Assert-SelectedAppFile $plan.app.host
+                $journal|ConvertTo-Json -Depth 40|Set-Content -LiteralPath $Evidence -Encoding UTF8
+                $row.host=Get-NewSelectedHost $plan $beforeRoots $row.host_started $supplierThumbprint
+                $row.host.installation_mode=if($plan.requested_host_root){'controlled-nsis-destination'}else{'source-preflight-standard-destination'}
+                $row.host.requested_root=$plan.requested_host_root
+                $plan.host_observed=$row.host
+                Assert-SelectedHostStopped $row.host.root
+                $row.remover=$row.host.remover;$row.remover_identity=$row.host.remover.identity;$row.root_identity=$row.host.root_identity
+                $journal|ConvertTo-Json -Depth 40|Set-Content -LiteralPath $Evidence -Encoding UTF8
+            }
+            if($plan.app.host.preparation){$null=Assert-SelectedAppFile $plan.app.host.preparation;Invoke-SelectedAppStep $row $plan.app.host.preparation.file @('--verify-only') 60 $journal $Evidence;$null=Assert-SelectedAppFile $plan.app.host.preparation}
+        }
+        $row.install_attempted=$true
+        $journal|ConvertTo-Json -Depth 40|Set-Content -LiteralPath $Evidence -Encoding UTF8
+        $null=Assert-SelectedAppFile $plan.app
+        Invoke-SelectedAppStep $row msiexec.exe (Get-CandidateInstallArguments $plan.package $false ('selected-'+$plan.app.id+'-install.log')) 300 $journal $Evidence
+        $null=Assert-SelectedAppFile $plan.app
+        $row.installed=$true;$row.files=@(Get-SelectedAppInstalledFiles $plan)
+        $journal|ConvertTo-Json -Depth 40|Set-Content -LiteralPath $Evidence -Encoding UTF8
+    }
+    $journal.state='installed';$journal|ConvertTo-Json -Depth 40|Set-Content -LiteralPath $Evidence -Encoding UTF8
+    return $journal
+}
+function Remove-SelectedAppChain($Plans,[string]$Evidence) {
+    Assert-SelectedAppMutationSafe $Evidence
+    if(-not(Test-Path -LiteralPath $Evidence -PathType Leaf)){throw 'Selected application ownership journal missing'}
+    $journal=Get-Content -LiteralPath $Evidence -Raw|ConvertFrom-Json
+    $failures=@()
+    $rows=@($journal.apps)
+    [array]::Reverse($rows)
+    foreach($row in $rows) {
+        try {
+            $plan=@($Plans|Where-Object{$_.app.id -ceq $row.id})
+            if($plan.Count -ne 1 -or $plan[0].compiled.product_code -cne $row.product_code){throw 'Selected application cleanup identity differs'}
+            $plan=$plan[0]
+            if($row.install_attempted) {
+                $null=Assert-SelectedAppFile $plan.app
+                $installer=New-Object -ComObject WindowsInstaller.Installer
+                if(@($installer.ProductsEx($row.product_code,'',7)).Count) {
+                    Invoke-SelectedAppStep $row msiexec.exe @('/x',"`"$($plan.package)`"",'/qn','/norestart','/l*v',('selected-'+$row.id+'-remove.log')) 300 $journal $Evidence
+                }
+                if(@($installer.ProductsEx($row.product_code,'',7)).Count){throw 'Selected application product survived removal'}
+                foreach($file in @($row.files)){if(Test-Path -LiteralPath $file.path){throw 'Selected integration file survived removal'}}
+            }
+            if($row.host_owned) {
+                if(-not $row.remover -or -not $row.remover_identity -or -not $row.root_identity){throw 'Host installation did not reach verified ownership; retain for reconciliation'}
+                $plan.host_observed=$row.host
+                $null=Assert-SelectedHost $plan
+                Assert-SelectedHostStopped $row.host.root
+                $removal=Get-SelectedHostRemoval $plan
+                $null=Assert-SelectedAppFile $row.remover
+                if($row.remover.path -ine $removal.path -or (Get-SelectedFileIdentity $removal.path) -cne $row.remover_identity -or
+                    (Get-SelectedFileIdentity $row.host.root) -cne $row.root_identity){throw 'Newly owned host/remover identity changed'}
+                $signature=Get-AuthenticodeSignature -LiteralPath $removal.path
+                if($signature.Status -ne 'Valid' -or $signature.SignerCertificate.Thumbprint -cne $row.host.signer_thumbprint){throw 'Newly owned remover publisher changed'}
+                Invoke-SelectedAppStep $row $removal.path $removal.arguments 300 $journal $Evidence
+                if(@(Get-SelectedHostRegistry $plan).Count){throw 'Official host registration survived fixture removal'}
+                $root=$row.host.root
+                if(Test-Path -LiteralPath $root) {
+                    if((Get-SelectedFileIdentity $root) -cne $row.root_identity -or @(Get-ChildItem -LiteralPath $root -Force).Count){throw 'Official host left nonempty or replaced root; retain without retry'}
+                    Remove-Item -LiteralPath $root # Verified empty original root, never recursive.
+                }
+                if(Test-Path -LiteralPath $root){throw 'Official host root survived fixture restoration'}
+                if($row.fixture_parent) {
+                    if((Get-SelectedFileIdentity $row.fixture_parent) -cne $row.fixture_parent_identity -or @(Get-ChildItem -LiteralPath $row.fixture_parent -Force).Count){throw 'Controlled fixture parent changed or is not empty'}
+                    Remove-Item -LiteralPath $row.fixture_parent
+                }
+                $parent=Join-Path (Get-ProfileFolder LocalApplicationData) 'Programs'
+                $afterRoots=if(Test-Path -LiteralPath $parent){@(Get-ChildItem -LiteralPath $parent -Directory -Force|ForEach-Object{$_.FullName})}else{@()}
+                if((@($afterRoots|Sort-Object)-join '|') -cne (@($row.host_before_roots|Sort-Object)-join '|')){throw 'Original Programs directory baseline changed'}
+                foreach($before in @($row.host_parent_baseline)){if((Get-SelectedFileIdentity $before.path) -cne $before.identity){throw 'Protected Programs directory identity changed'}}
+            } elseif($row.host_reused) { $null=Assert-SelectedHost $plan }
+            $row|Add-Member -NotePropertyName restored -NotePropertyValue $true -Force
+        } catch { $failures+=$_.Exception.Message;try{Assert-SelectedAppMutationSafe $Evidence}catch{break} }
+    }
+    if((ConvertTo-Json -InputObject (Get-SelectedAppRegistryBaseline) -Depth 12 -Compress) -cne
+       (ConvertTo-Json -InputObject $journal.registry_baseline -Depth 12 -Compress)){$failures+='Original installed product baseline changed'}
+    $journal.state=if($failures.Count){'restoration_failed'}else{'restored'}
+    $journal|Add-Member -NotePropertyName failures -NotePropertyValue $failures -Force
+    $journal|ConvertTo-Json -Depth 40|Set-Content -LiteralPath $Evidence -Encoding UTF8
+    if($failures.Count){throw ('Selected app restoration incomplete: '+($failures -join ' | '))}
+}
 function Assert-NativeCore([string]$Central, [string]$Tools, [string]$PythonPath, [string]$RequestPath) {
     $native = Get-Content -LiteralPath $RequestPath -Raw | ConvertFrom-Json
     if ($native.kind -ne 'local_msi' -or -not $native.core -or $native.core.source_sha -ne $native.source_sha) {
@@ -890,7 +1683,42 @@ function Assert-NativeCore([string]$Central, [string]$Tools, [string]$PythonPath
         native_request=@{path=$RequestPath;sha256=(Get-FileHash -LiteralPath $RequestPath -Algorithm SHA256).Hash.ToLowerInvariant();bytes=(Get-Item -LiteralPath $RequestPath).Length}
         runtime=@{path=$Central;sha256=$native.runtime_sha256;bytes=(Get-Item -LiteralPath $Central).Length}
         panel=@{path=$panel;sha256=$native.core.panel_sha256;bytes=(Get-Item -LiteralPath $panel).Length} }
+    if ($native.core.adopter_journey) {
+        $chain=Get-Content -LiteralPath (Join-Path (Get-Location) 'selected-app-chain.json') -Raw|ConvertFrom-Json
+        if (-not $chain.fixture_owner) { throw 'J1 owner input missing: actual fixture account and KnownFolder observation' }
+        # Raw installation and owner observations stay beside immutable core.
+        # The shared helper constructs the context; a supplied context is not authority.
+        $session.installed_chain=$chain
+        $session.observations=@{fixture_owner=$chain.fixture_owner;runtime=$session.runtime;panel=$session.panel}
+        if ($native.adopter_case -ceq 'opencode') {
+            $session.observations.profile=Get-ProfileFolder UserProfile
+        }
+        $roles=$native.selected_app_readback.opencode.journey_payload_roles
+        $cli=@($chain.apps|Where-Object{$_.id -ceq 'opencode'}|ForEach-Object{$_.files}|Where-Object{$_.id -ceq $roles.official_cli.id})
+        if($cli.Count -ne 1){throw 'J1 exact installed official CLI member required'}
+        $program=@{path=$cli[0].path;sha256=$cli[0].sha256;bytes=$cli[0].bytes}
+        $session.observations.j1_selection=Invoke-J1SelectionCollection $native $program $session.runtime $chain.fixture_owner.sid $directory
+    }
     $session | ConvertTo-Json -Depth 30 | Set-Content -LiteralPath $request -Encoding UTF8
+    if ($native.core.adopter_journey) {
+        if ($native.core.ordinary -or $native.acceptance.profile -cne 'automated' -or
+            $native.core.adopter_journey.probe_source_sha256 -cne $native.core.helper.sha256) {
+            throw 'Automated adopter journey requires its separate source-bound selection'
+        }
+        $result = Join-Path $directory 'adopter-journey-result.json'
+        try {
+            Invoke-Bounded $PythonPath @('-B',"`"$($native.core.helper.path)`"",'--adopter-journey-request',"`"$request`"") 600 -ObservationPath (Join-Path $directory 'adopter-process.json')
+        } finally {
+            # Retain failed/partial bytes before the ordinary lifecycle cleanup.
+            if (Test-Path -LiteralPath $result -PathType Leaf) {
+                Copy-Item -LiteralPath $result -Destination (Join-Path (Split-Path -Parent $RequestPath) 'adopter-journey-result.json')
+            }
+        }
+        Assert-OrdinaryNativeClosure $RequestPath
+        $proof = Get-Content -LiteralPath $result -Raw | ConvertFrom-Json
+        if ($proof.result -cne 'partial') { throw 'Automated adopter journey did not retain its partial disposition' }
+        return
+    }
     Invoke-Bounded $PythonPath @('-B',"`"$($native.core.journey.path)`"",'--native-request',"`"$request`"") 390
     $result = Join-Path $directory 'core-result.json'
     $proof = Get-Content -LiteralPath $result -Raw | ConvertFrom-Json
@@ -907,14 +1735,32 @@ function Assert-NativeCore([string]$Central, [string]$Tools, [string]$PythonPath
         Copy-Item -LiteralPath $ordinaryResult -Destination (Join-Path (Split-Path -Parent $RequestPath) 'ordinary-result.json')
     }
 }
-function Get-UserFixtureSeconds([bool]$HasPredecessor, [bool]$HasOrdinary) {
+function Get-UserFixtureSeconds([bool]$HasPredecessor, [bool]$HasOrdinary, [int]$Soak = 0) {
+    if ($Soak -notin @(0,3600)) { throw 'Soak duration must be zero or 3600' }
     $seconds = if ($HasPredecessor) { 600 } else { 300 }
     if ($HasOrdinary) { $seconds += 600 }
+    if ($Soak) { $seconds += $Soak + 185 }
     return $seconds
 }
 function Assert-OrdinaryNativeClosure([string]$RequestPath) {
     if (-not $RequestPath) { return }
     $native = Get-Content -LiteralPath $RequestPath -Raw | ConvertFrom-Json
+    if ($native.core.adopter_journey) {
+        $result = Join-Path (Split-Path -Parent $RequestPath) 'adopter-journey-result.json'
+        if (-not (Test-Path -LiteralPath $result -PathType Leaf)) { throw 'Adopter journey closure unknown; retain installed recovery state' }
+        $proof = Get-Content -LiteralPath $result -Raw | ConvertFrom-Json
+        $requestHash = (Get-FileHash -LiteralPath $RequestPath -Algorithm SHA256).Hash.ToLowerInvariant()
+        if ($proof.native_request.path -cne $RequestPath -or $proof.native_request.sha256 -cne $requestHash -or
+            $proof.core.source_sha -cne $native.source_sha -or $proof.runtime.sha256 -cne $native.runtime_sha256 -or
+            $proof.core.helper.sha256 -cne $native.core.helper.sha256 -or -not $proof.owned_children_exited -or
+            $proof.result -notin @('partial','failed')) { throw 'Adopter journey closure differs from selected native request' }
+        foreach ($child in @($proof.commands | Where-Object { $_.pid })) {
+            if (-not $child.exited -or (Get-CimInstance Win32_Process -Filter "ProcessId=$($child.pid)")) {
+                throw 'Adopter journey child lifetime unknown; retain installed recovery state'
+            }
+        }
+        return
+    }
     if (-not $native.core.ordinary) { return }
     $result = Join-Path $native.core.ordinary.directory 'scene\ordinary-result.json'
     if (-not (Test-Path -LiteralPath $result -PathType Leaf)) {
@@ -1008,7 +1854,7 @@ function Get-OpenAbstractionsFootprint([string]$Sid, [string]$LocalAppData, [str
                                        [string]$RegistryKey = 'HKCU:\Software\OpenAbstractions') {
     $items = @()
     foreach ($product in @(Get-InstalledProducts -UserSid $Sid -Context 2) + @(Get-InstalledProducts -Context 4)) {
-        if ($product.ProductName -eq 'Abstraction') { $items += "installed product $($product.ProductCode) $($product.VersionString) (context $($product.Context))" }
+        if ($product.ProductName -in @('OpenAbstractions', 'Abstraction')) { $items += "installed product $($product.ProductCode) $($product.VersionString) (context $($product.Context))" }
     }
     foreach ($service in @(Get-Service -Name 'OpenAbstractionsSupervisor*' -ErrorAction SilentlyContinue)) { $items += "service $($service.Name)" }
     foreach ($path in @((Join-Path $LocalAppData 'Programs\OpenAbstractions'), (Join-Path $ProgramFiles 'OpenAbstractions'),
@@ -1088,6 +1934,8 @@ if ($Mode -eq 'LocalAccount') {
     Assert-NoOpenAbstractions (& $footprint)
     $MsiPath = (Resolve-Path -LiteralPath $MsiPath).Path
     if ([IO.Path]::GetExtension($MsiPath) -ne '.msi') { throw 'Expected an MSI package' }
+    $nativeRequest=Join-Path $ResultDirectory 'native-request.json'
+    if(Test-Path -LiteralPath $nativeRequest -PathType Leaf){$preflight=Get-Content -LiteralPath $nativeRequest -Raw|ConvertFrom-Json;$null=Get-SelectedAppPlan $preflight;$null=Assert-J1SelectionInputs $preflight}
     $data = Join-Path $localAppData 'openabstractions'
     $dataExisted = Test-Path -LiteralPath $data
     $sentinel = Join-Path $data 'runtime-v1\qualification-sentinel.txt'
@@ -1099,6 +1947,7 @@ if ($Mode -eq 'LocalAccount') {
         if ($FailUpgrade) { New-FailingCandidate $MsiPath (Join-Path $directory 'failing-upgrade.msi') }
         if ($FailSameVersion) { New-FailingCandidate $MsiPath (Join-Path $directory 'failing-same-version.msi') -NewProductCode }
         $arguments = @('-NoProfile','-ExecutionPolicy','Bypass','-File',"`"$PSCommandPath`"",'-Mode','User','-MsiPath',"`"$directory\package.msi`"",'-ExpectedSid',$sid)
+        if ($SoakSeconds) { $arguments += @('-SoakSeconds',$SoakSeconds,'-ExpectedRuntimeSha256',$ExpectedRuntimeSha256,'-ExpectedSupervisorSha256',$ExpectedSupervisorSha256,'-SoakRequestPath',"`"$SoakRequestPath`"") }
         if ($PredecessorMsiPath) {
             $PredecessorMsiPath = (Resolve-Path -LiteralPath $PredecessorMsiPath).Path
             Assert-PackageHash $PredecessorMsiPath $PredecessorSHA256
@@ -1117,7 +1966,7 @@ if ($Mode -eq 'LocalAccount') {
         if (Test-Path -LiteralPath $nativeRequest -PathType Leaf) {
             $request = Get-Content -LiteralPath $nativeRequest -Raw | ConvertFrom-Json
             if ($request.core) { $arguments += @('-NativeCoreRequest',"`"$nativeRequest`"") }
-            $hasOrdinary = [bool]$request.core.ordinary
+            $hasOrdinary = [bool]($request.core.ordinary -or $request.core.adopter_journey)
         }
     if ($SdkSmokes) {
         Copy-Item -LiteralPath (Resolve-Path -LiteralPath $SdkSmokes).Path -Destination (Join-Path $directory 'sdk-smokes') -Recurse
@@ -1130,7 +1979,7 @@ if ($Mode -eq 'LocalAccount') {
         $info.Arguments = $arguments -join ' '
         $info.WorkingDirectory = $directory
         $info.EnvironmentVariables['OA_FIXTURE_LOCAL_ACCOUNT'] = $sid
-        $child = Invoke-FixtureProcess $info (Get-UserFixtureSeconds ([bool]$PredecessorMsiPath) $hasOrdinary)
+        $child = Invoke-FixtureProcess $info (Get-UserFixtureSeconds ([bool]$PredecessorMsiPath) $hasOrdinary $SoakSeconds) -ObservationPath (Join-Path $directory 'local-account-process.json')
         $child.Output | Set-Content -Encoding UTF8 (Join-Path $directory 'fixture.log')
         $child.Diagnostics | Set-Content -Encoding UTF8 (Join-Path $directory 'fixture.err')
         if ($child.ExitCode -ne 0) { throw "Local-account fixture exited $($child.ExitCode); inspect $directory" }
@@ -1138,6 +1987,9 @@ if ($Mode -eq 'LocalAccount') {
     } catch { $failure = $_ } finally {
         $cleanup = @()
         $canRemoveFixtureData = $true
+        if((Get-FixtureProcessClosure).closure -cne 'known'){Write-NativeFixtureClosure $directory}
+        try { Assert-NativeFixtureMutationSafe $directory -RequireTerminal }
+        catch {$canRemoveFixtureData=$false;$cleanup+=$_.Exception.Message}
         if (Test-Path -LiteralPath $nativeRequest -PathType Leaf) {
             try { Assert-OrdinaryNativeClosure $nativeRequest }
             catch {
@@ -1152,7 +2004,7 @@ if ($Mode -eq 'LocalAccount') {
         }
         foreach ($copy in 'package.msi','predecessor.msi','failing-upgrade.msi','failing-same-version.msi') {
             $path = Join-Path $directory $copy
-            try { if (Test-Path -LiteralPath $path) { Remove-Item -LiteralPath $path -Force } } catch { $cleanup += "package copy $path`: $($_.Exception.Message)" }
+            try { if ($canRemoveFixtureData -and (Test-Path -LiteralPath $path)) { Remove-Item -LiteralPath $path -Force } } catch { $cleanup += "package copy $path`: $($_.Exception.Message)" }
         }
         try { $left = & $footprint } catch { $left = @("footprint unreadable: $($_.Exception.Message)") }
         if ($left.Count) { $cleanup += "left installed: $($left -join '; ')" }
@@ -1168,13 +2020,18 @@ if ($Mode -eq 'User') {
     if ($identity.User.Value -ne $ExpectedSid -or $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
         throw 'Fixture requires the exact private non-admin account'
     }
+    if($NativeCoreRequest){$preflight=Get-Content -LiteralPath $NativeCoreRequest -Raw|ConvertFrom-Json;$null=Get-SelectedAppPlan $preflight;$null=Assert-J1SelectionInputs $preflight}
     if ($Unscoped -and $PredecessorMsiPath) { throw 'Unscoped verification installs a fresh package and takes no predecessor' }
     if (($PredecessorElsewhere -or $FailUpgrade) -and -not $PredecessorMsiPath) { throw 'PredecessorElsewhere and FailUpgrade qualify an upgrade and need -PredecessorMsiPath' }
     if ($FailSameVersion -and ($PredecessorMsiPath -or $Unscoped -or $CheckTools)) { throw 'FailSameVersion installs the candidate as its own predecessor and takes no other variant' }
     $env:ABSTRACTION_RUNTIME_ENDPOINT = $null
     $env:ABSTRACTION_STORE = $null
     $env:MODELGET_STORE = $null
-    $tools = Join-Path (Get-ProfileFolder LocalApplicationData) 'Programs\OpenAbstractions\tools'
+    $localAppData = Get-ProfileFolder LocalApplicationData
+    $tools = Join-Path $localAppData 'Programs\OpenAbstractions\tools'
+    $script:fixtureOwner=@{sid=$identity.User.Value;session=[Diagnostics.Process]::GetCurrentProcess().SessionId;
+        nonadmin=(-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator));
+        local_app_data=$localAppData;tools=$tools}
     $installed = $false
     $installAttempted = $false
     $predecessorAttempted = $false
@@ -1254,12 +2111,32 @@ if ($Mode -eq 'User') {
             if ($CheckTools -or $Unscoped) {
                 Assert-InstalledUserTools $tools
                 Assert-InstalledPanelWebView2 $tools
+                Assert-InstalledPanelShortcuts $tools $MsiPath
             }
             if ($Unscoped) { Assert-SingleUserScope }
             $central = Join-Path $tools 'openabstractions.exe'
             Assert-RuntimeReady $central post-install-status
             if ($CheckTools) { Assert-ServiceDownload $central $PythonPath }
-            if ($NativeCoreRequest) { Assert-NativeCore $central $tools $PythonPath $NativeCoreRequest }
+            if ($NativeCoreRequest) {
+                $native=Get-Content -LiteralPath $NativeCoreRequest -Raw|ConvertFrom-Json
+                $selectedPlans=@(Get-SelectedAppPlan $native)
+                if($selectedPlans.Count) {
+                    $selectedEvidence=Join-Path (Get-Location) 'selected-app-chain.json'
+                    if(Test-Path -LiteralPath $selectedEvidence){throw 'Selected app attempt already exists; reconcile it before another install'}
+                    $selectedSceneAttempted=$false
+                    try {
+                        $null=Install-SelectedAppChain $selectedPlans $selectedEvidence $NativeCoreRequest
+                        $selectedSceneAttempted=$true
+                        if($native.core.adopter_journey) {
+                            Assert-InstalledJ1Runtime $central $tools $PythonPath $NativeCoreRequest $selectedEvidence $ExpectedSid
+                        } else { Assert-NativeCore $central $tools $PythonPath $NativeCoreRequest }
+                    } finally {
+                        # Unknown child closure retains installed state and its journal.
+                        if($selectedSceneAttempted){Assert-OrdinaryNativeClosure $NativeCoreRequest}
+                        if(Test-Path -LiteralPath $selectedEvidence){Remove-SelectedAppChain $selectedPlans $selectedEvidence}
+                    }
+                } else { Assert-NativeCore $central $tools $PythonPath $NativeCoreRequest }
+            }
             if ($SdkSmokes) {
                 & (Join-Path $SdkSmokes 'run.ps1') -Directory $SdkSmokes -ExpectedSid $ExpectedSid -ExpectedProgram $central -PythonPath $PythonPath -NodePath $NodePath |
                     Set-Content -LiteralPath 'installed-sdk-smokes.txt' -Encoding UTF8
@@ -1281,6 +2158,9 @@ if ($Mode -eq 'User') {
             try { Invoke-Bounded $shortcut.TargetPath @($shortcut.Arguments) 30 } finally { Pop-Location }
             Assert-RuntimeReady $central runtime-status
             'ok: installed shortcut invocation resolved logging/config as a non-admin account' | Set-Content 'activation.txt'
+            if ($SoakSeconds) {
+                Assert-InstalledRuntimeSoak $central $ExpectedRuntimeSha256 $ExpectedSupervisorSha256 $ExpectedSid $SoakSeconds (Join-Path (Get-Location) 'installed-soak.json') @($MsiPath,$PSCommandPath,(Join-Path $PSScriptRoot 'OAFixture.psm1'),$SoakRequestPath)
+            }
             # The state Restart Manager is about to see, for comparison with a removal failure.
             try { Save-RuntimeSnapshot 'pre-uninstall-snapshot.json' $ExpectedSid 'before-uninstall' (Split-Path -Parent $tools) }
             catch { Write-Warning ('Pre-uninstall diagnostics failed: ' + (Protect-DiagnosticText $_.Exception.Message)) }
@@ -1306,7 +2186,8 @@ if ($Mode -eq 'User') {
         }
     } catch { $failure = $_ } finally {
         foreach ($process in $previousProcesses) { $process.Dispose() }
-        try { Assert-OrdinaryNativeClosure $NativeCoreRequest }
+        Write-NativeFixtureClosure (Get-Location).Path
+        try { Assert-NativeFixtureMutationSafe (Get-Location).Path;Assert-OrdinaryNativeClosure $NativeCoreRequest }
         catch {
             $closureFailure = $_
             Write-Warning ('Ordinary native closure UNKNOWN; retain installed runtime/data: ' + (Protect-DiagnosticText $_.Exception.Message)) -WarningAction Continue
@@ -1325,6 +2206,7 @@ if ($Mode -eq 'User') {
         $installerActions = Join-Path (Get-ProfileFolder LocalApplicationData) 'openabstractions\upgrade-v1\installer-actions.txt'
         try { if (Test-Path -LiteralPath $installerActions) { Copy-Item -LiteralPath $installerActions -Destination 'installer-actions.txt' -Force } }
         catch { Write-Warning ('Installer action diagnostics failed: ' + (Protect-DiagnosticText $_.Exception.Message)) }
+        Write-NativeFixtureClosure (Get-Location).Path
     }
     if ($failure) { throw $failure }
     if ($closureFailure) { throw $closureFailure }
@@ -1368,6 +2250,7 @@ exit $LASTEXITCODE
 '@
     Set-Content -LiteralPath (Join-Path $directory 'launcher.ps1') -Value $launcher -Encoding UTF8
     $arguments = @('-NoProfile','-ExecutionPolicy','Bypass','-File',"`"$directory\launcher.ps1`"",'-Mode','User','-MsiPath',"`"$directory\package.msi`"",'-ExpectedSid',$account.Sid)
+    if ($SoakSeconds) { $arguments += @('-SoakSeconds',$SoakSeconds,'-ExpectedRuntimeSha256',$ExpectedRuntimeSha256,'-ExpectedSupervisorSha256',$ExpectedSupervisorSha256,'-SoakRequestPath',"`"$SoakRequestPath`"") }
     if ($PredecessorMsiPath) { $arguments += @('-PredecessorMsiPath',"`"$directory\predecessor.msi`"",'-PredecessorSHA256',$PredecessorSHA256,'-PredecessorVersion',$PredecessorVersion,'-ExpectedVersion',$ExpectedVersion) }
     if ($Unscoped) { $arguments += '-Unscoped' }
     if ($PredecessorElsewhere) { $arguments += '-PredecessorElsewhere' }
@@ -1389,7 +2272,7 @@ exit $LASTEXITCODE
         }
         $arguments += @('-SdkSmokes',"`"$directory\sdk-smokes`"",'-NodePath',"`"$NodePath`"")
     }
-    $child = Invoke-AccountProcess -Account $account -FileName 'powershell.exe' -Arguments $arguments -WorkingDirectory $directory -Seconds $(if ($PredecessorMsiPath) { 600 } else { 300 })
+    $child = Invoke-AccountProcess -Account $account -FileName 'powershell.exe' -Arguments $arguments -WorkingDirectory $directory -Seconds (Get-UserFixtureSeconds ([bool]$PredecessorMsiPath) $false $SoakSeconds)
     $child.Output | Set-Content -Encoding UTF8 (Join-Path $directory 'fixture.log')
     $child.Diagnostics | Set-Content -Encoding UTF8 (Join-Path $directory 'fixture.err')
     if ($child.ExitCode -ne 0) { throw "Per-user fixture exited $($child.ExitCode); inspect diagnostics" }

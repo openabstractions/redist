@@ -21,7 +21,14 @@ import sys
 import tempfile
 import zipfile
 
-from app_assets import MAX_RELEASE_ASSET_BYTES, measured, roster, validate_release
+# Both the private source and public projection keep this dependency beside us.
+# Load that exact file even when this module is loaded through oa's file loader.
+_app_assets_spec = importlib.util.spec_from_file_location(
+    'oa_promotion_app_assets', Path(__file__).resolve().with_name('app_assets.py'))
+_app_assets = importlib.util.module_from_spec(_app_assets_spec)
+_app_assets_spec.loader.exec_module(_app_assets)
+MAX_RELEASE_ASSET_BYTES = _app_assets.MAX_RELEASE_ASSET_BYTES
+measured, roster, validate_release = _app_assets.measured, _app_assets.roster, _app_assets.validate_release
 
 REQUIRED_JOBS = {'candidate', 'windows-build', 'windows-native-build', 'windows-pe-sign',
                  'windows', 'windows-app-msi', 'windows-msi-sign', 'verify', 'linux',
@@ -36,6 +43,27 @@ UNFINISHED = ('failure', 'cancelled', 'timed_out')
 SETUP_RECEIPT = 'bundle-receipt.json'
 SETUP_SUMS = 'SHA256SUMS.setup'
 SETUP_CORE = ('OpenAbstractions', 'abstraction-x64.msi')
+
+
+def release_facts_owner():
+    """Use the existing public sibling or its owning private source."""
+    import types
+    target = Path(__file__).with_name('release_facts.py')
+    if not target.is_file(): target = Path(__file__).resolve().parents[3] / 'release/facts.py'
+    owner = types.ModuleType('oa_promoted_release_facts'); owner.__file__ = str(target)
+    exec(compile(target.read_bytes(), str(target), 'exec'), owner.__dict__)
+    return owner
+
+
+def final_release_facts(metadata, directory, names, setup_receipt):
+    """Project proofs already validated by unpack_verified/unpack_setup."""
+    assets = []
+    for name in names:
+        size, checksum = measured(lambda name=name: (directory / name).open('rb'))
+        assets.append({'name': name, 'artifact': {'sha256': checksum, 'bytes': size}})
+    signatures = {'result': 'pass', 'files': list(setup_receipt.get('signatures', {}).values()) +
+                  [row['signature'] for row in setup_receipt.get('chain', []) if 'signature' in row]}
+    return release_facts_owner().producer_record(metadata, assets, unsigned_platforms=['linux'], setup_signatures=signatures)
 
 
 def windows_signing_directory():
@@ -123,6 +151,27 @@ def optional_api(path):
         raise
 
 
+def release_by_tag(repo, version):
+    """Find authenticated drafts too; the by-tag endpoint returns published releases."""
+    release = optional_api(f'repos/{repo}/releases/tags/{version}')
+    if release is not None:
+        if release.get('tag_name') != version:
+            raise ValueError('release tag lookup differs')
+        return release
+    matches = []
+    # https://docs.github.com/en/rest/releases/releases#list-releases
+    for page in range(1, 101):
+        rows = api(f'repos/{repo}/releases?per_page=100&page={page}')
+        if not isinstance(rows, list) or any(not isinstance(row, dict) for row in rows):
+            raise ValueError('release listing shape differs')
+        matches.extend(row for row in rows if row.get('tag_name') == version)
+        if len(matches) > 1:
+            raise ValueError('release tag lookup is ambiguous')
+        if len(rows) < 100:
+            return matches[0] if matches else None
+    raise ValueError('release listing exceeded 100 pages')
+
+
 def pages(path, key, fetch=api):
     result = []
     for page in range(1, 101):
@@ -198,7 +247,60 @@ def setup_name(version):
     return f'OpenAbstractions-Setup-{version[1:]}.exe'
 
 
-def unpack_setup(blob, digest, destination, version, packages):
+def msi_name(version, arch):
+    """Name the public core MSI from the release version, preserving old Jobs."""
+    match = re.fullmatch(r'v(\d+)\.(\d+)\.(\d+)', version)
+    if not match or arch not in ('x64', 'arm64'):
+        raise ValueError('core MSI needs an exact release version and architecture')
+    if tuple(map(int, match.groups())) <= (0, 4, 0):
+        return f'abstraction-{arch}.msi'
+    return f'abstraction-{version[1:]}-{arch}.msi'
+
+
+def public_asset_names(directory, assets, version):
+    """Materialize future public filenames after validating signed intermediates.
+
+    Burn and signature receipts retain their verified internal names and hashes.
+    Both candidate acceptance and publication consume this exact public mapping.
+    Historical release layouts through 0.4.0 remain byte-for-byte readable.
+    """
+    names = {f'abstraction-{arch}.msi': msi_name(version, arch) for arch in ('x64', 'arm64')}
+    if all(old == new for old, new in names.items()):
+        return assets
+    already_named = set(names.values()) <= set(assets) and not names.keys() & set(assets)
+    if len(assets) != len(set(assets)) or (not names.keys() <= set(assets) and not already_named):
+        raise ValueError('public core MSI inventory is incomplete or ambiguous')
+    directory = Path(directory)
+    checksums = {}
+    for line in (directory / 'SHA256SUMS').read_text(encoding='utf-8').splitlines():
+        match = re.fullmatch(r'([0-9a-f]{64}) [ *](\S+)', line)
+        if not match or match[2] in checksums:
+            raise ValueError('malformed or duplicate public package checksum')
+        checksums[match[2]] = match[1]
+    if set(checksums) != set(assets) - {'SHA256SUMS'}:
+        raise ValueError('public checksum inventory differs from verified assets')
+    if already_named:
+        if any(not (directory / new).is_file() or (directory / old).exists() for old, new in names.items()):
+            raise ValueError('resumed public MSI inventory differs from verified assets')
+        notes = (directory / 'NOTES.md').read_text(encoding='utf-8')
+        if any(old in notes for old in names):
+            raise ValueError('resumed public notes retain intermediate MSI names')
+        return sorted(assets)
+    for old, new in names.items():
+        if not (directory / old).is_file() or (directory / new).exists():
+            raise ValueError('public MSI source is missing or destination already exists: ' + new)
+    notes = (directory / 'NOTES.md').read_text(encoding='utf-8')
+    for old, new in names.items():
+        (directory / old).rename(directory / new)
+        notes = notes.replace(old, new)
+    (directory / 'SHA256SUMS').write_text(''.join(
+        checksum + '  ' + names.get(name, name) + '\n' for name, checksum in checksums.items()),
+        encoding='utf-8', newline='')
+    (directory / 'NOTES.md').write_text(notes, encoding='utf-8', newline='')
+    return sorted(names.get(name, name) for name in assets)
+
+
+def unpack_setup(blob, digest, destination, version, packages, *, receipt_sink=None):
     """Check the Setup artifact and write the files it publishes.
 
     packages maps each verified-release package to its SHA-256; the bundle's
@@ -273,6 +375,8 @@ def unpack_setup(blob, digest, destination, version, packages):
         for name in published:
             with archive.open(name) as source, (destination / name).open('wb') as target:
                 shutil.copyfileobj(source, target, length=1024 * 1024)
+    if receipt_sink is not None:
+        receipt_sink.update(receipt)
     return list(published), {name: checksums[name] for name in published}
 
 
@@ -314,10 +418,19 @@ def unpack_verified(blob, digest, destination, run, version):
                     f'abstraction-{number}-linux-amd64.tar.gz', f'abstraction-{number}-linux-arm64.tar.gz'}
         if metadata['macos'] == 'signed':
             packages.add(f'abstraction-{number}-macos-universal.pkg')
-        app_pins = Path(__file__).with_name('apps.json')
+        app_pins = Path(__file__).resolve().parent.parent / 'apps.json'
         if not app_pins.exists():  # private monorepo tests use the authored file before splitting
             app_pins = Path(__file__).resolve().parents[3] / 'monitor/internal/setup/adopter_assets.json'
-        app_rows = roster(app_pins)
+        app_rows = roster(app_pins, admission=metadata.get('release_admission'))
+        if tuple(map(int, number.split('-')[0].split('.'))) >= (0, 8, 0):
+            from release_facts import validate_public_admission
+            if metadata.get('release_admission') != app_rows.admission:
+                raise ValueError('candidate declaration differs from the exact source producer capsule')
+            if metadata.get('app_roster_sha256') != hashlib.sha256(app_pins.read_bytes()).hexdigest():
+                raise ValueError('candidate source roster bytes differ from prepared producer source')
+            # Candidate unpack is also used before installed rehearsal. This
+            # validates the declaration; completed delivery remains external.
+            validate_public_admission(app_rows.admission, number, app_rows, run['head_sha'])
         if any(row['release_tag'] != version for row in app_rows):
             raise ValueError('optional app pin release tag differs from candidate')
         app_packages = validate_release(app_rows, metadata.get('apps', []), archive.open)
@@ -338,6 +451,15 @@ def unpack_verified(blob, digest, destination, run, version):
         for name, checksum in checksums.items():
             if measured(lambda: archive.open(name))[1] != checksum:
                 raise ValueError('package checksum mismatch: ' + name)
+        fact_assets = [{'name': name, 'artifact': {'sha256': checksum, 'bytes': archive.getinfo(name).file_size}}
+                       for name, checksum in checksums.items()]
+        required_facts = tuple(map(int, number.split('-')[0].split('.'))) >= (0, 8, 0)
+        if required_facts and 'release_facts' not in metadata:
+            raise ValueError('candidate release facts differ from measured producer inputs')
+        if 'release_facts' in metadata:
+            expected_facts = release_facts_owner().producer_record(metadata, fact_assets, unsigned_platforms=['linux'])
+            if metadata['release_facts'] != expected_facts:
+                raise ValueError('candidate release facts differ from measured producer inputs')
         if not archive.read('NOTES.md').strip():
             raise ValueError('release notes are empty')
         for name in names:
@@ -406,6 +528,41 @@ def pytorch_inputs_module():
     return module
 
 
+def owned_input_draft(repository, tag, source, identity, title, *, fetch=api, mutate=command, allow_create=True):
+    """Find/create one exact owned staging draft; creates no Git ref or asset."""
+    prefix = f"repos/{repository}"
+    body = json.dumps(identity, sort_keys=True) + "\n"
+    found = []
+    for page in range(1, 101):
+        batch = fetch(prefix + f"/releases?per_page=100&page={page}")
+        if not isinstance(batch, list):
+            raise ValueError("malformed input draft lookup")
+        found.extend(item for item in batch if item.get("tag_name") == tag)
+        if len(batch) < 100:
+            break
+    else:
+        raise ValueError("input draft lookup exceeds bounded pagination")
+    if len(found) > 1:
+        raise ValueError("input draft identity is ambiguous")
+    if found:
+        release = found[0]
+    else:
+        if not allow_create:
+            raise ValueError("PyTorch input tag exists without its owned draft")
+        payload = {"tag_name": tag, "target_commitish": source, "name": title,
+                   "draft": True, "prerelease": True, "make_latest": "false", "body": body}
+        with tempfile.TemporaryDirectory(prefix="oa-input-seed-") as temporary:
+            request = Path(temporary) / "request.json"
+            request.write_text(json.dumps(payload) + "\n", encoding="utf-8")
+            release = json.loads(mutate(["api", "--method", "POST", prefix + "/releases", "--input", str(request)]))
+    if (not isinstance(release, dict) or type(release.get("id")) is not int or release["id"] < 1
+            or release.get("draft") is not True
+            or release.get("tag_name") != tag or release.get("target_commitish") != source
+            or release.get("body", "").replace("\r\n", "\n") != body):
+        raise ValueError("input origin differs from its owned staging draft")
+    return release
+
+
 def seed_pytorch_inputs(directory, sources, source, version, *, fetch=api,
                         optional_fetch=optional_api, mutate=command, engine=None):
     """Create or resume one owned draft containing only the retained native input pair."""
@@ -426,32 +583,9 @@ def seed_pytorch_inputs(directory, sources, source, version, *, fetch=api,
     prefix = f"repos/{engine.INPUT_REPOSITORY}"
     tag_state = optional_fetch(prefix + "/git/ref/tags/" + tag)
     engine.input_tag(tag_state, source, required=False)
-    found = []
-    for page in range(1, 101):
-        batch = fetch(prefix + f"/releases?per_page=100&page={page}")
-        if not isinstance(batch, list):
-            raise ValueError("malformed PyTorch input draft lookup")
-        found.extend(item for item in batch if item.get("tag_name") == tag)
-        if len(batch) < 100:
-            break
-    else:
-        raise ValueError("PyTorch input draft lookup exceeds bounded pagination")
-    if len(found) > 1:
-        raise ValueError("PyTorch input draft identity is ambiguous")
-    if not found:
-        if tag_state is not None:
-            raise ValueError("PyTorch input tag exists without its owned draft")
-        payload = {"tag_name": tag, "target_commitish": source,
-                   "name": "Reviewed PyTorch input transport " + source[:12],
-                   "draft": True, "prerelease": True, "make_latest": "false",
-                   "body": json.dumps(identity, sort_keys=True) + "\n"}
-        with tempfile.TemporaryDirectory(prefix="oa-pytorch-input-seed-") as temporary:
-            request = Path(temporary) / "request.json"
-            request.write_text(json.dumps(payload) + "\n", encoding="utf-8")
-            release = json.loads(mutate(["api", "--method", "POST", prefix + "/releases",
-                                         "--input", str(request)]))
-    else:
-        release = found[0]
+    release = owned_input_draft(engine.INPUT_REPOSITORY, tag, source, identity,
+                               "Reviewed PyTorch input transport " + source[:12], fetch=fetch, mutate=mutate,
+                               allow_create=tag_state is None)
     assets = engine.input_assets(release, source, version, owner, complete=False)
     # The owned draft is created first so an interrupted direct-ref creation can
     # be retried against its exact identity, with no tag or asset replacement.
@@ -512,6 +646,13 @@ def seed_pytorch_main(argv):
 
 def main(argv=None):
     internal = list(sys.argv[1:] if argv is None else argv)
+    if internal[:1] == ['--msi-name']:
+        names = argparse.ArgumentParser(description='Print a public core MSI name without reading or changing release state.')
+        names.add_argument('--msi-name', required=True, metavar='vMAJOR.MINOR.PATCH')
+        names.add_argument('--arch', required=True, choices=('x64', 'arm64'))
+        selected = names.parse_args(internal)
+        print(msi_name(selected.msi_name, selected.arch))
+        return 0
     if internal[:1] == ["seed-pytorch-inputs"]:
         return seed_pytorch_main(internal[1:])
     parser = argparse.ArgumentParser(description=__doc__, epilog="For exact draft input transport: seed-pytorch-inputs --help.")
@@ -521,18 +662,34 @@ def main(argv=None):
     parser.add_argument('--version', help='vMAJOR.MINOR.PATCH of the verified packages')
     parser.add_argument('--source', help='exact redist commit running the promotion workflow')
     parser.add_argument('--resume', action='store_true', help='recover a partial promotion at the same tag/commit; verify existing draft assets and upload only missing files')
+    parser.add_argument('--expected-attempt', type=int, help='bind local accepted artifacts to this candidate attempt')
+    parser.add_argument('--verified-artifact-id', type=int)
+    parser.add_argument('--verified-artifact-digest')
+    parser.add_argument('--setup-artifact-id', type=int)
+    parser.add_argument('--setup-artifact-digest')
     args = parser.parse_args(argv)
+    accepted = (args.expected_attempt, args.verified_artifact_id, args.verified_artifact_digest,
+                args.setup_artifact_id, args.setup_artifact_digest)
+    if any(value is not None for value in accepted) and (any(value is None for value in accepted)
+            or min(args.expected_attempt, args.verified_artifact_id, args.setup_artifact_id) < 1
+            or any(not re.fullmatch(r'sha256:[0-9a-f]{64}', value) for value in
+                   (args.verified_artifact_digest, args.setup_artifact_digest))):
+        parser.error('accepted candidate requires exact attempt, artifact IDs and SHA256 digests together')
     if not re.fullmatch(r'[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+', args.repo) or args.run < 1:
         parser.error('expected owner/repository and a positive run ID')
     if not args.status and (not re.fullmatch(r'v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)', args.version or '')
                             or not re.fullmatch(r'[0-9a-f]{40}', args.source or '')):
         parser.error('promotion needs --version vMAJOR.MINOR.PATCH and --source full lowercase SHA')
+    if not args.status and tuple(map(int, args.version[1:].split('.'))) >= (0, 8, 0):
+        raise ValueError('final promotion pending authenticated external installed-admission producer intake; build declaration is pending qualification')
     run, jobs, artifacts = inspect(args.repo, args.run)
     if args.status:
         status(args.repo, args.run, run, jobs, artifacts)
         return 0
     artifact = verified_artifact(args.repo, args.run, args.source, run, jobs, artifacts)
     setup = setup_artifact(args.repo, args.run, args.source, run, jobs, artifacts)
+    if accepted[0] is not None and accepted != (run.get('run_attempt'), artifact['id'], artifact['digest'], setup['id'], setup['digest']):
+        raise ValueError('candidate artifacts differ from the exact installed acceptance identities')
     with tempfile.TemporaryDirectory(prefix='oa-promotion-') as tmp:
         directory = Path(tmp)
         retained = directory / 'candidate-artifact.zip'
@@ -543,15 +700,22 @@ def main(argv=None):
         packages = {line[66:]: line[:64] for line in lines}
         retained_setup = directory / 'setup-artifact.zip'
         download(['api', f'repos/{args.repo}/actions/artifacts/{setup["id"]}/zip'], retained_setup)
-        setup_assets, setup_sums = unpack_setup(retained_setup, setup['digest'], directory, args.version, packages)
+        setup_receipt = {}
+        setup_assets, setup_sums = unpack_setup(retained_setup, setup['digest'], directory, args.version, packages, receipt_sink=setup_receipt)
         notes = directory / 'NOTES.md'
-        if '`' + setup_name(args.version) + '`' not in notes.read_text(encoding='utf-8'):
+        if 'release_facts' not in metadata and '`' + setup_name(args.version) + '`' not in notes.read_text(encoding='utf-8'):
             raise ValueError('release notes do not name the signed ' + setup_name(args.version))
         # The published checksum file is the verified release's, then one
         # line per Setup file in the sha256sum format it already uses.
         lines += [setup_sums[name] + '  ' + name for name in setup_assets]
         sums.write_bytes(''.join(line + '\n' for line in lines).encode('utf-8'))
         assets = sorted(set(assets) | set(setup_assets))
+        assets = public_asset_names(directory, assets, args.version)
+        if 'release_facts' in metadata:
+            record = final_release_facts(metadata, directory, assets, setup_receipt)
+            notes.write_text(release_facts_owner().render_notes(notes.read_text(encoding='utf-8'), record), encoding='utf-8')
+            if '`' + setup_name(args.version) + '`' not in notes.read_text(encoding='utf-8'):
+                raise ValueError('candidate facts omit the exact measured Setup bundle')
         body = notes.read_text(encoding='utf-8') + f'\n\nVerified candidate: https://github.com/{args.repo}/actions/runs/{args.run}\n'
         notes.write_text(body, encoding='utf-8')
         # Create-only refs preserve existing tags. A failed lookup cannot authorize
@@ -561,7 +725,7 @@ def main(argv=None):
             tag = api(f'repos/{args.repo}/git/ref/tags/{args.version}')
             if tag.get('object', {}).get('type') != 'commit' or tag['object'].get('sha') != args.source:
                 raise ValueError('resume requires the existing tag to point directly to the verified commit')
-            release = optional_api(f'repos/{args.repo}/releases/tags/{args.version}')
+            release = release_by_tag(args.repo, args.version)
         else:
             command(['api', '--method', 'POST', f'repos/{args.repo}/git/refs',
                      '-f', 'ref=refs/tags/' + args.version, '-f', 'sha=' + args.source])

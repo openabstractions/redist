@@ -33,7 +33,6 @@ file-store packages leave the packages in 0.2.0
 | what | where | feature |
 |---|---|---|
 | `openabstractions` | `~/.local/bin/` | service |
-| the four default host declarations | `~/.local/bin/declarations/` | service |
 | shared runtime | `~/.config/systemd/user/abstraction-runtime.service` | service |
 | `USING.txt` | `~/.local/share/abstraction/dev/` | service |
 | `LICENSE` | `~/.local/share/abstraction/` | service |

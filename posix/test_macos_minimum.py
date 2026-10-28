@@ -10,6 +10,7 @@ Run: python3 -m unittest test_macos_minimum (from installer/posix).
 """
 import contextlib
 import io
+import os
 from pathlib import Path
 import tempfile
 import unittest
@@ -28,6 +29,35 @@ class MinimumMacosTests(unittest.TestCase):
 
     def test_info_plist_declares_a_version(self):
         self.assertRegex(build.package_minimum_macos(), r"^\d+\.\d+$")
+
+    def test_cgo_build_uses_the_package_floor_even_with_a_newer_host_setting(self):
+        with patch.dict(os.environ, MACOSX_DEPLOYMENT_TARGET="26.0"), patch.object(build.subprocess, "run") as run:
+            build.gobuild(self.source.parent, Path(self.temp.name) / "out/panel", "darwin", "arm64")
+        environment = run.call_args.kwargs["env"]
+        self.assertEqual(environment["MACOSX_DEPLOYMENT_TARGET"], build.package_minimum_macos())
+        self.assertEqual(environment["CGO_ENABLED"], "1")
+
+    def test_emitted_and_prebuilt_macho_minima_are_received_before_packaging(self):
+        image = Path(self.temp.name) / "panel"
+        def output(version, platform="MACOS"):
+            return f"{image}:\nLoad command 11\n cmd LC_BUILD_VERSION\n platform {platform}\n minos {version}\n sdk 27.0\n"
+        def tool(text):
+            return lambda args, **kwargs: "x86_64 arm64" if args[0] == "lipo" else text.get(args[3], "") if isinstance(text, dict) else text
+        for text in (output("12.0"), output("11.0"),
+                     "Load command 5\n cmd LC_VERSION_MIN_MACOSX\n version 12.0\n"):
+            with self.subTest(valid=text), patch.object(build.subprocess, "check_output", side_effect=tool(text)):
+                build.check_macos_minimum(image)
+        for text in ("", output("26.0"), output("12.0") + output("12.0"), output("12.0", "IOS"), output("unknown"),
+                     {"x86_64": output("12.0"), "arm64": ""}, {"x86_64": output("12.0"), "arm64": output("26.0")}):
+            with self.subTest(refused=text), patch.object(build.subprocess, "check_output", side_effect=tool(text)):
+                with self.assertRaises(SystemExit):
+                    build.check_macos_minimum(image)
+        prebuilt = Path(self.temp.name) / "prebuilt"
+        prebuilt.mkdir()
+        (prebuilt / "panel").write_bytes(b"inert prebuilt image")
+        with patch.object(build.subprocess, "check_output", side_effect=tool(output("26.0"))), self.assertRaises(SystemExit):
+            build.stage([("bin/panel", "gobuild", "charter", "monitor", "755")], {},
+                        Path(self.temp.name) / "payload", "darwin", "arm64", prebuilt=prebuilt)
 
     def test_a_matching_launcher_minimum_is_the_build_target(self):
         declared = build.package_minimum_macos()

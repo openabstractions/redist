@@ -111,18 +111,50 @@ def pinned(src, want):
 
 def gobuild(pkgdir, dst, goos, goarch):
     dst.parent.mkdir(parents=True, exist_ok=True)
+    environment = {**os.environ, "CGO_ENABLED": "1" if goos == "darwin" else "0", "GOOS": goos,
+                   "GOARCH": goarch, "GOFLAGS": "-trimpath"}
+    if goos == "darwin":
+        environment["MACOSX_DEPLOYMENT_TARGET"] = package_minimum_macos()
     subprocess.run(["go", "build", "-ldflags", "-s -w -buildid=", "-o", str(dst), "."],
                    cwd=pkgdir, check=True,
                    # Native macOS clients and receivers require XPC's cgo
                    # owner; retain the pure-Go Linux fallback.
-                   env={**os.environ, "CGO_ENABLED": "1" if goos == "darwin" else "0", "GOOS": goos,
-                        "GOARCH": goarch, "GOFLAGS": "-trimpath"})
+                   env=environment)
 
 
 def package_minimum_macos():
     """The macOS version the package declares (macos/Info.plist LSMinimumSystemVersion)."""
     with (HERE / "macos/Info.plist").open("rb") as info:
         return plistlib.load(info)["LSMinimumSystemVersion"]
+
+
+def check_macos_minimum(program):
+    """Receive each emitted/prebuilt program's deployment target from Apple's tool."""
+    architectures = subprocess.check_output(["lipo", "-archs", str(program)], text=True).split()
+    if not architectures or len(set(architectures)) != len(architectures) or not set(architectures) <= set(SWIFT_ARCH.values()):
+        sys.exit(f"FAIL  {program} has unsupported Mach-O architectures: {architectures}")
+    declared = package_minimum_macos()
+    def value(version):
+        if not re.fullmatch(r"\d+(?:\.\d+){1,2}", version):
+            sys.exit(f"FAIL  {program} has a malformed macOS deployment target")
+        return tuple((list(map(int, version.split("."))) + [0, 0])[:3])
+    for arch in architectures:
+        text = subprocess.check_output(["xcrun", "vtool", "-arch", arch, "-show-build", str(program)], text=True)
+        versions = []
+        for command in re.split(r"(?m)^Load command \d+\s*$", text):
+            if re.search(r"(?m)^\s*cmd LC_BUILD_VERSION\s*$", command):
+                platform = re.search(r"(?m)^\s*platform (\S+)\s*$", command)
+                version = re.search(r"(?m)^\s*minos (\S+)\s*$", command)
+                if not platform or platform.group(1) != "MACOS" or not version:
+                    sys.exit(f"FAIL  {program} has no macOS deployment target for {arch}")
+                versions.append(version.group(1))
+            elif re.search(r"(?m)^\s*cmd LC_VERSION_MIN_MACOSX\s*$", command):
+                version = re.search(r"(?m)^\s*version (\S+)\s*$", command)
+                if not version:
+                    sys.exit(f"FAIL  {program} has no macOS deployment target for {arch}")
+                versions.append(version.group(1))
+        if len(versions) != 1 or value(versions[0]) > value(declared):
+            sys.exit(f"FAIL  {program} {arch} exceeds or lacks declared macOS {declared}: {versions}")
 
 
 def launcher_minimum_macos(srcfile):
@@ -141,14 +173,23 @@ def launcher_minimum_macos(srcfile):
     return minimum
 
 
-def swiftbuild(srcfile, dst, goarch):
+def swiftbuild(srcfile, dst, goarch, native_source_root=None, native_source_roster=None, native_provenance=None):
     dst.parent.mkdir(parents=True, exist_ok=True)
     arch = SWIFT_ARCH[goarch]
+    native_builder = Path(srcfile).parent / "build_launcher.py"
+    if native_builder.is_file():
+        subprocess.run([sys.executable, str(native_builder), "--source", str(srcfile),
+                        "--output", str(dst), "--arch", arch,
+                        "--minimum", launcher_minimum_macos(srcfile),
+                        "--native-source-root", str(native_source_root),
+                        "--native-source-roster", str(native_source_roster),
+                        "--native-provenance", str(native_provenance)], check=True)
+        return
     subprocess.run(["swiftc", "-O", "-target", f"{arch}-apple-macos{launcher_minimum_macos(srcfile)}",
                     str(srcfile), "-o", str(dst)], check=True)
 
 
-def stage(items, src, root, goos, goarch, programs=True, prebuilt=None, license=None):
+def stage(items, src, root, goos, goarch, programs=True, prebuilt=None, license=None, native_sources=(None, None, None)):
     files = []
     for path, kind, source, frm, mode in items:
         dst = root / path
@@ -166,7 +207,7 @@ def stage(items, src, root, goos, goarch, programs=True, prebuilt=None, license=
             elif prebuilt is not None:
                 shutil.copyfile(prebuilt / Path(path).name, dst)
             else:
-                swiftbuild(src[source] / frm, dst, goarch)
+                swiftbuild(src[source] / frm, dst, goarch, *native_sources)
         elif kind == "generated":
             dst.write_bytes(b"")
         elif kind == "license":
@@ -185,6 +226,8 @@ def stage(items, src, root, goos, goarch, programs=True, prebuilt=None, license=
             # otherwise put CRLF into a shell script that a shell then refuses.
             base = HERE if source == "posix" else src[source]
             dst.write_bytes((base / frm).read_bytes().replace(b"\r\n", b"\n"))
+        if programs and goos == "darwin" and kind in ("gobuild", "swiftbuild"):
+            check_macos_minimum(dst)
         files.append((path, mode))
     return files
 
@@ -342,6 +385,19 @@ def sign_panel_app(root, identity, keychain=None):
     return signature.relative_to(root).as_posix()
 
 
+def sign_development_code(target, identifier):
+    """Seal owned development code without publisher trust or runtime exceptions."""
+    subprocess.run(["codesign", "--force", "--sign", "-", "--identifier", identifier, str(target)], check=True)
+    subprocess.run(["codesign", "--verify", "--all-architectures", "--strict", "--verbose=2", str(target)], check=True)
+    display = subprocess.run(["codesign", "-d", "-r-", "--verbose=4", str(target)],
+                             capture_output=True, text=True, check=True)
+    details = (display.stdout or "") + (display.stderr or "")
+    if ("Signature=adhoc" not in details or re.search(r"^Authority=", details, re.MULTILINE) or
+            not re.search(r"^Identifier=" + re.escape(identifier) + r"$", details, re.MULTILINE) or
+            not re.search(r"^(?:# )?designated => .+", details, re.MULTILINE)):
+        raise RuntimeError(str(target) + " lacks the expected development ad-hoc identity or designated requirement")
+
+
 def sign_development_programs(root, items):
     """Give every staged macOS program structural validity without publisher trust."""
     app = root / PANEL_APP
@@ -356,15 +412,7 @@ def sign_development_programs(root, items):
     if any(not target.is_file() for target, _ in programs):
         raise ValueError("all development programs must be assembled before signing")
     for target, identifier in [*programs, (app, PANEL_IDENTIFIER)]:
-        subprocess.run(["codesign", "--force", "--sign", "-", "--identifier", identifier, str(target)], check=True)
-        subprocess.run(["codesign", "--verify", "--all-architectures", "--strict", "--verbose=2", str(target)], check=True)
-        display = subprocess.run(["codesign", "-d", "-r-", "--verbose=4", str(target)],
-                                 capture_output=True, text=True, check=True)
-        details = (display.stdout or "") + (display.stderr or "")
-        if ("Signature=adhoc" not in details or re.search(r"^Authority=", details, re.MULTILINE) or
-                not re.search(r"^Identifier=" + re.escape(identifier) + r"$", details, re.MULTILINE) or
-                not re.search(r"^(?:# )?designated => .+", details, re.MULTILINE)):
-            raise RuntimeError(str(target) + " lacks the expected development ad-hoc identity or designated requirement")
+        sign_development_code(target, identifier)
     subprocess.run(["codesign", "--verify", "--deep", "--all-architectures", "--strict", "--verbose=2", str(app)], check=True)
     signature = PANEL_APP / "Contents/_CodeSignature/CodeResources"
     if not (root / signature).is_file():
@@ -446,6 +494,9 @@ def main():
                          "versions rather than out of checkouts; on macOS programs "
                          "must already be universal, because lipo is what joins "
                          "two thin builds and this route does not run it")
+    ap.add_argument("--native-source-root", type=Path, help="explicit four-repository C++ source assembly for a source-built macOS launcher")
+    ap.add_argument("--native-source-roster", type=Path, help="existing selected pypi.tsv for the native source assembly")
+    ap.add_argument("--native-provenance", type=Path, help="existing selected module-provenance.json for the native source assembly")
     ap.add_argument("--license", type=Path, default=nearest_license(),
                     help="the LICENSE the package installs")
     ap.add_argument("--sign-app-identity", help="macOS Developer ID Application identity for the runtime and complete Panel.app")
@@ -528,7 +579,8 @@ def main():
             thin = []
             for arch in sorted(ARCHES):
                 d = work / f"thin-{arch}"
-                stage(items, src, d, "darwin", arch, license=a.license)
+                stage(items, src, d, "darwin", arch, license=a.license,
+                      native_sources=(a.native_source_root, a.native_source_roster, a.native_provenance))
                 thin.append(d)
             files = stage(items, src, root, "darwin", "arm64",
                           programs=False, license=a.license)

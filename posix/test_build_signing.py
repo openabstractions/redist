@@ -49,15 +49,57 @@ class PanelSigningTests(unittest.TestCase):
         self.assertEqual(files, [(destination, 0o644), (text_path, 0o644)])
 
     def prebuilt_package_inputs(self):
+        # These files are inert signing fixtures. Supply Apple's metadata seam
+        # here; the minimum-version corpus owns malformed/newer target controls.
+        def vtool(args, **kwargs):
+            self.assertTrue(kwargs["text"])
+            if args[0] == "lipo":
+                self.assertEqual(args[1], "-archs")
+                return "x86_64 arm64"
+            self.assertEqual(args[:3], ["xcrun", "vtool", "-arch"])
+            self.assertIn(args[3], ("x86_64", "arm64"))
+            return ("Load command 1\n cmd LC_BUILD_VERSION\n platform MACOS\n minos "
+                    + build.package_minimum_macos() + "\n")
+        tool = patch.object(build.subprocess, "check_output", side_effect=vtool)
+        tool.start()
+        self.addCleanup(tool.stop)
         prebuilt = self.root / "universal"
         prebuilt.mkdir()
-        for name in ("panel", "Abstraction Panel", "openabstractions"):
+        for name in ("panel", "Abstraction Panel", "openabstractions", "modelpack"):
             (prebuilt / name).write_bytes(b"inert program fixture")
+        (prebuilt / "OA_APPLICATION_MANIFEST.json").write_bytes(b'{"fixture":"sealed manifest"}\n')
         license_file = self.root / "LICENSE"
         license_file.write_bytes(b"fixture license\r\n")
         argv = ["build.py", "--platform", "macos", "--out", str(self.root / "dist"),
                 "--bin", str(prebuilt), "--license", str(license_file)]
         return prebuilt, argv
+
+    def test_native_application_manifest_is_staged_verbatim_before_bundle_signing(self):
+        destination = (build.PANEL_APP / "Contents/Resources/OA_APPLICATION_MANIFEST.json").as_posix()
+        items = [item for item in build.payload("macos") if item[0] == destination]
+        self.assertEqual(len(items), 1)
+        self.assertEqual(items[0][1:4], ("copy", "charter", "monitor/panel-application.json"))
+        source = self.root / "manifest-source"
+        manifest = source / "monitor/panel-application.json"
+        manifest.parent.mkdir(parents=True)
+        raw = b'{\n "name": "fixture", "opaque": "<>&"\n}\n'
+        manifest.write_bytes(raw)
+        build.stage(items, {"charter": source}, self.root, "darwin", "arm64", programs=False)
+        self.assertEqual((self.root / destination).read_bytes(), raw)
+
+        identifiers = {}
+        def sign(args, **kwargs):
+            if args[1] == "--force": identifiers[args[-1]] = args[args.index("--identifier") + 1]
+            if args[1] == "--force" and Path(args[-1]) == self.app:
+                self.assertEqual((self.root / destination).read_bytes(), raw)
+                seal = self.app / "Contents/_CodeSignature/CodeResources"
+                seal.parent.mkdir(parents=True)
+                seal.write_text("fixture seal")
+            details = DETAILS.replace(build.PANEL_IDENTIFIER, identifiers.get(args[-1], build.PANEL_IDENTIFIER))
+            return subprocess.CompletedProcess(args, 0, stderr=details if kwargs.get("text") else None)
+
+        with patch.object(build.subprocess, "run", side_effect=sign):
+            build.sign_panel_app(self.root, "Developer ID Application: Fixture (TEAM)", None)
 
     def test_release_bin_route_carries_exact_icon_or_uses_explicit_source(self):
         prebuilt, argv = self.prebuilt_package_inputs()
@@ -240,7 +282,7 @@ class PanelSigningTests(unittest.TestCase):
         with patch.object(build, "needs"), patch.object(build.subprocess, "run", side_effect=run), \
              patch.object(build, "pkg", side_effect=package), patch.object(sys, "argv", argv):
             self.assertEqual(build.main(), 0)
-        self.assertEqual(set(events), {"openabstractions", "panel", "Abstraction Panel", "openabstractions-mcp", "Abstraction Panel.app"})
+        self.assertEqual(set(events), {"openabstractions", "modelpack", "panel", "Abstraction Panel", "openabstractions-mcp", "Abstraction Panel.app"})
 
     def test_development_native_failure_and_missing_requirement_refuse(self):
         items = [(str(build.PANEL_APP / "Contents/MacOS/panel"), "gobuild", "charter", "monitor", 0o755)]
@@ -272,7 +314,7 @@ class PanelSigningTests(unittest.TestCase):
         owner = {row[0]: build.BASE for row in items}
         prebuilt = self.root / "prebuilt"
         prebuilt.mkdir()
-        for name in ("panel", "Abstraction Panel", "openabstractions"):
+        for name in ("panel", "Abstraction Panel", "openabstractions", "modelpack"):
             (prebuilt / name).write_text(name)
         license_file = self.root / "LICENSE"
         license_file.write_text("license")

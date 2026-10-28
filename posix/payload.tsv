@@ -64,23 +64,22 @@ both		service	.local/share/abstraction/LICENSE				license		posix		-						644
 both		service	.local/share/abstraction/dev/USING.txt				authored	posix		dev/USING.txt					644
 linux		service	.local/share/abstraction/uninstall.sh				authored	posix		linux/uninstall.sh				755
 macos		service	.local/share/abstraction/com.openabstractions.runtime.plist	authored	posix		macos/com.openabstractions.runtime.plist		644
+macos		service	.local/share/abstraction/com.openabstractions.runtime-login.plist	authored	posix		macos/com.openabstractions.runtime-login.plist		644
 macos		service	.local/share/abstraction/FILES					generated	posix		-						644
 macos		service	.local/share/abstraction/uninstall.sh				authored	posix		macos/uninstall.sh				755
 macos		service	.local/share/abstraction/com.openabstractions.panel.plist	authored	posix		macos/com.openabstractions.panel.plist		644
 macos		service	.local/bin/Abstraction Panel.app/Contents/Info.plist		authored	posix		macos/Info.plist				644
 macos		service	.local/bin/Abstraction Panel.app/Contents/Resources/AppIcon.icns	copy		charter		monitor/icon/panel.icns				644
+macos		service	.local/bin/Abstraction Panel.app/Contents/Resources/OA_APPLICATION_MANIFEST.json	copy		charter		monitor/panel-application.json		644
 macos		service	.local/bin/Abstraction Panel.app/Contents/MacOS/panel		gobuild		charter		monitor						755
 macos		service	.local/bin/Abstraction Panel.app/Contents/MacOS/Abstraction Panel	swiftbuild	charter		monitor/macos/PanelLauncher.swift		755
 linux		service	.local/share/abstraction/FEATURES				generated	posix		-						644
 both	service	.local/bin/openabstractions	gobuild	charter	serve	755
+both	service	.local/bin/modelpack	gobuild	modelpack	go/cmd/modelpack	755
 linux	service	.config/systemd/user/abstraction-runtime.service	authored	posix	linux/abstraction-runtime.service	644
 linux	service	.local/share/abstraction/lifecycle.sh	authored	posix	linux/lifecycle.sh	644
 
 macos	service	.local/share/abstraction/lifecycle.sh	authored	posix	macos/lifecycle.sh	644
-both	service	.local/bin/declarations/lemonade.json	authored	posix	declarations/lemonade.json	644
-both	service	.local/bin/declarations/lmstudio.json	authored	posix	declarations/lmstudio.json	644
-both	service	.local/bin/declarations/ollama.json	authored	posix	declarations/ollama.json	644
-both	service	.local/bin/declarations/comfyui.json	authored	posix	declarations/comfyui.json	644
 linux	localstores	.local/bin/inventoryd	gobuild	localstores	go/cmd/inventoryd	755
 linux	localstores	.local/bin/declarations/local-stores.json	authored	posix	declarations/local-stores.json	644
 linux	modelhost	.local/bin/modelhostd	gobuild	modelhost	go/cmd/modelhostd	755

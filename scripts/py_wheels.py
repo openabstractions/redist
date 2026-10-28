@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build one platform-tagged `abstraction-ipc` wheel from a built native library.
+"""Build a client-owned platform wheel from its built native library.
 
 A Python adopter's native client ships inside its wheel (PACKAGING-2026-09-22,
 `research/adoption/comfyui/PACKAGING-2026-09-22.md`): one PyPI distribution,
@@ -20,6 +20,8 @@ here publishes: uploading to PyPI needs the owner's organization and consent.
   py scripts/py_wheels.py --check DIR/abstraction_ipc-0.2.0-py3-none-win_amd64.whl
 
 Versions come from --version alone. The source pyproject.toml keeps 0.0.0.
+--family abstraction-facade-native selects the optional Facade application-local
+component and its py-native source; the default family remains abstraction-ipc.
 A wheel missing a file its RECORD names, or carrying one it does not name, is
 refused by name; so is a wheel whose bundled library does not match its
 platform tag.
@@ -36,8 +38,10 @@ import zipfile
 from pathlib import Path
 try:
     from .windows_native import NativeDependencyError, validate_portable_windows_dll
+    from .npm_packages import FACADE_NATIVE
 except ImportError:  # direct script invocation from scripts/
     from windows_native import NativeDependencyError, validate_portable_windows_dll
+    from npm_packages import FACADE_NATIVE
 
 ROOT = Path(__file__).resolve().parent.parent
 NAME = "abstraction-ipc"
@@ -71,12 +75,46 @@ PLATFORM_LIBRARIES = {
 }
 
 
+# One assembler and receipt grammar for the two client-owned native families.
+NATIVE_FAMILIES = {
+    NAME: {"wheel": WHEEL_NAME, "package": DEFAULT_PACKAGE,
+           "module": "abstraction/ipc", "directory": "py", "libraries": PLATFORM_LIBRARIES},
+    FACADE_NATIVE['python']: {
+        "wheel": FACADE_NATIVE['python'].replace('-', '_'),
+        "repository": FACADE_NATIVE['repository'], "candidate_projection": True,
+        "package": 'openabstractions-flat/' + FACADE_NATIVE['repository'].split('/')[1] + '/' + FACADE_NATIVE['python_directory'],
+        "module": FACADE_NATIVE['python'].replace('-', '_'), "directory": FACADE_NATIVE['python_directory'],
+        "libraries": {
+            "win_amd64": FACADE_NATIVE['libraries']['win32-x64'],
+            "win_arm64": FACADE_NATIVE['libraries']['win32-x64'],
+            "manylinux_2_28_x86_64": FACADE_NATIVE['libraries']['linux-x64'],
+            "manylinux_2_28_aarch64": FACADE_NATIVE['libraries']['linux-x64'],
+            "macosx_11_0_arm64": FACADE_NATIVE['libraries']['darwin-arm64'],
+            "macosx_11_0_x86_64": FACADE_NATIVE['libraries']['darwin-x64']}},
+}
+
+
+def native_family(distribution):
+    try:
+        return NATIVE_FAMILIES[distribution]
+    except (KeyError, TypeError) as exc:
+        raise Refused("unrecognized native wheel family") from exc
+
+
 class Refused(Exception):
     """A condition the caller must fix; printed without a traceback."""
 
 
 class ValidatedWheelInputs(dict):
     """Receipt accepted against a selected successful Windows producer run."""
+
+
+def pure_wheel_version(candidate_version):
+    """Current trains are lockstep; pre-0.8 receipts retain their legacy version."""
+    if not isinstance(candidate_version, str) or not VERSION.fullmatch(candidate_version):
+        raise Refused('invalid candidate wheel version')
+    release = tuple(int(part) for part in candidate_version.split('-', 1)[0].split('.'))
+    return candidate_version if release >= (0, 8, 0) else '0.0.0'
 
 
 def _unique_json_object(pairs):
@@ -112,7 +150,7 @@ def load_wheel_inputs(path, *, candidate_source, candidate_version, run_id, run_
     for entry in receipt["wheels"]:
         if not isinstance(entry, dict):
             raise Refused("Windows wheel receipt entry is not an object")
-        native = entry.get("distribution") == NAME
+        native = isinstance(entry.get("distribution"), str) and entry["distribution"] in NATIVE_FAMILIES
         fields = WHEEL_FIELDS | ({"native_library_sha256"} if native else set())
         if set(entry) != fields:
             raise Refused("Windows wheel receipt entry has unexpected fields")
@@ -123,30 +161,38 @@ def load_wheel_inputs(path, *, candidate_source, candidate_version, run_id, run_
                 or not isinstance(entry["repository"], str)
                 or not re.fullmatch(r"openabstractions/[A-Za-z0-9._-]+", entry["repository"])
                 or not isinstance(entry["commit"], str) or not COMMIT.fullmatch(entry["commit"])
-                or entry["directory"] != "py" or type(entry["bytes"]) is not int
+                or entry["directory"] not in ("py", "python", "py-native")
+                or (native and entry["directory"] != native_family(distribution)["directory"])
+                or (not native and entry["directory"] == "py-native")
+                or type(entry["bytes"]) is not int
                 or not 0 < entry["bytes"] < 2 * 1024 * 1024 * 1024
                 or not isinstance(entry["sha256"], str) or not SHA256.fullmatch(entry["sha256"])
                 or (native and (not isinstance(entry["native_library_sha256"], str)
                                 or not SHA256.fullmatch(entry["native_library_sha256"])))):
             raise Refused("Windows wheel receipt entry is invalid or duplicated")
+        version = candidate_version if native else pure_wheel_version(candidate_version)
+        platform = 'win_amd64' if native else 'any'
+        if filename != f"{distribution.replace('-', '_')}-{version}-py3-none-{platform}.whl":
+            raise Refused('Windows wheel filename differs from selected candidate version')
         distributions.add(distribution)
         filenames.add(filename)
     return ValidatedWheelInputs(receipt)
 
 
-def verify_native_receipt_wheel(receipt, wheel_dir, *, repository, commit, directory="py"):
+def verify_native_receipt_wheel(receipt, wheel_dir, *, repository, commit, directory="py", distribution=NAME):
     """Check one pinned native wheel and return its path, exact DLL bytes and receipt entry."""
     if (not isinstance(receipt, ValidatedWheelInputs)
             or not isinstance(receipt.get("candidate_version"), str)
             or not VERSION.fullmatch(receipt["candidate_version"])):
         raise Refused("native wheel requires a selected and validated Windows receipt")
-    native = [entry for entry in receipt["wheels"] if entry["distribution"] == NAME]
+    family = native_family(distribution)
+    native = [entry for entry in receipt["wheels"] if entry["distribution"] == distribution]
     if len(native) != 1 or not isinstance(repository, str) or not isinstance(commit, str) or not COMMIT.fullmatch(commit):
-        raise Refused("Windows wheel receipt needs exactly one pinned native IPC wheel")
+        raise Refused("Windows wheel receipt needs exactly one pinned native family wheel")
     entry = native[0]
     if (entry["repository"], entry["commit"], entry["directory"]) != (repository, commit, directory):
         raise Refused("native wheel source differs from selected pypi.tsv pin")
-    filename = f"{WHEEL_NAME}-{receipt['candidate_version']}-py3-none-win_amd64.whl"
+    filename = f"{family['wheel']}-{receipt['candidate_version']}-py3-none-win_amd64.whl"
     if entry["filename"] != filename or entry["bytes"] > MAX_NATIVE_WHEEL_BYTES:
         raise Refused("native wheel filename or size is not the selected Windows candidate")
     path = Path(wheel_dir) / filename
@@ -164,7 +210,7 @@ def verify_native_receipt_wheel(receipt, wheel_dir, *, repository, commit, direc
         with zipfile.ZipFile(path) as archive:
             if sum(item.file_size for item in archive.infolist()) > MAX_NATIVE_UNPACKED_BYTES:
                 raise Refused("native wheel expands beyond the review limit")
-            dll = archive.read("abstraction/ipc/_native/abstraction_ipc.dll")
+            dll = archive.read(f"{family['module']}/_native/{family['libraries']['win_amd64']}")
     except (zipfile.BadZipFile, KeyError) as exc:
         raise Refused("native wheel lacks a readable fixed DLL") from exc
     version, platform_tag, _ = check(path)
@@ -179,6 +225,8 @@ def host_platform():
     """This host's platform tag, in the table above's spelling."""
     system = sys.platform
     machine = host_platform_module.machine().lower()
+    if machine not in ("amd64", "x86_64", "arm64", "aarch64"):
+        raise Refused(f"no platform tag is defined for {system}/{machine}")
     arm = machine in ("arm64", "aarch64")
     if system == "win32":
         return "win_arm64" if arm else "win_amd64"
@@ -189,7 +237,7 @@ def host_platform():
     raise Refused(f"no platform tag is defined for {system}/{machine}")
 
 
-def read_metadata(package):
+def read_metadata(package, distribution=NAME):
     """name, version placeholder and description, read out of pyproject.toml.
 
     A hand-rolled reader rather than tomllib on a `[project]` table this
@@ -201,8 +249,8 @@ def read_metadata(package):
     match = re.search(r'(?m)^\[project\]\s*$(.*?)^\[', text + "\n[", re.S)
     body = match.group(1) if match else ""
     fields = dict(re.findall(r'(?m)^(\w[\w-]*)\s*=\s*"([^"]*)"\s*$', body))
-    if fields.get("name") != NAME:
-        raise Refused(f"{package}/pyproject.toml names {fields.get('name')!r}, expected {NAME!r}")
+    if fields.get("name") != distribution:
+        raise Refused(f"{package}/pyproject.toml names {fields.get('name')!r}, expected {distribution!r}")
     requires_python = fields.get("requires-python")
     if not requires_python:
         raise Refused(f"{package}/pyproject.toml carries no requires-python")
@@ -215,12 +263,13 @@ def record_hash(data):
     return "sha256=" + base64.urlsafe_b64encode(digest).rstrip(b"=").decode("ascii")
 
 
-def stage_package(stage, package):
-    """Copy the pure-Python `abstraction.ipc` package into the wheel root, unchanged."""
-    source = package / "abstraction" / "ipc"
+def stage_package(stage, package, distribution=NAME):
+    """Copy this family's Python package into the wheel root, unchanged."""
+    module = native_family(distribution)["module"]
+    source = package / module
     if not (source / "__init__.py").is_file():
         raise Refused(f"{source} has no __init__.py; not a package to stage")
-    destination = stage / "abstraction" / "ipc"
+    destination = stage / module
     shutil.copytree(source, destination, ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
     if (destination / "_native").exists():
         raise Refused(f"{source} already carries _native/; a source checkout must not")
@@ -241,9 +290,11 @@ def write_wheel(output_dir, wheel_name, files):
     return target
 
 
-def assemble(version, platform_tag, library, package, license_file, output):
+def assemble(version, platform_tag, library, package, license_file, output, *, distribution=NAME):
     """Build one platform wheel; returns (path, files-added-to-the-zip)."""
-    library_filename = PLATFORM_LIBRARIES.get(platform_tag)
+    family = native_family(distribution)
+    wheel_basename = family["wheel"]
+    library_filename = family["libraries"].get(platform_tag)
     if library_filename is None:
         raise Refused(f"{platform_tag} has no qualified platform wheel; "
                       "this script names " + ", ".join(sorted(PLATFORM_LIBRARIES)))
@@ -256,22 +307,22 @@ def assemble(version, platform_tag, library, package, license_file, output):
             raise Refused(str(exc)) from exc
     if not license_file.is_file():
         raise Refused(f"--license must name an existing file: {license_file}")
-    description, requires_python = read_metadata(package)
+    description, requires_python = read_metadata(package, distribution)
 
-    stage = output.parent / f".py_wheels-stage-{platform_tag}"
+    stage = output.parent / f".py_wheels-stage-{wheel_basename}-{platform_tag}"
     if stage.exists():
         shutil.rmtree(stage)
     stage.mkdir(parents=True)
     try:
-        ipc_dir = stage_package(stage, package)
+        ipc_dir = stage_package(stage, package, distribution)
         native_dir = ipc_dir / "_native"
         native_dir.mkdir()
         shutil.copyfile(library, native_dir / library_filename)
 
-        dist_info = f"{WHEEL_NAME}-{version}.dist-info"
+        dist_info = f"{wheel_basename}-{version}.dist-info"
         metadata = (
             "Metadata-Version: 2.1\n"
-            f"Name: {NAME}\n"
+            f"Name: {distribution}\n"
             f"Version: {version}\n"
             f"Summary: {description}\n"
             f"Requires-Python: {requires_python}\n"
@@ -295,7 +346,7 @@ def assemble(version, platform_tag, library, package, license_file, output):
         record_lines.append(f"{dist_info}/RECORD,,")
         files[f"{dist_info}/RECORD"] = ("\n".join(record_lines) + "\n").encode("utf-8")
 
-        wheel_name = f"{WHEEL_NAME}-{version}-py3-none-{platform_tag}.whl"
+        wheel_name = f"{wheel_basename}-{version}-py3-none-{platform_tag}.whl"
         target = write_wheel(output, wheel_name, files)
         return target, sorted(files)
     finally:
@@ -304,15 +355,21 @@ def assemble(version, platform_tag, library, package, license_file, output):
 
 def check(wheel_path):
     """Validate a built wheel's filename, RECORD and platform tag; return its listing."""
-    match = re.fullmatch(rf"{WHEEL_NAME}-([^-]+)-py3-none-([^-]+)\.whl", wheel_path.name)
+    candidates = [(name, value) for name, value in NATIVE_FAMILIES.items()
+                  if wheel_path.name.startswith(value["wheel"] + "-")]
+    if len(candidates) != 1:
+        raise Refused("unrecognized native wheel family")
+    distribution, family = candidates[0]
+    wheel_basename = family["wheel"]
+    match = re.fullmatch(rf"{wheel_basename}-([^-]+)-py3-none-([^-]+)\.whl", wheel_path.name)
     if not match:
-        raise Refused(f"{wheel_path.name} is not named {WHEEL_NAME}-VERSION-py3-none-PLATFORM.whl")
+        raise Refused(f"{wheel_path.name} is not named {wheel_basename}-VERSION-py3-none-PLATFORM.whl")
     version, platform_tag = match.groups()
-    library_filename = PLATFORM_LIBRARIES.get(platform_tag)
+    library_filename = family["libraries"].get(platform_tag)
     if library_filename is None:
         raise Refused(f"{wheel_path.name}: {platform_tag} is not a qualified platform wheel tag; "
                       "this script names " + ", ".join(sorted(PLATFORM_LIBRARIES)))
-    dist_info = f"{WHEEL_NAME}-{version}.dist-info"
+    dist_info = f"{wheel_basename}-{version}.dist-info"
     with zipfile.ZipFile(wheel_path) as archive:
         names = archive.namelist()
         if len(names) != len(set(names)):
@@ -328,7 +385,7 @@ def check(wheel_path):
     if metadata is None:
         raise Refused(f"{wheel_path.name} carries no {dist_info}/METADATA")
     metadata_lines = metadata.decode("utf-8").splitlines()
-    if metadata_lines.count(f"Name: {NAME}") != 1 or metadata_lines.count(f"Version: {version}") != 1:
+    if metadata_lines.count(f"Name: {distribution}") != 1 or metadata_lines.count(f"Version: {version}") != 1:
         raise Refused(f"{wheel_path.name}: METADATA name or version differs")
     record_bytes = contents.get(f"{dist_info}/RECORD")
     if record_bytes is None:
@@ -352,23 +409,25 @@ def check(wheel_path):
     missing = set(contents) - listed
     if missing:
         raise Refused(f"{wheel_path.name}: RECORD does not name {sorted(missing)}")
-    native = f"abstraction/ipc/_native/{library_filename}"
+    native = f"{family['module']}/_native/{library_filename}"
     if native not in contents or not contents[native]:
         raise Refused(f"{wheel_path.name} carries no non-empty {native}")
+    if {name for name in contents if name.startswith(family['module'] + '/_native/')} != {native}:
+        raise Refused(f"{wheel_path.name} carries an unexpected native family member")
     if platform_tag.startswith("win_"):
         try:
             validate_portable_windows_dll(contents[native], platform_tag)
         except NativeDependencyError as exc:
             raise Refused(str(exc)) from exc
-    if "abstraction/ipc/__init__.py" not in contents:
-        raise Refused(f"{wheel_path.name} carries no abstraction/ipc/__init__.py")
+    if family["module"] + "/__init__.py" not in contents:
+        raise Refused(f"{wheel_path.name} carries no {family['module']}/__init__.py")
     return version, platform_tag, sorted(contents)
 
 
 def run(args):
     if args.check:
         version, platform_tag, contents = check(Path(args.check).resolve())
-        print(f"ok    {Path(args.check).name}: {NAME} {version} {platform_tag}")
+        print(f"ok    {Path(args.check).name}: {version} {platform_tag}")
         for path in contents:
             print(f"        {path}")
         return 0
@@ -378,18 +437,19 @@ def run(args):
     library = Path(args.library).resolve()
     if not library.is_file():
         raise Refused(f"--library must name an existing file: {library}")
-    package = Path(args.package or ROOT / DEFAULT_PACKAGE).resolve()
+    family = native_family(args.family)
+    package = Path(args.package or ROOT / family["package"]).resolve()
     if not (package / "pyproject.toml").is_file():
         raise Refused(f"no pyproject.toml at {package}")
     license_file = Path(args.license or ROOT / "LICENSE").resolve()
     output = Path(args.output).resolve()
 
-    target, files = assemble(args.version, platform_tag, library, package, license_file, output)
+    target, files = assemble(args.version, platform_tag, library, package, license_file, output, distribution=args.family)
     version, checked_tag, _ = check(target)
     if (version, checked_tag) != (args.version, platform_tag):
         raise Refused(f"{target.name}: built as {version} {checked_tag}, expected {args.version} {platform_tag}")
 
-    print(f"\n{NAME} {args.version} {platform_tag}")
+    print(f"\n{args.family} {args.version} {platform_tag}")
     print(f"  {target.name}  {target.stat().st_size} bytes  sha256 {hashlib.sha256(target.read_bytes()).hexdigest()}")
     for path in files:
         print(f"    {path}")
@@ -399,6 +459,7 @@ def run(args):
 
 def parser():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("--family", choices=sorted(NATIVE_FAMILIES), default=NAME, help="client-owned native wheel family")
     p.add_argument("--version", metavar="X.Y.Z", help="the version the built wheel carries")
     p.add_argument("--output", metavar="DIR", help="directory receiving the wheel")
     p.add_argument("--library", metavar="PATH", help="the built shared C ABI library for --platform")

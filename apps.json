@@ -1,5 +1,114 @@
 {
   "schema": 1,
-  "release_tag": "v0.4.0",
-  "apps": []
+  "release_tag": "v0.8.0",
+  "apps": [],
+  "release_admission": {
+    "schema": 1,
+    "version": "0.8.0",
+    "scope_sha256": "c392bdf87eb4f32729fc40a7bf8d02f59d3e5ca38b1affa7041c34773eab212c",
+    "delivery_accepted": false,
+    "outcomes": {
+      "adopters": [
+        {
+          "id": "lemonade",
+          "target": "windows-x64",
+          "state": "pending"
+        },
+        {
+          "id": "opencode",
+          "target": "windows-x64",
+          "state": "pending"
+        },
+        {
+          "id": "comfyui",
+          "target": "windows-x64",
+          "state": "pending"
+        }
+      ],
+      "journeys": [
+        {
+          "id": "J-1",
+          "target": "windows-x64",
+          "state": "pending"
+        },
+        {
+          "id": "P-M9",
+          "target": "windows-x64",
+          "state": "pending"
+        },
+        {
+          "id": "P-J1a",
+          "target": "windows-x64",
+          "state": "pending"
+        },
+        {
+          "id": "W2-17a",
+          "target": "web",
+          "state": "pending"
+        },
+        {
+          "id": "F16",
+          "target": "windows-x64",
+          "state": "pending"
+        },
+        {
+          "id": "F18",
+          "target": "windows-x64",
+          "state": "pending"
+        },
+        {
+          "id": "F19",
+          "target": "windows-x64",
+          "state": "pending"
+        },
+        {
+          "id": "F20",
+          "target": "windows-x64",
+          "state": "pending"
+        },
+        {
+          "id": "F21",
+          "target": "windows-x64",
+          "state": "pending"
+        },
+        {
+          "id": "AB-1",
+          "target": "windows-x64",
+          "state": "pending"
+        },
+        {
+          "id": "AB-2",
+          "target": "windows-x64",
+          "state": "pending"
+        },
+        {
+          "id": "AB-2",
+          "target": "macos-arm64",
+          "state": "pending"
+        },
+        {
+          "id": "A-XM5",
+          "target": "windows-x64",
+          "state": "pending"
+        },
+        {
+          "id": "A-XM5",
+          "target": "macos-arm64",
+          "state": "pending"
+        },
+        {
+          "id": "AD-01",
+          "target": "windows-x64",
+          "state": "pending"
+        },
+        {
+          "id": "HP5",
+          "target": "windows-x64",
+          "state": "pending"
+        }
+      ]
+    },
+    "selections": [],
+    "capsule_sha256": "68a3a489ccf93ea90f25983271cbbbb880909d4b1585418f70dd7c2e853a0ef3"
+  }
 }

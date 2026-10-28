@@ -40,7 +40,7 @@ exec "$@"''')
         self.assertTrue((self.root / "calls.stopped").exists())
         self.assertIn("bootout gui/1000/com.openabstractions.runtime", (self.root / "calls").read_text())
         self.assertIn("booted out running previous LaunchAgent", result.stdout)
-        self.assertNotIn("no previous LaunchAgent com.openabstractions.runtime", result.stdout)
+        self.assertNotIn("no previous LaunchAgent com.openabstractions.runtime registered", result.stdout)
         self.assertEqual(self.payload.read_text(), "payload")
         self.assertEqual(self.data.read_text(), "accepted work")
 

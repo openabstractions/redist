@@ -11,6 +11,7 @@ import argparse
 import hashlib
 import json
 import os
+import re
 from pathlib import Path
 import shutil
 import subprocess
@@ -23,6 +24,8 @@ MODULES = {
     "abstraction-identity": "github.com/openabstractions/abstraction-identity",
     "abstraction-facade": "github.com/openabstractions/abstraction-facade/go",
     "abstraction-config": "github.com/openabstractions/abstraction-config/go",
+    "abstraction-inference": "github.com/openabstractions/abstraction-inference/go",
+    "abstraction-router": "github.com/openabstractions/abstraction-router/go",
 }
 SERVICE_MODULE = "github.com/openabstractions/abstractions/serve"
 SERVICE_PROGRAMS = {"openabstractions.exe", "openabstractionsw.exe"}
@@ -50,8 +53,59 @@ def service_version(tools: Path) -> str:
     return version
 
 
-def provenance_rows(record: Path, tools: Path) -> dict[str, dict[str, str]]:
+def prepared_provenance_rows(evidence, tools, expected_producer):
+    """Consume this run's verified prepared graph without claiming public tags."""
+    graph, verified = evidence.get('graph') or {}, evidence.get('verification') or {}
+    if (set(evidence) != {'schema', 'kind', 'graph', 'verification', 'archive', 'producer', 'publication_admitted'} or
+            evidence['schema'] != 2 or evidence['kind'] != 'prepared-module-provenance' or evidence['publication_admitted'] is not False or
+            not expected_producer or evidence['producer'] != expected_producer or
+            not re.fullmatch(r'[0-9a-f]{40}', str(expected_producer.get('source'))) or
+            any(type(expected_producer.get(k)) is not int or expected_producer[k] < 1 for k in ('run_id', 'run_attempt')) or
+            graph.get('schema') != 2 or graph.get('kind') != 'unpublished-go-graph' or
+            graph.get('version') != service_version(tools) or not re.fullmatch(r'[0-9a-f]{40}', str(graph.get('source'))) or
+            verified.get('source') != graph['source'] or verified.get('version') != graph['version']):
+        raise RuntimeError('prepared SDK provenance differs from exact producer/source/version')
+    archive = evidence['archive']
+    if (set(archive) != {'bytes', 'sha256'} or type(archive['bytes']) is not int or not 0 < archive['bytes'] < 80 * 1024**2 or
+            not re.fullmatch(r'[0-9a-f]{64}', str(archive['sha256']))):
+        raise RuntimeError('prepared SDK provenance has no bounded capsule digest')
+    observations = {}
+    for row in verified.get('modules', []):
+        key = (row.get('module'), row.get('version'))
+        if key in observations:
+            raise RuntimeError('duplicate prepared SDK verification')
+        observations[key] = row
+    expected = graph.get('modules', []) + graph.get('dependencies', [])
+    if len(observations) != len(expected):
+        raise RuntimeError('prepared SDK graph verification is incomplete')
+    rows = {}
+    for row in graph.get('modules', []):
+        path = row.get('module'); version = row.get('version')
+        if not isinstance(path, str) or not path.startswith('github.com/openabstractions/') or path in rows or version != graph['version']:
+            raise RuntimeError('prepared SDK graph repeats or changes a train module')
+        rest = path.removeprefix('github.com/openabstractions/'); repo, _, subdir = rest.partition('/')
+        observed = observations.get((path, version), {})
+        if (row.get('repository') != 'https://github.com/openabstractions/' + repo or
+                row.get('subdir') != subdir or row.get('tag') != (subdir + '/' if subdir else '') + version or
+                not re.fullmatch(r'[0-9a-f]{40}', str(row.get('commit'))) or
+                observed.get('commit') != row['commit'] or
+                any(not re.fullmatch(r'h1:[A-Za-z0-9+/]{43}=', str(row.get(k))) or observed.get(k) != row[k] for k in ('sum', 'gomodsum'))):
+            raise RuntimeError('prepared SDK commit/checksums/nested location differ')
+        rows[path] = {'path': path, 'version': version, 'expected_commit': row['commit'],
+            'repository': row['repository'], 'prepared_tag': row['tag'], 'provenance_kind': 'prepared-public-commit'}
+    if not (set(MODULES.values()) | {GO_CORE, SERVICE_MODULE}).issubset(rows):
+        raise RuntimeError('prepared service graph lacks required SDK modules')
+    for row in graph.get('dependencies', []):
+        observed = observations.get((row.get('module'), row.get('version')), {})
+        if any(observed.get(k) != row.get(k) for k in ('sum', 'gomodsum')):
+            raise RuntimeError('prepared dependency verification differs')
+    return rows
+
+
+def provenance_rows(record: Path, tools: Path, *, expected_producer=None) -> dict[str, dict[str, str]]:
     evidence = json.loads(record.read_text(encoding="utf-8"))
+    if evidence.get('schema') == 2:
+        return prepared_provenance_rows(evidence, tools, expected_producer)
     if evidence.get("schema") != 1:
         raise RuntimeError("unrecognized module provenance record")
     version = service_version(tools)
@@ -122,7 +176,8 @@ def prepare_python(out: Path, sources: Path, wheel_dir: Path) -> None:
 
 def prepare_javascript(out: Path, sources: Path, npm_dir: Path, temporary: Path) -> None:
     archive = list(npm_dir.glob("*.tgz"))
-    names = ("@openabstractions/ipc", "@openabstractions/ipc-win32-x64", "@openabstractions/facade")
+    names = ("@openabstractions/ipc", "@openabstractions/ipc-win32-x64", "@openabstractions/facade",
+             "@openabstractions/inference", "@openabstractions/router")
     by_name = {}
     for package in archive:
         with tarfile.open(package, "r:gz") as content:
@@ -153,11 +208,15 @@ def prepare_javascript(out: Path, sources: Path, npm_dir: Path, temporary: Path)
             "--no-package-lock", "--prefix", out, *chosen, config[0], env=npm_env)
     copy_probe("javascript_probe.mjs", out)
     checked("node", "--check", out / "javascript_probe.mjs")
+    copy_probe("j1_selection_probe.mjs", out)
+    checked("node", "--check", out / "j1_selection_probe.mjs")
 
 
 def check_go_selection(raw: str, rows: dict[str, dict[str, str]]) -> None:
     resolved = dict(line.rsplit("@", 1) for line in raw.splitlines() if "@" in line)
-    for path in set(MODULES.values()) | {GO_CORE}:
+    # The Go config probe imports the original three SDKs. The additional
+    # inference/router source pins belong to the JavaScript J1 collector.
+    for path in {MODULES[name] for name in ('abstraction-identity', 'abstraction-facade', 'abstraction-config')} | {GO_CORE}:
         if resolved.get(path) != rows[path]["version"]:
             raise RuntimeError(f"composed Go SDK selects {path}@{resolved.get(path)}, "
                                f"expected verified service graph {rows[path]['version']}")
@@ -172,9 +231,13 @@ def prepare_go(out: Path, selected: dict[str, dict[str, str]], rows: dict[str, d
     if not core_row:
         raise RuntimeError("candidate provenance lacks facade/go-core")
     core = core_row["version"]
+    identity = selected["abstraction-identity"]["version"]
+    if rows[MODULES["abstraction-identity"]]["version"] != identity:
+        raise RuntimeError("file identity helper differs from candidate identity pin")
     (source / "go.mod").write_text(
         "module openabstractions.invalid/sdk-smoke\n\ngo 1.26.0\n\nrequire (\n"
         f" github.com/openabstractions/abstraction-facade/go {facade}\n"
+        f" github.com/openabstractions/abstraction-identity {identity}\n"
         f" github.com/openabstractions/abstraction-facade/go-core {core}\n)\n", encoding="utf-8")
     env = dict(os.environ, GOWORK="off", GOTOOLCHAIN="local", GOFLAGS="-trimpath -p=2")
     checked("go", "mod", "tidy", cwd=source, env=env)
@@ -184,7 +247,7 @@ def prepare_go(out: Path, selected: dict[str, dict[str, str]], rows: dict[str, d
     checked("go", "build", "-o", out / "go_probe.exe", ".", cwd=source, env=env)
 
 
-def msvc_cmake() -> tuple[Path, str]:
+def msvc_toolchain() -> dict:
     vswhere = Path(os.environ.get("ProgramFiles(x86)", "C:/Program Files (x86)")) / "Microsoft Visual Studio/Installer/vswhere.exe"
     if not vswhere.is_file():
         raise RuntimeError("Visual Studio compiler inventory is unavailable")
@@ -200,9 +263,16 @@ def msvc_cmake() -> tuple[Path, str]:
     major = version.partition(".")[0]
     generator = {"17": "Visual Studio 17 2022", "18": "Visual Studio 18 2026"}.get(major)
     cmake = path / "Common7/IDE/CommonExtensions/Microsoft/CMake/CMake/bin/cmake.exe"
-    if not generator or not cmake.is_file():
-        raise RuntimeError("Visual Studio has no supported bundled CMake")
-    return cmake, generator
+    msbuild = path / "MSBuild/Current/Bin/MSBuild.exe"
+    if not path.is_absolute() or not generator or not cmake.is_file() or not msbuild.is_file():
+        raise RuntimeError("Visual Studio has no supported bundled CMake/MSBuild")
+    return {"installation_path": path, "installation_version": version,
+            "cmake": cmake, "generator": generator, "msbuild": msbuild}
+
+
+def msvc_cmake() -> tuple[Path, str]:
+    selected = msvc_toolchain()
+    return selected["cmake"], selected["generator"]
 
 
 def prepare_cpp(out: Path, sources: Path, temporary: Path) -> Path:
@@ -266,7 +336,13 @@ def main() -> None:
     out = args.out.resolve()
     if out.exists():
         raise RuntimeError("SDK smoke output already exists: " + str(out))
-    rows = provenance_rows(args.provenance, args.tools)
+    expected = None
+    if os.environ.get('GITHUB_SHA') and os.environ.get('GITHUB_RUN_ID'):
+        name = os.environ.get('SDK_PROVENANCE_ARTIFACT', '')
+        match = re.fullmatch(r'module-provenance-Windows-([1-9][0-9]*)', name)
+        if match:
+            expected = {'source': os.environ['GITHUB_SHA'], 'run_id': int(os.environ['GITHUB_RUN_ID']), 'run_attempt': int(match[1])}
+    rows = provenance_rows(args.provenance, args.tools, expected_producer=expected)
     selected = pins(rows)
     out.mkdir(parents=True)
     with tempfile.TemporaryDirectory(prefix=".sdk-smokes-build-", dir=out.parent) as scratch:
@@ -276,7 +352,7 @@ def main() -> None:
         prepare_python(out, sources, args.pypi)
         prepare_javascript(out, sources, args.npm, temporary)
         prepare_go(out, selected, rows, temporary)
-        # C++ and Rust preparation uses these same three pinned source trees.
+        # C++ and Rust preparation reuses the pinned Identity source tree.
         prefix = prepare_cpp(out, sources, temporary)
         prepare_rust(out, sources, temporary, prefix)
     copy_probe("run.ps1", out)

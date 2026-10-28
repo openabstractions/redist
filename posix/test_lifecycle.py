@@ -13,6 +13,8 @@ HERE = Path(__file__).resolve().parent
 # captured pipes still fails this bound.
 SCRIPT_TIMEOUT = 15
 
+FORMER_DEFAULT_HOSTS = {'comfyui': b'{\n  "version": 2,\n  "declaration": {\n    "name": "comfyui",\n    "program": "",\n    "arguments": [],\n    "endpoint": "",\n    "transport": "http@1",\n    "contracts": [],\n    "resources": [\n      "profile:image"\n    ],\n    "activation": "attach",\n    "role": "host",\n    "host": {\n      "base": "http://127.0.0.1:8188",\n      "kind": "comfyui",\n      "hosted": false\n    }\n  },\n  "declared_by": "installation",\n  "declared_unix_ms": 0\n}\n', 'lemonade': b'{\n  "version": 2,\n  "declaration": {\n    "name": "lemonade",\n    "program": "",\n    "arguments": [],\n    "endpoint": "",\n    "transport": "http@1",\n    "contracts": [],\n    "activation": "attach",\n    "role": "host",\n    "host": {\n      "base": "http://127.0.0.1:13305",\n      "kind": "lemonade",\n      "hosted": false\n    }\n  },\n  "declared_by": "installation",\n  "declared_unix_ms": 0\n}\n', 'lmstudio': b'{\n  "version": 2,\n  "declaration": {\n    "name": "lmstudio",\n    "program": "",\n    "arguments": [],\n    "endpoint": "",\n    "transport": "http@1",\n    "contracts": [],\n    "activation": "attach",\n    "role": "host",\n    "host": {\n      "base": "http://127.0.0.1:1234",\n      "kind": "lmstudio",\n      "hosted": false\n    }\n  },\n  "declared_by": "installation",\n  "declared_unix_ms": 0\n}\n', 'ollama': b'{\n  "version": 2,\n  "declaration": {\n    "name": "ollama",\n    "program": "",\n    "arguments": [],\n    "endpoint": "",\n    "transport": "http@1",\n    "contracts": [],\n    "activation": "attach",\n    "role": "host",\n    "host": {\n      "base": "http://127.0.0.1:11434",\n      "kind": "ollama",\n      "hosted": false\n    }\n  },\n  "declared_by": "installation",\n  "declared_unix_ms": 0\n}\n'}
+
 class Lifecycle(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -37,6 +39,7 @@ class Lifecycle(unittest.TestCase):
         self.env = dict(os.environ, HOME=str(self.home), PATH=str(self.bin)+":"+os.environ["PATH"], LOG=str(self.root/"calls"),
                         TMPDIR=str(self.root/"fixture-tmp"), USER="fixture-user")
         self.command("id", 'echo 1000')
+        self.command("stat", 'case "$2" in %Lp) echo 755;; %l) echo 1;; *) echo 1000;; esac')
         # Manager commands are mocked on both native hosts; Python bounds tests.
         # macOS has no bundled GNU timeout. Real Linux timeout is exercised by
         # test_systemd.sh separately.
@@ -73,8 +76,8 @@ list)
         printf -- '- 0 %s\n' "${AGENT_LABEL:-com.openabstractions.runtime}"
     fi;;
 bootout) [ "${FAIL:-}" != stop ] || exit 5; touch "$LOG.stopped";;
-bootstrap) [ "${FAIL:-}" != bootstrap ];;
-print) case "$2" in */"${AGENT_LABEL:-com.openabstractions.runtime}") [ "${ACTIVE:-}" = active ];; *) [ "${FAIL:-}" != verify ];; esac;;
+bootstrap) [ "${FAIL:-}" != bootstrap ] && touch "$LOG.started";;
+print) case "$2" in */"${AGENT_LABEL:-com.openabstractions.runtime}") [ "${ACTIVE:-}" = active ] || [ -f "$LOG.started" ];; *) [ "${FAIL:-}" != verify ];; esac;;
 *) exit 0;;
 esac''')
         # A receipt lives on one volume, recorded in $LOG.receipt. pkgutil with
@@ -100,6 +103,8 @@ exit 1''')
         (self.root/"calls.receipt").write_text(str(self.home))
         self.mac_helper = (HERE/"macos/lifecycle.sh").read_text().replace('/bin/launchctl', '"'+str(self.bin/"launchctl")+'"')
         (self.share/"lifecycle.sh").write_text(self.mac_helper)
+        for name in ("com.openabstractions.runtime-login.plist", "com.openabstractions.panel.plist"):
+            (self.share / name).write_bytes((HERE / "macos" / name).read_bytes().replace(b"\r\n", b"\n"))
 
         self.payload = self.home / ".local/bin/jobd"
         self.env["PAYLOAD"] = str(self.payload)
@@ -164,6 +169,43 @@ exit 1''')
                     self.assertFalse(retired.exists())
                 self.assertEqual(self.data.read_text(), "accepted work")
                 self.share.mkdir(parents=True, exist_ok=True)
+
+    def test_linux_upgrade_retires_only_owned_unchanged_default_hosts(self):
+        for crlf in (False, True):
+            with self.subTest(crlf=crlf):
+                first = self.linux_package("default-first" + str(crlf), retired=False)
+                for name in ("comfyui", "lemonade", "ollama"):
+                    target = first / "payload/.local/bin/declarations" / (name + ".json")
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    raw = FORMER_DEFAULT_HOSTS[name]
+                    target.write_bytes(raw.replace(b"\n", b"\r\n") if crlf else raw)
+                result = self.install_linux(first)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                declarations = self.home / ".local/bin/declarations"
+                custom = declarations / "ollama.json"
+                custom.write_text('{"operator": "saved offline endpoint"}')
+                unowned = declarations / "lmstudio.json"
+                unowned.write_bytes(FORMER_DEFAULT_HOSTS["lmstudio"])
+                result = self.install_linux(self.linux_package("default-next" + str(crlf), retired=False))
+                self.assertEqual(result.returncode, 0, result.stderr)
+                for name in ("comfyui", "lemonade"):
+                    self.assertFalse((declarations / (name + ".json")).exists())
+                self.assertEqual(custom.read_text(), '{"operator": "saved offline endpoint"}')
+                self.assertEqual(unowned.read_bytes(), FORMER_DEFAULT_HOSTS["lmstudio"])
+
+    def test_linux_default_host_retirement_rolls_back_after_payload_failure(self):
+        first = self.linux_package("default-rollback-first", retired=False)
+        target = first / "payload/.local/bin/declarations/lemonade.json"
+        target.parent.mkdir(parents=True)
+        target.write_bytes(FORMER_DEFAULT_HOSTS["lemonade"])
+        result = self.install_linux(first)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        manifest = (self.share / "MANIFEST").read_bytes()
+        self.command("mv", 'case "$*" in *new/.local/bin/openabstractions*) exit 7;; esac; exec /bin/mv "$@"')
+        result = self.install_linux(self.linux_package("default-rollback-next", retired=False))
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual((self.home / ".local/bin/declarations/lemonade.json").read_bytes(), FORMER_DEFAULT_HOSTS["lemonade"])
+        self.assertEqual((self.share / "MANIFEST").read_bytes(), manifest)
 
     def test_linux_unhashed_legacy_retirement_preserves_file(self):
         retired = self.home / ".local/bin/jobctl"
@@ -511,10 +553,127 @@ exit 1''')
 
     def template(self):
         shutil.copyfile(HERE/"macos/com.openabstractions.runtime.plist", self.share/"com.openabstractions.runtime.plist")
+        self.mac_runtime()
         return self.home/"Library/LaunchAgents/com.openabstractions.runtime.plist"
 
+    def mac_runtime(self):
+        path = self.home / ".local/bin/openabstractions"
+        path.write_text('#!/bin/sh\nprintf "start:%s\\n" "$*" >> "$LOG"\n[ "${FAIL:-}" != start ]\n')
+        path.chmod(0o755)
+        return path
+
+    def test_macos_empty_install_records_future_triggers_and_initializes_by_start(self):
+        plist = self.template()
+        self.command("chown", "exit 0")
+        (self.share / "FILES").write_text(".local/bin/openabstractions\n")
+        result = subprocess.run(["sh", str(HERE / "macos/postinstall")], env=self.env, text=True, capture_output=True, timeout=SCRIPT_TIMEOUT)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        import plistlib
+        permanent = plistlib.loads(plist.read_bytes())
+        self.assertNotIn("RunAtLoad", permanent)
+        self.assertNotIn("KeepAlive", permanent)
+        ledger = (self.share / "MANIFEST").read_text().splitlines()
+        for name in ("com.openabstractions.runtime-login", "com.openabstractions.panel"):
+            path = plist.parent / (name + ".plist")
+            self.assertIn(str(path), ledger)
+            self.assertFalse(path.exists())
+        calls = (self.root / "calls").read_text()
+        self.assertIn("start:start --timeout 20s", calls)
+        self.assertNotIn("bootstrap gui/1000 " + str(plist.parent / "com.openabstractions.panel.plist"), calls)
+        self.assertLess(calls.index("bootstrap gui/1000 " + str(plist)), calls.index("start:start --timeout 20s"))
+
+    def test_macos_foreign_trigger_or_template_refuses_before_permanent_agent_write(self):
+        plist = self.template()
+        self.command("chown", "exit 0")
+        (self.share / "FILES").write_text(".local/bin/openabstractions\n")
+        plist.parent.mkdir(parents=True)
+        trigger = plist.parent / "com.openabstractions.panel.plist"
+        trigger.write_text("foreign trigger")
+        result = subprocess.run(["sh", str(HERE / "macos/postinstall")], env=self.env, text=True, capture_output=True, timeout=SCRIPT_TIMEOUT)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(trigger.read_text(), "foreign trigger")
+        self.assertFalse(plist.exists())
+        trigger.unlink()
+        (self.share / "com.openabstractions.panel.plist").write_text("changed source template")
+        result = subprocess.run(["sh", str(HERE / "macos/postinstall")], env=self.env, text=True, capture_output=True, timeout=SCRIPT_TIMEOUT)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertFalse(plist.exists())
+
+    def test_macos_late_created_trigger_is_removed_but_foreign_bytes_are_retained(self):
+        agents = self.home / "Library/LaunchAgents"
+        agents.mkdir(parents=True)
+        trigger = agents / "com.openabstractions.runtime-login.plist"
+        template = (self.share / trigger.name).read_text()
+        from xml.sax.saxutils import escape
+        trigger.write_text(template.replace("@BIN@", escape(str(self.home / ".local/bin"))))
+        (self.share / "MANIFEST").write_text(str(self.payload) + "\n" + str(trigger) + "\n")
+        result = self.uninstall("macos", ABSENT="yes")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(trigger.exists())
+        self.assertEqual(self.data.read_text(), "accepted work")
+
+    def test_macos_uninstall_retains_changed_late_trigger_before_manager(self):
+        agents = self.home / "Library/LaunchAgents"
+        agents.mkdir(parents=True)
+        trigger = agents / "com.openabstractions.runtime-login.plist"
+        trigger.write_text("foreign changed trigger")
+        (self.share / "MANIFEST").write_text(str(self.payload) + "\n" + str(trigger) + "\n")
+        result = self.uninstall("macos", ABSENT="yes")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(trigger.read_text(), "foreign changed trigger")
+        self.assertTrue(self.payload.exists())
+        self.assertFalse((self.root / "calls").exists())
+
+    def test_macos_hardlinked_login_template_refuses_without_unlinking_either_name(self):
+        plist = self.template()
+        self.command("chown", "exit 0")
+        self.command("stat", 'case "$2" in %Lp) echo 755;; %l) exec /usr/bin/stat -c %h "$3";; *) echo 1000;; esac')
+        template = self.share / "com.openabstractions.panel.plist"
+        twin = self.root / "template-twin"
+        os.link(template, twin)
+        (self.share / "FILES").write_text(".local/bin/openabstractions\n")
+        result = subprocess.run(["sh", str(HERE / "macos/postinstall")], env=self.env, text=True, capture_output=True, timeout=SCRIPT_TIMEOUT)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertFalse(plist.exists())
+        self.assertEqual(template.read_bytes(), twin.read_bytes())
+
+    def test_macos_trigger_changed_while_stopping_is_retained_before_receipt_forget(self):
+        agents = self.home / "Library/LaunchAgents"
+        agents.mkdir(parents=True)
+        trigger = agents / "com.openabstractions.runtime-login.plist"
+        from xml.sax.saxutils import escape
+        trigger.write_text((self.share / trigger.name).read_text().replace("@BIN@", escape(str(self.home / ".local/bin"))))
+        (self.share / "MANIFEST").write_text(str(self.payload) + "\n" + str(trigger) + "\n")
+        self.command("launchctl", r'''echo "$*" >> "$LOG"
+case "$1" in
+manageruid) echo 1000;;
+managername) echo Aqua;;
+list) printf 'PID Status Label\n'; [ -f "$LOG.stopped" ] || echo '- 0 com.openabstractions.runtime';;
+bootout) echo 'changed during stop' > "$RACE_TARGET"; touch "$LOG.stopped";;
+*) exit 0;;
+esac''')
+        result = self.uninstall("macos", RACE_TARGET=str(trigger))
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("changed during shutdown", result.stderr)
+        self.assertEqual(trigger.read_text(), "changed during stop\n")
+        self.assertTrue(self.payload.exists())
+        self.assertNotIn("--forget", (self.root / "calls").read_text())
+
+    def test_macos_absent_trigger_with_lock_under_linked_parent_is_retained(self):
+        outside = self.root / "other-agent-owner"
+        outside.mkdir()
+        lock = outside / "com.openabstractions.runtime-login.plist.lock"
+        lock.write_bytes(b"")
+        (self.home / "Library").mkdir()
+        (self.home / "Library/LaunchAgents").symlink_to(outside, target_is_directory=True)
+        result = self.uninstall("macos", ABSENT="yes")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertTrue(lock.exists())
+        self.assertTrue(self.payload.exists())
+        self.assertFalse((self.root / "calls").exists())
+
     def test_macos_bootstrap_failure_is_installation_failure(self):
-        self.command("stat", 'case "$2" in %Lp) echo 755;; *) echo 1000;; esac')
+        self.command("stat", 'case "$2" in %Lp) echo 755;; %l) echo 1;; *) echo 1000;; esac')
         self.command("chown", "exit 0")
         self.template()
         # A fresh install: no predecessor ledger names a retired file to remove.
@@ -525,7 +684,7 @@ exit 1''')
         self.assertTrue(self.payload.exists())
 
     def test_macos_owns_installed_ancestors_without_touching_siblings(self):
-        self.command("stat", 'case "$2" in %Lp) echo 755;; *) echo 1000;; esac')
+        self.command("stat", 'case "$2" in %Lp) echo 755;; %l) echo 1;; *) echo 1000;; esac')
         self.command("chown", 'printf "chown:%s\\n" "$*" >> "$LOG"')
         self.command("chmod", 'printf "chmod:%s\\n" "$*" >> "$LOG"; exec /bin/chmod "$@"')
         # Every rename is logged with what the source held, so a placeholder
@@ -536,7 +695,7 @@ printf "mv:%s -> %s bin=%s\n" "$src" "$last" "$(grep -c '@BIN@' "$src")" >> "$LO
 exec /bin/mv "$@"''')
         plist = self.template()
         current = self.home/".local/bin/openabstractions"
-        current.write_text("installed runtime")
+        self.mac_runtime()
         other = self.payload.parent/"other-tool"
         other.write_text("unrelated")
         (self.share/"FILES").write_text(".local/bin/openabstractions\n.local/share/abstraction/com.openabstractions.runtime.plist\n")
@@ -573,7 +732,7 @@ exec /bin/mv "$@"''')
         self.assertEqual(other.read_text(), "unrelated")
 
     def test_macos_upgrade_removes_the_retired_label_and_programs_the_predecessor_listed(self):
-        self.command("stat", 'case "$2" in %Lp) echo 755;; *) echo 1000;; esac')
+        self.command("stat", 'case "$2" in %Lp) echo 755;; %l) echo 1;; *) echo 1000;; esac')
         self.command("chown", "exit 0")
         self.template()
         retired_plist = self.home/"Library/LaunchAgents/com.openabstractions.jobd.plist"
@@ -585,7 +744,7 @@ exec /bin/mv "$@"''')
         unlisted.write_text("a jobctl the predecessor did not install")
         (self.share/"MANIFEST").write_text(str(retired_plist) + "\n" + str(dl) + "\n" + str(self.payload) + "\n")
         (self.share/"FILES").write_text(".local/bin/openabstractions\n")
-        (self.home/".local/bin/openabstractions").write_text("candidate")
+        self.mac_runtime()
         result = subprocess.run(["sh", str(HERE/"macos/postinstall")], env=dict(self.env, ACTIVE="active"), text=True, capture_output=True, timeout=SCRIPT_TIMEOUT)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertFalse(retired_plist.exists())
@@ -601,7 +760,7 @@ exec /bin/mv "$@"''')
         # check needs an XPC endpoint): a 0.3.0 install's inventoryd, its
         # declaration and modelhostd go, so no declaration names a provider
         # that stops at startup.
-        self.command("stat", 'case "$2" in %Lp) echo 755;; *) echo 1000;; esac')
+        self.command("stat", 'case "$2" in %Lp) echo 755;; %l) echo 1;; *) echo 1000;; esac')
         self.command("chown", "exit 0")
         self.template()
         bin_dir = self.home/".local/bin"
@@ -613,7 +772,7 @@ exec /bin/mv "$@"''')
         kept.write_text("shipped declaration")
         (self.share/"MANIFEST").write_text("".join(str(p) + "\n" for p in retired + [kept]))
         (self.share/"FILES").write_text(".local/bin/openabstractions\n.local/bin/declarations/ollama.json\n")
-        (bin_dir/"openabstractions").write_text("candidate")
+        self.mac_runtime()
         result = subprocess.run(["sh", str(HERE/"macos/postinstall")], env=dict(self.env, ACTIVE="active"), text=True, capture_output=True, timeout=SCRIPT_TIMEOUT)
         self.assertEqual(result.returncode, 0, result.stderr)
         for path in retired:
@@ -624,8 +783,31 @@ exec /bin/mv "$@"''')
         self.assertFalse(any(str(p) in manifest for p in retired))
         self.assertIn(str(kept), manifest)
 
+    def test_macos_upgrade_retires_only_owned_unchanged_default_hosts(self):
+        self.command("stat", 'case "$2" in %Lp) echo 755;; %l) echo 1;; *) echo 1000;; esac')
+        self.command("chown", "exit 0")
+        self.template()
+        declarations = self.home / ".local/bin/declarations"
+        declarations.mkdir(parents=True)
+        for crlf in (False, True):
+            with self.subTest(crlf=crlf):
+                for name, raw in FORMER_DEFAULT_HOSTS.items():
+                    (declarations / (name + ".json")).write_bytes(raw.replace(b"\n", b"\r\n") if crlf else raw)
+                custom = declarations / "ollama.json"
+                custom.write_text('{"operator": "saved offline endpoint"}')
+                (self.share / "MANIFEST").write_text("".join(str(declarations / (name + ".json")) + "\n" for name in ("comfyui", "lemonade", "ollama")))
+                (self.share / "FILES").write_text(".local/bin/openabstractions\n")
+                self.mac_runtime()
+                result = subprocess.run(["sh", str(HERE / "macos/postinstall")], env=dict(self.env, ACTIVE="active"), text=True, capture_output=True, timeout=SCRIPT_TIMEOUT)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                for name in ("comfyui", "lemonade"):
+                    self.assertFalse((declarations / (name + ".json")).exists())
+                self.assertEqual(custom.read_text(), '{"operator": "saved offline endpoint"}')
+                raw = FORMER_DEFAULT_HOSTS["lmstudio"]
+                self.assertEqual((declarations / "lmstudio.json").read_bytes(), raw.replace(b"\n", b"\r\n") if crlf else raw)
+
     def test_macos_refuses_symlink_ancestor_before_ownership_change(self):
-        self.command("stat", 'case "$2" in %Lp) echo 755;; *) echo 1000;; esac')
+        self.command("stat", 'case "$2" in %Lp) echo 755;; %l) echo 1;; *) echo 1000;; esac')
         self.command("chown", 'echo "chown $*" >> "$LOG"')
         self.template()
         outside = self.root/"outside"
@@ -641,7 +823,7 @@ exec /bin/mv "$@"''')
 
     def test_macos_refuses_writable_existing_ancestor_before_registration(self):
         unsafe = self.home/".local"
-        self.command("stat", 'case "$2" in %Lp) [ "$3" = "$UNSAFE_DIR" ] && echo 775 || echo 755;; *) echo 1000;; esac')
+        self.command("stat", 'case "$2" in %Lp) [ "$3" = "$UNSAFE_DIR" ] && echo 775 || echo 755;; %l) echo 1;; *) echo 1000;; esac')
         self.command("chown", 'echo "chown $*" >> "$LOG"')
         self.template()
         before = (self.share/"MANIFEST").read_bytes()
@@ -675,7 +857,8 @@ exec /bin/mv "$@"''')
         self.assertEqual(minimum.attrib, {"min": "12.0"})
         self.assertEqual(len(plist["MachServices"]), 16)
         self.assertTrue(all(plist["MachServices"].values()))
-        self.assertTrue(plist["KeepAlive"])
+        self.assertNotIn("KeepAlive", plist)
+        self.assertNotIn("RunAtLoad", plist)
         self.assertNotIn("StartInterval", plist)
         # The payload carries only a template; postinstall places the plist.
         payload = (HERE/"payload.tsv").read_text()

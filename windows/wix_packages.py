@@ -29,12 +29,24 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import io
+import json
 from pathlib import Path
 import shutil
 import sys
 import urllib.request
 import xml.etree.ElementTree as ET
 import zipfile
+
+
+def embedded_wixlib(dll: bytes) -> zipfile.ZipFile:
+    """The bootstrapper wixlib the extension DLL carries as a resource: a ZIP
+    whose end record is the last one in the DLL."""
+    end = dll.rfind(b"PK\x05\x06")
+    if end < 0:
+        raise ValueError("the extension DLL carries no wixlib")
+    comment = int.from_bytes(dll[end + 20:end + 22], "little")
+    return zipfile.ZipFile(io.BytesIO(dll[:end + 22 + comment]))
 
 NUGET = "https://api.nuget.org/v3-flatcontainer/"
 PACKAGES = {
@@ -74,6 +86,113 @@ def pinned(data: bytes, size: int, sha256: str, what: str) -> bytes:
     if (len(data), digest) != (size, sha256):
         raise ValueError(f"{what} is not the pinned file ({len(data)} bytes, sha256 {digest})")
     return data
+
+
+def _closed_members(archive: zipfile.ZipFile, *, count: int, total: int) -> dict:
+    """Bound a source ZIP without extracting or following any member path."""
+    members = archive.infolist()
+    if len(members) > count or sum(item.file_size for item in members) > total:
+        raise ValueError("WiX source archive exceeds its bounds")
+    result = {}
+    for item in members:
+        name = item.filename
+        if (not name or "\\" in name or ":" in name or name.startswith("/")
+                or any(part in ("", ".", "..") for part in name.split("/"))
+                or (item.external_attr >> 16) & 0o170000 == 0o120000):
+            raise ValueError("unsafe WiX source member path")
+        if name in result:
+            raise ValueError("duplicate WiX source member")
+        result[name] = item
+    return result
+
+
+def _unique_json_object(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("duplicate WiX source JSON member")
+        result[key] = value
+    return result
+
+
+def ui_source_resources(package_path: Path, *, architecture: str,
+                        required_ids: list[str]) -> dict[str, dict]:
+    """Read selected Binary source bytes from the pinned WiX UI package.
+
+    Rows contain data (bytes), sha256, bytes (length), embedded_path and the
+    source/override ancestry in wix-ir.json. The caller owns Product.wxs
+    variable overrides and Icon inputs. No MSI or signature verdict is read.
+    This module is standalone and may be loaded by path in an app producer.
+    """
+    platforms = {"x64": "X64", "x86": "X86", "arm64": "A64"}
+    if architecture not in platforms:
+        raise ValueError("unknown WiX UI architecture")
+    if (not isinstance(required_ids, list) or not required_ids
+            or any(not isinstance(item, str) or not item for item in required_ids)
+            or len(required_ids) != len(set(required_ids)) or len(required_ids) > 16):
+        raise ValueError("WiX UI resource IDs must be a bounded unique list")
+    for name in required_ids:
+        if name.startswith("WixUiCa_") and name != "WixUiCa_" + platforms[architecture]:
+            raise ValueError("WiX UI custom action architecture differs")
+    package = PACKAGES["WixToolset.UI.wixext"]
+    path = Path(package_path)
+    if path.stat().st_size != package["bytes"]:
+        raise ValueError("WiX UI package size differs from its pin")
+    data = pinned(path.read_bytes(), package["bytes"], package["sha256"], str(path))
+    try:
+        with zipfile.ZipFile(io.BytesIO(data)) as outer:
+            members = _closed_members(outer, count=32, total=8 << 20)
+            if package["dll"] not in members:
+                raise ValueError("WiX UI package has no declared DLL")
+            dll = pinned(outer.read(members[package["dll"]]), package["dll_bytes"],
+                         package["dll_sha256"], package["dll"])
+        with embedded_wixlib(dll) as archive:
+            members = _closed_members(archive, count=64, total=8 << 20)
+            if "wix-ir.json" not in members or members["wix-ir.json"].file_size > 4 << 20:
+                raise ValueError("WiX UI source JSON missing or too large")
+            tree = json.loads(archive.read(members["wix-ir.json"]),
+                              object_pairs_hook=_unique_json_object)
+            sections = tree.get("sections")
+            if not isinstance(sections, list) or len(sections) > 128:
+                raise ValueError("WiX UI sections missing or too numerous")
+            symbols = []
+            for section in sections:
+                rows = section.get("symbols")
+                if not isinstance(rows, list) or len(rows) > 10000:
+                    raise ValueError("WiX UI symbols missing or too numerous")
+                symbols.extend(rows)
+            if len(symbols) > 10000:
+                raise ValueError("WiX UI symbols exceed their bound")
+            declared = {}
+            for symbol in symbols:
+                if symbol.get("type") != "Binary":
+                    continue
+                name = symbol["id"]["id"]
+                if name in declared:
+                    raise ValueError("duplicate WiX UI Binary ID")
+                declared[name] = symbol
+            result = {}
+            for name in required_ids:
+                if name not in declared:
+                    raise ValueError("unknown WiX UI Binary ID: " + name)
+                symbol = declared[name]
+                fields = symbol["fields"]
+                if not isinstance(fields, list) or len(fields) != 1:
+                    raise ValueError("unexpected WiX UI Binary fields")
+                field = fields[0]
+                embedded = field["data"]
+                member = embedded["path"]
+                if embedded.get("embed") != "true" or member not in members:
+                    raise ValueError("WiX UI Binary has no embedded source member")
+                raw = archive.read(members[member])
+                result[name] = {"id": name, "data": raw, "bytes": len(raw),
+                                "sha256": hashlib.sha256(raw).hexdigest(),
+                                "embedded_path": member, "source": symbol.get("ln"),
+                                "override": field.get("prev")}
+            return result
+    except (zipfile.BadZipFile, KeyError, TypeError, AttributeError,
+            json.JSONDecodeError, UnicodeDecodeError, RecursionError) as error:
+        raise ValueError("invalid WiX UI source resource structure") from error
 
 
 def nuget_config(folder: Path) -> str:

@@ -67,6 +67,12 @@
 > the release workflow takes out of that run's win_amd64 wheel,
 > abstraction/ipc/_native/abstraction_ipc.dll; a workstation passes a folder
 > holding a built abstraction_ipc.dll as --src ipclibrary=DIR.
+>
+> appmodellibrary is the actual candidate-selected abstraction-facade native
+> source, prepared through the shared native producer. Its directory contains
+> the matching architecture's abstraction_facade_appmodel.dll. The normal
+> candidate source-map owner writes its real prepared commit; this unprepared
+> source reference claims no published native artifact or installation proof.
 
 id		repo						ref
 installer	-						-
@@ -75,9 +81,11 @@ UNRESOLVED	-						-
 charter	openabstractions/abstractions	3ef816c8bbd62a9e1da21c8e51ce69f99b70af41
 localstores	openabstractions/abstraction-storage-over-local-stores	2e45aaa1e4bb17b7eb4d5eab8d569908ddbff4f2
 modelhost	openabstractions/abstraction-provider-modelhost	872d1103b3f3d1ecc9a98fdd4f72cc8704f7ae41
+modelpack	openabstractions/abstraction-provider-kit	-
 modelhostengine	ggml-org/llama.cpp	9e0e220594af405a62835dc3a27495729fd8506b
 lemonadeimage	openabstractions/abstraction-provider-lemonade	32aae329a1a672c4fdd79fc3d3e3eceba9d17ba6
 thenoiseimage	openabstractions/abstraction-provider-thenoise	cdc96f4d94025774662a15098ee971282bb11234
 pytorchimage	openabstractions/abstraction-provider-pytorch	493be78d9666265112320c48ad7b3e62abb40b8d
 pytorchengine	openabstractions/abstraction-provider-pytorch	493be78d9666265112320c48ad7b3e62abb40b8d
 ipclibrary	openabstractions/abstraction-identity	1267f150df094a372b29080fe110fe82c955c295
+appmodellibrary	openabstractions/abstraction-facade	-

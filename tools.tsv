@@ -43,6 +43,7 @@ Abstraction Panel.exe	github.com/openabstractions/abstractions/monitor@v0.4.0	.	
 inventoryd.exe	github.com/openabstractions/abstraction-storage-over-local-stores/go@v0.2.0	cmd/inventoryd	localstores	console
 lemonaded.exe	github.com/openabstractions/abstraction-provider-lemonade/go@v0.4.0	cmd/lemonaded	lemonadeimage	console
 modelhostd.exe	github.com/openabstractions/abstraction-provider-modelhost/go@v0.2.0	cmd/modelhostd	modelhost	console
+modelpack.exe	github.com/openabstractions/abstraction-provider-kit/go@v0.1.0	cmd/modelpack	service	console
 openabstractions-mcp.exe	github.com/openabstractions/abstractions/mcp-gateway@v0.4.0	.	mcpgateway	console
 openabstractions.exe	github.com/openabstractions/abstractions/serve@v0.4.0	.	service	console
 openabstractionsw.exe	github.com/openabstractions/abstractions/serve@v0.4.0	.	service	windows

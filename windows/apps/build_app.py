@@ -2,7 +2,7 @@
 """Build one showcase application's own per-user MSI (installer/apps/app.wxs).
 
 The package installs the files of the release's application ZIP under
-%LOCALAPPDATA%\\OpenAbstractions\\apps\\<app-id>, carries the application's
+%LOCALAPPDATA%\\Programs\\OpenAbstractions\\apps\\<app-id>, carries the application's
 manifest (adopters/<app>/application-manifest.json: the Facade's
 ApplicationDescriptor in its wire form, whose paths name {app},
 {local_app_data} and {pictures}, which the OpenAbstractions Panel resolves on

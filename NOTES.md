@@ -21,6 +21,10 @@ status, package verification and tested architectures.
   while Lemonade is busy, cancel its own waiting request, then continue after an
   idle Lemonade model yields. The tested Windows run recorded memory release
   and a ComfyUI render.
+- **Provisional provider-held wake.** GPU providers hold wake for the work they
+  serve. The current default permits a declared card provider to hold `awake`;
+  the platform display request lives only beside that provider's card lease.
+  Requester-owned wake and its per-application policy remain pending research.
 - **Keep provider keys out of OpenCode.** A guided Panel flow stores a named
   DeepSeek credential and requests scoped access for an identified application.
   OpenCode uses the credential name while the key remains in Open Abstractions.
@@ -88,8 +92,9 @@ elevation. Programs live in `tools\`; runnable examples live in `examples\`.
 
 **Add to PATH is optional.** Select it to use the commands from a new terminal;
 leave it unchecked to invoke them by full path. A *Just me* install starts the
-runtime immediately and registers a windowless Startup shortcut for subsequent
-sign-ins; the runtime host restarts a runtime that fails, and the next
+runtime immediately. Subsequent Windows sign-in registration follows confirmed
+Applications and their conditional login policy. The runtime host restarts a
+runtime that fails, and the next
 `openabstractions start` or application that needs it starts a host that exited.
 The elevated scope registers the Windows per-user service, which starts the
 user's runtime host at sign-in and restarts it after a crash. Uninstall through

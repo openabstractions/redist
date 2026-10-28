@@ -2,8 +2,8 @@
 <Wix xmlns="http://wixtoolset.org/schemas/v4/wxs"
      xmlns:ui="http://wixtoolset.org/schemas/v4/wxs/ui">
 
-  <Package Name="Abstraction"
-           Manufacturer="Open Abstractions"
+  <Package Name="OpenAbstractions"
+           Manufacturer="OpenAbstractions"
            Version="$(var.Version)"
            UpgradeCode="CEEF6550-5E44-4E83-8E18-A855C9D941CA"
            Scope="perUserOrMachine"
@@ -24,7 +24,7 @@
          own uninstall fails, both products stay installed
          (https://learn.microsoft.com/en-us/windows/win32/msi/removeexistingproducts-action). -->
     <MajorUpgrade AllowSameVersionUpgrades="yes" Schedule="afterInstallFinalize"
-                  DowngradeErrorMessage="A newer Abstraction is already installed. Remove it from Apps and features before installing this one." />
+                  DowngradeErrorMessage="A newer OpenAbstractions is already installed. Remove it from Apps and features before installing this one." />
     <MediaTemplate EmbedCab="yes" />
 
     <Property Id="ARPURLINFOABOUT" Value="https://github.com/openabstractions" />
@@ -49,7 +49,7 @@
          person reads in Apps and features. An incomplete package may ship;
          one that does not say it is incomplete may not. -->
     <?if $(var.Panel) = yes ?><?define NoPanel = "" ?>
-    <?else?><?define NoPanel = " The Abstraction Panel, the graphical front end, is not in it." ?><?endif?>
+    <?else?><?define NoPanel = " The OpenAbstractions Panel, the graphical front end, is not in it." ?><?endif?>
     <?if $(var.Cpp) = yes ?><?define NoCpp = "" ?>
     <?else?><?define NoCpp = " The C++ header is not in it; no module carries it." ?><?endif?>
     <?if $(var.LocalStores) = yes ?><?define NoLocalStores = "" ?>
@@ -129,7 +129,8 @@
     </StandardDirectory>
 
     <StandardDirectory Id="ProgramMenuFolder">
-      <Directory Id="AbstractionMenuFolder" Name="Abstraction" />
+      <Directory Id="AbstractionMenuFolder" Name="OpenAbstractions" />
+      <Directory Id="LegacyAbstractionMenuFolder" Name="Abstraction" />
     </StandardDirectory>
 
     <StandardDirectory Id="CommonAppDataFolder">
@@ -151,6 +152,9 @@
          service's ImagePath is written by `host register` from its own
          os.Executable(). -->
     <ComponentGroup Id="ServiceFiles">
+      <Component Directory="ToolsFolder">
+        <File Id="modelpack.exe" Source="payload/tools/modelpack.exe" KeyPath="yes" />
+      </Component>
       <Component Directory="ToolsFolder">
         <File Id="openabstractions.exe" Source="payload/tools/openabstractions.exe" KeyPath="yes" />
         <!-- Restart Manager ends only the processes holding a file this
@@ -197,18 +201,6 @@
                        Name="ipc_library" Type="string" Value="[#abstraction_ipc.dll]" />
       </Component>
       <?endif?>
-      <Component Directory="DeclarationsFolder">
-        <File Id="declaration.lemonade.json" Source="payload/tools/declarations/lemonade.json" KeyPath="yes" />
-      </Component>
-      <Component Directory="DeclarationsFolder">
-        <File Id="declaration.lmstudio.json" Source="payload/tools/declarations/lmstudio.json" KeyPath="yes" />
-      </Component>
-      <Component Directory="DeclarationsFolder">
-        <File Id="declaration.ollama.json" Source="payload/tools/declarations/ollama.json" KeyPath="yes" />
-      </Component>
-      <Component Directory="DeclarationsFolder">
-        <File Id="declaration.comfyui.json" Source="payload/tools/declarations/comfyui.json" KeyPath="yes" />
-      </Component>
       <Component Id="RegistryRoot" Directory="APPLICATIONFOLDER"
                  Guid="8821E881-5E73-465E-904E-EF7FC1223A5C">
         <RegistryValue Root="HKMU" Key="Software\OpenAbstractions\Abstraction"
@@ -342,6 +334,12 @@
          nothing. -->
     <CustomAction Id="RemoveLeftoverSandboxes" FileRef="openabstractions.exe" ExeCommand="service remove-sandboxes"
                   Execute="immediate" Return="ignore" />
+    <!-- The Binary-table copy survives payload removal. Commit cleanup only
+         removes this account's two exact-owned Run values; foreign edits and
+         other accounts are retained. No cleanup runs during predecessor removal. -->
+    <CustomAction Id="RemoveUserLogin" BinaryRef="UpgradeSupervisorCode"
+                  ExeCommand="service remove-login --user &quot;[ToolsFolder].&quot;"
+                  Execute="commit" Impersonate="yes" Return="ignore" />
     <!-- Activation follows the committed install and the predecessor's removal.
          `start` refuses an elevated token before anything else, launches the
          windowless host detached and waits for readiness. When Restart Manager
@@ -364,7 +362,7 @@
          copied or registered, and names both remedies. Selecting machine scope
          here instead would be a scope change nobody asked for. -->
     <CustomAction Id="RefuseElevatedPerUserInstall"
-                  Error="Abstraction cannot install for your account from an elevated administrator session, because its runtime does not start with administrator rights. Run the installer without administrator rights to install for your account, or pass ALLUSERS=1 to install for everyone." />
+                  Error="OpenAbstractions cannot install for your account from an elevated administrator session, because its runtime does not start with administrator rights. Run the installer without administrator rights to install for your account, or pass ALLUSERS=1 to install for everyone." />
     <!-- The providers make the engine folders they install read-only for the
          account (inference CONTRACT.md INF-F3). Removal leaves those folders
          as user data, and once a provider is gone nothing gives them back:
@@ -428,6 +426,8 @@
               Condition="ALLUSERS AND Privileged AND REMOVE=&quot;ALL&quot; AND NOT UPGRADINGPRODUCTCODE" />
       <Custom Action="RemoveLeftoverSandboxes" Before="RemoveFiles"
               Condition="REMOVE=&quot;ALL&quot; AND NOT UPGRADINGPRODUCTCODE AND NOT (AdminUser AND NOT ALLUSERS)" />
+      <Custom Action="RemoveUserLogin" Before="RemoveFiles"
+              Condition="REMOVE=&quot;ALL&quot; AND NOT UPGRADINGPRODUCTCODE AND NOT (AdminUser AND NOT ALLUSERS)" />
       <Custom Action="RegisterSupervisorAfterRemoval" After="RemoveExistingProducts"
               Condition="ALLUSERS AND WIX_UPGRADE_DETECTED AND NOT REMOVE" />
       <Custom Action="StartUserRuntime" After="RegisterSupervisorAfterRemoval"
@@ -448,24 +448,9 @@
       </Component>
     </ComponentGroup>
 
-    <!-- Per-user activation at sign-in. The windowless host starts the
-         contained runtime, restarts it after failure, and registers for
-         restart so an upgrade that ends it gets it back. A host that exits is
-         started again by the next `openabstractions start`, SDK activation or
-         sign-in. -->
-    <ComponentGroup Id="LogonStart" Directory="StartupFolder">
-      <Component Id="LogonStartShortcut" Guid="C84BB684-4B58-4B42-9B05-8F12DAFAABDE"
-                 Condition="NOT ALLUSERS">
-        <Shortcut Id="LogonStartFile" Name="Abstraction supervisor"
-                  Description="Starts the OpenAbstractions runtime host"
-                  Target="[#openabstractionsw.exe]" Arguments="serve supervisor"
-                  WorkingDirectory="ToolsFolder" />
-        <RegistryValue Root="HKCU" Key="Software\OpenAbstractions\Abstraction\Supervisor"
-                       Name="atLogon" Type="integer" Value="1" KeyPath="yes" />
-        <RemoveRegistryKey Root="HKCU" Key="Software\OpenAbstractions\Abstraction\Supervisor"
-                           Action="removeOnUninstall" />
-      </Component>
-    </ComponentGroup>
+    <!-- Account login registration is reconciled from confirmed Applications.
+         MajorUpgrade removes the predecessor's owned Startup components;
+         this product does not recreate unconditional login shortcuts. -->
 
     <!-- %ProgramData%\abstraction is where config.MachinePath() reads the file
          that answers for every account on the box, and C:\ProgramData grants
@@ -563,6 +548,9 @@
       <Component>
         <File Id="panel.exe" Name="Abstraction Panel.exe" Source="payload/tools/Abstraction Panel.exe" KeyPath="yes" />
       </Component>
+      <Component Id="PanelAppModelLibrary">
+        <File Id="abstraction_facade_appmodel.dll" Source="payload/tools/abstraction_facade_appmodel.dll" KeyPath="yes" />
+      </Component>
     </ComponentGroup>
     <ComponentGroup Id="PanelShortcut" Directory="AbstractionMenuFolder">
       <Component Id="PanelStartMenu" Guid="E5D9EA35-65C8-4930-9FC0-06120E9F39BE">
@@ -570,7 +558,7 @@
              OA-held notifications (monitor/notification_windows.go, ASK-N7).
              Windows starts the activator's LocalServer32 to deliver a click
              after every OA process exited. -->
-        <Shortcut Id="PanelShortcutFile" Name="Abstraction Panel"
+        <Shortcut Id="PanelShortcutFile" Name="OpenAbstractions Panel"
                   Description="What this machine is doing with downloads, and what is holding the card"
                   Target="[#panel.exe]" WorkingDirectory="ToolsFolder" Icon="PanelIcon">
           <ShortcutProperty Key="System.AppUserModel.ID" Value="OpenAbstractions.Panel" />
@@ -580,10 +568,13 @@
                        Type="string" Value="&quot;[#panel.exe]&quot; --background" />
         <RemoveRegistryKey Root="HKMU" Key="Software\Classes\CLSID\{CC32C67F-0E49-4CC5-A212-C4CB329CD06C}"
                            Action="removeOnUninstall" />
-        <Shortcut Id="SetupShortcutFile" Name="OpenAbstractions Setup"
-                  Description="Choose and prepare applications with OpenAbstractions"
-                  Target="[#panel.exe]" Arguments="--page setup"
-                  WorkingDirectory="ToolsFolder" Icon="PanelIcon" />
+        <RemoveFile Id="RemoveSetupShortcut" Name="OpenAbstractions Setup.lnk"
+                    Directory="AbstractionMenuFolder" On="install" />
+        <RemoveFile Id="RemoveLegacySetupShortcut" Name="OpenAbstractions Setup.lnk"
+                    Directory="LegacyAbstractionMenuFolder" On="install" />
+        <!-- The old link has the same AUMID and can win Windows' app-name index. -->
+        <RemoveFile Id="RemoveLegacyPanelShortcut" Name="Abstraction Panel.lnk"
+                    Directory="LegacyAbstractionMenuFolder" On="install" />
         <RemoveFolder Id="RemoveStartMenuFolder" On="uninstall" />
         <RegistryValue Root="HKMU" Key="Software\OpenAbstractions\Abstraction\Panel"
                        Name="installed" Type="integer" Value="1" KeyPath="yes" />
@@ -597,23 +588,6 @@
       </Component>
     </ComponentGroup>
 
-    <!-- The Panel's background question presenter at sign-in, the same
-         Startup-folder pattern LogonStart above uses for the runtime host.
-         MSI resolves StartupFolder for the installing account or all users
-         according to installation scope; HKMU keeps its marker in that scope.
-         The component and registry names are retained
-         for upgrades of existing per-user registrations (installer/README.md). -->
-    <ComponentGroup Id="PanelTrayLogonStart" Directory="StartupFolder">
-      <Component Id="PanelTrayLogonStartShortcut" Guid="332A435E-CCA6-4D6B-B814-596735F40DE1">
-        <Shortcut Id="PanelTrayLogonStartFile" Name="Abstraction Panel notifications"
-                  Description="Presents pending OpenAbstractions questions in your session"
-                  Target="[#panel.exe]" Arguments="--background" WorkingDirectory="ToolsFolder" Icon="PanelIcon" />
-        <RegistryValue Root="HKMU" Key="Software\OpenAbstractions\Abstraction\Panel"
-                       Name="trayAtLogon" Type="integer" Value="1" KeyPath="yes" />
-        <RemoveRegistryKey Root="HKMU" Key="Software\OpenAbstractions\Abstraction\Panel"
-                           Action="removeOnUninstall" />
-      </Component>
-    </ComponentGroup>
     <?endif?>
 
     <ComponentGroup Id="DeveloperFiles">
@@ -760,19 +734,18 @@
 
     <Feature Id="Service" Level="1" AllowAbsent="no" AllowAdvertise="no"
              Title="Background supervisor"
-             Description="Runs the OpenAbstractions runtime for applications, and keeps accepted work going after the calling program closes. For everyone, Windows starts the runtime host in each user's session at sign-in and restarts it after failure. For your account, installation starts the runtime host, a Startup shortcut starts it at sign-in, and the next command or application that needs it starts it again. The host restarts a runtime that fails, and upgrades restart it.">
+             Description="Runs the OpenAbstractions runtime and keeps accepted work going after the calling program closes. Confirmed applications in your account enable runtime and optional Panel login activation. With no confirmed applications, owned login entries are removed and the runtime stays installed. Supported clients can start it on demand; demand activation for every client is still a qualification prerequisite. The host restarts a runtime that fails, and upgrades restart it.">
       <ComponentGroupRef Id="ServiceFiles" />
       <ComponentGroupRef Id="SupervisorService" />
-      <ComponentGroupRef Id="LogonStart" />
       <ComponentGroupRef Id="MachineConfigFolderGroup" />
     </Feature>
 
     <?if $(var.Panel) = yes ?>
     <?define ToolsTitle = "Examples and the panel" ?>
-    <?define PanelStartText = " After installation, open OpenAbstractions Setup from Start to choose and prepare applications. Abstraction Panel shows runtime settings." ?>
+    <?define PanelStartText = " After installation, open OpenAbstractions Panel from Start to choose applications, prepare AI tools and view runtime settings." ?>
     <?else?>
     <?define ToolsTitle = "Examples" ?>
-    <?define PanelStartText = " This build does not include the Abstraction Panel." ?>
+    <?define PanelStartText = " This build does not include the OpenAbstractions Panel." ?>
     <?endif?>
     <Feature Id="Tools" Level="1" AllowAdvertise="no"
              Title="$(var.ToolsTitle)"
@@ -781,7 +754,6 @@
       <?if $(var.Panel) = yes ?>
       <ComponentGroupRef Id="PanelFiles" />
       <ComponentGroupRef Id="PanelShortcut" />
-      <ComponentGroupRef Id="PanelTrayLogonStart" />
       <?endif?>
 
       <Feature Id="Path" Level="1" AllowAdvertise="no"

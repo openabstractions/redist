@@ -20,12 +20,16 @@ from pathlib import Path
 import subprocess
 import sys
 import tempfile
+import zipfile
 
 # Runs in an isolated interpreter (-I): only the directories it is given import.
 CODEC_IMPORT = ("import importlib, os, sys\n"
                 "sys.path[:0] = sys.argv[1].split(os.pathsep)\n"
                 "for name in sys.argv[2:]:\n"
-                "    importlib.import_module(name)\n")
+                "    module = importlib.import_module(name)\n"
+                "    file = os.path.realpath(module.__file__)\n"
+                "    if not any(os.path.commonpath([os.path.realpath(root), file]) == os.path.realpath(root) for root in sys.argv[1].split(os.pathsep)):\n"
+                "        raise ImportError(name + ' escaped the selected package target')\n")
 
 
 def codec_modules(directory):
@@ -39,11 +43,28 @@ def codec_modules(directory):
 def import_codecs(path, modules):
     """None when every module imports with only path (a list of directories) on sys.path; else the last error line."""
     # -B: an import of package source writes no __pycache__ into it.
-    result = subprocess.run([sys.executable, "-I", "-B", "-c", CODEC_IMPORT, os.pathsep.join(map(str, path)), *modules],
+    result = subprocess.run([sys.executable, "-I", "-S", "-B", "-c", CODEC_IMPORT, os.pathsep.join(map(str, path)), *modules],
                             capture_output=True, text=True)
     if result.returncode:
         return (result.stderr.strip().splitlines() or ["exit %d" % result.returncode])[-1]
     return None
+
+
+def wheel_modules(wheel):
+    """Public package roots and declared standalone modules carried by a wheel."""
+    with zipfile.ZipFile(wheel) as archive:
+        modules = set()
+        for name in archive.namelist():
+            parts = Path(name).parts
+            if (name.endswith('.py') and len(parts) == 1 and parts[0].startswith('abstraction_')):
+                modules.add(Path(name).stem)
+            elif (parts and parts[0] == 'abstraction' and parts[-1] in ('__init__.py', '_codec.py')):
+                dotted = list(parts[:-1]) if parts[-1] == '__init__.py' else list(parts[:-1]) + ['_codec']
+                if all(part.isidentifier() for part in dotted):
+                    modules.add('.'.join(dotted))
+        if not modules:
+            raise ValueError('wheel has no declared OA package import: ' + Path(wheel).name)
+        return modules
 
 
 def wheel_set_findings(wheels):
@@ -51,17 +72,22 @@ def wheel_set_findings(wheels):
     files = sorted(Path(wheels).glob("*.whl"))
     if not files:
         return ["no wheels in " + str(wheels)]
+    try:
+        expected = set().union(*(wheel_modules(wheel) for wheel in files))
+    except (ValueError, zipfile.BadZipFile) as error:
+        return [str(error)]
     with tempfile.TemporaryDirectory(prefix="py-codec-imports-") as tmp:
         target = Path(tmp) / "site"
         result = subprocess.run([sys.executable, "-m", "pip", "install", "--disable-pip-version-check", "--no-index",
-                                 "--no-compile", "--find-links", str(wheels), "--target", str(target),
+                                 "--no-compile", "--ignore-installed", "--find-links", str(wheels), "--target", str(target),
                                  *map(str, files)], capture_output=True, text=True)
         if result.returncode:
             reason = (result.stderr.strip().splitlines() or ["exit %d" % result.returncode])[-1]
             return ["the wheel set does not install together from %s alone: %s" % (wheels, reason)]
-        modules = codec_modules(target)
-        if not modules:
+        codecs = codec_modules(target)
+        if not codecs:
             return ["the wheel set installed no generated codec"]
+        modules = sorted(expected | set(codecs))
         reason = import_codecs([target], modules)
         if reason:
             return ["the wheel set's codecs do not import together: " + reason]

@@ -1,4 +1,4 @@
-# Shared helpers for OpenAbstractions installation fixtures on disposable
+﻿# Shared helpers for OpenAbstractions installation fixtures on disposable
 # GitHub-hosted Windows runners: bounded processes, disposable standard
 # accounts and their processes, process owners, runtime process and pipe
 # checks, MSI product enumeration, PATH matching and diagnostic redaction.
@@ -20,41 +20,105 @@ function Assert-DisposableRunner {
 
 # Runs StartInfo with redirected output and keeps the creation handle, so an
 # already-exited child still reports its exit code. Kills and throws after $Seconds.
+function Assert-FixtureMutationSafe {
+    if(Get-Variable -Name OAFixtureProcessClosureUnknown -Scope Global -ValueOnly -ErrorAction SilentlyContinue){
+        throw 'Previous fixture process closure is unknown; reconcile the original observation before any further mutation'
+    }
+}
+function Get-FixtureProcessClosure {
+    $unknown=[bool](Get-Variable -Name OAFixtureProcessClosureUnknown -Scope Global -ValueOnly -ErrorAction SilentlyContinue)
+    return @{schema=1;closure=$(if($unknown){'unknown'}else{'known'});scope='recorded held-process failures, not independent service/descendant proof'}
+}
 function Invoke-FixtureProcess {
-    param([Parameter(Mandatory)][Diagnostics.ProcessStartInfo]$StartInfo, [Parameter(Mandatory)][ValidateRange(1, 86400)][int]$Seconds)
+    param([Parameter(Mandatory)][Diagnostics.ProcessStartInfo]$StartInfo, [Parameter(Mandatory)][ValidateRange(1, 86400)][int]$Seconds,
+          [string]$ObservationPath)
+    Assert-FixtureMutationSafe
     $StartInfo.UseShellExecute = $false
     $StartInfo.CreateNoWindow = $true
     $StartInfo.WindowStyle = [Diagnostics.ProcessWindowStyle]::Hidden
     if (-not $StartInfo.WorkingDirectory) { $StartInfo.WorkingDirectory = (Get-Location).Path }
     $StartInfo.RedirectStandardOutput = $true
     $StartInfo.RedirectStandardError = $true
+    if(-not $ObservationPath){$ObservationPath=Join-Path (Get-Location).Path ('fixture-process-'+[Guid]::NewGuid().ToString('N')+'.json')}
+    if($ObservationPath -and (-not [IO.Path]::IsPathRooted($ObservationPath) -or (Test-Path -LiteralPath $ObservationPath) -or (Test-Path -LiteralPath ($ObservationPath+'.tmp')))){
+        throw 'Fresh absolute fixture process observation path required'
+    }
+    $observation=[ordered]@{Schema=1;State='intent';Closure='unknown';StartedUtc=[DateTime]::UtcNow.ToString('o');FinishedUtc=$null
+        ProcessId=$null;CreationUtc=$null;CreationError=$null;ExitCode=$null;Output='';Diagnostics=''
+        RequestedFileName=$StartInfo.FileName;RequestedArguments=$StartInfo.Arguments;UseShellExecute=$false
+        ActualImage=$null;ActualImageStatus='not independently captured by this held-process owner'
+        DirectExited=$false;OutputClosed=$false;TerminationAttempted=$false;Failure=$null
+        ClosureScope='held process and redirected streams; service and descendants are not independently observed'}
+    $save={
+        if($ObservationPath){
+            [IO.File]::WriteAllText($ObservationPath+'.tmp',($observation|ConvertTo-Json -Depth 8),[Text.UTF8Encoding]::new($false))
+            Move-Item -LiteralPath ($ObservationPath+'.tmp') -Destination $ObservationPath -Force
+        }
+    }
+    & $save
     $process = New-Object Diagnostics.Process
     $process.StartInfo = $StartInfo
+    $started=$false
     try {
         if (-not $process.Start()) { throw 'Fixture process did not start' }
+        $started=$true;$observation.State='running';$observation.ProcessId=$process.Id
+        try {$observation.CreationUtc=$process.StartTime.ToUniversalTime().ToString('o')}
+        catch {$observation.CreationError=Protect-DiagnosticText $_.Exception.Message}
+        & $save
         $output = $process.StandardOutput.ReadToEndAsync()
         $diagnostics = $process.StandardError.ReadToEndAsync()
         if (-not $process.WaitForExit($Seconds * 1000)) {
+            $observation.TerminationAttempted=$true
             $process.Kill()
-            if (-not $process.WaitForExit(5000)) { throw 'Fixture process termination was not observed' }
-            throw "Fixture process exceeded ${Seconds}s"
+            $observation.DirectExited=$process.WaitForExit(5000)
+            throw "Fixture process exceeded ${Seconds}s; transaction closure remains unknown"
         }
-        if (-not $output.Wait(5000) -or -not $diagnostics.Wait(5000)) { throw 'Fixture process output did not close' }
-        $code = $process.ExitCode
-        if ($null -eq $code) { throw 'Fixture process exit code was not observed' }
-        return [pscustomobject]@{ ExitCode=$code; Output=$output.Result; Diagnostics=$diagnostics.Result }
-    } finally { $process.Dispose() }
+        $observation.DirectExited=$true
+        if (-not $output.Wait(5000) -or -not $diagnostics.Wait(5000)) { throw 'Fixture process output did not close; transaction closure remains unknown' }
+        $observation.OutputClosed=$true;$observation.ExitCode=$process.ExitCode
+        if ($null -eq $observation.ExitCode) { throw 'Fixture process exit code was not observed' }
+        $observation.Output=$output.Result;$observation.Diagnostics=$diagnostics.Result
+        if(-not $observation.CreationUtc -or $observation.CreationError){throw 'Held fixture process creation identity was not observed'}
+        $observation.State='completed';$observation.Closure='known'
+        $observation.FinishedUtc=[DateTime]::UtcNow.ToString('o')
+        return [pscustomobject]$observation
+    } catch {
+        $observation.Failure=Protect-DiagnosticText $_.Exception.Message
+        if($started){
+            $observation.State='unknown';$observation.Closure='unknown'
+            $global:OAFixtureProcessClosureUnknown=$true
+            try {
+                if(-not $process.HasExited -and -not $observation.TerminationAttempted){
+                    $observation.TerminationAttempted=$true;$process.Kill();$observation.DirectExited=$process.WaitForExit(5000)
+                }
+            }catch{}
+            try {if($process.HasExited){$observation.DirectExited=$true;$observation.ExitCode=$process.ExitCode}}catch{}
+        } else {$observation.State='not_started';$observation.Closure='known'}
+        $_.Exception.Data['FixtureProcessObservation']=[pscustomobject]$observation
+        throw
+    } finally {
+        if(-not $observation.FinishedUtc){$observation.FinishedUtc=[DateTime]::UtcNow.ToString('o')}
+        try { & $save }
+        catch { $global:OAFixtureProcessClosureUnknown=$true;throw }
+        finally { $process.Dispose() }
+    }
 }
 
-# Runs one image with arguments. A nonzero exit throws with redacted output; a
-# timeout throws. Success returns nothing.
+# A completed nonzero exit retains its original failure behavior and raw held
+# observation. Timeout/interruption/output-close unknowns remain mutation-blocking.
 function Invoke-Bounded {
-    param([Parameter(Mandatory)][string]$Image, [string[]]$Arguments = @(), [ValidateRange(1, 86400)][int]$Seconds = 90)
+    param([Parameter(Mandatory)][string]$Image, [string[]]$Arguments = @(), [ValidateRange(1, 86400)][int]$Seconds = 90,
+          [switch]$PassThru, [string]$ObservationPath)
     $info = New-Object Diagnostics.ProcessStartInfo
     $info.FileName = $Image
     $info.Arguments = $Arguments -join ' '
-    $result = Invoke-FixtureProcess $info $Seconds
-    if ($result.ExitCode -ne 0) { throw "$([IO.Path]::GetFileName($Image)) exited $($result.ExitCode): $(Protect-DiagnosticText ($result.Output + $result.Diagnostics))" }
+    $result = Invoke-FixtureProcess $info $Seconds -ObservationPath $ObservationPath
+    if ($result.ExitCode -ne 0) {
+        $failure=[InvalidOperationException]::new("$([IO.Path]::GetFileName($Image)) exited $($result.ExitCode): $(Protect-DiagnosticText ($result.Output + $result.Diagnostics))")
+        $failure.Data['FixtureProcessObservation']=$result
+        throw $failure
+    }
+    if($PassThru){return $result}
 }
 
 # Bounded text with credentials, bearer tokens and URL user information masked.
@@ -72,6 +136,7 @@ function New-DisposableAccount {
     param([ValidatePattern('^[a-z][a-z0-9_]{1,9}$')][string]$Prefix = 'oa_ci',
           [ValidatePattern('^[a-z][a-z0-9_]{1,19}$')][string]$Name,
           [ValidatePattern('^S-1-5-32-\d+$')][string]$GroupSid = 'S-1-5-32-545')
+    Assert-FixtureMutationSafe
     Assert-DisposableRunner
     if (-not $Name) { $Name = $Prefix + '_' + [Guid]::NewGuid().ToString('N').Substring(0, 10) }
     $bytes = New-Object byte[] 30
@@ -92,6 +157,7 @@ function New-DisposableAccount {
 # Grants the account Modify or ReadExecute on a directory tree.
 function Grant-AccountAccess {
     param([Parameter(Mandatory)][string]$Path, [Parameter(Mandatory)][string]$Sid, [ValidateSet('Modify', 'ReadExecute')][string]$Access = 'Modify')
+    Assert-FixtureMutationSafe
     Assert-DisposableRunner
     $right = if ($Access -eq 'Modify') { 'M' } else { 'RX' }
     & icacls.exe $Path /grant "*${Sid}:(OI)(CI)$right" /T /Q | Out-Null
@@ -111,7 +177,9 @@ function Invoke-AccountProcess {
     $info.Domain = $env:COMPUTERNAME
     $info.Password = $Account.Credential.Password
     $info.LoadUserProfile = $true
-    return Invoke-FixtureProcess $info $Seconds
+    $result=Invoke-FixtureProcess $info $Seconds
+    if($result.ExitCode -ne 0){$global:OAFixtureProcessClosureUnknown=$true}
+    return $result
 }
 
 function Test-CimNotFound([Exception]$Exception) {
@@ -154,6 +222,7 @@ function Get-ProcessOwnerSid($Process) {
 # a changed identity.
 function Remove-DisposableAccount {
     param([Parameter(Mandatory)]$Account, [switch]$RuntimeProcessesOnly, [switch]$RequirePresent)
+    Assert-FixtureMutationSafe
     Assert-DisposableRunner
     $current = Get-LocalUser -Name $Account.Name -ErrorAction SilentlyContinue
     if (-not $current) {
@@ -380,8 +449,127 @@ function Invoke-MachineRemovalChecks {
     if ($failures.Count) { throw ('Machine removal checks failed: ' + ($failures -join "`n")) }
 }
 
-Export-ModuleMember -Function Assert-DisposableRunner, Invoke-FixtureProcess, Invoke-Bounded, Protect-DiagnosticText,
+function Invoke-InstalledPanelShortcutSmoke([string]$Target, [string]$Arguments, [string]$Directory, [string]$Page) {
+    # The installed acceptance fixture owns this process and its handle through cleanup.
+    # Explicit invalid standard handles reproduce a Start-menu GUI launch even when
+    # the fixture itself has a captured console. No console or pipe is substituted.
+    Add-Type -AssemblyName UIAutomationClient, UIAutomationTypes, WindowsBase
+    if (-not ('OaInstalledPanelSmoke' -as [type])) {
+        $references = @('System.dll', [Windows.Automation.AutomationElement].Assembly.Location,
+            [Windows.Automation.ControlType].Assembly.Location, [Windows.DependencyObject].Assembly.Location)
+        Add-Type -ReferencedAssemblies $references -TypeDefinition @'
+using System;
+using System.ComponentModel;
+using System.Runtime.InteropServices;
+using System.Text;
+using System.Threading;
+using System.Windows.Automation;
+public sealed class OaInstalledPanelSmoke : IDisposable {
+    [StructLayout(LayoutKind.Sequential, CharSet=CharSet.Unicode)] struct Startup {
+        public int cb; public string reserved, desktop, title;
+        public int x,y,cx,cy,charsX,charsY,fill,flags; public short show,reserved2;
+        public IntPtr bytes, input, output, error;
+    }
+    [StructLayout(LayoutKind.Sequential)] struct ProcessInfo { public IntPtr process, thread; public uint pid, tid; }
+    delegate bool EnumProc(IntPtr hwnd, IntPtr state);
+    [DllImport("kernel32.dll", CharSet=CharSet.Unicode, SetLastError=true)] static extern bool CreateProcess(string app, StringBuilder command, IntPtr pa, IntPtr ta, bool inherit, uint flags, IntPtr env, string cwd, ref Startup startup, out ProcessInfo result);
+    [DllImport("kernel32.dll")] static extern uint WaitForSingleObject(IntPtr handle, uint milliseconds);
+    [DllImport("kernel32.dll", SetLastError=true)] static extern bool TerminateProcess(IntPtr handle, uint code);
+    [DllImport("kernel32.dll")] static extern bool CloseHandle(IntPtr handle);
+    [DllImport("user32.dll")] static extern bool EnumWindows(EnumProc callback, IntPtr state);
+    [DllImport("user32.dll")] static extern uint GetWindowThreadProcessId(IntPtr hwnd, out uint pid);
+    [DllImport("user32.dll")] static extern bool IsWindowVisible(IntPtr hwnd);
+    [DllImport("user32.dll", CharSet=CharSet.Unicode)] static extern int GetClassName(IntPtr hwnd, StringBuilder name, int count);
+    [DllImport("user32.dll")] static extern bool PostMessage(IntPtr hwnd, uint message, IntPtr w, IntPtr l);
+    ProcessInfo owned;
+    public uint Pid { get { return owned.pid; } }
+    public OaInstalledPanelSmoke(string target, string arguments, string directory) {
+        Startup startup = new Startup(); startup.cb=Marshal.SizeOf(startup);
+        startup.flags=0x100; // STARTF_USESTDHANDLES
+        startup.input=startup.output=startup.error=new IntPtr(-1);
+        // DETACHED_PROCESS; no inherited handles, console, stdout pipe or --quiet.
+        if (!CreateProcess(target, new StringBuilder("\""+target+"\" "+arguments), IntPtr.Zero, IntPtr.Zero, false, 0x8, IntPtr.Zero, directory, ref startup, out owned))
+            throw new Win32Exception(Marshal.GetLastWin32Error());
+        CloseHandle(owned.thread); owned.thread=IntPtr.Zero;
+    }
+    public bool Exited { get { return WaitForSingleObject(owned.process,0)==0; } }
+    public IntPtr Window() {
+        IntPtr found=IntPtr.Zero;
+        EnumWindows((hwnd,state)=>{uint pid; GetWindowThreadProcessId(hwnd,out pid);
+            if(pid!=owned.pid || !IsWindowVisible(hwnd)) return true;
+            StringBuilder name=new StringBuilder(128); GetClassName(hwnd,name,name.Capacity);
+            if(name.ToString()=="abstraction.panel") { found=hwnd; return false; }
+            return true;
+        },IntPtr.Zero);
+        return found;
+    }
+    // Each UIA observation has its own bound. A hung provider cannot hang the
+    // fixture or prevent owned-process cleanup; background probe threads do no writes.
+    public bool Ready(IntPtr hwnd, string page) {
+        bool ready=false; Exception failure=null;
+        Thread probe=new Thread(()=>{try {
+            AutomationElement window=AutomationElement.FromHandle(hwnd);
+            AutomationElement document=window.FindFirst(TreeScope.Descendants,new PropertyCondition(AutomationElement.ControlTypeProperty,ControlType.Document));
+            if(document==null) return;
+            string heading=page=="setup" ? "Get started" : "Apps";
+            AutomationElement title=document.FindFirst(TreeScope.Descendants,new PropertyCondition(AutomationElement.NameProperty,heading));
+            if(title==null || title.Current.IsOffscreen) return;
+            if(page=="setup") {
+                AutomationElement choice=document.FindFirst(TreeScope.Descendants,new AndCondition(new PropertyCondition(AutomationElement.ControlTypeProperty,ControlType.CheckBox),new PropertyCondition(AutomationElement.NameProperty,"ComfyUI")));
+                AutomationElement review=document.FindFirst(TreeScope.Descendants,new AndCondition(new PropertyCondition(AutomationElement.ControlTypeProperty,ControlType.Button),new PropertyCondition(AutomationElement.NameProperty,"Review")));
+                ready=choice!=null && review!=null && review.Current.IsEnabled && !review.Current.IsOffscreen;
+            } else {
+                // The default page has its own content; sidebar text cannot satisfy it.
+                AutomationElement body=document.FindFirst(TreeScope.Descendants,new PropertyCondition(AutomationElement.NameProperty,"Your apps"));
+                AutomationElement caption=document.FindFirst(TreeScope.Descendants,new PropertyCondition(AutomationElement.NameProperty,"Apps that use OpenAbstractions."));
+                if(body==null || caption==null || body.Current.IsOffscreen || caption.Current.IsOffscreen) return;
+                // renderApps creates these nodes only after /apps/registrations
+                // answered. Static shell headings and an empty/loading body fail.
+                AutomationElement empty=document.FindFirst(TreeScope.Descendants,new PropertyCondition(AutomationElement.NameProperty,"No apps have registered yet."));
+                if(empty!=null && !empty.Current.IsOffscreen) { ready=true; return; }
+                AutomationElementCollection links=document.FindAll(TreeScope.Descendants,new PropertyCondition(AutomationElement.ControlTypeProperty,ControlType.Hyperlink));
+                foreach(AutomationElement link in links) {
+                    if(link.Current.IsOffscreen) continue;
+                    AutomationElement state=link.FindFirst(TreeScope.Descendants,new OrCondition(new PropertyCondition(AutomationElement.NameProperty,"Running"),new PropertyCondition(AutomationElement.NameProperty,"Not running")));
+                    if(state!=null && !state.Current.IsOffscreen) { ready=true; return; }
+                }
+            }
+        } catch(Exception error) { failure=error; }});
+        probe.IsBackground=true; probe.SetApartmentState(ApartmentState.STA); probe.Start();
+        if(!probe.Join(1500)) throw new TimeoutException("Installed Panel UIA provider deadline");
+        if(failure!=null) return false;
+        return ready;
+    }
+    public void Dispose() {
+        if(owned.process==IntPtr.Zero) return;
+        IntPtr hwnd=Window(); if(hwnd!=IntPtr.Zero) PostMessage(hwnd,0x10,IntPtr.Zero,IntPtr.Zero);
+        if(WaitForSingleObject(owned.process,3000)!=0) {
+            if(!TerminateProcess(owned.process,1)) throw new Win32Exception(Marshal.GetLastWin32Error());
+            if(WaitForSingleObject(owned.process,5000)!=0) throw new TimeoutException("Owned installed Panel did not exit");
+        }
+        CloseHandle(owned.process); owned.process=IntPtr.Zero;
+    }
+}
+'@
+    }
+    $owned = [OaInstalledPanelSmoke]::new($Target, $Arguments, $Directory)
+    try {
+        $deadline = [DateTime]::UtcNow.AddSeconds(30)
+        do {
+            if ($owned.Exited) { throw 'Installed shortcut exited before its native page became ready' }
+            $window = $owned.Window()
+            if ($window -ne [IntPtr]::Zero -and $owned.Ready($window, $Page)) {
+                return [ordered]@{ page=$Page; pid=$owned.Pid; target=$Target; arguments=$Arguments;
+                    standardHandles='invalid'; nativeClass='abstraction.panel'; renderedPage=$true }
+            }
+            Start-Sleep -Milliseconds 200
+        } while ([DateTime]::UtcNow -lt $deadline)
+        throw 'Installed shortcut native page readiness deadline'
+    } finally { $owned.Dispose() }
+}
+
+Export-ModuleMember -Function Assert-DisposableRunner, Assert-FixtureMutationSafe, Get-FixtureProcessClosure, Invoke-FixtureProcess, Invoke-Bounded, Protect-DiagnosticText,
     New-DisposableAccount, Grant-AccountAccess, Invoke-AccountProcess, Test-CimNotFound, Test-ProcessGone,
     Get-ProcessOwnerSid, Remove-DisposableAccount, Get-RuntimeProcesses, Get-PipeNames, Get-CapabilityPipes,
     Assert-NoRuntime, Get-InstalledProducts, Test-PathNames, Get-ProfileView, Assert-RealProfileView,
-    Save-MachineRemovalEvidence, Invoke-MachineRemovalChecks
+    Save-MachineRemovalEvidence, Invoke-MachineRemovalChecks, Invoke-InstalledPanelShortcutSmoke

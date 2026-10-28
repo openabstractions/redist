@@ -1,9 +1,26 @@
 name: verified release candidate
-run-name: candidate ${{ inputs.version }} [oa-job:${{ inputs.oa_job_intent }}]
+run-name: candidate ${{ inputs.version }} [oa-job:${{ inputs.oa_job_intent }}]${{ inputs.producer_mode == 'train-graph' && ' [oa-mode:train-graph]' || inputs.producer_mode == 'train' && ' [oa-mode:train]' || '' }}
 
 on:
   workflow_dispatch:
     inputs:
+      diagnostic_host_sign_only:
+        description: Sign only the exact reviewed Comfy h3 host copy; no build or release
+        type: boolean
+        default: false
+      diagnostic_input_release_id:
+        description: Same-repository unpublished exact-host staging draft ID
+        type: string
+        default: ''
+      diagnostic_input_asset_id:
+        description: Exact reviewed host asset ID in that draft
+        type: string
+        default: ''
+      producer_mode:
+        description: Existing candidate producer route; train-graph uploads only source-bound public Go inputs
+        type: choice
+        options: [legacy, train-graph, train]
+        default: legacy
       version:
         description: Candidate version (vMAJOR.MINOR.PATCH); no tag or release is created
         type: string
@@ -63,6 +80,10 @@ defaults:
 
 env:
   WIX_VERSION: '5.0.2'
+  # SDK shared components retain the existing manylinux 2.28 / macOS 11 floors.
+  # Resolved manifest and config are retained in PosixNative1743 image provenance.
+  CLIENT_MANYLINUX_IMAGE: quay.io/pypa/manylinux_2_28_x86_64@sha256:e0adf18521ad35192df733a6c62d35df7801957d24e0470238aacecfab2188a3
+  CLIENT_MANYLINUX_CONFIG: sha256:e9156ba0a5e68ec0da2eac7253109eea135e52291ffac058c26cd770685a684d
   # C declares P here only after real producer review. Empty means the strict
   # legacy same-run path. IDs/digests/inputs and derived evidence are literal
   # reviewed source inputs, never downloaded sidecar authority.
@@ -71,13 +92,185 @@ env:
   COMFYUI_PRODUCER_ADOPTER_COMMIT: ${{ inputs.comfyui_producer_adopter_commit }}
 
 jobs:
+  diagnostic-host-intake:
+    if: ${{ inputs.diagnostic_host_sign_only && !inputs.signing_probe_only && inputs.producer_mode == 'legacy' && inputs.app_producer_only == 'none' && inputs.version == 'v0.8.0' && github.repository == 'openabstractions/redist' && github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/release/0.8.0' && github.actor == 'ReinisLusis' && github.triggering_actor == 'ReinisLusis' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      # The existing draft canary proved contents:read receives HTTP 403.
+      # This isolated job has no signing secrets or mutation commands.
+      contents: write
+    outputs:
+      artifact-id: ${{ steps.artifact.outputs.artifact-id }}
+      artifact-digest: ${{ steps.artifact.outputs.artifact-digest }}
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
+        with:
+          ref: ${{ github.sha }}
+      - uses: actions/setup-python@e797f83bcb11b83ae66e0230d6156d7c80228e7c
+        with:
+          python-version: '3.12'
+      - name: admit exact reviewed unsigned host before credentials
+        env:
+          GH_TOKEN: ${{ github.token }}
+          INPUT_RELEASE_ID: ${{ inputs.diagnostic_input_release_id }}
+          INPUT_ASSET_ID: ${{ inputs.diagnostic_input_asset_id }}
+        run: >-
+          python3 windows/windows_signing.py diagnostic-host intake --root diagnostic-host
+          --source "$GITHUB_SHA" --release-id "$INPUT_RELEASE_ID" --asset-id "$INPUT_ASSET_ID"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        id: artifact
+        with:
+          name: diagnostic-comfy-h3-unsigned-${{ github.run_attempt }}
+          path: diagnostic-host/
+          if-no-files-found: error
+  diagnostic-host-sign:
+    if: ${{ inputs.diagnostic_host_sign_only }}
+    needs: diagnostic-host-intake
+    runs-on: windows-latest
+    timeout-minutes: 20
+    environment: signing
+    permissions:
+      contents: read
+      actions: read
+    env:
+      OA_CERTUM_SIGNING_ONLY: '1'
+    outputs:
+      artifact-id: ${{ steps.artifact.outputs.artifact-id }}
+      artifact-digest: ${{ steps.artifact.outputs.artifact-digest }}
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
+        with:
+          ref: ${{ github.sha }}
+      - uses: actions/setup-python@e797f83bcb11b83ae66e0230d6156d7c80228e7c
+        with:
+          python-version: '3.12'
+      - name: consume exact same-run unsigned artifact before credentials
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ARTIFACT_ID: ${{ needs.diagnostic-host-intake.outputs.artifact-id }}
+          ARTIFACT_DIGEST: ${{ needs.diagnostic-host-intake.outputs.artifact-digest }}
+        run: >-
+          python3 windows/windows_signing.py consume --artifact-id "$ARTIFACT_ID"
+          --digest "$ARTIFACT_DIGEST" --name "diagnostic-comfy-h3-unsigned-$GITHUB_RUN_ATTEMPT"
+          --source "$GITHUB_SHA" --run-id "$GITHUB_RUN_ID" --attempt "$GITHUB_RUN_ATTEMPT" --out diagnostic-host
+      - name: revalidate exact unsigned host before credentials
+        run: >-
+          python3 windows/windows_signing.py diagnostic-host check --root diagnostic-host --source "$GITHUB_SHA"
+      - name: exact pinned Microsoft signature tools
+        run: python3 windows/windows_signing.py prepare-tools --root "$RUNNER_TEMP/signing-tools" --github-env "$GITHUB_ENV"
+      - name: download pinned SimplySign Desktop installer
+        shell: pwsh
+        run: |
+          $policy = Get-Content windows/certum_simplysign.json -Raw | ConvertFrom-Json
+          Invoke-WebRequest -Uri $policy.installer.url -OutFile "$env:RUNNER_TEMP/simplysign.msi"
+      - name: connect exact reviewed signing identity
+        shell: pwsh
+        env:
+          CERTUM_USERNAME: ${{ secrets.CERTUM_USERNAME }}
+          CERTUM_OTP_URI: ${{ secrets.CERTUM_OTP_URI }}
+        run: >-
+          ./windows/certum_simplysign.ps1 -Mode Connect
+          -InstallerPath "$env:RUNNER_TEMP/simplysign.msi"
+          -SessionPath "$env:RUNNER_TEMP/signing-session.json"
+      - name: sign only the admitted copy and compare every payload byte
+        run: >-
+          python3 windows/windows_signing.py diagnostic-host sign --root diagnostic-host
+          --source "$GITHUB_SHA" --policy windows/certum_simplysign.json --signtool "$SIGNTOOL"
+      - name: disconnect owned signing session
+        if: always()
+        shell: pwsh
+        run: >-
+          ./windows/certum_simplysign.ps1 -Mode Disconnect
+          -SessionPath "$env:RUNNER_TEMP/signing-session.json"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        id: artifact
+        with:
+          name: diagnostic-comfy-h3-signed-${{ github.run_attempt }}
+          path: diagnostic-host/
+          if-no-files-found: error
+  diagnostic-host-verify:
+    if: ${{ inputs.diagnostic_host_sign_only }}
+    needs: diagnostic-host-sign
+    runs-on: windows-latest
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
+        with:
+          ref: ${{ github.sha }}
+      - uses: actions/setup-python@e797f83bcb11b83ae66e0230d6156d7c80228e7c
+        with:
+          python-version: '3.12'
+      - name: consume exact same-run signed artifact
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ARTIFACT_ID: ${{ needs.diagnostic-host-sign.outputs.artifact-id }}
+          ARTIFACT_DIGEST: ${{ needs.diagnostic-host-sign.outputs.artifact-digest }}
+        run: >-
+          python3 windows/windows_signing.py consume --artifact-id "$ARTIFACT_ID"
+          --digest "$ARTIFACT_DIGEST" --name "diagnostic-comfy-h3-signed-$GITHUB_RUN_ATTEMPT"
+          --source "$GITHUB_SHA" --run-id "$GITHUB_RUN_ID" --attempt "$GITHUB_RUN_ATTEMPT" --out diagnostic-host
+      - name: exact pinned Microsoft signature tools
+        run: python3 windows/windows_signing.py prepare-tools --root "$RUNNER_TEMP/signing-tools" --github-env "$GITHUB_ENV"
+      - name: independent normal signature and unchanged payload resource verification
+        run: >-
+          python3 windows/windows_signing.py diagnostic-host verify --root diagnostic-host
+          --source "$GITHUB_SHA" --policy windows/certum_simplysign.json --signtool "$SIGNTOOL"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: diagnostic-comfy-h3-verified-${{ github.run_attempt }}
+          path: diagnostic-host/
+          if-no-files-found: error
+  train-graph:
+    if: ${{ !inputs.diagnostic_host_sign_only && (inputs.producer_mode == 'train-graph') }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
+        with:
+          ref: ${{ github.sha }}
+      - name: validate the exact source-bound graph candidate branch
+        env:
+          RELEASE_VERSION: ${{ inputs.version }}
+        run: |
+          [[ "$RELEASE_VERSION" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]] || exit 1
+          [ "$GITHUB_REPOSITORY" = openabstractions/redist ] && [ "$GITHUB_EVENT_NAME" = workflow_dispatch ] || exit 1
+          [ "$GITHUB_ACTOR" = ReinisLusis ] && [ "$GITHUB_TRIGGERING_ACTOR" = ReinisLusis ] || exit 1
+          [ "$GITHUB_REF" = "refs/heads/release/${RELEASE_VERSION#v}" ] && [ "$(git rev-parse HEAD)" = "$GITHUB_SHA" ] || exit 1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e
+        with:
+          go-version: '1.26.5'
+          cache: false
+      - name: verify source-bound unpublished module graph
+        env:
+          RELEASE_VERSION: ${{ inputs.version }}
+          GOTOOLCHAIN: local
+          GOENV: 'off'
+          GOWORK: 'off'
+          GOPROXY: 'off'
+          GOSUMDB: 'off'
+        run: python3 scripts/module_provenance.py --prepared-graph public-go-graph.zip --prepared-sidecar public-go-graph.json --release-version "$RELEASE_VERSION" --output graph-verification.json
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: staged-go-graph-${{ github.run_attempt }}
+          path: public-go-graph.zip
+          if-no-files-found: error
   candidate:
+    if: ${{ !inputs.diagnostic_host_sign_only && (inputs.producer_mode != 'train-graph') }}
     runs-on: ubuntu-latest
     outputs:
       sha: ${{ steps.candidate.outputs.sha }}
       version: ${{ steps.candidate.outputs.version }}
       comfyui: ${{ steps.optional-apps.outputs.comfyui }}
       comfyui-predecessor: ${{ steps.optional-apps.outputs.comfyui-predecessor }}
+      opencode: ${{ steps.optional-apps.outputs.opencode }}
+      lemonade: ${{ steps.optional-apps.outputs.lemonade }}
+      required-products: ${{ steps.optional-apps.outputs.required-products }}
+      installer-comfyui: ${{ steps.optional-apps.outputs.installer-comfyui }}
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
         with:
@@ -86,6 +279,7 @@ jobs:
         id: candidate
         env:
           RELEASE_VERSION: ${{ inputs.version }}
+          PRODUCER_MODE: ${{ inputs.producer_mode }}
         run: |
           [[ "$RELEASE_VERSION" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]] || {
             echo 'FAIL version must be vMAJOR.MINOR.PATCH'; exit 1;
@@ -97,6 +291,9 @@ jobs:
           [ "$major" -le 255 ] && [ "$minor" -le 255 ] && [ "$patch" -le 65535 ] || {
             echo 'FAIL version exceeds Windows Installer limits'; exit 1;
           }
+          if [ "$major" -gt 0 ] || [ "$minor" -ge 8 ]; then
+            [ "$PRODUCER_MODE" = train ] || { echo 'FAIL releases from 0.8.0 require train mode'; exit 1; }
+          fi
           [ "$GITHUB_REF_TYPE" != tag ] || { echo 'FAIL dispatch from a branch, not an existing tag'; exit 1; }
           sha=$(git rev-parse HEAD)
           [ "$sha" = "$GITHUB_SHA" ] || { echo 'FAIL checkout differs from dispatch commit'; exit 1; }
@@ -107,34 +304,15 @@ jobs:
 
       - name: select authored optional app producers
         id: optional-apps
+        env:
+          RELEASE_VERSION: ${{ inputs.version }}
         run: |
-          python3 - <<'PY'
-          import os, pathlib, sys
-          sys.path.insert(0, 'scripts')
-          from app_assets import optional_app_sources, roster, predecessor_pins
-          rows = roster('apps.json')
-          optional_app_sources('app-sources.tsv', rows)
-          selected = {row['id'] for row in rows}
-          predecessors = predecessor_pins(os.environ['APP_PRODUCERS'])
-          mode = os.environ['APP_PRODUCER_ONLY']
-          if mode not in ('none', 'comfyui'):
-              raise SystemExit('unknown app producer-only mode')
-          if mode != 'none':
-              if selected or predecessors:
-                  raise SystemExit('producer-only requires empty Setup catalog and no predecessor selection')
-              selected = {mode}
-          elif not set(predecessors) <= selected:
-              raise SystemExit('app predecessor is not declared by current catalog')
-          with pathlib.Path(os.environ['GITHUB_OUTPUT']).open('a', encoding='utf-8') as output:
-              for app in ('comfyui',):
-                  output.write(f'{app}={str(app in selected).lower()}\n')
-                  output.write(f'{app}-predecessor={str(app in predecessors).lower()}\n')
-          PY
+          python3 scripts/train/steps/select_app_producers.py
 
   # The input job only admits the reviewed retained bytes. Draft visibility with
   # this token is proved by the authorized real run, and fails closed on refusal.
   pytorch-input:
-    if: ${{ !inputs.signing_probe_only && (inputs.app_producer_only == 'none' || inputs.app_producer_only == '') }}
+    if: ${{ !inputs.diagnostic_host_sign_only && (inputs.producer_mode != 'train-graph' && (!inputs.signing_probe_only && (inputs.app_producer_only == 'none' || inputs.app_producer_only == ''))) }}
     needs: candidate
     runs-on: ubuntu-latest
     permissions:
@@ -153,18 +331,7 @@ jobs:
       - name: select the authored PyTorch executable
         id: selected
         run: |
-          python3 - <<'PY'
-          import os, pathlib, sys
-          sys.path.insert(0, 'scripts')
-          from release_tsv_rows import rows
-          selected = [row for row in rows(pathlib.Path('tools.tsv').read_text(), 'tools.tsv')
-                      if row[0] == 'pytorchd.exe']
-          if selected and (not selected[0][1].startswith('github.com/openabstractions/abstraction-provider-pytorch/go@')
-                           or selected[0][2:] != ('cmd/pytorchd', 'pytorchimage', 'console')):
-              raise ValueError('PyTorch executable has an unexpected owning module or feature')
-          with pathlib.Path(os.environ['GITHUB_OUTPUT']).open('a', encoding='utf-8') as output:
-              output.write(f'enabled={str(bool(selected)).lower()}\n')
-          PY
+          python3 scripts/train/steps/select_pytorch_executable.py
       - name: intake exact reviewed draft input assets
         if: steps.selected.outputs.enabled == 'true'
         env:
@@ -189,9 +356,59 @@ jobs:
           path: pytorch-input/
           compression-level: 0
           if-no-files-found: error
+  windows-app-delivery:
+    if: ${{ !inputs.diagnostic_host_sign_only && (inputs.producer_mode == 'train' && !inputs.signing_probe_only && needs.candidate.outputs.installer-comfyui == 'true') }}
+    needs: [candidate, windows-app-sign]
+    runs-on: windows-latest
+    permissions:
+      contents: read
+      actions: read
+    outputs:
+      comfyui-artifact: ${{ steps.comfy-final.outputs.artifact }}
+      comfyui-source-commit: ${{ steps.comfy-final.outputs.source_commit }}
+      comfyui-artifact-id: ${{ steps.comfy-artifact.outputs.artifact-id }}
+      comfyui-artifact-digest: ${{ steps.comfy-artifact.outputs.artifact-digest }}
+      comfyui-artifact-attempt: ${{ github.run_attempt }}
+    env:
+      CANDIDATE_VERSION: ${{ needs.candidate.outputs.version }}
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
+        with:
+          ref: ${{ needs.candidate.outputs.sha }}
+      - uses: actions/setup-python@e797f83bcb11b83ae66e0230d6156d7c80228e7c
+        with:
+          python-version: '3.12'
+      - name: exact pinned Microsoft signature tools
+        run: python3 windows/windows_signing.py prepare-tools --root "$RUNNER_TEMP/signing-tools" --github-env "$GITHUB_ENV"
+      - name: assemble authenticated application delivery before Panel compilation
+        id: comfy-final
+        if: inputs.producer_mode == 'train' && needs.candidate.outputs.installer-comfyui == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CANDIDATE_SHA: ${{ needs.candidate.outputs.sha }}
+          APP_CONTEXT_ARTIFACT_ID: ${{ needs.windows-app-sign.outputs.artifact-id }}
+          APP_CONTEXT_ARTIFACT_DIGEST: ${{ needs.windows-app-sign.outputs.artifact-digest }}
+          APP_CONTEXT_ARTIFACT_ATTEMPT: ${{ needs.windows-app-sign.outputs.artifact-attempt }}
+          DESKTOP_SIGNED_RECEIPT_SHA256: ${{ needs.windows-app-sign.outputs.desktop-receipt-sha256 }}
+          DESKTOP_SIGNED_RECEIPT_BYTES: ${{ needs.windows-app-sign.outputs.desktop-receipt-bytes }}
+          DESKTOP_SIGNER_ATTEMPT: ${{ needs.windows-app-sign.outputs.desktop-signer-attempt }}
+        run: |
+          python3 windows/windows_signing.py consume --artifact-id "$APP_CONTEXT_ARTIFACT_ID" --digest "$APP_CONTEXT_ARTIFACT_DIGEST" \
+            --name "windows-app-signed-$APP_CONTEXT_ARTIFACT_ATTEMPT" --source "$CANDIDATE_SHA" \
+            --run-id "$GITHUB_RUN_ID" --attempt "$APP_CONTEXT_ARTIFACT_ATTEMPT" --out signed-msis --receipt signed-msis/artifact-intake.json
+          python3 scripts/train/steps/build_application_msis.py --phase assemble-final
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        id: comfy-artifact
+        if: inputs.producer_mode == 'train' && needs.candidate.outputs.installer-comfyui == 'true'
+        with:
+          name: ${{ steps.comfy-final.outputs.artifact }}
+          path: final-apps/comfyui/
+          if-no-files-found: error
+
+
   windows-build:
-    if: ${{ !inputs.signing_probe_only && (inputs.app_producer_only == 'none' || inputs.app_producer_only == '') }}
-    needs: [candidate, pytorch-input]
+    if: ${{ !inputs.diagnostic_host_sign_only && (!cancelled() && needs.candidate.result == 'success' && needs.pytorch-input.result == 'success' && ((inputs.producer_mode == 'train' && needs.candidate.outputs.installer-comfyui == 'true' && needs.windows-app-delivery.result == 'success') || ((inputs.producer_mode != 'train' || needs.candidate.outputs.installer-comfyui != 'true') && needs.windows-app-delivery.result == 'skipped')) && inputs.producer_mode != 'train-graph' && (!inputs.signing_probe_only && (inputs.app_producer_only == 'none' || inputs.app_producer_only == ''))) }}
+    needs: [candidate, pytorch-input, windows-app-delivery]
     runs-on: windows-latest
     permissions:
       contents: read
@@ -200,6 +417,9 @@ jobs:
       CANDIDATE_VERSION: ${{ needs.candidate.outputs.version }}
       GOTOOLCHAIN: local
     outputs:
+      panel-catalogue-artifact-id: ${{ steps.panel-catalogue.outputs.artifact-id }}
+      panel-catalogue-artifact-digest: ${{ steps.panel-catalogue.outputs.artifact-digest }}
+      panel-catalogue-artifact-attempt: ${{ github.run_attempt }}
       engine-artifact-id: ${{ steps.engines.outputs.artifact-id }}
       engine-artifact-digest: ${{ steps.engines.outputs.artifact-digest }}
       artifact-attempt: ${{ github.run_attempt }}
@@ -209,6 +429,9 @@ jobs:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
         with:
           ref: ${{ needs.candidate.outputs.sha }}
+      - uses: actions/setup-python@e797f83bcb11b83ae66e0230d6156d7c80228e7c
+        with:
+          python-version: '3.12'
 
       - name: verify and consume the exact immutable PyTorch input artifact
         if: needs.pytorch-input.outputs.artifact-id != ''
@@ -289,61 +512,99 @@ jobs:
       # built out of a cache. The proxy is asked second, and answers a different
       # question: whether `go install` can reach the version a stranger is told
       # to install.
-      - name: verify and record published module provenance
-        run: python3 scripts/module_provenance.py --tools tools.tsv --output module-provenance.json
+      - name: verify and record selected module provenance
+        env:
+          PRODUCER_MODE: ${{ inputs.producer_mode }}
+          TRAIN_VERSION: ${{ inputs.version }}
+        run: |
+          if [ "$PRODUCER_MODE" = train ]; then
+            python3 scripts/module_provenance.py --prepared-graph public-go-graph.zip --prepared-sidecar public-go-graph.json --release-version "$TRAIN_VERSION" --prepared-directory "$RUNNER_TEMP/prepared-go-inputs" --workflow-environment --output module-provenance.json
+          else
+            python3 scripts/module_provenance.py --tools tools.tsv --output module-provenance.json
+          fi
 
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+
+      - name: receive completed application delivery and generate Panel catalogue input
+        if: inputs.producer_mode == 'train' && needs.candidate.outputs.installer-comfyui == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          CANDIDATE_SHA: ${{ needs.candidate.outputs.sha }}
+          COMFY_FINAL_ARTIFACT_ID: ${{ needs.windows-app-delivery.outputs.comfyui-artifact-id }}
+          COMFY_FINAL_ARTIFACT_DIGEST: ${{ needs.windows-app-delivery.outputs.comfyui-artifact-digest }}
+          COMFY_FINAL_ARTIFACT_ATTEMPT: ${{ needs.windows-app-delivery.outputs.comfyui-artifact-attempt }}
+        run: python3 scripts/train/steps/build_application_msis.py --phase stage-final
+      - name: generate explicit passive Panel catalogue input
+        if: inputs.producer_mode == 'train' && needs.candidate.outputs.installer-comfyui != 'true'
+        env:
+          CANDIDATE_SHA: ${{ needs.candidate.outputs.sha }}
+        run: python3 scripts/train/steps/build_application_msis.py --phase panel-inputs
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        id: panel-catalogue
+        if: inputs.producer_mode == 'train'
         with:
-          name: module-provenance-${{ runner.os }}-${{ github.run_attempt }}
-          path: module-provenance.json
+          name: panel-catalogue-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/panel-catalogue/panel-catalogue.json
+            ${{ runner.temp }}/panel-catalogue/panel-catalogue-input.json
           if-no-files-found: error
 
-      - name: build from the published modules
+      - name: build from selected verified module inputs
         env:
           CGO_ENABLED: '0'
+          PRODUCER_MODE: ${{ inputs.producer_mode }}
           GOOS: windows
           GOFLAGS: -trimpath
+          PANEL_APPS: ${{ needs.candidate.outputs.installer-comfyui == 'true' && '["comfyui"]' || '[]' }}
         run: |
-          python3 scripts/release_tsv_rows.py tools.tsv --output tools.rows
-          root=$PWD
-          for arch in amd64 arm64; do
-            while IFS= read -r -d '' path && IFS= read -r -d '' module &&
-                  IFS= read -r -d '' package && IFS= read -r -d '' feature &&
-                  IFS= read -r -d '' subsystem; do
-              mod=${module%@*}
-              version=${module##*@}
-              case "$package" in
-                .) target="$mod@$version" ;;
-                *) target="$mod/$package@$version" ;;
-              esac
-              ld='-s -w -buildid='
-              case "$subsystem" in
-                windows) ld="$ld -H=windowsgui" ;;
-                console) ;;
-                *) printf 'FAIL  %s has subsystem %s, which is console or windows\n' \
-                     "$path" "$subsystem"; exit 1 ;;
-              esac
-              # GOBIN refuses a cross-compiled install, so these land in
-              # GOPATH/bin under a name go chooses â€” at the root for the
-              # runner's own arch, in windows_arm64/ for the other. Emptying it
-              # first is what makes "the one file in there" a safe way to find
-              # what this install just produced.
-              gobin="$(go env GOPATH)/bin"
-              for pass in a b; do
-                mkdir -p "$root/$pass/$arch"
-                rm -rf "$gobin"
-                GOARCH="$arch" go install -ldflags "$ld" "$target"
-                built=$(find "$gobin" -type f -name '*.exe')
-                n=$(printf '%s\n' "$built" | sed '/^$/d' | wc -l)
-                if [ "$n" -ne 1 ]; then
-                  printf 'FAIL  %s produced %s binaries, expected 1\n' "$target" "$n"
-                  exit 1
-                fi
-                mv "$built" "$root/$pass/$arch/$path"
-              done
-              printf 'built %s %s from %s\n' "$arch" "$path" "$target"
-            done < tools.rows
-          done
+          if [ "$PRODUCER_MODE" = train ]; then
+            python3 scripts/module_provenance.py --tools tools.tsv --observe-windows-builds . \
+              --provenance module-provenance.json --output windows-build-observation.json \
+              --panel-catalogue-directory "$RUNNER_TEMP/panel-catalogue" \
+              --panel-proxy "$RUNNER_TEMP/prepared-go-inputs/proxy" \
+              --panel-apps "$PANEL_APPS"
+          else
+            python3 scripts/release_tsv_rows.py tools.tsv --output tools.rows
+            root=$PWD
+            for arch in amd64 arm64; do
+              while IFS= read -r -d '' path && IFS= read -r -d '' module &&
+                    IFS= read -r -d '' package && IFS= read -r -d '' feature &&
+                    IFS= read -r -d '' subsystem; do
+                mod=${module%@*}
+                version=${module##*@}
+                case "$package" in
+                  .) target="$mod@$version" ;;
+                  *) target="$mod/$package@$version" ;;
+                esac
+                ld='-s -w -buildid='
+                case "$subsystem" in
+                  windows) ld="$ld -H=windowsgui" ;;
+                  console) ;;
+                  *) printf 'FAIL  %s has subsystem %s, which is console or windows\n' \
+                       "$path" "$subsystem"; exit 1 ;;
+                esac
+                # GOBIN refuses a cross-compiled install, so these land in
+                # GOPATH/bin under a name go chooses â€” at the root for the
+                # runner's own arch, in windows_arm64/ for the other. Emptying it
+                # first is what makes "the one file in there" a safe way to find
+                # what this install just produced.
+                gobin="$(go env GOPATH)/bin"
+                for pass in a b; do
+                  mkdir -p "$root/$pass/$arch"
+                  rm -rf "$gobin"
+                  GOARCH="$arch" go install -ldflags "$ld" "$target"
+                  built=$(find "$gobin" -type f -name '*.exe')
+                  n=$(printf '%s\n' "$built" | sed '/^$/d' | wc -l)
+                  if [ "$n" -ne 1 ]; then
+                    printf 'FAIL  %s produced %s binaries, expected 1\n' "$target" "$n"
+                    exit 1
+                  fi
+                  mv "$built" "$root/$pass/$arch/$path"
+                done
+                printf 'built %s %s from %s\n' "$arch" "$path" "$target"
+              done < tools.rows
+            done
+          fi
 
       - name: reproducible
         run: |
@@ -363,6 +624,16 @@ jobs:
             exit 1
           fi
           exit $rc
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: module-provenance-${{ runner.os }}-${{ github.run_attempt }}
+          path: |
+            module-provenance.json
+            windows-build-observation.json
+          if-no-files-found: error
+
 
       # The publisher ZIP is an input only. The helper uses the same-source
       # modelhostd pin to check its exact digest and each kept file, then
@@ -408,9 +679,14 @@ jobs:
       # source is that checked folder (<clear/> drops nuget.org), and the
       # extension DLLs are passed by path.
       - name: retain only runtime build and reviewed engine inputs
+        env:
+          PRODUCER_MODE: ${{ inputs.producer_mode }}
         run: |
           mkdir raw-windows
           cp -r a raw-windows/
+          if [ "$PRODUCER_MODE" = train ]; then
+            cp module-provenance.json windows-build-observation.json raw-windows/
+          fi
           mkdir windows-engine-inputs
           printf 'Reviewed optional engine inputs from this Windows build.\n' > windows-engine-inputs/README.txt
           for directory in engine-input pytorch-input; do
@@ -430,7 +706,7 @@ jobs:
           path: windows-engine-inputs/
           if-no-files-found: error
   windows-native-build:
-    if: ${{ !inputs.signing_probe_only && (inputs.app_producer_only == 'none' || inputs.app_producer_only == '' || inputs.app_producer_only == 'comfyui') }}
+    if: ${{ !inputs.diagnostic_host_sign_only && (inputs.producer_mode != 'train-graph' && (!inputs.signing_probe_only && (inputs.app_producer_only == 'none' || inputs.app_producer_only == '' || inputs.app_producer_only == 'comfyui'))) }}
     needs: candidate
     runs-on: windows-latest
     env:
@@ -487,6 +763,9 @@ jobs:
             printf 'ok    %s from %s %s\n' "$package" "$repository" "$commit"
           done < npm.rows
 
+      - name: validate selected native source families
+        run: python3 windows/windows_signing.py check-native-source --pypi pypi.tsv --npm npm.tsv --native-roster pypi.tsv --root sources --github-env "$GITHUB_ENV"
+
       # Exact Node-API header tarball and, on Windows, the matching official
       # Node runtime ZIP and its separately published same-version win-x64
       # import library. All three inputs are bounded and SHA-checked
@@ -541,9 +820,36 @@ jobs:
           printf 'IPC_ADDON=%s\n' "$PWD/native/oa_ipc_node.node" >> "$GITHUB_ENV"
           ls -l native
 
+      # One object compilation feeds the client C ABI DLL and static Node addon.
+      - name: build the shared AppModel client once
+        if: env.OA_FACADE_NATIVE == '1'
+        run: |
+          cmake -S sources/abstraction-facade/cpp -B build/facade-appmodel -A x64 -DCMAKE_BUILD_TYPE=Release \
+            -DABSTRACTION_FACADE_BUILD_AGGREGATE=OFF -DABSTRACTION_FACADE_BUILD_APPMODEL=ON \
+            -DABSTRACTION_FACADE_NODE_APPMODEL=ON -DABSTRACTION_FACADE_APPMODEL_PORTABLE_WINDOWS=ON \
+            -DNODE_INCLUDE_DIR="$NODE_INCLUDE_DIR" -DNODE_IMPORT_LIBRARY="$NODE_IMPORT_LIBRARY"
+          cmake --build build/facade-appmodel --config Release --target abstraction_facade_appmodel oa_appmodel_node
+          for name in abstraction_facade_appmodel.dll oa_appmodel_node.node; do
+            mapfile -t outputs < <(find build/facade-appmodel -name "$name" -type f)
+            [ "${#outputs[@]}" -eq 1 ] || { printf 'FAIL  ambiguous AppModel native output %s\n' "$name"; exit 1; }
+            cp "${outputs[0]}" "native/$name"
+          done
+          cmake -S sources/abstraction-facade/cpp -B build/facade-appmodel-arm64 -A ARM64 -DCMAKE_BUILD_TYPE=Release \
+            -DABSTRACTION_FACADE_BUILD_AGGREGATE=OFF -DABSTRACTION_FACADE_BUILD_APPMODEL=ON \
+            -DABSTRACTION_FACADE_NODE_APPMODEL=OFF -DABSTRACTION_FACADE_APPMODEL_PORTABLE_WINDOWS=ON
+          cmake --build build/facade-appmodel-arm64 --config Release --target abstraction_facade_appmodel
+          mapfile -t outputs < <(find build/facade-appmodel-arm64 -name abstraction_facade_appmodel.dll -type f)
+          [ "${#outputs[@]}" -eq 1 ] || { printf 'FAIL  ambiguous ARM64 AppModel DLL output\n'; exit 1; }
+          mkdir -p native/arm64
+          cp "${outputs[0]}" native/arm64/abstraction_facade_appmodel.dll
+
+      - name: validate portable AppModel producer outputs
+        if: env.OA_FACADE_NATIVE == '1'
+        run: |
+          PYTHONPATH=scripts python3 -c 'from pathlib import Path; from windows_native import validate_portable_windows_dll; validate_portable_windows_dll(Path("native/abstraction_facade_appmodel.dll"), "win32-x64"); validate_portable_windows_dll(Path("native/arm64/abstraction_facade_appmodel.dll"), "win32-arm64")'
+
       - name: bind the canonical DLL to the Python and npm source pins
         run: |
-          python3 windows/windows_signing.py check-native-source --pypi pypi.tsv --npm npm.tsv
           mkdir -p native/build-inputs
           cp build/node-inputs/node-api-headers-1.9.0.tgz build/node-inputs/node-v22.23.3-win-x64.zip \
             build/node-inputs/node-v22.23.3-win-x64.lib build/node-inputs/receipt.json native/build-inputs/
@@ -554,9 +860,75 @@ jobs:
           path: native/
           if-no-files-found: error
 
+  windows-sdk-sign:
+    if: ${{ !inputs.diagnostic_host_sign_only && (inputs.producer_mode != 'train-graph' && (always() && !inputs.signing_probe_only && needs.windows-native-build.result == 'success' && github.repository == 'openabstractions/redist' && github.event_name == 'workflow_dispatch' && (github.ref == 'refs/heads/release/0.4.0' || (inputs.producer_mode == 'train' && github.ref == format('refs/heads/release/{0}', needs.candidate.outputs.version))) && github.actor == 'ReinisLusis' && github.triggering_actor == 'ReinisLusis')) }}
+    needs: [candidate, windows-native-build]
+    runs-on: windows-latest
+    timeout-minutes: 20
+    environment: signing
+    env:
+      OA_CERTUM_SIGNING_ONLY: '1'
+    permissions:
+      contents: read
+      actions: read
+    outputs:
+      artifact-attempt: ${{ github.run_attempt }}
+      artifact-id: ${{ steps.artifact.outputs.artifact-id }}
+      artifact-digest: ${{ steps.artifact.outputs.artifact-digest }}
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
+        with:
+          ref: ${{ needs.candidate.outputs.sha }}
+      - uses: actions/setup-python@e797f83bcb11b83ae66e0230d6156d7c80228e7c
+        with:
+          python-version: '3.12'
+      - name: consume exact windows-native-raw producer bytes
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ARTIFACT_ID: ${{ needs.windows-native-build.outputs.artifact-id }}
+          ARTIFACT_DIGEST: ${{ needs.windows-native-build.outputs.artifact-digest }}
+          ARTIFACT_ATTEMPT: ${{ needs.windows-native-build.outputs.artifact-attempt }}
+          CANDIDATE_SHA: ${{ needs.candidate.outputs.sha }}
+        run: |
+          python3 windows/windows_signing.py consume --artifact-id "$ARTIFACT_ID" --digest "$ARTIFACT_DIGEST" \
+            --name "windows-native-raw-$ARTIFACT_ATTEMPT" --source "$CANDIDATE_SHA" \
+            --run-id "$GITHUB_RUN_ID" --attempt "$ARTIFACT_ATTEMPT" --out signed/native
+      - name: exact pinned Microsoft signature tools
+        run: python3 windows/windows_signing.py prepare-tools --root "$RUNNER_TEMP/signing-tools" --github-env "$GITHUB_ENV"
+      - name: download pinned SimplySign Desktop installer
+        shell: pwsh
+        run: |
+          $policy = Get-Content windows/certum_simplysign.json -Raw | ConvertFrom-Json
+          Invoke-WebRequest -Uri $policy.installer.url -OutFile "$env:RUNNER_TEMP/simplysign.msi"
+      - name: connect exact reviewed signing identity
+        shell: pwsh
+        env:
+          CERTUM_USERNAME: ${{ secrets.CERTUM_USERNAME }}
+          CERTUM_OTP_URI: ${{ secrets.CERTUM_OTP_URI }}
+        run: >-
+          ./windows/certum_simplysign.ps1 -Mode Connect
+          -InstallerPath "$env:RUNNER_TEMP/simplysign.msi"
+          -SessionPath "$env:RUNNER_TEMP/signing-session.json"
+      - name: sign authoritative payload PEs and canonical native inputs
+        env:
+          CANDIDATE_SHA: ${{ needs.candidate.outputs.sha }}
+        run: python3 windows/windows_signing.py sign-pe --scope native --policy windows/certum_simplysign.json --signtool "$SIGNTOOL" --root signed --payload windows/payload.tsv --receipt signed/signatures.json --native-roster pypi.tsv
+      - name: disconnect owned signing session
+        if: always()
+        shell: pwsh
+        run: >-
+          ./windows/certum_simplysign.ps1 -Mode Disconnect
+          -SessionPath "$env:RUNNER_TEMP/signing-session.json"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        id: artifact
+        with:
+          name: windows-sdk-signed-${{ github.run_attempt }}
+          path: signed/
+          if-no-files-found: error
+
   windows-pe-sign:
-    if: ${{ always() && !inputs.signing_probe_only && needs.windows-native-build.result == 'success' && (needs.windows-build.result == 'success' || (inputs.app_producer_only == 'comfyui' && needs.windows-build.result == 'skipped')) && github.repository == 'openabstractions/redist' && github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/release/0.4.0' && github.actor == 'ReinisLusis' && github.triggering_actor == 'ReinisLusis' }}
-    needs: [candidate, windows-build, windows-native-build]
+    if: ${{ !inputs.diagnostic_host_sign_only && (inputs.producer_mode != 'train-graph' && (always() && !inputs.signing_probe_only && needs.windows-sdk-sign.result == 'success' && (needs.windows-build.result == 'success' || (inputs.app_producer_only == 'comfyui' && needs.windows-build.result == 'skipped')) && github.repository == 'openabstractions/redist' && github.event_name == 'workflow_dispatch' && (github.ref == 'refs/heads/release/0.4.0' || (inputs.producer_mode == 'train' && github.ref == format('refs/heads/release/{0}', needs.candidate.outputs.version))) && github.actor == 'ReinisLusis' && github.triggering_actor == 'ReinisLusis')) }}
+    needs: [candidate, windows-build, windows-sdk-sign]
     runs-on: windows-latest
     timeout-minutes: 20
     environment: signing
@@ -591,14 +963,17 @@ jobs:
       - name: consume exact windows-native-raw producer bytes
         env:
           GH_TOKEN: ${{ github.token }}
-          ARTIFACT_ID: ${{ needs.windows-native-build.outputs.artifact-id }}
-          ARTIFACT_DIGEST: ${{ needs.windows-native-build.outputs.artifact-digest }}
-          ARTIFACT_ATTEMPT: ${{ needs.windows-native-build.outputs.artifact-attempt }}
+          ARTIFACT_ID: ${{ needs.windows-sdk-sign.outputs.artifact-id }}
+          ARTIFACT_DIGEST: ${{ needs.windows-sdk-sign.outputs.artifact-digest }}
+          ARTIFACT_ATTEMPT: ${{ needs.windows-sdk-sign.outputs.artifact-attempt }}
           CANDIDATE_SHA: ${{ needs.candidate.outputs.sha }}
         run: |
           python3 windows/windows_signing.py consume --artifact-id "$ARTIFACT_ID" --digest "$ARTIFACT_DIGEST" \
-            --name "windows-native-raw-$ARTIFACT_ATTEMPT" --source "$CANDIDATE_SHA" \
-            --run-id "$GITHUB_RUN_ID" --attempt "$ARTIFACT_ATTEMPT" --out signed/native
+            --name "windows-sdk-signed-$ARTIFACT_ATTEMPT" --source "$CANDIDATE_SHA" \
+            --run-id "$GITHUB_RUN_ID" --attempt "$ARTIFACT_ATTEMPT" --out retained-sdk
+          mkdir -p signed
+          cp -R retained-sdk/native signed/native
+          cp retained-sdk/signatures.json signed/sdk-signatures.json
       - name: exact pinned Microsoft signature tools
         run: python3 windows/windows_signing.py prepare-tools --root "$RUNNER_TEMP/signing-tools" --github-env "$GITHUB_ENV"
       - name: download pinned SimplySign Desktop installer
@@ -618,7 +993,7 @@ jobs:
       - name: sign authoritative payload PEs and canonical native inputs
         env:
           CANDIDATE_SHA: ${{ needs.candidate.outputs.sha }}
-        run: python3 windows/windows_signing.py sign-pe --policy windows/certum_simplysign.json --signtool "$SIGNTOOL" --root signed --payload windows/payload.tsv --receipt signed/signatures.json
+        run: python3 windows/windows_signing.py sign-pe --scope runtime --retained-signatures signed/sdk-signatures.json --policy windows/certum_simplysign.json --signtool "$SIGNTOOL" --root signed --payload windows/payload.tsv --receipt signed/signatures.json --native-roster pypi.tsv
       - name: disconnect owned signing session
         if: always()
         shell: pwsh
@@ -632,7 +1007,7 @@ jobs:
           path: signed/
           if-no-files-found: error
   windows:
-    if: ${{ !inputs.signing_probe_only && (inputs.app_producer_only == 'none' || inputs.app_producer_only == '') }}
+    if: ${{ !inputs.diagnostic_host_sign_only && (inputs.producer_mode != 'train-graph' && (!inputs.signing_probe_only && (inputs.app_producer_only == 'none' || inputs.app_producer_only == ''))) }}
     needs: [candidate, windows-build, windows-pe-sign, python]
     runs-on: windows-latest
     permissions:
@@ -679,7 +1054,7 @@ jobs:
       - name: stage signed authoritative runtime inputs
         run: |
           cp -r signed/runtime/* .
-          python3 windows/windows_signing.py verify-pe --policy windows/certum_simplysign.json --signtool "$SIGNTOOL" --root signed --payload windows/payload.tsv --receipt pe-verification.json
+          python3 windows/windows_signing.py verify-pe --policy windows/certum_simplysign.json --signtool "$SIGNTOOL" --root signed --payload windows/payload.tsv --receipt pe-verification.json --native-roster pypi.tsv --github-env "$GITHUB_ENV"
       - name: pinned WiX packages
         run: python3 windows/wix_packages.py --dest wix-packages --env "$GITHUB_ENV"
 
@@ -701,25 +1076,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          python3 - <<'PY'
-          import json, os, pathlib, subprocess, sys
-          sys.path.insert(0, 'scripts')
-          sys.path.insert(0, 'windows')
-          from app_assets import select_windows_wheel_artifact
-          from windows_signing import consume_artifact
-          repository = os.environ['GITHUB_REPOSITORY']
-          run = int(os.environ['GITHUB_RUN_ID'])
-          def pages(path, key):
-              result = json.loads(subprocess.check_output(['gh', 'api', '--paginate', '--slurp', path]))
-              return [item for page in result for item in page[key]]
-          jobs = pages(f'repos/{repository}/actions/runs/{run}/jobs?filter=all&per_page=100', 'jobs')
-          artifacts = pages(f'repos/{repository}/actions/runs/{run}/artifacts?per_page=100', 'artifacts')
-          selected = select_windows_wheel_artifact(jobs, artifacts, run, os.environ['GITHUB_SHA'])
-          attempt = int(selected['name'].rsplit('-', 1)[1])
-          consume_artifact(selected['id'], selected['digest'].removeprefix('sha256:'), selected['name'],
-                           os.environ['GITHUB_SHA'], run, attempt, pathlib.Path('ipc_wheels') / selected['name'])
-          pathlib.Path('ipc-wheel-selection.txt').write_text(selected['name'])
-          PY
+          python3 scripts/train/steps/select_windows_wheel_artifact.py
       - name: take the IPC library out of this run's win_amd64 wheel
         env:
           GH_TOKEN: ${{ github.token }}
@@ -727,35 +1084,7 @@ jobs:
         run: |
           latest="ipc_wheels/$(cat ipc-wheel-selection.txt)"
           mkdir -p dist
-          python3 - "$latest" <<'PY'
-          import hashlib, json, os, pathlib, re, sys, zipfile
-          folder = pathlib.Path(sys.argv[1])
-          wheels = sorted(folder.glob('abstraction_ipc-*-win_amd64.whl'))
-          if len(wheels) != 1:
-              raise SystemExit('FAIL  expected one win_amd64 abstraction-ipc wheel in %s, found %d'
-                               % (folder, len(wheels)))
-          wheel = wheels[0]
-          wheel_sha256 = hashlib.sha256(wheel.read_bytes()).hexdigest()
-          sums = (folder / 'SHA256SUMS.pypi.win32-x64').read_text(encoding='utf-8').splitlines()
-          lines = [line for line in sums if re.fullmatch(r'[0-9a-f]{64} [ *]' + re.escape(wheel.name), line)]
-          if len(lines) != 1 or lines[0][:64] != wheel_sha256:
-              raise SystemExit('FAIL  SHA256SUMS.pypi.win32-x64 does not list %s with its SHA-256 %s'
-                               % (wheel.name, wheel_sha256))
-          member = 'abstraction/ipc/_native/abstraction_ipc.dll'
-          with zipfile.ZipFile(wheel) as archive:
-              data = archive.read(member)
-          target = pathlib.Path('ipc-library/abstraction_ipc.dll')
-          target.parent.mkdir(exist_ok=True)
-          target.write_bytes(data)
-          receipt = {'schema': 1, 'run_id': int(os.environ['GITHUB_RUN_ID']), 'artifact': folder.name,
-                     'wheel': wheel.name, 'wheel_sha256': wheel_sha256, 'wheel_sums_line': lines[0],
-                     'member': member, 'library': 'tools/abstraction_ipc.dll',
-                     'sha256': hashlib.sha256(data).hexdigest(), 'bytes': len(data)}
-          pathlib.Path('dist/ipc-library.json').write_text(
-              json.dumps(receipt, indent=2, sort_keys=True) + '\n', encoding='utf-8')
-          print('ok    %s, %d bytes, sha256 %s, from %s (%s)'
-                % (target, len(data), receipt['sha256'], wheel.name, folder.name))
-          PY
+          python3 scripts/train/steps/take_ipc_library.py "$latest"
 
       # windows/build.py is the packager on a workstation and it is the packager
       # here, because two assemblers cannot be kept agreeing about what the
@@ -775,12 +1104,25 @@ jobs:
             case $arch in x64) goarch=amd64 ;; *) goarch=arm64 ;; esac
             ipc=()
             [ "$arch" = x64 ] && ipc=(--src ipclibrary=ipc-library)
+            if [ "$arch" = x64 ] && [ "$OA_FACADE_NATIVE" = 1 ]; then
+              ipc+=(--src appmodellibrary=signed/native)
+            elif [ "$arch" = arm64 ] && [ "$OA_FACADE_NATIVE" = 1 ]; then
+              ipc+=(--src appmodellibrary=signed/native/arm64)
+            fi
             for pass in a b; do
               python3 windows/build.py --arch "$arch" --version "$version" \
                 --out "pkg-$pass/$arch" --bin "a/$goarch" --license LICENSE --ext "$WIX_UI_EXT" \
                 --src modelhostengine=engine-input --src pytorchengine=pytorch-input "${ipc[@]}"
               if [ "$arch" = x64 ] && ! cmp -s ipc-library/abstraction_ipc.dll "pkg-$pass/x64/payload/tools/abstraction_ipc.dll"; then
                 printf 'FAIL  the x64 package did not stage the IPC library that dist/ipc-library.json records\n'
+                exit 1
+              fi
+              if [ "$arch" = x64 ] && [ "$OA_FACADE_NATIVE" = 1 ] && ! cmp -s signed/native/abstraction_facade_appmodel.dll "pkg-$pass/x64/payload/tools/abstraction_facade_appmodel.dll"; then
+                printf 'FAIL  the x64 package did not stage the canonical signed AppModel library\n'
+                exit 1
+              fi
+              if [ "$arch" = arm64 ] && [ "$OA_FACADE_NATIVE" = 1 ] && ! cmp -s signed/native/arm64/abstraction_facade_appmodel.dll "pkg-$pass/arm64/payload/tools/abstraction_facade_appmodel.dll"; then
+                printf 'FAIL  the ARM64 package did not stage the canonical signed AppModel library\n'
                 exit 1
               fi
             done
@@ -821,16 +1163,311 @@ jobs:
   # So: each leg names its scope on the command line, and asserts what the
   # install did rather than what the package promised. A manifest is checked by
   # windows/validate.py, before anything is built; nothing below reads one.
-  windows-app-msi:
-    if: ${{ !inputs.signing_probe_only && (inputs.app_producer_only == 'none' || inputs.app_producer_only == '') }}
-    needs: [candidate, app_comfyui]
+  windows-app-native-build:
+    if: ${{ !inputs.diagnostic_host_sign_only && (inputs.producer_mode == 'train' && !inputs.signing_probe_only && (inputs.app_producer_only == 'none' || inputs.app_producer_only == '') && needs.candidate.outputs.required-products != '[]') }}
+    needs: [candidate, javascript, python, windows-sdk-sign, app_comfyui]
     runs-on: windows-latest
     permissions:
       contents: read
       actions: read
     env:
+      CANDIDATE_SHA: ${{ needs.candidate.outputs.sha }}
       CANDIDATE_VERSION: ${{ needs.candidate.outputs.version }}
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
     outputs:
+      artifact-attempt: ${{ github.run_attempt }}
+      artifact-id: ${{ steps.artifact.outputs.artifact-id }}
+      artifact-digest: ${{ steps.artifact.outputs.artifact-digest }}
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
+        with:
+          ref: ${{ needs.candidate.outputs.sha }}
+      - uses: actions/setup-python@e797f83bcb11b83ae66e0230d6156d7c80228e7c
+        with:
+          python-version: '3.12'
+      - uses: actions/setup-node@2028fbc5c25fe9cf00d9f06a71cc4710d4507903 # v6.0.0
+        with:
+          node-version: '22.23.3'
+      - name: pinned WiX packages
+        run: python3 windows/wix_packages.py --dest wix-packages --env "$GITHUB_ENV"
+      - name: wix
+        run: |
+          dotnet tool install --global wix --version "$WIX_VERSION" --configfile "$WIX_NUGET_CONFIG"
+          echo "$HOME/.dotnet/tools" >> "$GITHUB_PATH"
+      - name: exact pinned Microsoft signature tools
+        run: python3 windows/windows_signing.py prepare-tools --root "$RUNNER_TEMP/signing-tools" --github-env "$GITHUB_ENV"
+      - name: acquire source-bound native producer inputs
+        env:
+          PE_ARTIFACT_ID: ${{ needs.windows-sdk-sign.outputs.artifact-id }}
+          PE_ARTIFACT_DIGEST: ${{ needs.windows-sdk-sign.outputs.artifact-digest }}
+          PE_ARTIFACT_ATTEMPT: ${{ needs.windows-sdk-sign.outputs.artifact-attempt }}
+          COMFY_BACKEND_ARTIFACT_ID: ${{ needs.app_comfyui.outputs.artifact-id }}
+          COMFY_BACKEND_ARTIFACT_DIGEST: ${{ needs.app_comfyui.outputs.artifact-digest }}
+          COMFY_BACKEND_ARTIFACT_ATTEMPT: ${{ needs.app_comfyui.outputs.artifact-attempt }}
+          COMFY_CONTROL_ARTIFACT_ID: ${{ needs.app_comfyui.outputs.control-artifact-id }}
+          COMFY_CONTROL_ARTIFACT_DIGEST: ${{ needs.app_comfyui.outputs.control-artifact-digest }}
+          COMFY_CONTROL_ARTIFACT_ATTEMPT: ${{ needs.app_comfyui.outputs.control-artifact-attempt }}
+        run: python3 scripts/train/steps/build_application_msis.py --phase inputs
+      - name: prepare native outputs through selected MSVC environment
+        shell: cmd
+        run: |
+          call "%OA_APP_VCVARS%"
+          if errorlevel 1 exit /b %errorlevel%
+          python scripts/train/steps/build_application_msis.py --phase prepare-native
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        id: artifact
+        with:
+          name: windows-app-native-raw-${{ github.run_attempt }}
+          path: |
+            app-native/
+            !app-native/native/comfyui/backend-launch-build/
+          include-hidden-files: true
+          if-no-files-found: error
+
+  windows-app-native-sign:
+    if: ${{ !inputs.diagnostic_host_sign_only && (inputs.producer_mode != 'train-graph' && (always() && !inputs.signing_probe_only && needs.windows-app-native-build.result == 'success' && github.repository == 'openabstractions/redist' && github.event_name == 'workflow_dispatch' && (github.ref == 'refs/heads/release/0.4.0' || (inputs.producer_mode == 'train' && github.ref == format('refs/heads/release/{0}', needs.candidate.outputs.version))) && github.actor == 'ReinisLusis' && github.triggering_actor == 'ReinisLusis')) }}
+    needs: [candidate, windows-app-native-build]
+    runs-on: windows-latest
+    environment: signing
+    permissions:
+      contents: read
+      actions: read
+    env:
+      CANDIDATE_SHA: ${{ needs.candidate.outputs.sha }}
+      CANDIDATE_VERSION: ${{ needs.candidate.outputs.version }}
+      GH_TOKEN: ${{ github.token }}
+      OA_CERTUM_SIGNING_ONLY: '1'
+    outputs:
+      desktop-receipt-sha256: ${{ steps.native-signature.outputs.desktop-receipt-sha256 }}
+      desktop-receipt-bytes: ${{ steps.native-signature.outputs.desktop-receipt-bytes }}
+      artifact-attempt: ${{ github.run_attempt }}
+      artifact-id: ${{ steps.artifact.outputs.artifact-id }}
+      artifact-digest: ${{ steps.artifact.outputs.artifact-digest }}
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
+        with:
+          ref: ${{ needs.candidate.outputs.sha }}
+      - uses: actions/setup-python@e797f83bcb11b83ae66e0230d6156d7c80228e7c
+        with:
+          python-version: '3.12'
+      - name: consume exact windows-app-native-raw producer bytes
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ARTIFACT_ID: ${{ needs.windows-app-native-build.outputs.artifact-id }}
+          ARTIFACT_DIGEST: ${{ needs.windows-app-native-build.outputs.artifact-digest }}
+          ARTIFACT_ATTEMPT: ${{ needs.windows-app-native-build.outputs.artifact-attempt }}
+        run: |
+          python3 windows/windows_signing.py consume --artifact-id "$ARTIFACT_ID" --digest "$ARTIFACT_DIGEST" \
+            --name "windows-app-native-raw-$ARTIFACT_ATTEMPT" --source "$CANDIDATE_SHA" \
+            --run-id "$GITHUB_RUN_ID" --attempt "$ARTIFACT_ATTEMPT" --out app-native
+      - name: exact pinned Microsoft signature tools
+        run: python3 windows/windows_signing.py prepare-tools --root "$RUNNER_TEMP/signing-tools" --github-env "$GITHUB_ENV"
+      - name: download pinned SimplySign Desktop installer
+        shell: pwsh
+        run: |
+          $policy = Get-Content windows/certum_simplysign.json -Raw | ConvertFrom-Json
+          Invoke-WebRequest -Uri $policy.installer.url -OutFile "$env:RUNNER_TEMP/simplysign.msi"
+      - name: connect exact reviewed signing identity
+        shell: pwsh
+        env:
+          CERTUM_USERNAME: ${{ secrets.CERTUM_USERNAME }}
+          CERTUM_OTP_URI: ${{ secrets.CERTUM_OTP_URI }}
+        run: >-
+          ./windows/certum_simplysign.ps1 -Mode Connect
+          -InstallerPath "$env:RUNNER_TEMP/simplysign.msi"
+          -SessionPath "$env:RUNNER_TEMP/signing-session.json"
+      - name: sign only source-selected application native members
+        id: native-signature
+        run: python3 scripts/train/steps/build_application_msis.py --phase sign-native
+      - name: disconnect owned signing session
+        if: always()
+        shell: pwsh
+        run: >-
+          ./windows/certum_simplysign.ps1 -Mode Disconnect
+          -SessionPath "$env:RUNNER_TEMP/signing-session.json"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        id: artifact
+        with:
+          name: windows-app-native-signed-${{ github.run_attempt }}
+          path: |
+            app-native/
+            !app-native/native/comfyui/backend-launch-build/
+          include-hidden-files: true
+          if-no-files-found: error
+
+  windows-app-helpers-build:
+    if: ${{ !inputs.diagnostic_host_sign_only && (needs.windows-app-native-sign.result == 'success' && inputs.producer_mode == 'train' && !inputs.signing_probe_only && (inputs.app_producer_only == 'none' || inputs.app_producer_only == '') && needs.candidate.outputs.required-products != '[]') }}
+    needs: [candidate, windows-app-native-sign]
+    runs-on: windows-latest
+    permissions:
+      contents: read
+      actions: read
+    env:
+      CANDIDATE_SHA: ${{ needs.candidate.outputs.sha }}
+      CANDIDATE_VERSION: ${{ needs.candidate.outputs.version }}
+      DESKTOP_SIGNER_ATTEMPT: ${{ needs.windows-app-native-sign.outputs.artifact-attempt }}
+      DESKTOP_SIGNED_RECEIPT_SHA256: ${{ needs.windows-app-native-sign.outputs.desktop-receipt-sha256 }}
+      DESKTOP_SIGNED_RECEIPT_BYTES: ${{ needs.windows-app-native-sign.outputs.desktop-receipt-bytes }}
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      ARTIFACT_ID: ${{ needs.windows-app-native-sign.outputs.artifact-id }}
+      ARTIFACT_DIGEST: ${{ needs.windows-app-native-sign.outputs.artifact-digest }}
+      ARTIFACT_ATTEMPT: ${{ needs.windows-app-native-sign.outputs.artifact-attempt }}
+      ARTIFACT_NAME: windows-app-native-signed-${{ needs.windows-app-native-sign.outputs.artifact-attempt }}
+    outputs:
+      desktop-signer-attempt: ${{ needs.windows-app-native-sign.outputs.artifact-attempt }}
+      desktop-receipt-sha256: ${{ needs.windows-app-native-sign.outputs.desktop-receipt-sha256 }}
+      desktop-receipt-bytes: ${{ needs.windows-app-native-sign.outputs.desktop-receipt-bytes }}
+      artifact-attempt: ${{ github.run_attempt }}
+      artifact-id: ${{ steps.artifact.outputs.artifact-id }}
+      artifact-digest: ${{ steps.artifact.outputs.artifact-digest }}
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
+        with:
+          ref: ${{ needs.candidate.outputs.sha }}
+      - uses: actions/setup-python@e797f83bcb11b83ae66e0230d6156d7c80228e7c
+        with:
+          python-version: '3.12'
+      - uses: actions/setup-node@2028fbc5c25fe9cf00d9f06a71cc4710d4507903 # v6.0.0
+        with:
+          node-version: '22.23.3'
+      - name: pinned WiX packages
+        run: python3 windows/wix_packages.py --dest wix-packages --env "$GITHUB_ENV"
+      - name: wix
+        run: |
+          dotnet tool install --global wix --version "$WIX_VERSION" --configfile "$WIX_NUGET_CONFIG"
+          echo "$HOME/.dotnet/tools" >> "$GITHUB_PATH"
+      - name: exact pinned Microsoft signature tools
+        run: python3 windows/windows_signing.py prepare-tools --root "$RUNNER_TEMP/signing-tools" --github-env "$GITHUB_ENV"
+      - name: consume authenticated signed Desktop and shared native closure
+        run: |
+          python3 windows/windows_signing.py consume --artifact-id "$ARTIFACT_ID" --digest "$ARTIFACT_DIGEST" \
+            --name "$ARTIFACT_NAME" --source "$CANDIDATE_SHA" --run-id "$GITHUB_RUN_ID" \
+            --attempt "$ARTIFACT_ATTEMPT" --out app-native --receipt app-native/artifact-intake.json
+      - name: select retained compiler environment
+        shell: pwsh
+        run: |
+          $selected = Get-Content app-native/inputs/selected-toolchain.json -Raw | ConvertFrom-Json
+          "OA_APP_VCVARS=$($selected.installation_path)/VC/Auxiliary/Build/vcvars64.bat" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+      - name: compile hash-bound helpers and emit deterministic unsigned uninstaller
+        shell: cmd
+        run: |
+          call "%OA_APP_VCVARS%"
+          if errorlevel 1 exit /b %errorlevel%
+          python scripts/train/steps/build_application_msis.py --phase prepare-helpers
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        id: artifact
+        with:
+          name: windows-app-helpers-raw-${{ github.run_attempt }}
+          path: |
+            app-native/
+            !app-native/artifact-intake.json
+            !app-native/native/comfyui/backend-launch-build/
+          include-hidden-files: true
+          if-no-files-found: error
+
+  windows-app-helpers-sign:
+    if: ${{ !inputs.diagnostic_host_sign_only && (inputs.producer_mode != 'train-graph' && (always() && !inputs.signing_probe_only && needs.windows-app-helpers-build.result == 'success' && github.repository == 'openabstractions/redist' && github.event_name == 'workflow_dispatch' && (github.ref == 'refs/heads/release/0.4.0' || (inputs.producer_mode == 'train' && github.ref == format('refs/heads/release/{0}', needs.candidate.outputs.version))) && github.actor == 'ReinisLusis' && github.triggering_actor == 'ReinisLusis')) }}
+    needs: [candidate, windows-app-helpers-build]
+    runs-on: windows-latest
+    environment: signing
+    permissions:
+      contents: read
+      actions: read
+    env:
+      CANDIDATE_SHA: ${{ needs.candidate.outputs.sha }}
+      CANDIDATE_VERSION: ${{ needs.candidate.outputs.version }}
+      DESKTOP_SIGNER_ATTEMPT: ${{ needs.windows-app-helpers-build.outputs.desktop-signer-attempt }}
+      DESKTOP_SIGNED_RECEIPT_SHA256: ${{ needs.windows-app-helpers-build.outputs.desktop-receipt-sha256 }}
+      DESKTOP_SIGNED_RECEIPT_BYTES: ${{ needs.windows-app-helpers-build.outputs.desktop-receipt-bytes }}
+      GH_TOKEN: ${{ github.token }}
+      OA_CERTUM_SIGNING_ONLY: '1'
+      ARTIFACT_ID: ${{ needs.windows-app-helpers-build.outputs.artifact-id }}
+      ARTIFACT_DIGEST: ${{ needs.windows-app-helpers-build.outputs.artifact-digest }}
+      ARTIFACT_ATTEMPT: ${{ needs.windows-app-helpers-build.outputs.artifact-attempt }}
+      ARTIFACT_NAME: windows-app-helpers-raw-${{ needs.windows-app-helpers-build.outputs.artifact-attempt }}
+    outputs:
+      desktop-signer-attempt: ${{ needs.windows-app-helpers-build.outputs.desktop-signer-attempt }}
+      desktop-receipt-sha256: ${{ needs.windows-app-helpers-build.outputs.desktop-receipt-sha256 }}
+      desktop-receipt-bytes: ${{ needs.windows-app-helpers-build.outputs.desktop-receipt-bytes }}
+      artifact-attempt: ${{ github.run_attempt }}
+      artifact-id: ${{ steps.artifact.outputs.artifact-id }}
+      artifact-digest: ${{ steps.artifact.outputs.artifact-digest }}
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
+        with:
+          ref: ${{ needs.candidate.outputs.sha }}
+      - uses: actions/setup-python@e797f83bcb11b83ae66e0230d6156d7c80228e7c
+        with:
+          python-version: '3.12'
+      - name: consume exact windows-app-helpers-raw producer bytes
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ARTIFACT_ID: ${{ needs.windows-app-helpers-build.outputs.artifact-id }}
+          ARTIFACT_DIGEST: ${{ needs.windows-app-helpers-build.outputs.artifact-digest }}
+          ARTIFACT_ATTEMPT: ${{ needs.windows-app-helpers-build.outputs.artifact-attempt }}
+        run: |
+          python3 windows/windows_signing.py consume --artifact-id "$ARTIFACT_ID" --digest "$ARTIFACT_DIGEST" \
+            --name "windows-app-helpers-raw-$ARTIFACT_ATTEMPT" --source "$CANDIDATE_SHA" \
+            --run-id "$GITHUB_RUN_ID" --attempt "$ARTIFACT_ATTEMPT" --out app-native --receipt app-native/artifact-intake.json
+      - name: exact pinned Microsoft signature tools
+        run: python3 windows/windows_signing.py prepare-tools --root "$RUNNER_TEMP/signing-tools" --github-env "$GITHUB_ENV"
+      - name: download pinned SimplySign Desktop installer
+        shell: pwsh
+        run: |
+          $policy = Get-Content windows/certum_simplysign.json -Raw | ConvertFrom-Json
+          Invoke-WebRequest -Uri $policy.installer.url -OutFile "$env:RUNNER_TEMP/simplysign.msi"
+      - name: connect exact reviewed signing identity
+        shell: pwsh
+        env:
+          CERTUM_USERNAME: ${{ secrets.CERTUM_USERNAME }}
+          CERTUM_OTP_URI: ${{ secrets.CERTUM_OTP_URI }}
+        run: >-
+          ./windows/certum_simplysign.ps1 -Mode Connect
+          -InstallerPath "$env:RUNNER_TEMP/simplysign.msi"
+          -SessionPath "$env:RUNNER_TEMP/signing-session.json"
+      - name: sign only source-selected application native members
+        run: python3 scripts/train/steps/build_application_msis.py --phase sign-helpers
+      - name: disconnect owned signing session
+        if: always()
+        shell: pwsh
+        run: >-
+          ./windows/certum_simplysign.ps1 -Mode Disconnect
+          -SessionPath "$env:RUNNER_TEMP/signing-session.json"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        id: artifact
+        with:
+          name: windows-app-helpers-signed-${{ github.run_attempt }}
+          path: |
+            app-native/
+            !app-native/artifact-intake.json
+            !app-native/native/comfyui/backend-launch-build/
+          include-hidden-files: true
+          if-no-files-found: error
+
+  windows-app-msi:
+    if: ${{ !inputs.diagnostic_host_sign_only && (always() && needs.candidate.result == 'success' && (needs.app_comfyui.result == 'success' || needs.app_comfyui.result == 'skipped') && (inputs.producer_mode != 'train' || needs.candidate.outputs.required-products == '[]' || needs.windows-app-helpers-sign.result == 'success') && inputs.producer_mode != 'train-graph' && (!inputs.signing_probe_only && (inputs.app_producer_only == 'none' || inputs.app_producer_only == ''))) }}
+    needs: [candidate, app_comfyui, windows-app-helpers-sign]
+    runs-on: windows-latest
+    permissions:
+      contents: read
+      actions: read
+    env:
+      CANDIDATE_SHA: ${{ needs.candidate.outputs.sha }}
+      GH_TOKEN: ${{ github.token }}
+      CANDIDATE_VERSION: ${{ needs.candidate.outputs.version }}
+      ARTIFACT_ID: ${{ needs.windows-app-helpers-sign.outputs.artifact-id }}
+      ARTIFACT_DIGEST: ${{ needs.windows-app-helpers-sign.outputs.artifact-digest }}
+      ARTIFACT_ATTEMPT: ${{ needs.windows-app-helpers-sign.outputs.artifact-attempt }}
+      ARTIFACT_NAME: windows-app-helpers-signed-${{ needs.windows-app-helpers-sign.outputs.artifact-attempt }}
+      DESKTOP_SIGNER_ATTEMPT: ${{ needs.windows-app-helpers-sign.outputs.desktop-signer-attempt }}
+      DESKTOP_SIGNED_RECEIPT_SHA256: ${{ needs.windows-app-helpers-sign.outputs.desktop-receipt-sha256 }}
+      DESKTOP_SIGNED_RECEIPT_BYTES: ${{ needs.windows-app-helpers-sign.outputs.desktop-receipt-bytes }}
+    outputs:
+      desktop-receipt-sha256: ${{ needs.windows-app-helpers-sign.outputs.desktop-receipt-sha256 }}
+      desktop-receipt-bytes: ${{ needs.windows-app-helpers-sign.outputs.desktop-receipt-bytes }}
+      desktop-signer-attempt: ${{ needs.windows-app-helpers-sign.outputs.desktop-signer-attempt }}
       artifact-attempt: ${{ github.run_attempt }}
       artifact-id: ${{ steps.artifact.outputs.artifact-id }}
       artifact-digest: ${{ steps.artifact.outputs.artifact-digest }}
@@ -847,7 +1484,8 @@ jobs:
         run: |
           dotnet tool install --global wix --version "$WIX_VERSION" --configfile "$WIX_NUGET_CONFIG"
           echo "$HOME/.dotnet/tools" >> "$GITHUB_PATH"
-      - name: verify optional adopter pairs from this candidate
+      - if: inputs.producer_mode != 'train'
+        name: verify optional adopter pairs from this candidate
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
@@ -856,75 +1494,34 @@ jobs:
           CANDIDATE_SHA: ${{ needs.candidate.outputs.sha }}
         run: |
           mkdir -p app-inputs dist
-          python3 - <<'PY'
-          import json, os, pathlib, subprocess, sys
-          sys.path.insert(0, 'scripts')
-          from app_assets import roster, select_producers
-          outputs = {
-              app: {'artifact': os.environ[app.upper() + '_ARTIFACT'],
-                    'source_commit': os.environ[app.upper() + '_SOURCE_COMMIT']}
-              for app in ('comfyui',)}
-          for app, artifact in select_producers(roster('apps.json'), outputs):
-              destination = pathlib.Path('app-inputs') / app
-              destination.mkdir()
-              subprocess.run(['gh', 'run', 'download', os.environ['GITHUB_RUN_ID'],
-                              '-n', artifact, '-D', str(destination)], check=True)
-          pathlib.Path('app-producer-outputs.json').write_text(json.dumps(outputs, sort_keys=True) + '\n',
-                                                                encoding='utf-8')
-          PY
+          python3 scripts/train/steps/verify_adopter_pairs.py
           python3 scripts/app_assets.py stage --roster apps.json \
             --inputs app-inputs --dist dist --metadata "$RUNNER_TEMP/apps.json" \
             --outputs app-producer-outputs.json --candidate-source "$CANDIDATE_SHA" \
             --run-id "$GITHUB_RUN_ID" --predecessors "$APP_PRODUCERS"
 
-      - name: stage exact app binaries
+      - if: inputs.producer_mode != 'train'
+        name: stage exact app binaries
         run: |
           mkdir -p verified-release
           find dist -maxdepth 1 -name '*.zip' -exec cp {} verified-release/ \;
+      - if: inputs.producer_mode == 'train' && needs.candidate.outputs.required-products != '[]'
+        name: consume exact windows-app-helpers-signed producer bytes
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ARTIFACT_ID: ${{ needs.windows-app-helpers-sign.outputs.artifact-id }}
+          ARTIFACT_DIGEST: ${{ needs.windows-app-helpers-sign.outputs.artifact-digest }}
+          ARTIFACT_ATTEMPT: ${{ needs.windows-app-helpers-sign.outputs.artifact-attempt }}
+        run: |
+          python3 windows/windows_signing.py consume --artifact-id "$ARTIFACT_ID" --digest "$ARTIFACT_DIGEST" \
+            --name "windows-app-helpers-signed-$ARTIFACT_ATTEMPT" --source "$CANDIDATE_SHA" \
+            --run-id "$GITHUB_RUN_ID" --attempt "$ARTIFACT_ATTEMPT" --out app-native --receipt app-native/artifact-intake.json
       - name: application MSIs from exact app producer binaries
         run: |
-          python3 - <<'PY'
-          import hashlib, json, os, pathlib, re, subprocess, sys
-          version = os.environ['CANDIDATE_VERSION']
-          release = pathlib.Path('verified-release')
-          out = pathlib.Path('setup')
-          out.mkdir()
-          def pin(path):
-              data = path.read_bytes()
-              return {'file': str(path.resolve()), 'sha256': hashlib.sha256(data).hexdigest(), 'bytes': len(data)}
-          apps = []
-          for row in json.loads(pathlib.Path('apps.json').read_text(encoding='utf-8'))['apps']:
-              archive = release / row['binary_zip']
-              if not archive.is_file():
-                  raise SystemExit('FAIL  the verified release lacks ' + row['binary_zip'])
-              manifest = pathlib.Path('windows/apps') / row['id'] / 'application-manifest.json'
-              text = manifest.read_text(encoding='utf-8')
-              names = sorted(set(re.findall(r'@([a-z][a-z0-9_]{0,63})@', text)))
-              title = json.loads(re.sub(r'@[a-z][a-z0-9_]{0,63}@', '', text))['title']
-              built = out / 'apps' / row['id']
-              subprocess.run([sys.executable, 'windows/apps/build_app.py', '--app-id', row['id'],
-                              '--title', title, '--publisher', 'OpenAbstractions', '--version', version,
-                              '--zip', str(archive), '--zip-sha256', row['binary_sha256'],
-                              '--zip-bytes', str(row['binary_bytes']), '--manifest', str(manifest),
-                              '--out', str(built),
-                              *[x for name in names for x in ('--define', f'{name}={row[name]}')]], check=True)
-              apps.append(dict(id=row['id'], title=title, **pin(built / f"{row['id']}-{version}.msi")))
-          chain = {'version': version, 'apps': apps}
-          (out / 'chain.json').write_text(json.dumps(chain, indent=2) + '\n', encoding='utf-8')
-          print(json.dumps(chain, indent=2))
-          PY
+          python3 scripts/train/steps/build_application_msis.py --phase package
 
-      - name: retain only application MSI containers and their existing chain metadata
-        run: |
-          mkdir app-msi-raw
-          cp setup/chain.json app-msi-raw/
-          for msi in setup/apps/*/*.msi; do
-            if [ -f "$msi" ]; then
-              app=$(basename "$(dirname "$msi")")
-              mkdir -p "app-msi-raw/apps/$app"
-              cp "$msi" "app-msi-raw/apps/$app/"
-            fi
-          done
+      - name: retain complete application MSI provenance and chain metadata
+        run: mv setup app-msi-raw
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         id: artifact
         with:
@@ -932,20 +1529,142 @@ jobs:
           path: app-msi-raw/
           if-no-files-found: error
 
-  windows-msi-sign:
-    if: ${{ !inputs.signing_probe_only && (inputs.app_producer_only == 'none' || inputs.app_producer_only == '') && github.repository == 'openabstractions/redist' && github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/release/0.4.0' && github.actor == 'ReinisLusis' && github.triggering_actor == 'ReinisLusis' }}
-    needs: [candidate, windows-pe-sign, windows, windows-app-msi]
+  windows-app-sign:
+    if: ${{ !inputs.diagnostic_host_sign_only && (inputs.producer_mode != 'train-graph' && (!inputs.signing_probe_only && (inputs.app_producer_only == 'none' || inputs.app_producer_only == '') && github.repository == 'openabstractions/redist' && github.event_name == 'workflow_dispatch' && (github.ref == 'refs/heads/release/0.4.0' || (inputs.producer_mode == 'train' && github.ref == format('refs/heads/release/{0}', needs.candidate.outputs.version))) && github.actor == 'ReinisLusis' && github.triggering_actor == 'ReinisLusis')) }}
+    needs: [candidate, windows-sdk-sign, windows-app-msi]
     runs-on: windows-latest
     timeout-minutes: 20
     environment: signing
     env:
       OA_CERTUM_SIGNING_ONLY: '1'
+      DESKTOP_SIGNED_RECEIPT_SHA256: ${{ needs.windows-app-msi.outputs.desktop-receipt-sha256 }}
+      DESKTOP_SIGNED_RECEIPT_BYTES: ${{ needs.windows-app-msi.outputs.desktop-receipt-bytes }}
+      DESKTOP_SIGNER_ATTEMPT: ${{ needs.windows-app-msi.outputs.desktop-signer-attempt }}
     permissions:
       contents: read
       actions: read
     outputs:
+      desktop-receipt-sha256: ${{ needs.windows-app-msi.outputs.desktop-receipt-sha256 }}
+      desktop-receipt-bytes: ${{ needs.windows-app-msi.outputs.desktop-receipt-bytes }}
+      desktop-signer-attempt: ${{ needs.windows-app-msi.outputs.desktop-signer-attempt }}
+      artifact-attempt: ${{ github.run_attempt }}
+      app-producer-attempt: ${{ needs.windows-app-msi.outputs.artifact-attempt }}
+      artifact-id: ${{ steps.artifact.outputs.artifact-id }}
+      artifact-digest: ${{ steps.artifact.outputs.artifact-digest }}
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
+        with:
+          ref: ${{ needs.candidate.outputs.sha }}
+      - uses: actions/setup-python@e797f83bcb11b83ae66e0230d6156d7c80228e7c
+        with:
+          python-version: '3.12'
+      - name: consume exact windows-app-msi-raw producer bytes
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ARTIFACT_ID: ${{ needs.windows-app-msi.outputs.artifact-id }}
+          ARTIFACT_DIGEST: ${{ needs.windows-app-msi.outputs.artifact-digest }}
+          ARTIFACT_ATTEMPT: ${{ needs.windows-app-msi.outputs.artifact-attempt }}
+          CANDIDATE_SHA: ${{ needs.candidate.outputs.sha }}
+        run: |
+          python3 windows/windows_signing.py consume --artifact-id "$ARTIFACT_ID" --digest "$ARTIFACT_DIGEST" \
+            --name "windows-app-msi-raw-$ARTIFACT_ATTEMPT" --source "$CANDIDATE_SHA" \
+            --run-id "$GITHUB_RUN_ID" --attempt "$ARTIFACT_ATTEMPT" --out signed/apps --receipt signed/apps/artifact-intake.json
+      - name: pinned WiX packages
+        run: python3 windows/wix_packages.py --dest wix-packages --env "$GITHUB_ENV"
+      - name: wix
+        run: |
+          dotnet tool install --global wix --version "$WIX_VERSION" --configfile "$WIX_NUGET_CONFIG"
+          echo "$HOME/.dotnet/tools" >> "$GITHUB_PATH"
+      - name: admit exact windows-sdk-signed bytes
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ARTIFACT_ID: ${{ needs.windows-sdk-sign.outputs.artifact-id }}
+          ARTIFACT_DIGEST: ${{ needs.windows-sdk-sign.outputs.artifact-digest }}
+          ARTIFACT_ATTEMPT: ${{ needs.windows-sdk-sign.outputs.artifact-attempt }}
+          CANDIDATE_SHA: ${{ needs.candidate.outputs.sha }}
+        run: |
+          python3 windows/windows_signing.py consume --artifact-id "$ARTIFACT_ID" --digest "$ARTIFACT_DIGEST" --name "windows-sdk-signed-$ARTIFACT_ATTEMPT" --source "$CANDIDATE_SHA" --run-id "$GITHUB_RUN_ID" --attempt "$ARTIFACT_ATTEMPT" --out signed/canonical
+      - name: exact pinned Microsoft signature tools
+        run: python3 windows/windows_signing.py prepare-tools --root "$RUNNER_TEMP/signing-tools" --github-env "$GITHUB_ENV"
+      - name: download pinned SimplySign Desktop installer
+        shell: pwsh
+        run: |
+          $policy = Get-Content windows/certum_simplysign.json -Raw | ConvertFrom-Json
+          Invoke-WebRequest -Uri $policy.installer.url -OutFile "$env:RUNNER_TEMP/simplysign.msi"
+      - name: connect exact reviewed signing identity
+        shell: pwsh
+        env:
+          CERTUM_USERNAME: ${{ secrets.CERTUM_USERNAME }}
+          CERTUM_OTP_URI: ${{ secrets.CERTUM_OTP_URI }}
+        run: >-
+          ./windows/certum_simplysign.ps1 -Mode Connect
+          -InstallerPath "$env:RUNNER_TEMP/simplysign.msi"
+          -SessionPath "$env:RUNNER_TEMP/signing-session.json"
+      - if: inputs.producer_mode == 'train'
+        name: bind actual uploaded application artifact to selected source policy
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CANDIDATE_VERSION: ${{ needs.candidate.outputs.version }}
+          CANDIDATE_SHA: ${{ needs.candidate.outputs.sha }}
+          APP_INSTALLER_ARTIFACT_ID: ${{ needs.windows-app-msi.outputs.artifact-id }}
+          APP_INSTALLER_ARTIFACT_DIGEST: ${{ needs.windows-app-msi.outputs.artifact-digest }}
+          APP_INSTALLER_ARTIFACT_ATTEMPT: ${{ needs.windows-app-msi.outputs.artifact-attempt }}
+        run: |
+          python3 scripts/train/steps/build_application_msis.py --phase sign-host
+          python3 scripts/train/steps/build_application_msis.py --phase bind
+      - name: sign MSI containers after payload verification
+        env:
+          PRODUCER_MODE: ${{ inputs.producer_mode }}
+          APP_INSTALLER_ARTIFACT_ATTEMPT: ${{ needs.windows-app-msi.outputs.artifact-attempt }}
+          CANDIDATE_SHA: ${{ needs.candidate.outputs.sha }}
+        run: |
+          args=()
+          if [ "$PRODUCER_MODE" = train ]; then
+            args+=(--producer-bindings signed/apps/producer-bindings.json --source "$CANDIDATE_SHA" --run-id "$GITHUB_RUN_ID" --run-attempt "$APP_INSTALLER_ARTIFACT_ATTEMPT")
+          fi
+          python3 windows/windows_signing.py sign-msi --scope apps --policy windows/certum_simplysign.json --signtool "$SIGNTOOL" --root signed --receipt signed/signatures.json "${args[@]}"
+          cp signed/signatures.json signed/app-msi-signatures.json
+      - if: inputs.producer_mode == 'train'
+        name: retain verified application external helper proofs
+        env:
+          CANDIDATE_SHA: ${{ needs.candidate.outputs.sha }}
+          APP_INSTALLER_ARTIFACT_ATTEMPT: ${{ needs.windows-app-msi.outputs.artifact-attempt }}
+          CANDIDATE_VERSION: ${{ needs.candidate.outputs.version }}
+        run: python3 scripts/train/steps/build_application_msis.py --phase seal-native
+      - name: disconnect owned signing session
+        if: always()
+        shell: pwsh
+        run: >-
+          ./windows/certum_simplysign.ps1 -Mode Disconnect
+          -SessionPath "$env:RUNNER_TEMP/signing-session.json"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        id: artifact
+        with:
+          name: windows-app-signed-${{ github.run_attempt }}
+          path: signed/
+          if-no-files-found: error
+
+  windows-msi-sign:
+    if: ${{ !inputs.diagnostic_host_sign_only && (inputs.producer_mode != 'train-graph' && (!inputs.signing_probe_only && (inputs.app_producer_only == 'none' || inputs.app_producer_only == '') && github.repository == 'openabstractions/redist' && github.event_name == 'workflow_dispatch' && (github.ref == 'refs/heads/release/0.4.0' || (inputs.producer_mode == 'train' && github.ref == format('refs/heads/release/{0}', needs.candidate.outputs.version))) && github.actor == 'ReinisLusis' && github.triggering_actor == 'ReinisLusis')) }}
+    needs: [candidate, windows-pe-sign, windows, windows-app-sign]
+    runs-on: windows-latest
+    timeout-minutes: 20
+    environment: signing
+    env:
+      OA_CERTUM_SIGNING_ONLY: '1'
+      DESKTOP_SIGNED_RECEIPT_SHA256: ${{ needs.windows-app-sign.outputs.desktop-receipt-sha256 }}
+      DESKTOP_SIGNED_RECEIPT_BYTES: ${{ needs.windows-app-sign.outputs.desktop-receipt-bytes }}
+      DESKTOP_SIGNER_ATTEMPT: ${{ needs.windows-app-sign.outputs.desktop-signer-attempt }}
+    permissions:
+      contents: read
+      actions: read
+    outputs:
+      desktop-receipt-sha256: ${{ needs.windows-app-sign.outputs.desktop-receipt-sha256 }}
+      desktop-receipt-bytes: ${{ needs.windows-app-sign.outputs.desktop-receipt-bytes }}
+      desktop-signer-attempt: ${{ needs.windows-app-sign.outputs.desktop-signer-attempt }}
       artifact-attempt: ${{ github.run_attempt }}
       package-artifact: abstraction-windows-${{ github.run_attempt }}
+      app-producer-attempt: ${{ needs.windows-app-sign.outputs.app-producer-attempt }}
       package-artifact-id: ${{ steps.packages.outputs.artifact-id }}
       package-artifact-digest: ${{ steps.packages.outputs.artifact-digest }}
       artifact-id: ${{ steps.artifact.outputs.artifact-id }}
@@ -968,17 +1687,23 @@ jobs:
           python3 windows/windows_signing.py consume --artifact-id "$ARTIFACT_ID" --digest "$ARTIFACT_DIGEST" \
             --name "windows-msi-raw-$ARTIFACT_ATTEMPT" --source "$CANDIDATE_SHA" \
             --run-id "$GITHUB_RUN_ID" --attempt "$ARTIFACT_ATTEMPT" --out signed/core
-      - name: consume exact windows-app-msi-raw producer bytes
+      - name: consume exact windows-app-signed producer bytes
         env:
           GH_TOKEN: ${{ github.token }}
-          ARTIFACT_ID: ${{ needs.windows-app-msi.outputs.artifact-id }}
-          ARTIFACT_DIGEST: ${{ needs.windows-app-msi.outputs.artifact-digest }}
-          ARTIFACT_ATTEMPT: ${{ needs.windows-app-msi.outputs.artifact-attempt }}
+          ARTIFACT_ID: ${{ needs.windows-app-sign.outputs.artifact-id }}
+          ARTIFACT_DIGEST: ${{ needs.windows-app-sign.outputs.artifact-digest }}
+          ARTIFACT_ATTEMPT: ${{ needs.windows-app-sign.outputs.artifact-attempt }}
           CANDIDATE_SHA: ${{ needs.candidate.outputs.sha }}
         run: |
           python3 windows/windows_signing.py consume --artifact-id "$ARTIFACT_ID" --digest "$ARTIFACT_DIGEST" \
-            --name "windows-app-msi-raw-$ARTIFACT_ATTEMPT" --source "$CANDIDATE_SHA" \
-            --run-id "$GITHUB_RUN_ID" --attempt "$ARTIFACT_ATTEMPT" --out signed/apps
+            --name "windows-app-signed-$ARTIFACT_ATTEMPT" --source "$CANDIDATE_SHA" \
+            --run-id "$GITHUB_RUN_ID" --attempt "$ARTIFACT_ATTEMPT" --out retained-apps --receipt retained-apps/artifact-intake.json
+          cp -R retained-apps/apps signed/apps
+          cp retained-apps/app-chain-context.json signed/app-chain-context.json
+          cp retained-apps/app-msi-signatures.json signed/app-msi-signatures.json
+          if [ -f retained-apps/app-native-signatures.json ]; then
+            cp retained-apps/app-native-signatures.json signed/app-native-signatures.json
+          fi
       - name: pinned WiX packages
         run: python3 windows/wix_packages.py --dest wix-packages --env "$GITHUB_ENV"
       - name: wix
@@ -1011,13 +1736,35 @@ jobs:
           -InstallerPath "$env:RUNNER_TEMP/simplysign.msi"
           -SessionPath "$env:RUNNER_TEMP/signing-session.json"
       - name: sign MSI containers after payload verification
-        run: python3 windows/windows_signing.py sign-msi --policy windows/certum_simplysign.json --signtool "$SIGNTOOL" --root signed --receipt signed/signatures.json
+        env:
+          PRODUCER_MODE: ${{ inputs.producer_mode }}
+          APP_INSTALLER_ARTIFACT_ATTEMPT: ${{ needs.windows-app-sign.outputs.app-producer-attempt }}
+          CANDIDATE_SHA: ${{ needs.candidate.outputs.sha }}
+        run: |
+          args=()
+          if [ "$PRODUCER_MODE" = train ]; then
+            args+=(--producer-bindings signed/apps/producer-bindings.json --source "$CANDIDATE_SHA" --run-id "$GITHUB_RUN_ID" --run-attempt "$APP_INSTALLER_ARTIFACT_ATTEMPT")
+          fi
+          python3 windows/windows_signing.py sign-msi --scope core --retained-signatures signed/app-msi-signatures.json --policy windows/certum_simplysign.json --signtool "$SIGNTOOL" --root signed --receipt signed/signatures.json --native-roster pypi.tsv "${args[@]}"
+      - if: inputs.producer_mode == 'train'
+        name: retain verified application external helper proofs
+        env:
+          CANDIDATE_SHA: ${{ needs.candidate.outputs.sha }}
+          APP_INSTALLER_ARTIFACT_ATTEMPT: ${{ needs.windows-app-sign.outputs.app-producer-attempt }}
+          CANDIDATE_VERSION: ${{ needs.candidate.outputs.version }}
+        run: python3 scripts/train/steps/build_application_msis.py --phase seal-native
       - name: checksum final signed core packages
+        env:
+          PRODUCER_MODE: ${{ inputs.producer_mode }}
         run: |
           (cd signed/core && sha256sum ./*.msi | sed 's#\./##' > SHA256SUMS.windows)
           mkdir packages
           cp signed/core/* packages/
           cp signed/signatures.json packages/windows-signatures.json
+          if [ "$PRODUCER_MODE" = train ]; then
+            cp signed/apps/chain.json packages/windows-installer-chain.json
+            cp signed/app-chain-context.json packages/windows-app-chain-context.json
+          fi
           (cd packages && sha256sum ./*.msi | sed 's#\./##' > SHA256SUMS.windows)
       - name: disconnect owned signing session
         if: always()
@@ -1038,7 +1785,7 @@ jobs:
           path: packages/
           if-no-files-found: error
   verify:
-    if: ${{ !inputs.signing_probe_only && (inputs.app_producer_only == 'none' || inputs.app_producer_only == '') }}
+    if: ${{ !inputs.diagnostic_host_sign_only && (inputs.producer_mode != 'train-graph' && (!inputs.signing_probe_only && (inputs.app_producer_only == 'none' || inputs.app_producer_only == ''))) }}
     needs: [candidate, windows-msi-sign, windows-pe-sign, javascript, python]
     runs-on: windows-latest
     permissions:
@@ -1087,7 +1834,7 @@ jobs:
       - name: exact pinned Microsoft signature tools
         run: python3 windows/windows_signing.py prepare-tools --root "$RUNNER_TEMP/signing-tools" --github-env "$GITHUB_ENV"
       - name: independent signed MSI and canonical payload verification
-        run: python3 windows/windows_signing.py verify-msis --root pkg --canonical canonical/native/abstraction_ipc.dll --policy windows/certum_simplysign.json --signtool "$SIGNTOOL" --receipt pkg-verification.json
+        run: python3 windows/windows_signing.py verify-msis --root pkg --canonical canonical/native/abstraction_ipc.dll --policy windows/certum_simplysign.json --signtool "$SIGNTOOL" --receipt pkg-verification.json --native-roster pypi.tsv
       # A per-user service instance is created at logon, so whether one can
       # appear here at all is a property of the runner and not of the package.
       # It is measured before anything is installed, because it decides what the
@@ -1117,6 +1864,12 @@ jobs:
         with:
           go-version: '1.26.5'
           cache: false
+      - name: prepare exact train inputs for installed Go SDK checks
+        if: ${{ inputs.producer_mode == 'train' }}
+        env:
+          TRAIN_VERSION: ${{ inputs.version }}
+        run: python3 scripts/module_provenance.py --prepared-graph public-go-graph.zip --prepared-sidecar public-go-graph.json --release-version "$TRAIN_VERSION" --prepared-directory "$RUNNER_TEMP/prepared-go-inputs" --workflow-environment --output module-provenance.json
+
       - name: select verified Windows Go SDK and smoke duplex pipes
         if: runner.os == 'Windows'
         shell: bash
@@ -1162,7 +1915,7 @@ jobs:
             --tools user-fixture/tools.tsv \
             --provenance sdk-inputs/provenance/module-provenance.json
       - name: canonical signed DLL and addon bytes in wheel and npm
-        run: python3 windows/windows_signing.py verify-language --root sdk-inputs --canonical canonical/native --policy windows/certum_simplysign.json --signtool "$SIGNTOOL"
+        run: python3 windows/windows_signing.py verify-language --root sdk-inputs --canonical canonical/native --policy windows/certum_simplysign.json --signtool "$SIGNTOOL" --native-roster pypi.tsv
       - name: fetch reviewed predecessor package
         env:
           GH_TOKEN: ${{ github.token }}
@@ -1680,9 +2433,10 @@ jobs:
           if-no-files-found: ignore
 
   linux:
-    if: ${{ !inputs.signing_probe_only && (inputs.app_producer_only == 'none' || inputs.app_producer_only == '') }}
+    if: ${{ !inputs.diagnostic_host_sign_only && (inputs.producer_mode != 'train-graph' && (!inputs.signing_probe_only && (inputs.app_producer_only == 'none' || inputs.app_producer_only == ''))) }}
     needs: candidate
     outputs:
+      artifact-attempt: ${{ github.run_attempt }}
       package-artifact: ${{ steps.artifact-names.outputs.package }}
       package-artifact-id: ${{ steps.packages.outputs.artifact-id }}
       package-artifact-digest: ${{ steps.packages.outputs.artifact-digest }}
@@ -1720,8 +2474,16 @@ jobs:
 
       # The repository first, the proxy second, for the reason the windows job
       # states: a cache that never forgets cannot say whether a tag exists.
-      - name: verify and record published module provenance
-        run: python3 scripts/module_provenance.py --tools tools.tsv --output module-provenance.json
+      - name: verify and record selected module provenance
+        env:
+          PRODUCER_MODE: ${{ inputs.producer_mode }}
+          TRAIN_VERSION: ${{ inputs.version }}
+        run: |
+          if [ "$PRODUCER_MODE" = train ]; then
+            python3 scripts/module_provenance.py --prepared-graph public-go-graph.zip --prepared-sidecar public-go-graph.json --release-version "$TRAIN_VERSION" --prepared-directory "$RUNNER_TEMP/prepared-go-inputs" --workflow-environment --output module-provenance.json
+          else
+            python3 scripts/module_provenance.py --tools tools.tsv --output module-provenance.json
+          fi
 
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
@@ -1734,7 +2496,7 @@ jobs:
         run: |
           python3 posix/test_lifecycle.py
 
-      - name: build from the published modules
+      - name: build from selected verified module inputs
         env:
           CGO_ENABLED: '0'
           GOOS: linux
@@ -1825,7 +2587,7 @@ jobs:
           if-no-files-found: error
 
   linux-verify:
-    if: ${{ !inputs.signing_probe_only && (inputs.app_producer_only == 'none' || inputs.app_producer_only == '') }}
+    if: ${{ !inputs.diagnostic_host_sign_only && (inputs.producer_mode != 'train-graph' && (!inputs.signing_probe_only && (inputs.app_producer_only == 'none' || inputs.app_producer_only == ''))) }}
     needs: [candidate, linux]
     env:
       CANDIDATE_VERSION: ${{ needs.candidate.outputs.version }}
@@ -1844,11 +2606,12 @@ jobs:
           PACKAGE_ARTIFACT: ${{ needs.linux.outputs.package-artifact }}
           ARTIFACT_ID: ${{ needs.linux.outputs.package-artifact-id }}
           ARTIFACT_DIGEST: ${{ needs.linux.outputs.package-artifact-digest }}
+          ARTIFACT_ATTEMPT: ${{ needs.linux.outputs.artifact-attempt }}
           CANDIDATE_SHA: ${{ needs.candidate.outputs.sha }}
         run: |
           python3 windows/windows_signing.py consume --artifact-id "$ARTIFACT_ID" --digest "$ARTIFACT_DIGEST" \
             --name "$PACKAGE_ARTIFACT" --source "$CANDIDATE_SHA" --run-id "$GITHUB_RUN_ID" \
-            --attempt "$GITHUB_RUN_ATTEMPT" --out pkg
+            --attempt "$ARTIFACT_ATTEMPT" --out pkg
 
       - name: the checksum file is true
         run: (cd pkg && sha256sum -c SHA256SUMS.linux)
@@ -1964,13 +2727,7 @@ jobs:
             [ "$(user cat "$home/.abstraction/candidate-data")" = preserved ]
             echo 'PASS Linux installed runtime readiness, a download through the runtime, native stop/removal and user-data preservation'
           } 2>&1 | tee pkg/linux-installed-lifecycle.log
-          python3 - <<'PY'
-          import json, pathlib
-          p = pathlib.Path('pkg/package-verification.json')
-          evidence = json.loads(p.read_text())
-          evidence['installed_lifecycle'] = 'passed_disposable_user_systemd'
-          p.write_text(json.dumps(evidence, indent=2))
-          PY
+          python3 scripts/train/steps/run_linux_installed_lifecycle.py
 
       - name: capture disposable Linux runtime diagnostics
         if: always()
@@ -2044,7 +2801,7 @@ jobs:
           if-no-files-found: warn
 
   macos:
-    if: ${{ !inputs.signing_probe_only && (inputs.app_producer_only == 'none' || inputs.app_producer_only == '') }}
+    if: ${{ !inputs.diagnostic_host_sign_only && (inputs.producer_mode != 'train-graph' && (!inputs.signing_probe_only && (inputs.app_producer_only == 'none' || inputs.app_producer_only == ''))) }}
     needs: candidate
     env:
       CANDIDATE_VERSION: ${{ needs.candidate.outputs.version }}
@@ -2145,8 +2902,16 @@ jobs:
           printf 'SIGNING_KEYCHAIN=%s\n' "$kc" >> "$GITHUB_ENV"
           printf 'ok    two identities imported into a keychain this job will delete\n'
 
-      - name: verify and record published module provenance
-        run: python3 scripts/module_provenance.py --tools tools.tsv --output module-provenance.json
+      - name: verify and record selected module provenance
+        env:
+          PRODUCER_MODE: ${{ inputs.producer_mode }}
+          TRAIN_VERSION: ${{ inputs.version }}
+        run: |
+          if [ "$PRODUCER_MODE" = train ]; then
+            python3 scripts/module_provenance.py --prepared-graph public-go-graph.zip --prepared-sidecar public-go-graph.json --release-version "$TRAIN_VERSION" --prepared-directory "$RUNNER_TEMP/prepared-go-inputs" --workflow-environment --output module-provenance.json
+          else
+            python3 scripts/module_provenance.py --tools tools.tsv --output module-provenance.json
+          fi
 
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
@@ -2159,12 +2924,14 @@ jobs:
         run: |
           python3 posix/test_lifecycle.py
 
-      - name: build from the published modules, universal
+      - name: build from selected verified module inputs, universal
         env:
           CGO_ENABLED: '1'
           GOOS: darwin
           GOFLAGS: -trimpath
         run: |
+          MACOSX_DEPLOYMENT_TARGET="$(python3 -c 'import sys; sys.path.insert(0,"posix"); import build; print(build.package_minimum_macos())')"
+          export MACOSX_DEPLOYMENT_TARGET
           python3 scripts/release_tsv_rows.py tools.tsv --output tools.rows
           root=$PWD
           mkdir -p universal
@@ -2203,7 +2970,24 @@ jobs:
           CGO_ENABLED: '1'
           GOFLAGS: -trimpath
         run: |
+          MACOSX_DEPLOYMENT_TARGET="$(python3 -c 'import sys; sys.path.insert(0,"posix"); import build; print(build.package_minimum_macos())')"
+          export MACOSX_DEPLOYMENT_TARGET
           root=$PWD
+          # Reuse the SDK's full repository source assembly and exact pins.
+          # Go module zips contain no sibling C++ identity/header closure.
+          python3 scripts/release_tsv_rows.py pypi.tsv --output native-pypi.rows
+          while IFS= read -r -d '' package && IFS= read -r -d '' repository &&
+                IFS= read -r -d '' commit && IFS= read -r -d '' directory; do
+            case "$repository" in
+              openabstractions/abstraction-identity|openabstractions/abstraction-facade|openabstractions/abstraction-download|openabstractions/abstraction-router) ;;
+              *) continue ;;
+            esac
+            [[ "$commit" =~ ^[0-9a-f]{40}$ ]] || exit 1
+            name=${repository#*/}
+            [ -d "native-sources/$name" ] || git clone --quiet "https://github.com/$repository.git" "native-sources/$name"
+            git -C "native-sources/$name" checkout --quiet "$commit"
+            [ "$(git -C "native-sources/$name" rev-parse HEAD)" = "$commit" ] || exit 1
+          done < native-pypi.rows
           panel_module=$(awk -F '\t' '$1 == "Abstraction Panel.exe" {print $2}' tools.tsv)
           case "$panel_module" in
             github.com/openabstractions/abstractions/monitor@v*) ;;
@@ -2216,6 +3000,7 @@ jobs:
           test -f "$module_dir/icon/panel.icns" ||
             { printf 'FAIL  published Panel module has no native app icon\n'; exit 1; }
           cp "$module_dir/icon/panel.icns" universal/AppIcon.icns
+          cp "$module_dir/panel-application.json" universal/OA_APPLICATION_MANIFEST.json
           for arch in amd64 arm64; do
             mkdir -p "$root/thin/$arch"
             GOOS=darwin GOARCH="$arch" go -C "$module_dir" build -ldflags '-s -w -buildid=' \
@@ -2227,12 +3012,20 @@ jobs:
           for arch in amd64 arm64; do
             case $arch in amd64) swiftarch=x86_64 ;; arm64) swiftarch=arm64 ;; esac
             mkdir -p "$root/thin/$arch"
-            swiftc -O -target "$swiftarch-apple-macos12.0" \
-              "$module_dir/macos/PanelLauncher.swift" -o "$root/thin/$arch/Abstraction Panel"
+            python3 "$module_dir/macos/build_launcher.py" --arch "$swiftarch" --minimum 12.0 \
+              --output "$root/thin/$arch/Abstraction Panel" --native-source-root "$root/native-sources" \
+              --native-source-roster "$root/pypi.tsv" --native-provenance "$root/module-provenance.json"
+            cp "$root/thin/$arch/Abstraction Panel.native-inputs.json" "$root/module-native-inputs-$arch.json"
           done
           lipo -create -output "universal/Abstraction Panel" \
             "$root/thin/amd64/Abstraction Panel" "$root/thin/arm64/Abstraction Panel"
           lipo -info "universal/Abstraction Panel"
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: native-launcher-inputs-macos-${{ github.run_attempt }}
+          path: module-native-inputs-*.json
+          if-no-files-found: error
 
       # Each thin Go image is inspected before signing and packaging. The published
       # identity XPC transport, Keychain and native network-cost backends select
@@ -2271,7 +3064,7 @@ jobs:
           fi
           printf 'identity=%s\n' "$1" >> "$GITHUB_OUTPUT"
           for f in universal/*; do
-            case "$(basename "$f")" in panel|"Abstraction Panel"|AppIcon.icns) continue ;; esac
+            case "$(basename "$f")" in panel|"Abstraction Panel"|AppIcon.icns|OA_APPLICATION_MANIFEST.json) continue ;; esac
             codesign --force --timestamp --options runtime \
               --keychain "$SIGNING_KEYCHAIN" --sign "$1" "$f"
             codesign --verify --strict --verbose=2 "$f"
@@ -2448,9 +3241,9 @@ jobs:
   # consent; the tarballs are retained as artifacts beside the installers for
   # that decision.
   javascript:
-    if: ${{ !inputs.signing_probe_only && (inputs.app_producer_only == 'none' || inputs.app_producer_only == '') }}
+    if: ${{ !inputs.diagnostic_host_sign_only && (inputs.producer_mode != 'train-graph' && (!inputs.signing_probe_only && (inputs.app_producer_only == 'none' || inputs.app_producer_only == ''))) }}
     name: javascript (${{ matrix.id }})
-    needs: [candidate, windows-pe-sign]
+    needs: [candidate, windows-sdk-sign]
     env:
       CANDIDATE_VERSION: ${{ needs.candidate.outputs.version }}
     strategy:
@@ -2534,58 +3327,141 @@ jobs:
       # Two builds of one source: the shared library Bun opens through bun:ffi,
       # and the static archive the Node addon links into itself. The addon's
       # CMakeLists refuses a shared package for exactly that reason.
+      - name: admit selected client-native sources
+        if: runner.os != 'Windows'
+        run: |
+          python3 windows/windows_signing.py check-native-source --pypi pypi.tsv --npm npm.tsv \
+            --native-roster pypi.tsv --root sources --github-env "$GITHUB_ENV"
+
       - name: build the shared C ABI library and the Node addon
         if: runner.os != 'Windows'
         env:
           ARCHITECTURES: ${{ matrix.architectures }}
         run: |
-          identity=sources/abstraction-identity
-          arch=()
-          [ -z "$ARCHITECTURES" ] || arch=(-DCMAKE_OSX_ARCHITECTURES="$ARCHITECTURES")
-          node_lib=()
-          [ -z "${NODE_IMPORT_LIBRARY:-}" ] || node_lib=(-DNODE_IMPORT_LIBRARY="$NODE_IMPORT_LIBRARY")
-          portable=()
-          if [ "$RUNNER_OS" = Windows ]; then portable=(-DABSTRACTION_IPC_PORTABLE_WINDOWS=ON); fi
-          cmake -S "$identity/cpp" -B build/shared -DCMAKE_BUILD_TYPE=Release \
-            -DBUILD_SHARED_LIBS=ON -DABSTRACTION_IPC_BUILD_TESTS=OFF "${arch[@]}" "${portable[@]}"
-          cmake --build build/shared --config Release
-          cmake -S "$identity/cpp" -B build/static -DCMAKE_BUILD_TYPE=Release \
-            -DBUILD_SHARED_LIBS=OFF -DABSTRACTION_IPC_BUILD_TESTS=OFF \
-            -DCMAKE_INSTALL_PREFIX="$PWD/build/prefix" "${arch[@]}"
-          cmake --build build/static --config Release
-          cmake --install build/static --config Release
-          cmake -S "$identity/javascript" -B build/addon -DCMAKE_BUILD_TYPE=Release \
-            -DCMAKE_PREFIX_PATH="$PWD/build/prefix" -DNODE_INCLUDE_DIR="$NODE_INCLUDE_DIR" \
-            "${node_lib[@]}" "${arch[@]}"
-          cmake --build build/addon --config Release
-          case "$RUNNER_OS" in
-            Windows) library=abstraction_ipc.dll ;;
-            Linux) library=libabstraction_ipc.so ;;
-            macOS) library=libabstraction_ipc.dylib ;;
-          esac
-          mkdir -p native
-          cp "$(find build/shared -name "$library" -type f | head -1)" "native/$library"
-          cp "$(find build/addon -name oa_ipc_node.node -type f | head -1)" native/oa_ipc_node.node
+          case "${OA_FACADE_NATIVE:-}" in 0|1) ;; *) printf 'FAIL native source admission is missing\n'; exit 1 ;; esac
+          if [ "$OA_FACADE_NATIVE" = 1 ]; then
+            test -f sources/abstraction-download/cpp/abstraction/download/request/rec.h
+            test -f sources/abstraction-router/cpp/abstraction/router/rec.h
+          fi
+          build_client_native() {
+            identity=sources/abstraction-identity
+            arch=()
+            [ -z "$ARCHITECTURES" ] || arch=(-DCMAKE_OSX_ARCHITECTURES="$ARCHITECTURES")
+            if [ "$RUNNER_OS" = macOS ]; then arch+=(-DCMAKE_OSX_DEPLOYMENT_TARGET=11.0); fi
+            portable=()
+            if [ "$RUNNER_OS" = Windows ]; then portable=(-DABSTRACTION_IPC_PORTABLE_WINDOWS=ON); fi
+            cmake -S "$identity/cpp" -B build/shared -DCMAKE_BUILD_TYPE=Release \
+              -DBUILD_SHARED_LIBS=ON -DABSTRACTION_IPC_BUILD_TESTS=OFF "${arch[@]}" "${portable[@]}"
+            cmake --build build/shared --config Release
+            cmake -S "$identity/cpp" -B build/static -DCMAKE_BUILD_TYPE=Release \
+              -DBUILD_SHARED_LIBS=OFF -DABSTRACTION_IPC_BUILD_TESTS=OFF \
+              -DCMAKE_INSTALL_PREFIX="$PWD/build/prefix" "${arch[@]}"
+            cmake --build build/static --config Release
+            cmake --install build/static --config Release
+            cmake -S "$identity/javascript" -B build/addon -DCMAKE_BUILD_TYPE=Release \
+              -DCMAKE_PREFIX_PATH="$PWD/build/prefix" -DNODE_INCLUDE_DIR="$NODE_INCLUDE_DIR" "${arch[@]}"
+            cmake --build build/addon --config Release
+            if [ "$OA_FACADE_NATIVE" = 1 ]; then
+              cmake -S sources/abstraction-facade/cpp -B build/facade -DCMAKE_BUILD_TYPE=Release \
+                -DABSTRACTION_FACADE_BUILD_AGGREGATE=OFF -DABSTRACTION_FACADE_BUILD_APPMODEL=ON \
+                -DAPPMODEL_DOWNLOAD_RECORDS="$PWD/sources/abstraction-download/cpp" \
+                -DAPPMODEL_ROUTER_RECORDS="$PWD/sources/abstraction-router/cpp" \
+                -DABSTRACTION_FACADE_NODE_APPMODEL=ON -DNODE_INCLUDE_DIR="$NODE_INCLUDE_DIR" \
+                "${arch[@]}"
+              cmake --build build/facade --config Release --target abstraction_facade_appmodel oa_appmodel_node
+            fi
+            case "$RUNNER_OS" in
+              Linux) extension=so; platform=linux-x64 ;;
+              macOS)
+                extension=dylib
+                case "$ARCHITECTURES" in
+                  x86_64) platform=darwin-x64 ;;
+                  arm64) platform=darwin-arm64 ;;
+                  'x86_64;arm64') platform=darwin-universal ;;
+                  *) printf 'FAIL unsupported native architecture set\n'; exit 1 ;;
+                esac ;;
+            esac
+            files=(--file "build/shared/libabstraction_ipc.$extension")
+            files+=(--file build/addon/oa_ipc_node.node)
+            if [ "$OA_FACADE_NATIVE" = 1 ]; then
+              files+=(--file "build/facade/libabstraction_facade_appmodel.$extension")
+              files+=(--file build/facade/oa_appmodel_node.node)
+            fi
+            if [ "$RUNNER_OS" = Linux ]; then
+              for ((i=1; i<${#files[@]}; i+=2)); do
+                readelf -h -d -V "${files[$i]}" > "build/native-inputs/$(basename "${files[$i]}").readelf"
+              done
+            fi
+            python3 scripts/posix_native.py --platform "$platform" "${files[@]}" \
+              --receipt build/native-inputs/native-policy.json
+          }
+          mkdir -p native build/native-inputs
+          cp pypi.tsv npm.tsv build/native-inputs/
+          source_repos=(abstraction-identity)
+          if [ "$OA_FACADE_NATIVE" = 1 ]; then source_repos+=(abstraction-facade abstraction-download abstraction-router); fi
+          for repository in "${source_repos[@]}"; do
+            head=$(GIT_NO_LAZY_FETCH=1 GIT_TERMINAL_PROMPT=0 git -C "sources/$repository" rev-parse --verify HEAD)
+            printf '%s\t%s\n' "$repository" "$head"
+          done > build/native-inputs/source-heads.tsv
+          if [ "$RUNNER_OS" = Linux ]; then
+            # One compatible baseline builds both native families; the mounted
+            # source/header closure is read without network access by the compiler.
+            docker pull "$CLIENT_MANYLINUX_IMAGE"
+            test "$(docker image inspect --format '{{.Id}}' "$CLIENT_MANYLINUX_IMAGE")" = "$CLIENT_MANYLINUX_CONFIG"
+            docker image inspect "$CLIENT_MANYLINUX_IMAGE" > build/native-inputs/manylinux-image.json
+            docker run --rm --network none -v "$PWD:$PWD" -w "$PWD" \
+              -e RUNNER_OS -e ARCHITECTURES -e OA_FACADE_NATIVE -e NODE_INCLUDE_DIR \
+              "$CLIENT_MANYLINUX_IMAGE" /bin/bash -e -o pipefail -c \
+              "$(declare -f build_client_native); export PATH=/opt/_internal/pipx/venvs/auditwheel/bin:\$PATH; cmake --version; c++ --version; build_client_native" \
+              > build/native-inputs/build-tools.log
+          elif [ "$RUNNER_OS" = macOS ]; then
+            build_client_native
+          else
+            printf 'FAIL unsupported POSIX native producer platform\n'; exit 1
+          fi
+          case "$RUNNER_OS" in Linux) extension=so ;; macOS) extension=dylib ;; esac
+          library=libabstraction_ipc.$extension
+          # Canonical target outputs only: an alternate stale tree is never a substitute.
+          test -f "build/shared/$library"
+          test -f build/addon/oa_ipc_node.node
+          if [ "$OA_FACADE_NATIVE" = 1 ]; then
+            facade_library=libabstraction_facade_appmodel.$extension
+            test -f "build/facade/$facade_library"
+            test -f build/facade/oa_appmodel_node.node
+          fi
+          cp "build/shared/$library" "native/$library"
+          cp build/addon/oa_ipc_node.node native/oa_ipc_node.node
+          if [ "$OA_FACADE_NATIVE" = 1 ]; then
+            cp "build/facade/$facade_library" "native/$facade_library"
+            cp build/facade/oa_appmodel_node.node native/oa_appmodel_node.node
+          fi
           printf 'IPC_LIBRARY=%s\n' "$PWD/native/$library" >> "$GITHUB_ENV"
           printf 'IPC_ADDON=%s\n' "$PWD/native/oa_ipc_node.node" >> "$GITHUB_ENV"
+          if [ "$OA_FACADE_NATIVE" = 1 ]; then
+            printf 'FACADE_APPMODEL_LIBRARY=%s\n' "$PWD/native/$facade_library" >> "$GITHUB_ENV"
+            printf 'FACADE_APPMODEL_ADDON=%s\n' "$PWD/native/oa_appmodel_node.node" >> "$GITHUB_ENV"
+          fi
           ls -l native
 
       - if: runner.os == 'Windows'
-        name: consume exact windows-pe-signed producer bytes
+        name: consume exact windows-sdk-signed producer bytes
         env:
           GH_TOKEN: ${{ github.token }}
-          ARTIFACT_ID: ${{ needs.windows-pe-sign.outputs.artifact-id }}
-          ARTIFACT_DIGEST: ${{ needs.windows-pe-sign.outputs.artifact-digest }}
-          ARTIFACT_ATTEMPT: ${{ needs.windows-pe-sign.outputs.artifact-attempt }}
+          ARTIFACT_ID: ${{ needs.windows-sdk-sign.outputs.artifact-id }}
+          ARTIFACT_DIGEST: ${{ needs.windows-sdk-sign.outputs.artifact-digest }}
+          ARTIFACT_ATTEMPT: ${{ needs.windows-sdk-sign.outputs.artifact-attempt }}
           CANDIDATE_SHA: ${{ needs.candidate.outputs.sha }}
         run: |
           python3 windows/windows_signing.py consume --artifact-id "$ARTIFACT_ID" --digest "$ARTIFACT_DIGEST" \
-            --name "windows-pe-signed-$ARTIFACT_ATTEMPT" --source "$CANDIDATE_SHA" \
+            --name "windows-sdk-signed-$ARTIFACT_ATTEMPT" --source "$CANDIDATE_SHA" \
             --run-id "$GITHUB_RUN_ID" --attempt "$ARTIFACT_ATTEMPT" --out signed
       - name: select canonical signed Windows native bytes
         if: runner.os == 'Windows'
         run: |
           printf 'IPC_LIBRARY=%s\nIPC_ADDON=%s\n' "$PWD/signed/native/abstraction_ipc.dll" "$PWD/signed/native/oa_ipc_node.node" >> "$GITHUB_ENV"
+          if [ -f signed/native/abstraction_facade_appmodel.dll ]; then
+            printf 'FACADE_APPMODEL_LIBRARY=%s\nFACADE_APPMODEL_ADDON=%s\n' "$PWD/signed/native/abstraction_facade_appmodel.dll" "$PWD/signed/native/oa_appmodel_node.node" >> "$GITHUB_ENV"
+          fi
           mkdir -p build/node-inputs
           cp signed/native/build-inputs/node-api-headers-1.9.0.tgz signed/native/build-inputs/node-v22.23.3-win-x64.zip \
             signed/native/build-inputs/node-v22.23.3-win-x64.lib signed/native/build-inputs/receipt.json build/node-inputs/
@@ -2611,8 +3487,13 @@ jobs:
           ARTIFACT: ${{ matrix.id }}
         run: |
           for platform in $PLATFORMS; do
+            facade_native=()
+            if [ -n "${FACADE_APPMODEL_LIBRARY:-}" ]; then
+              facade_native=(--facade-library "${FACADE_APPMODEL_LIBRARY:?missing canonical AppModel DLL}" --facade-addon "${FACADE_APPMODEL_ADDON:?missing canonical AppModel addon}")
+            fi
             python3 scripts/npm_packages.py --version "$CANDIDATE_VERSION" --platform "$platform" \
               --library "$IPC_LIBRARY" --addon "$IPC_ADDON" --output npm \
+              "${facade_native[@]}" \
               --ipc sources/abstraction-identity/javascript \
               --facade sources/abstraction-facade/javascript \
               --inference sources/abstraction-inference/javascript \
@@ -2621,11 +3502,24 @@ jobs:
               --rights sources/abstraction-rights/javascript \
               --router sources/abstraction-router/javascript \
               --storage sources/abstraction-storage/javascript \
+              --config sources/abstraction-config/javascript \
+              --credentials sources/abstraction-credentials/javascript \
+              --download sources/abstraction-download/javascript \
+              --job sources/abstraction-job/javascript \
+              --model sources/abstraction-model/javascript \
+              --resource sources/abstraction-resource/javascript \
               --opencode sources/abstractions/adopters/opencode \
               --license LICENSE
           done
           digests() { if command -v sha256sum >/dev/null 2>&1; then sha256sum "$@"; else shasum -a 256 "$@"; fi; }
           (cd npm && digests ./*.tgz | sed 's#\./##' | tee "SHA256SUMS.npm.$ARTIFACT")
+
+      - name: retain POSIX native source and portability receipts
+        if: runner.os != 'Windows'
+        run: |
+          mkdir -p npm/build-inputs
+          cp -R build/native-inputs/. npm/build-inputs/
+          cp build/node-inputs/receipt.json npm/build-inputs/node-inputs.json
 
       - name: retain exact Windows addon build input archives
         if: matrix.id == 'win32-x64'
@@ -2655,9 +3549,9 @@ jobs:
   # and consent; the wheels are retained as artifacts beside the installers
   # and the npm tarballs for that decision.
   python:
-    if: ${{ !inputs.signing_probe_only && (inputs.app_producer_only == 'none' || inputs.app_producer_only == '' || inputs.app_producer_only == 'comfyui') }}
+    if: ${{ !inputs.diagnostic_host_sign_only && (inputs.producer_mode != 'train-graph' && (!inputs.signing_probe_only && (inputs.app_producer_only == 'none' || inputs.app_producer_only == '' || inputs.app_producer_only == 'comfyui'))) }}
     name: python (${{ matrix.id }})
-    needs: [candidate, windows-pe-sign]
+    needs: [candidate, windows-sdk-sign]
     env:
       CANDIDATE_VERSION: ${{ needs.candidate.outputs.version }}
     strategy:
@@ -2722,48 +3616,124 @@ jobs:
             printf 'ok    %s from %s %s\n' "$package" "$repository" "$commit"
           done < pypi.rows
 
-      # Windows consumes the one signed canonical DLL from windows-pe-sign.
+      # Windows consumes the one signed canonical DLL from windows-sdk-sign.
       # Other platforms build their shared library here. The wheel loads only
       # that library through ctypes; no Node addon enters a Python wheel.
+      - name: admit selected client-native sources
+        if: runner.os != 'Windows'
+        run: |
+          python3 windows/windows_signing.py check-native-source --pypi pypi.tsv --npm npm.tsv \
+            --native-roster pypi.tsv --root sources --github-env "$GITHUB_ENV"
+
       - name: build the shared C ABI library
         if: runner.os != 'Windows'
         env:
           ARCHITECTURES: ${{ matrix.architectures }}
         run: |
-          identity=sources/abstraction-identity
-          arch=()
-          [ -z "$ARCHITECTURES" ] || arch=(-DCMAKE_OSX_ARCHITECTURES="$ARCHITECTURES")
-          portable=()
-          if [ "$RUNNER_OS" = Windows ]; then portable=(-DABSTRACTION_IPC_PORTABLE_WINDOWS=ON); fi
-          cmake -S "$identity/cpp" -B build/shared -DCMAKE_BUILD_TYPE=Release \
-            -DBUILD_SHARED_LIBS=ON -DABSTRACTION_IPC_BUILD_TESTS=OFF "${arch[@]}" "${portable[@]}"
-          cmake --build build/shared --config Release
-          case "$RUNNER_OS" in
-            Windows) library=abstraction_ipc.dll ;;
-            Linux) library=libabstraction_ipc.so ;;
-            macOS) library=libabstraction_ipc.dylib ;;
-          esac
-          mkdir -p native
-          cp "$(find build/shared -name "$library" -type f | head -1)" "native/$library"
+          case "${OA_FACADE_NATIVE:-}" in 0|1) ;; *) printf 'FAIL native source admission is missing\n'; exit 1 ;; esac
+          if [ "$OA_FACADE_NATIVE" = 1 ]; then
+            test -f sources/abstraction-download/cpp/abstraction/download/request/rec.h
+            test -f sources/abstraction-router/cpp/abstraction/router/rec.h
+          fi
+          build_client_native() {
+            identity=sources/abstraction-identity
+            arch=()
+            [ -z "$ARCHITECTURES" ] || arch=(-DCMAKE_OSX_ARCHITECTURES="$ARCHITECTURES")
+            if [ "$RUNNER_OS" = macOS ]; then arch+=(-DCMAKE_OSX_DEPLOYMENT_TARGET=11.0); fi
+            portable=()
+            if [ "$RUNNER_OS" = Windows ]; then portable=(-DABSTRACTION_IPC_PORTABLE_WINDOWS=ON); fi
+            cmake -S "$identity/cpp" -B build/shared -DCMAKE_BUILD_TYPE=Release \
+              -DBUILD_SHARED_LIBS=ON -DABSTRACTION_IPC_BUILD_TESTS=OFF "${arch[@]}" "${portable[@]}"
+            cmake --build build/shared --config Release
+            if [ "$OA_FACADE_NATIVE" = 1 ]; then
+              cmake -S sources/abstraction-facade/cpp -B build/facade -DCMAKE_BUILD_TYPE=Release \
+                -DABSTRACTION_FACADE_BUILD_AGGREGATE=OFF -DABSTRACTION_FACADE_BUILD_APPMODEL=ON \
+                -DAPPMODEL_DOWNLOAD_RECORDS="$PWD/sources/abstraction-download/cpp" \
+                -DAPPMODEL_ROUTER_RECORDS="$PWD/sources/abstraction-router/cpp" \
+                "${arch[@]}"
+              cmake --build build/facade --config Release --target abstraction_facade_appmodel
+            fi
+            case "$RUNNER_OS" in
+              Linux) extension=so; platform=linux-x64 ;;
+              macOS)
+                extension=dylib
+                case "$ARCHITECTURES" in
+                  x86_64) platform=darwin-x64 ;;
+                  arm64) platform=darwin-arm64 ;;
+                  'x86_64;arm64') platform=darwin-universal ;;
+                  *) printf 'FAIL unsupported native architecture set\n'; exit 1 ;;
+                esac ;;
+            esac
+            files=(--file "build/shared/libabstraction_ipc.$extension")
+            if [ "$OA_FACADE_NATIVE" = 1 ]; then
+              files+=(--file "build/facade/libabstraction_facade_appmodel.$extension")
+            fi
+            if [ "$RUNNER_OS" = Linux ]; then
+              for ((i=1; i<${#files[@]}; i+=2)); do
+                readelf -h -d -V "${files[$i]}" > "build/native-inputs/$(basename "${files[$i]}").readelf"
+              done
+            fi
+            python3 scripts/posix_native.py --platform "$platform" "${files[@]}" \
+              --receipt build/native-inputs/native-policy.json
+          }
+          mkdir -p native build/native-inputs
+          cp pypi.tsv npm.tsv build/native-inputs/
+          source_repos=(abstraction-identity)
+          if [ "$OA_FACADE_NATIVE" = 1 ]; then source_repos+=(abstraction-facade abstraction-download abstraction-router); fi
+          for repository in "${source_repos[@]}"; do
+            head=$(GIT_NO_LAZY_FETCH=1 GIT_TERMINAL_PROMPT=0 git -C "sources/$repository" rev-parse --verify HEAD)
+            printf '%s\t%s\n' "$repository" "$head"
+          done > build/native-inputs/source-heads.tsv
+          if [ "$RUNNER_OS" = Linux ]; then
+            # One compatible baseline builds both native families; the mounted
+            # source/header closure is read without network access by the compiler.
+            docker pull "$CLIENT_MANYLINUX_IMAGE"
+            test "$(docker image inspect --format '{{.Id}}' "$CLIENT_MANYLINUX_IMAGE")" = "$CLIENT_MANYLINUX_CONFIG"
+            docker image inspect "$CLIENT_MANYLINUX_IMAGE" > build/native-inputs/manylinux-image.json
+            docker run --rm --network none -v "$PWD:$PWD" -w "$PWD" \
+              -e RUNNER_OS -e ARCHITECTURES -e OA_FACADE_NATIVE -e NODE_INCLUDE_DIR \
+              "$CLIENT_MANYLINUX_IMAGE" /bin/bash -e -o pipefail -c \
+              "$(declare -f build_client_native); export PATH=/opt/_internal/pipx/venvs/auditwheel/bin:\$PATH; cmake --version; c++ --version; build_client_native" \
+              > build/native-inputs/build-tools.log
+          elif [ "$RUNNER_OS" = macOS ]; then
+            build_client_native
+          else
+            printf 'FAIL unsupported POSIX native producer platform\n'; exit 1
+          fi
+          case "$RUNNER_OS" in Linux) extension=so ;; macOS) extension=dylib ;; esac
+          library=libabstraction_ipc.$extension
+          # Canonical target outputs only: an alternate stale tree is never a substitute.
+          test -f "build/shared/$library"
+          if [ "$OA_FACADE_NATIVE" = 1 ]; then
+            facade_library=libabstraction_facade_appmodel.$extension
+            test -f "build/facade/$facade_library"
+          fi
+          cp "build/shared/$library" "native/$library"
+          if [ "$OA_FACADE_NATIVE" = 1 ]; then
+            cp "build/facade/$facade_library" "native/$facade_library"
+          fi
           printf 'IPC_LIBRARY=%s\n' "$PWD/native/$library" >> "$GITHUB_ENV"
+          if [ "$OA_FACADE_NATIVE" = 1 ]; then
+            printf 'FACADE_APPMODEL_LIBRARY=%s\n' "$PWD/native/$facade_library" >> "$GITHUB_ENV"
+          fi
           ls -l native
 
       - if: runner.os == 'Windows'
-        name: consume exact windows-pe-signed producer bytes
+        name: consume exact windows-sdk-signed producer bytes
         env:
           GH_TOKEN: ${{ github.token }}
-          ARTIFACT_ID: ${{ needs.windows-pe-sign.outputs.artifact-id }}
-          ARTIFACT_DIGEST: ${{ needs.windows-pe-sign.outputs.artifact-digest }}
-          ARTIFACT_ATTEMPT: ${{ needs.windows-pe-sign.outputs.artifact-attempt }}
+          ARTIFACT_ID: ${{ needs.windows-sdk-sign.outputs.artifact-id }}
+          ARTIFACT_DIGEST: ${{ needs.windows-sdk-sign.outputs.artifact-digest }}
+          ARTIFACT_ATTEMPT: ${{ needs.windows-sdk-sign.outputs.artifact-attempt }}
           CANDIDATE_SHA: ${{ needs.candidate.outputs.sha }}
         run: |
           python3 windows/windows_signing.py consume --artifact-id "$ARTIFACT_ID" --digest "$ARTIFACT_DIGEST" \
-            --name "windows-pe-signed-$ARTIFACT_ATTEMPT" --source "$CANDIDATE_SHA" \
+            --name "windows-sdk-signed-$ARTIFACT_ATTEMPT" --source "$CANDIDATE_SHA" \
             --run-id "$GITHUB_RUN_ID" --attempt "$ARTIFACT_ATTEMPT" --out signed
       - name: select canonical signed Windows native bytes
         if: runner.os == 'Windows'
         run: |
-          printf 'IPC_LIBRARY=%s\nIPC_ADDON=%s\n' "$PWD/signed/native/abstraction_ipc.dll" "$PWD/signed/native/oa_ipc_node.node" >> "$GITHUB_ENV"
+          printf 'IPC_LIBRARY=%s\nIPC_ADDON=%s\nFACADE_APPMODEL_LIBRARY=%s\n' "$PWD/signed/native/abstraction_ipc.dll" "$PWD/signed/native/oa_ipc_node.node" "$PWD/signed/native/abstraction_facade_appmodel.dll" >> "$GITHUB_ENV"
 
       # scripts/py_wheels.py is the assembler for this job and for a
       # workstation, the way scripts/npm_packages.py is for the javascript
@@ -2772,6 +3742,7 @@ jobs:
       # built rather than trusting the process that wrote it.
       - name: assemble and check the exact roster's wheels
         env:
+          PRODUCER_MODE: ${{ inputs.producer_mode }}
           PLATFORM: ${{ matrix.platform }}
           ARTIFACT: ${{ matrix.id }}
         run: |
@@ -2785,27 +3756,31 @@ jobs:
             exit 1
           fi
           python3 scripts/py_wheels.py --check pypi/*.whl
-          python3 - <<'PY'
-          import pathlib, subprocess, sys
-          sys.path.insert(0, 'scripts')
-          from app_assets import python_package_pins
-          pins = python_package_pins('pypi.tsv')
-          for pin in pins[1:]:
-              repo = pin['repository'].split('/', 1)[1]
-              root = pathlib.Path('sources') / repo
-              subprocess.run([sys.executable, 'scripts/py_pure_wheels.py',
-                              '--source', str(root / pin['directory']),
-                              '--license', str(root / 'LICENSE'), '--output', 'pypi'], check=True)
-          built = sorted(pathlib.Path('pypi').glob('*.whl'))
-          if len(built) != len(pins):
-              raise SystemExit('Python wheel set differs from pypi.tsv')
-          for wheel in built:
-              if wheel.name.startswith('abstraction_ipc-'):
-                  continue
-              subprocess.run([sys.executable, 'scripts/py_pure_wheels.py', '--check', str(wheel)], check=True)
-          PY
+          train_version=()
+          if [ "$PRODUCER_MODE" = train ]; then train_version=(--version "$CANDIDATE_VERSION"); fi
+          python3 scripts/train/steps/assemble_roster_wheels.py "${train_version[@]}"
           digests() { if command -v sha256sum >/dev/null 2>&1; then sha256sum "$@"; else shasum -a 256 "$@"; fi; }
           (cd pypi && digests ./*.whl | sed 's#\./##' | tee "SHA256SUMS.pypi.$ARTIFACT")
+
+      - name: receive the actual Linux wheels against the shared native policy
+        if: runner.os == 'Linux'
+        run: |
+          wheels=(--wheel pypi/abstraction_ipc-*.whl)
+          files=(--file "$IPC_LIBRARY")
+          if [ "$OA_FACADE_NATIVE" = 1 ]; then
+            wheels+=(--wheel pypi/abstraction_facade_native-*.whl)
+            files+=(--file "$FACADE_APPMODEL_LIBRARY")
+          fi
+          docker run --rm --network none -v "$PWD:$PWD" -w "$PWD" \
+            "$CLIENT_MANYLINUX_IMAGE" /opt/_internal/pipx/venvs/auditwheel/bin/python \
+            scripts/posix_native.py --platform linux-x64 "${files[@]}" "${wheels[@]}" \
+            --receipt build/native-inputs/wheel-policy.json
+
+      - name: retain POSIX native source and portability receipts
+        if: runner.os != 'Windows'
+        run: |
+          mkdir -p pypi/build-inputs
+          cp -R build/native-inputs/. pypi/build-inputs/
 
       # What an adopter installs is this set, together: a generated client reads
       # types off the codecs of the packages it requires when it is imported
@@ -2831,17 +3806,7 @@ jobs:
         env:
           CANDIDATE_SHA: ${{ needs.candidate.outputs.sha }}
         run: |
-          python3 - <<'PY'
-          import json, os, pathlib, sys
-          sys.path.insert(0, 'scripts')
-          from app_assets import windows_wheel_receipt
-          receipt = windows_wheel_receipt(
-              'pypi.tsv', 'pypi', 'sources', os.environ['CANDIDATE_SHA'],
-              int(os.environ['GITHUB_RUN_ID']), int(os.environ['GITHUB_RUN_ATTEMPT']),
-              os.environ['CANDIDATE_VERSION'], os.environ['IPC_LIBRARY'])
-          pathlib.Path('pypi/wheel-inputs.json').write_text(
-              json.dumps(receipt, sort_keys=True) + '\n', encoding='utf-8')
-          PY
+          python3 scripts/train/steps/record_windows_wheel_inputs.py
 
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
@@ -2854,133 +3819,106 @@ jobs:
   # The runner is named here, so the reviewed workflow digest covers it; no
   # repository variable can send the candidate source to another machine.
   app_comfyui:
+    if: ${{ !inputs.diagnostic_host_sign_only && (inputs.producer_mode != 'train-graph') }}
     needs: [candidate, python]
     runs-on: windows-latest
     permissions:
       contents: read
       actions: read
+    env:
+      CANDIDATE_SHA: ${{ needs.candidate.outputs.sha }}
+      CANDIDATE_VERSION: ${{ needs.candidate.outputs.version }}
+      PRODUCER_MODE: ${{ inputs.producer_mode }}
+      INSTALLER_COMFYUI: ${{ needs.candidate.outputs.installer-comfyui }}
     outputs:
       artifact: ${{ steps.identity.outputs.artifact }}
       source_commit: ${{ steps.identity.outputs.source_commit }}
+      artifact-attempt: ${{ github.run_attempt }}
+      artifact-id: ${{ steps.artifact.outputs.artifact-id }}
+      artifact-digest: ${{ steps.artifact.outputs.artifact-digest }}
+      control-artifact-id: ${{ steps.control-artifact.outputs.artifact-id }}
+      control-artifact-digest: ${{ steps.control-artifact.outputs.artifact-digest }}
+      control-artifact-attempt: ${{ github.run_attempt }}
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
         with:
           ref: ${{ needs.candidate.outputs.sha }}
       - uses: actions/setup-python@e797f83bcb11b83ae66e0230d6156d7c80228e7c # v6.0.0
-        if: needs.candidate.outputs.comfyui == 'true'
+        if: (needs.candidate.outputs.comfyui == 'true' || needs.candidate.outputs.installer-comfyui == 'true')
         with:
           python-version: '3.12'
       - name: verify and check out exact public app sources
-        if: needs.candidate.outputs.comfyui == 'true'
+        if: (needs.candidate.outputs.comfyui == 'true' || needs.candidate.outputs.installer-comfyui == 'true')
         run: |
-          python3 - <<'PY'
-          import os, subprocess, sys
-          extra = ['--producer-only'] if os.environ['APP_PRODUCER_ONLY'] == 'comfyui' else []
-          if extra:
-              extra += ['--adopter-commit', os.environ['COMFYUI_PRODUCER_ADOPTER_COMMIT']]
-          for operation in ('pins', 'checkout'):
-              subprocess.run([sys.executable, 'scripts/app_producer_inputs.py', operation,
-                              '--app', 'comfyui', *extra], check=True)
-          PY
+          if [ "$PRODUCER_MODE" = train ] && [ "$INSTALLER_COMFYUI" = true ]; then
+            python3 scripts/train/steps/build_application_msis.py --phase backend-inputs
+          else
+            python3 scripts/train/steps/check_out_app_sources.py
+          fi
       - name: refuse undersized disposable producer before asset downloads
-        if: needs.candidate.outputs.comfyui == 'true' && needs.candidate.outputs.comfyui-predecessor != 'true'
+        if: (needs.candidate.outputs.comfyui == 'true' || needs.candidate.outputs.installer-comfyui == 'true') && needs.candidate.outputs.comfyui-predecessor != 'true' && (inputs.producer_mode != 'train' || needs.candidate.outputs.installer-comfyui != 'true')
         run: |
           extra=(); if [ "$APP_PRODUCER_ONLY" = "comfyui" ]; then extra=(--producer-only --adopter-commit "$COMFYUI_PRODUCER_ADOPTER_COMMIT"); fi
           python3 scripts/app_producer_inputs.py preflight --app comfyui "${extra[@]}" --minimum-free-gib 1
       - name: select this run's successful Windows Python wheel set
-        if: needs.candidate.outputs.comfyui == 'true' && needs.candidate.outputs.comfyui-predecessor != 'true'
+        if: (needs.candidate.outputs.comfyui == 'true' || needs.candidate.outputs.installer-comfyui == 'true') && (needs.candidate.outputs.comfyui-predecessor != 'true' || (inputs.producer_mode == 'train' && needs.candidate.outputs.installer-comfyui == 'true'))
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
           CANDIDATE_SHA: ${{ needs.candidate.outputs.sha }}
         run: |
-          python3 - <<'PY'
-          import json, os, pathlib, subprocess, sys
-          selected = json.loads(subprocess.check_output([
-              sys.executable, 'scripts/app_producer_inputs.py', 'select-wheels', '--app', 'comfyui',
-              '--candidate-source', os.environ['CANDIDATE_SHA'], '--run-id', os.environ['GITHUB_RUN_ID']]))
-          with pathlib.Path(os.environ['GITHUB_ENV']).open('a', encoding='utf-8') as output:
-              output.write('WHEEL_ARTIFACT=' + selected['artifact'] + '\n')
-              output.write('WHEEL_ATTEMPT=' + str(selected['run_attempt']) + '\n')
-          PY
+          python3 scripts/train/steps/select_windows_wheel_set.py
       - name: fetch this run's successful Windows Python wheel set
-        if: needs.candidate.outputs.comfyui == 'true' && needs.candidate.outputs.comfyui-predecessor != 'true'
+        if: (needs.candidate.outputs.comfyui == 'true' || needs.candidate.outputs.installer-comfyui == 'true') && (needs.candidate.outputs.comfyui-predecessor != 'true' || (inputs.producer_mode == 'train' && needs.candidate.outputs.installer-comfyui == 'true'))
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
         run: |
           mkdir -p app-build-inputs/wheels
           gh run download "$GITHUB_RUN_ID" -n "$WHEEL_ARTIFACT" -D app-build-inputs/wheels
-      - name: fetch exact ComfyUI and CPU inputs
-        if: needs.candidate.outputs.comfyui == 'true' && needs.candidate.outputs.comfyui-predecessor != 'true'
+      - name: fetch exact source-selected ComfyUI inputs
+        if: (needs.candidate.outputs.comfyui == 'true' || needs.candidate.outputs.installer-comfyui == 'true') && needs.candidate.outputs.comfyui-predecessor != 'true' && (inputs.producer_mode != 'train' || needs.candidate.outputs.installer-comfyui != 'true')
         run: |
           extra=(); if [ "$APP_PRODUCER_ONLY" = "comfyui" ]; then extra=(--producer-only --adopter-commit "$COMFYUI_PRODUCER_ADOPTER_COMMIT"); fi
           python3 scripts/app_producer_inputs.py download-comfy --app comfyui "${extra[@]}"
-      - name: build exact public integration and app/source pair
-        if: needs.candidate.outputs.comfyui == 'true' && needs.candidate.outputs.comfyui-predecessor != 'true'
+      - name: build exact public integration and source-selected app/backend output
+        if: (needs.candidate.outputs.comfyui == 'true' || needs.candidate.outputs.installer-comfyui == 'true') && (needs.candidate.outputs.comfyui-predecessor != 'true' || (inputs.producer_mode == 'train' && needs.candidate.outputs.installer-comfyui == 'true'))
         env:
           CANDIDATE_SHA: ${{ needs.candidate.outputs.sha }}
           CANDIDATE_VERSION: ${{ needs.candidate.outputs.version }}
         run: |
-          python3 - <<'PY'
-          import json, os, pathlib, subprocess, sys
-          sys.path.insert(0, 'scripts')
-          from app_assets import optional_app_sources, roster, app_output_names
-          first = os.environ['APP_PRODUCER_ONLY'] == 'comfyui'
-          row = app_output_names('comfyui') if first else next(row for row in roster('apps.json') if row['id'] == 'comfyui')
-          source_pin = (os.environ['COMFYUI_PRODUCER_ADOPTER_COMMIT'] if first else
-                        optional_app_sources('app-sources.tsv', [row])['comfyui']['commit'])
-          root = pathlib.Path('sources/abstractions')
-          inputs = pathlib.Path('app-build-inputs')
-          output = pathlib.Path('app-output')
-          output.mkdir()
-          charter = subprocess.check_output(['git', '-C', str(root), 'rev-parse', 'HEAD'], text=True).strip()
-          wheels = inputs / 'wheels'
-          receipt = wheels / 'wheel-inputs.json'
-          integration = inputs / 'integration.zip'
-          sidecar = inputs / 'integration-producer.json'
-          common = ['--redist-source-root', '.', '--redist-source-commit', os.environ['CANDIDATE_SHA'],
-                    '--redist-version', os.environ['CANDIDATE_VERSION'],
-                    '--run-id', os.environ['GITHUB_RUN_ID'],
-                    '--run-attempt', os.environ['WHEEL_ATTEMPT']]
-          subprocess.run([sys.executable, str(root / 'scripts/package_comfyui_integration.py'),
-                          '--source-mode', 'public-split', '--wheel-receipt', str(receipt),
-                          '--wheel-dir', str(wheels), '--public-source-root', 'sources',
-                          '--adopter-source-root', 'sources/adopter-comfyui',
-                          '--adopter-commit', source_pin, '--packager-source-commit', charter,
-                          '--producer-receipt-output', str(sidecar), '--output', str(integration),
-                          '--native-wheel-version', os.environ['CANDIDATE_VERSION'],
-                          '--version', os.environ['CANDIDATE_VERSION'] + '-candidate', *common], check=True)
-          integration_info = json.loads(sidecar.read_text(encoding='utf-8'))['integration']
-          subprocess.run([sys.executable, str(root / 'scripts/package_comfyui_app.py'),
-                          '--archive', str(inputs / 'ComfyUI_windows_portable_amd.7z'),
-                          '--output', str(output / row['binary_zip']),
-                          '--source-output', str(output / row['source_zip']),
-                          '--frontend-checkout', str(inputs / 'upstream/ComfyUI_frontend'),
-                          '--embedded-docs-checkout', str(inputs / 'upstream/embedded-docs'),
-                          '--pygit2-checkout', str(inputs / 'upstream/pygit2'),
-                          '--libgit2-checkout', str(inputs / 'upstream/libgit2'),
-                          '--integration-archive', str(integration),
-                          '--integration-public-source-root', 'sources',
-                          '--integration-producer-receipt', str(sidecar),
-                          '--integration-wheel-receipt', str(receipt),
-                          '--integration-redist-source-commit', os.environ['CANDIDATE_SHA'],
-                          '--integration-run-id', os.environ['GITHUB_RUN_ID'],
-                          '--integration-run-attempt', os.environ['WHEEL_ATTEMPT'],
-                          '--integration-bytes', str(integration_info['bytes']),
-                          '--integration-sha256', integration_info['sha256'],
-                          '--cpu-wheelhouse', str(inputs / 'cpu-wheels'),
-                          '--minimum-free-gib', '1'], check=True)
-          PY
+          python3 scripts/train/steps/build_integration_source_pair.py
+      - name: assemble complete source-bound native control Python
+        id: control
+        if: inputs.producer_mode == 'train' && needs.candidate.outputs.installer-comfyui == 'true'
+        run: python3 scripts/train/steps/build_application_msis.py --phase control-inputs
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        id: control-artifact
+        if: steps.control.outputs.selected == 'true'
+        with:
+          name: oa-control-comfyui-${{ github.run_attempt }}
+          path: app-control-output/
+          if-no-files-found: error
       - name: bind reviewed pair to this producer attempt
-        if: needs.candidate.outputs.comfyui == 'true'
+        if: (needs.candidate.outputs.comfyui == 'true' || needs.candidate.outputs.installer-comfyui == 'true')
         id: identity
         env:
           CANDIDATE_SHA: ${{ needs.candidate.outputs.sha }}
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
           CANDIDATE_VERSION: ${{ needs.candidate.outputs.version }}
+          PRODUCER_MODE: ${{ inputs.producer_mode }}
         run: |
+          if [ "$PRODUCER_MODE" = train ]; then
+            # This job supplies an intermediate backend only. The existing
+            # Windows signing/bind/seal chain owns the final hosted-app pair.
+            python3 scripts/app_producer_inputs.py verify-backend-output --app comfyui \
+              --candidate-source "$CANDIDATE_SHA" --run-id "$GITHUB_RUN_ID" \
+              --run-attempt "$GITHUB_RUN_ATTEMPT"
+            printf 'artifact=oa-backend-comfyui-%s\n' "$GITHUB_RUN_ATTEMPT" >> "$GITHUB_OUTPUT"
+            printf 'source_commit=63be2f9b82ad0dac88a7ceaa28a9cf3154125a18\n' >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
           selected=$(python3 -c 'import json,os; print(str("comfyui" in json.loads(os.environ["APP_PRODUCERS"])).lower())')
           if [ "$selected" = true ]; then
             python3 scripts/app_assets.py consume --roster apps.json --app comfyui \
@@ -3000,15 +3938,16 @@ jobs:
           printf 'artifact=oa-app-comfyui-%s\n' "$GITHUB_RUN_ATTEMPT" >> "$GITHUB_OUTPUT"
           printf 'source_commit=40c4fcdf513a4523e39d54a9d391908af8df8171\n' >> "$GITHUB_OUTPUT"
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        if: needs.candidate.outputs.comfyui == 'true'
+        id: artifact
+        if: (needs.candidate.outputs.comfyui == 'true' || needs.candidate.outputs.installer-comfyui == 'true')
         with:
           name: ${{ steps.identity.outputs.artifact }}
           path: app-output/
           if-no-files-found: error
 
   draft:
-    if: ${{ !inputs.signing_probe_only && (inputs.app_producer_only == 'none' || inputs.app_producer_only == '') }}
-    needs: [candidate, windows-msi-sign, verify, linux, linux-verify, macos, app_comfyui]
+    if: ${{ !inputs.diagnostic_host_sign_only && (!cancelled() && needs.candidate.result == 'success' && needs.windows-msi-sign.result == 'success' && needs.verify.result == 'success' && needs.linux.result == 'success' && needs.linux-verify.result == 'success' && needs.macos.result == 'success' && needs.app_comfyui.result == 'success' && ((inputs.producer_mode == 'train' && needs.candidate.outputs.installer-comfyui == 'true' && needs.windows-app-delivery.result == 'success') || ((inputs.producer_mode != 'train' || needs.candidate.outputs.installer-comfyui != 'true') && needs.windows-app-delivery.result == 'skipped')) && inputs.producer_mode != 'train-graph' && (!inputs.signing_probe_only && (inputs.app_producer_only == 'none' || inputs.app_producer_only == ''))) }}
+    needs: [candidate, windows-msi-sign, verify, linux, linux-verify, macos, app_comfyui, windows-app-delivery]
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -3049,10 +3988,21 @@ jobs:
           GH_REPO: ${{ github.repository }}
           MACOS_STATE: ${{ needs.macos.outputs.state }}
           WINDOWS_ARTIFACT: ${{ needs.windows-msi-sign.outputs.package-artifact }}
+          WINDOWS_ARTIFACT_ID: ${{ needs.windows-msi-sign.outputs.package-artifact-id }}
+          WINDOWS_ARTIFACT_DIGEST: ${{ needs.windows-msi-sign.outputs.package-artifact-digest }}
+          WINDOWS_ARTIFACT_ATTEMPT: ${{ needs.windows-msi-sign.outputs.artifact-attempt }}
+          CANDIDATE_SHA: ${{ needs.candidate.outputs.sha }}
+          PRODUCER_MODE: ${{ inputs.producer_mode }}
           LINUX_ARTIFACT: ${{ needs.linux.outputs.package-artifact }}
           MACOS_ARTIFACT: ${{ needs.macos.outputs.package-artifact }}
         run: |
-          gh run download "$GITHUB_RUN_ID" -n "$WINDOWS_ARTIFACT" -D dist
+          if [ "$PRODUCER_MODE" = train ]; then
+            python3 windows/windows_signing.py consume --artifact-id "$WINDOWS_ARTIFACT_ID" --digest "$WINDOWS_ARTIFACT_DIGEST" \
+              --name "$WINDOWS_ARTIFACT" --source "$CANDIDATE_SHA" --run-id "$GITHUB_RUN_ID" \
+              --attempt "$WINDOWS_ARTIFACT_ATTEMPT" --out dist --receipt dist/artifact-intake.json
+          else
+            gh run download "$GITHUB_RUN_ID" -n "$WINDOWS_ARTIFACT" -D dist
+          fi
           gh run download "$GITHUB_RUN_ID" -n "$LINUX_ARTIFACT" -D dist
           if [ "$MACOS_STATE" = signed ]; then
             gh run download "$GITHUB_RUN_ID" -n "$MACOS_ARTIFACT" -D dist
@@ -3067,35 +4017,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
         run: |
-          python3 - <<'PY'
-          import hashlib, json, os, pathlib, re, shutil, subprocess, zipfile
-          path = pathlib.Path('dist/ipc-library.json')
-          receipt = json.loads(path.read_text(encoding='utf-8'))
-          artifact = receipt.get('artifact', '')
-          if (receipt.get('schema') != 1 or receipt.get('run_id') != int(os.environ['GITHUB_RUN_ID'])
-                  or not re.fullmatch(r'abstraction-pypi-win32-x64-[1-9][0-9]*', artifact)
-                  or not re.fullmatch(r'abstraction_ipc-[A-Za-z0-9_.+-]+-win_amd64\.whl', receipt.get('wheel', ''))
-                  or receipt.get('member') != 'abstraction/ipc/_native/abstraction_ipc.dll'
-                  or receipt.get('library') != 'tools/abstraction_ipc.dll'):
-              raise SystemExit('FAIL  dist/ipc-library.json does not name a win_amd64 wheel artifact of this run')
-          folder = pathlib.Path('ipc-wheel')
-          subprocess.run(['gh', 'run', 'download', os.environ['GITHUB_RUN_ID'], '-n', artifact,
-                          '-D', str(folder)], check=True)
-          wheel = folder / receipt['wheel']
-          if hashlib.sha256(wheel.read_bytes()).hexdigest() != receipt['wheel_sha256']:
-              raise SystemExit('FAIL  %s is not the wheel the receipt records' % wheel.name)
-          sums = (folder / 'SHA256SUMS.pypi.win32-x64').read_text(encoding='utf-8').splitlines()
-          if [line for line in sums if line.endswith(wheel.name)] != [receipt['wheel_sums_line']] \
-                  or receipt['wheel_sums_line'][:64] != receipt['wheel_sha256']:
-              raise SystemExit('FAIL  SHA256SUMS.pypi.win32-x64 differs from the receipt for %s' % wheel.name)
-          with zipfile.ZipFile(wheel) as archive:
-              data = archive.read(receipt['member'])
-          if (hashlib.sha256(data).hexdigest(), len(data)) != (receipt['sha256'], receipt['bytes']):
-              raise SystemExit('FAIL  the DLL in %s differs from the receipt' % wheel.name)
-          shutil.move(str(path), os.path.join(os.environ['RUNNER_TEMP'], 'ipc-library.json'))
-          print('ok    dist/ipc-library.json matches %s in %s: abstraction_ipc.dll sha256 %s'
-                % (wheel.name, artifact, receipt['sha256']))
-          PY
+          python3 scripts/train/steps/check_ipc_library_receipt.py
 
       # Producer outputs come from successful required jobs, not downloaded
       # producer JSON. A draft-only retry may consume a prior successful app
@@ -3104,37 +4026,40 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
-          COMFYUI_ARTIFACT: ${{ needs.app_comfyui.outputs.artifact }}
-          COMFYUI_SOURCE_COMMIT: ${{ needs.app_comfyui.outputs.source_commit }}
+          COMFYUI_ARTIFACT: ${{ inputs.producer_mode != 'train' && needs.app_comfyui.outputs.artifact || needs.windows-app-delivery.outputs.comfyui-artifact }}
+          COMFYUI_SOURCE_COMMIT: ${{ inputs.producer_mode != 'train' && needs.app_comfyui.outputs.source_commit || needs.windows-app-delivery.outputs.comfyui-source-commit }}
           CANDIDATE_SHA: ${{ needs.candidate.outputs.sha }}
+          CANDIDATE_VERSION: ${{ needs.candidate.outputs.version }}
+          PRODUCER_MODE: ${{ inputs.producer_mode }}
+          INSTALLER_COMFYUI: ${{ needs.candidate.outputs.installer-comfyui }}
+          COMFY_FINAL_ARTIFACT_ID: ${{ needs.windows-app-delivery.outputs.comfyui-artifact-id }}
+          COMFY_FINAL_ARTIFACT_DIGEST: ${{ needs.windows-app-delivery.outputs.comfyui-artifact-digest }}
+          COMFY_FINAL_ARTIFACT_ATTEMPT: ${{ needs.windows-app-delivery.outputs.comfyui-artifact-attempt }}
         run: |
           mkdir -p app-inputs dist
-          python3 - <<'PY'
-          import json, os, pathlib, subprocess, sys
-          sys.path.insert(0, 'scripts')
-          from app_assets import roster, select_producers
-          outputs = {
-              app: {'artifact': os.environ[app.upper() + '_ARTIFACT'],
-                    'source_commit': os.environ[app.upper() + '_SOURCE_COMMIT']}
-              for app in ('comfyui',)}
-          for app, artifact in select_producers(roster('apps.json'), outputs):
-              destination = pathlib.Path('app-inputs') / app
-              destination.mkdir()
-              subprocess.run(['gh', 'run', 'download', os.environ['GITHUB_RUN_ID'],
-                              '-n', artifact, '-D', str(destination)], check=True)
-          pathlib.Path('app-producer-outputs.json').write_text(json.dumps(outputs, sort_keys=True) + '\n',
-                                                                encoding='utf-8')
-          PY
-          python3 scripts/app_assets.py stage --roster apps.json \
-            --inputs app-inputs --dist dist --metadata "$RUNNER_TEMP/apps.json" \
-            --outputs app-producer-outputs.json --candidate-source "$CANDIDATE_SHA" \
-            --run-id "$GITHUB_RUN_ID" --predecessors "$APP_PRODUCERS"
+          if [ "$PRODUCER_MODE" = train ] && [ "$INSTALLER_COMFYUI" = true ]; then
+            python3 scripts/train/steps/build_application_msis.py --phase stage-final
+          else
+            python3 scripts/train/steps/verify_adopter_pairs.py
+            python3 scripts/app_assets.py stage --roster apps.json \
+              --inputs app-inputs --dist dist --metadata "$RUNNER_TEMP/apps.json" \
+              --outputs app-producer-outputs.json --candidate-source "$CANDIDATE_SHA" \
+              --run-id "$GITHUB_RUN_ID" --predecessors "$APP_PRODUCERS"
+          fi
 
       # Each line was computed by the job that made the bytes. Joining them is
       # not recomputing them, so the file is checked once more here against what
       # is actually about to be attached.
       - name: retain exact signed Windows container proof
-        run: mv dist/windows-signatures.json "$RUNNER_TEMP/windows-signatures.json"
+        env:
+          PRODUCER_MODE: ${{ inputs.producer_mode }}
+        run: |
+          mv dist/windows-signatures.json "$RUNNER_TEMP/windows-signatures.json"
+          if [ "$PRODUCER_MODE" = train ]; then
+            mv dist/windows-installer-chain.json "$RUNNER_TEMP/windows-installer-chain.json"
+            mv dist/windows-app-chain-context.json "$RUNNER_TEMP/windows-app-chain-context.json"
+            mv dist/artifact-intake.json "$RUNNER_TEMP/windows-artifact-intake.json"
+          fi
       - name: one checksum file, checked
         run: |
           (cd dist && cat SHA256SUMS.* > SHA256SUMS && rm SHA256SUMS.[a-z]*)
@@ -3170,36 +4095,15 @@ jobs:
           done
           [ "$rc" = 0 ] || exit 1
           {
-            printf '\n## Signatures\n\n'
-            printf -- '- **Windows** â€” `abstraction-x64.msi` and `abstraction-arm64.msi` are\n'
-            printf -- '  **signed** with the reviewed OpenAbstractions code-signing certificate,\n'
-            printf -- '  SHA-256 Authenticode and an RFC3161 SHA-256 timestamp.\n'
-            printf -- '- **Windows Setup**: `OpenAbstractions-Setup-%s.exe`, which installs\n' "$CANDIDATE_VERSION"
-            printf -- '  `abstraction-x64.msi` and offers each application MSI beside it, is\n'
-            printf -- '  **signed** after each MSI, then its Burn engine and outer Setup.\n'
-            printf -- '- **Linux** â€” the tarballs are **not signed**. There is no signature\n'
-            printf -- '  scheme for them here.\n'
-            if [ "$MACOS_STATE" = signed ]; then
-              printf -- '- **macOS** â€” the `.pkg` **is signed**: a Developer ID Installer\n'
-              printf -- '  certificate, notarised by Apple and stapled, and `openabstractions`\n'
-              printf -- '  inside it signed with a Developer ID Application certificate with the\n'
-              printf -- '  hardened runtime enabled. Signing is separate from installed-package\n'
-              printf -- '  acceptance; consult the retained platform evidence for its scope.\n'
-              printf '\nA checksum says the bytes\n'
-              printf 'did not change in transit and nothing about who made them.\n'
-            else
-              printf '\nWindows outputs are signed. A checksum says the bytes did not change\n'
-              printf 'in transit and nothing about who made them.\n'
-            fi
             printf '\n## Absent from this release\n\n'
             if [ "$MACHINE_SERVICE" != proven ]; then
               printf -- '- **The Windows machine-scope supervisor was not proved on this run.**\n'
               printf -- '  Installing for everyone registers a per-user service, and this run saw\n'
               printf -- '  the registration and its restart policy but never saw an instance\n'
               printf -- '  running: the service manager clones one into a session at sign-in and\n'
-              printf -- '  the runner had no session to clone into. Installing just for you is\n'
-              printf -- '  unaffected and gets a Startup shortcut, which is what it has always\n'
-              printf -- '  got.\n'
+              printf -- '  the runner had no session to clone into. Windows sign-in registration\n'
+              printf -- '  follows confirmed Applications and their conditional login policy;\n'
+              printf -- '  this observation does not prove that installed behavior.\n'
             fi
             case "$MACOS_STATE" in
               signed) ;;
@@ -3229,12 +4133,9 @@ jobs:
           cat "$RUNNER_TEMP/state.md" >> "$GITHUB_STEP_SUMMARY"
           cat "$RUNNER_TEMP/state.md"
 
-      # The body above is written from $MACOS_STATE; these are the questions
-      # that ask whether $MACOS_STATE is what is on the disk about to be
-      # uploaded. Prose is not matched, because prose gets reworded and a check
-      # that silently stops matching is how the last one failed â€” except for
-      # the two words the rule requires and a reworder must not lose.
-      - name: the body against the files, before either is published
+      # Check the selected macOS outcome against the files before assembly.
+      # The shared facts renderer owns signature prose from measured receipts.
+      - name: the macOS outcome against the package files before assembly
         env:
           MACOS_STATE: ${{ needs.macos.outputs.state }}
         run: |
@@ -3251,17 +4152,16 @@ jobs:
             printf 'FAIL  the body says macOS has no asset and %s .pkg files are here\n' "$pkgs"
             rc=1
           fi
-          n=$(grep -c 'not signed' "$RUNNER_TEMP/state.md" || true)
-          n=${n:-0}
-          if [ "$n" -lt 1 ]; then
-            printf 'FAIL  Linux is unsigned and the body says "not signed" %s times\n' "$n"
-            rc=1
-          fi
           [ "$rc" = 0 ] || exit 1
-          printf 'ok    the body names %s .pkg, and says "not signed" %s times for the packages that are not\n' "$pkgs" "$n"
+          printf 'ok    macOS outcome %s matches %s .pkg files\n' "$MACOS_STATE" "$pkgs"
 
       - name: assemble the verified release artifact
         env:
+          WINDOWS_ARTIFACT: ${{ needs.windows-msi-sign.outputs.package-artifact }}
+          WINDOWS_ARTIFACT_ID: ${{ needs.windows-msi-sign.outputs.package-artifact-id }}
+          WINDOWS_ARTIFACT_DIGEST: ${{ needs.windows-msi-sign.outputs.package-artifact-digest }}
+          WINDOWS_ARTIFACT_ATTEMPT: ${{ needs.windows-msi-sign.outputs.artifact-attempt }}
+          APP_PRODUCER_ATTEMPT: ${{ needs.windows-msi-sign.outputs.app-producer-attempt }}
           CANDIDATE_SHA: ${{ needs.candidate.outputs.sha }}
           RELEASE_VERSION: ${{ inputs.version }}
           PREVIEW: ${{ inputs.preview }}
@@ -3272,23 +4172,7 @@ jobs:
             dist/*-linux-amd64.tar.gz dist/*-linux-arm64.tar.gz \
             dist/SHA256SUMS "$RUNNER_TEMP/NOTES.md" verified-release/
           if [ "$MACOS_STATE" = signed ]; then cp dist/*.pkg verified-release/; fi
-          python3 - <<'PY'
-          import json, os, pathlib, shutil
-          preview = os.environ['PREVIEW'].lower()
-          if preview not in ('true', 'false'):
-              raise SystemExit('preview must be a boolean')
-          apps = json.loads((pathlib.Path(os.environ['RUNNER_TEMP']) / 'apps.json').read_text(encoding='utf-8'))
-          for app in apps:
-              for role in ('binary', 'source'):
-                  name = app[role]['name']
-                  shutil.copyfile(pathlib.Path('dist') / name, pathlib.Path('verified-release') / name)
-          candidate = {'schema': 1, 'source': os.environ['CANDIDATE_SHA'],
-              'version': os.environ['RELEASE_VERSION'], 'run_id': int(os.environ['GITHUB_RUN_ID']),
-              'run_attempt': int(os.environ['GITHUB_RUN_ATTEMPT']), 'preview': preview == 'true',
-              'kind': 'release-candidate', 'windows_signing': json.loads((pathlib.Path(os.environ['RUNNER_TEMP']) / 'windows-signatures.json').read_bytes()),
-              'macos': os.environ['MACOS_STATE'], 'apps': apps}
-          pathlib.Path('verified-release/candidate.json').write_text(json.dumps(candidate, indent=2) + '\n', encoding='utf-8')
-          PY
+          python3 scripts/train/steps/assemble_release_artifact.py
           (cd verified-release && sha256sum -c SHA256SUMS)
 
       - name: retain the verified release for promotion
@@ -3305,7 +4189,7 @@ jobs:
   # outer Setup after this build, followed by independent Windows verification.
   # Promotion consumes that exact setup-bundle-<attempt> and its final receipt.
   bundle:
-    if: ${{ !inputs.signing_probe_only && (inputs.app_producer_only == 'none' || inputs.app_producer_only == '') }}
+    if: ${{ !inputs.diagnostic_host_sign_only && (inputs.producer_mode != 'train-graph' && (!inputs.signing_probe_only && (inputs.app_producer_only == 'none' || inputs.app_producer_only == ''))) }}
     needs: [candidate, draft, windows-msi-sign]
     runs-on: windows-latest
     permissions:
@@ -3313,6 +4197,11 @@ jobs:
       actions: read
     env:
       CANDIDATE_VERSION: ${{ needs.candidate.outputs.version }}
+      CANDIDATE_SHA: ${{ needs.candidate.outputs.sha }}
+      PRODUCER_MODE: ${{ inputs.producer_mode }}
+      APP_CONTEXT_ARTIFACT_ID: ${{ needs.windows-msi-sign.outputs.artifact-id }}
+      APP_CONTEXT_ARTIFACT_DIGEST: ${{ needs.windows-msi-sign.outputs.artifact-digest }}
+      APP_CONTEXT_ARTIFACT_ATTEMPT: ${{ needs.windows-msi-sign.outputs.artifact-attempt }}
     outputs:
       artifact-attempt: ${{ github.run_attempt }}
       artifact-id: ${{ steps.artifact.outputs.artifact-id }}
@@ -3335,7 +4224,7 @@ jobs:
         run: |
           python3 windows/windows_signing.py consume --artifact-id "$ARTIFACT_ID" --digest "$ARTIFACT_DIGEST" \
             --name "windows-msi-signed-$ARTIFACT_ATTEMPT" --source "$CANDIDATE_SHA" \
-            --run-id "$GITHUB_RUN_ID" --attempt "$ARTIFACT_ATTEMPT" --out signed-msis
+            --run-id "$GITHUB_RUN_ID" --attempt "$ARTIFACT_ATTEMPT" --out signed-msis --receipt signed-msis/artifact-intake.json
       - name: fetch the verified release
         env:
           GH_TOKEN: ${{ github.token }}
@@ -3354,16 +4243,29 @@ jobs:
           dotnet tool install --global wix --version "$WIX_VERSION" --configfile "$WIX_NUGET_CONFIG"
           echo "$HOME/.dotnet/tools" >> "$GITHUB_PATH"
 
+      - name: exact pinned Microsoft signature tools
+        run: python3 windows/windows_signing.py prepare-tools --root "$RUNNER_TEMP/signing-tools" --github-env "$GITHUB_ENV"
       - name: pin the signed MSI chain
-        run: python3 windows/windows_signing.py prepare-chain --root signed-msis --release verified-release --out setup --policy windows/certum_simplysign.json
+        run: |
+          args=()
+          if [ "$PRODUCER_MODE" = train ]; then
+            args+=(--producer-context signed-msis/app-chain-context.json --source "$CANDIDATE_SHA" --run-id "$GITHUB_RUN_ID" --version "$CANDIDATE_VERSION"
+              --artifact-id "$APP_CONTEXT_ARTIFACT_ID" --artifact-name "windows-msi-signed-$APP_CONTEXT_ARTIFACT_ATTEMPT"
+              --artifact-digest "$APP_CONTEXT_ARTIFACT_DIGEST" --artifact-attempt "$APP_CONTEXT_ARTIFACT_ATTEMPT")
+          fi
+          python3 windows/windows_signing.py prepare-chain --root signed-msis --release verified-release --out setup --policy windows/certum_simplysign.json --signtool "$SIGNTOOL" "${args[@]}"
       - name: the bundle
         run: |
-          python3 windows/apps/build_bundle.py --chain setup/chain.json --bal-ext "$WIX_BAL_EXT" --out setup/bundle
+          python3 scripts/train/steps/build_application_msis.py --phase bundle
           mkdir setup-dist
           cp setup/bundle/OpenAbstractions-Setup-"$CANDIDATE_VERSION".exe setup/bundle/bundle-receipt.json setup-dist/
-          for msi in setup/apps/*/*.msi; do
-            if [ -e "$msi" ]; then cp "$msi" setup-dist/; fi
-          done
+          args=()
+          if [ "$PRODUCER_MODE" = train ]; then
+            args+=(--producer-context signed-msis/app-chain-context.json --source "$CANDIDATE_SHA" --run-id "$GITHUB_RUN_ID" --version "$CANDIDATE_VERSION"
+              --artifact-id "$APP_CONTEXT_ARTIFACT_ID" --artifact-name "windows-msi-signed-$APP_CONTEXT_ARTIFACT_ATTEMPT"
+              --artifact-digest "$APP_CONTEXT_ARTIFACT_DIGEST" --artifact-attempt "$APP_CONTEXT_ARTIFACT_ATTEMPT")
+          fi
+          python3 windows/windows_signing.py copy-chain --root setup --out setup-dist "${args[@]}"
           (cd setup-dist && sha256sum ./*.exe ./*.json $(ls ./*.msi 2>/dev/null) | sed 's#\./##' | tee SHA256SUMS.setup)
 
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -3373,13 +4275,19 @@ jobs:
           path: setup-dist/
           if-no-files-found: error
   windows-bundle-sign:
-    if: ${{ !inputs.signing_probe_only && (inputs.app_producer_only == 'none' || inputs.app_producer_only == '') && github.repository == 'openabstractions/redist' && github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/release/0.4.0' && github.actor == 'ReinisLusis' && github.triggering_actor == 'ReinisLusis' }}
+    if: ${{ !inputs.diagnostic_host_sign_only && (inputs.producer_mode != 'train-graph' && (!inputs.signing_probe_only && (inputs.app_producer_only == 'none' || inputs.app_producer_only == '') && github.repository == 'openabstractions/redist' && github.event_name == 'workflow_dispatch' && (github.ref == 'refs/heads/release/0.4.0' || (inputs.producer_mode == 'train' && github.ref == format('refs/heads/release/{0}', needs.candidate.outputs.version))) && github.actor == 'ReinisLusis' && github.triggering_actor == 'ReinisLusis')) }}
     needs: [candidate, bundle, windows-msi-sign]
     runs-on: windows-latest
     timeout-minutes: 20
     environment: signing
     env:
       OA_CERTUM_SIGNING_ONLY: '1'
+      CANDIDATE_VERSION: ${{ needs.candidate.outputs.version }}
+      CANDIDATE_SHA: ${{ needs.candidate.outputs.sha }}
+      PRODUCER_MODE: ${{ inputs.producer_mode }}
+      APP_CONTEXT_ARTIFACT_ID: ${{ needs.bundle.outputs.artifact-id }}
+      APP_CONTEXT_ARTIFACT_DIGEST: ${{ needs.bundle.outputs.artifact-digest }}
+      APP_CONTEXT_ARTIFACT_ATTEMPT: ${{ needs.bundle.outputs.artifact-attempt }}
     permissions:
       contents: read
       actions: read
@@ -3404,7 +4312,7 @@ jobs:
         run: |
           python3 windows/windows_signing.py consume --artifact-id "$ARTIFACT_ID" --digest "$ARTIFACT_DIGEST" \
             --name "setup-bundle-raw-$ARTIFACT_ATTEMPT" --source "$CANDIDATE_SHA" \
-            --run-id "$GITHUB_RUN_ID" --attempt "$ARTIFACT_ATTEMPT" --out setup-dist
+            --run-id "$GITHUB_RUN_ID" --attempt "$ARTIFACT_ATTEMPT" --out setup-dist --receipt setup-dist/artifact-intake.json
       - name: pinned WiX packages
         run: python3 windows/wix_packages.py --dest wix-packages --env "$GITHUB_ENV"
       - name: wix
@@ -3428,7 +4336,14 @@ jobs:
           -InstallerPath "$env:RUNNER_TEMP/simplysign.msi"
           -SessionPath "$env:RUNNER_TEMP/signing-session.json"
       - name: sign and verify detached engine then attached Setup
-        run: python3 windows/windows_signing.py sign-bundle --policy windows/certum_simplysign.json --signtool "$SIGNTOOL" --root setup-dist --receipt setup-dist/bundle-receipt.json
+        run: |
+          args=()
+          if [ "$PRODUCER_MODE" = train ]; then
+            args+=(--producer-context setup-dist/app-chain-context.json --source "$CANDIDATE_SHA" --run-id "$GITHUB_RUN_ID" --version "$CANDIDATE_VERSION"
+              --artifact-id "$APP_CONTEXT_ARTIFACT_ID" --artifact-name "setup-bundle-raw-$APP_CONTEXT_ARTIFACT_ATTEMPT"
+              --artifact-digest "$APP_CONTEXT_ARTIFACT_DIGEST" --artifact-attempt "$APP_CONTEXT_ARTIFACT_ATTEMPT")
+          fi
+          python3 windows/windows_signing.py sign-bundle --policy windows/certum_simplysign.json --signtool "$SIGNTOOL" --root setup-dist --receipt setup-dist/bundle-receipt.json "${args[@]}"
       - name: disconnect owned signing session
         if: always()
         shell: pwsh
@@ -3439,11 +4354,13 @@ jobs:
         id: artifact
         with:
           name: setup-bundle-${{ github.run_attempt }}
-          path: setup-dist/
+          path: |
+            setup-dist/
+            !setup-dist/artifact-intake.json
           if-no-files-found: error
 
   windows-signing-probe-build:
-    if: inputs.signing_probe_only
+    if: ${{ !inputs.diagnostic_host_sign_only && (inputs.producer_mode != 'train-graph' && (inputs.signing_probe_only)) }}
     needs: candidate
     runs-on: windows-latest
     outputs:
@@ -3473,7 +4390,7 @@ jobs:
           if-no-files-found: error
 
   windows-signing-probe:
-    if: inputs.signing_probe_only && github.repository == 'openabstractions/redist' && github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/release/0.4.0' && github.actor == 'ReinisLusis' && github.triggering_actor == 'ReinisLusis'
+    if: ${{ !inputs.diagnostic_host_sign_only && (inputs.producer_mode != 'train-graph' && (inputs.signing_probe_only && github.repository == 'openabstractions/redist' && github.event_name == 'workflow_dispatch' && (github.ref == 'refs/heads/release/0.4.0' || (inputs.producer_mode == 'train' && github.ref == format('refs/heads/release/{0}', needs.candidate.outputs.version))) && github.actor == 'ReinisLusis' && github.triggering_actor == 'ReinisLusis')) }}
     needs: [candidate, windows-signing-probe-build]
     runs-on: windows-latest
     timeout-minutes: 20
@@ -3541,12 +4458,19 @@ jobs:
           if-no-files-found: error
 
   windows-bundle-verify:
-    if: ${{ !inputs.signing_probe_only && (inputs.app_producer_only == 'none' || inputs.app_producer_only == '') }}
+    if: ${{ !inputs.diagnostic_host_sign_only && (inputs.producer_mode != 'train-graph' && (!inputs.signing_probe_only && (inputs.app_producer_only == 'none' || inputs.app_producer_only == ''))) }}
     needs: [candidate, windows-bundle-sign]
     runs-on: windows-latest
     permissions:
       contents: read
       actions: read
+    env:
+      CANDIDATE_VERSION: ${{ needs.candidate.outputs.version }}
+      CANDIDATE_SHA: ${{ needs.candidate.outputs.sha }}
+      PRODUCER_MODE: ${{ inputs.producer_mode }}
+      APP_CONTEXT_ARTIFACT_ID: ${{ needs.windows-bundle-sign.outputs.artifact-id }}
+      APP_CONTEXT_ARTIFACT_DIGEST: ${{ needs.windows-bundle-sign.outputs.artifact-digest }}
+      APP_CONTEXT_ARTIFACT_ATTEMPT: ${{ needs.windows-bundle-sign.outputs.artifact-attempt }}
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
         with:
@@ -3562,7 +4486,7 @@ jobs:
           ARTIFACT_ATTEMPT: ${{ needs.windows-bundle-sign.outputs.artifact-attempt }}
           CANDIDATE_SHA: ${{ needs.candidate.outputs.sha }}
         run: |
-          python3 windows/windows_signing.py consume --artifact-id "$ARTIFACT_ID" --digest "$ARTIFACT_DIGEST" --name "setup-bundle-$ARTIFACT_ATTEMPT" --source "$CANDIDATE_SHA" --run-id "$GITHUB_RUN_ID" --attempt "$ARTIFACT_ATTEMPT" --out setup-dist
+          python3 windows/windows_signing.py consume --artifact-id "$ARTIFACT_ID" --digest "$ARTIFACT_DIGEST" --name "setup-bundle-$ARTIFACT_ATTEMPT" --source "$CANDIDATE_SHA" --run-id "$GITHUB_RUN_ID" --attempt "$ARTIFACT_ATTEMPT" --out setup-dist --receipt setup-dist/artifact-intake.json
       - name: pinned WiX packages
         run: python3 windows/wix_packages.py --dest wix-packages --env "$GITHUB_ENV"
       - name: wix
@@ -3572,4 +4496,36 @@ jobs:
       - name: exact pinned Microsoft signature tools
         run: python3 windows/windows_signing.py prepare-tools --root "$RUNNER_TEMP/signing-tools" --github-env "$GITHUB_ENV"
       - name: independent signed Setup engine outer and MSI chain verification
-        run: python3 windows/windows_signing.py verify-bundle --root setup-dist --policy windows/certum_simplysign.json --signtool "$SIGNTOOL" --receipt setup-dist/bundle-receipt.json
+        run: |
+          args=()
+          if [ "$PRODUCER_MODE" = train ]; then
+            args+=(--producer-context setup-dist/app-chain-context.json --source "$CANDIDATE_SHA" --run-id "$GITHUB_RUN_ID" --version "$CANDIDATE_VERSION"
+              --artifact-id "$APP_CONTEXT_ARTIFACT_ID" --artifact-name "setup-bundle-$APP_CONTEXT_ARTIFACT_ATTEMPT"
+              --artifact-digest "$APP_CONTEXT_ARTIFACT_DIGEST" --artifact-attempt "$APP_CONTEXT_ARTIFACT_ATTEMPT")
+          fi
+          python3 windows/windows_signing.py verify-bundle --root setup-dist --policy windows/certum_simplysign.json --signtool "$SIGNTOOL" --receipt setup-dist/bundle-receipt.json \
+            --installed-inputs setup-installed-inputs.json --setup-fixture test_setup_runtime.ps1 \
+            --source "$CANDIDATE_SHA" --run-id "$GITHUB_RUN_ID" --run-attempt "$GITHUB_RUN_ATTEMPT" --version "$CANDIDATE_VERSION" "${args[@]}"
+      - name: exact signed Setup hosted elevated install readiness and removal
+        shell: powershell
+        timeout-minutes: 25
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $inputs = Get-Content -LiteralPath setup-installed-inputs.json -Raw | ConvertFrom-Json
+          $bundle = Join-Path (Resolve-Path setup-dist).Path $inputs.bundle.name
+          $fixture = (Resolve-Path test_setup_runtime.ps1).Path
+          $result = Join-Path $PWD 'setup-installed-diagnostics'
+          & powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $fixture -HostedElevated -BundlePath $bundle -BundleSha256 $inputs.bundle.sha256 -ExpectedRuntimeSha256 $inputs.runtime.sha256 -FixtureSha256 $inputs.fixture.sha256 -ModuleSha256 $inputs.module.sha256 -ArtifactSource $env:CANDIDATE_SHA -AcceptanceTool $env:CANDIDATE_SHA -Version $env:CANDIDATE_VERSION -ResultDirectory $result
+          if ($LASTEXITCODE -ne 0) { throw "Hosted Setup fixture exited $LASTEXITCODE" }
+          python windows/windows_signing.py check-setup-installed --root setup-dist --policy windows/certum_simplysign.json --installed-inputs setup-installed-inputs.json --installed-result "$result/receipt.json" --setup-fixture test_setup_runtime.ps1 --source "$env:CANDIDATE_SHA" --run-id "$env:GITHUB_RUN_ID" --run-attempt "$env:GITHUB_RUN_ATTEMPT" --version "$env:CANDIDATE_VERSION"
+          if ($LASTEXITCODE -ne 0) { throw "Hosted Setup terminal validation exited $LASTEXITCODE" }
+      - name: retain exact Setup installed acceptance evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: setup-installed-${{ github.run_attempt }}
+          path: |
+            setup-installed-inputs.json
+            setup-installed-diagnostics/
+          if-no-files-found: error
+          include-hidden-files: true

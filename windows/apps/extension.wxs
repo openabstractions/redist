@@ -1,0 +1,159 @@
+<!--
+  One extension's own per-user installer, built by
+  installer/apps/build_extension.py from adopters/<app>/extension.json and the
+  extension's folder. An extension is a folder another application loads
+  from its own folder, such as a plug-in folder. The package names no
+  application: every name, path and sentence is a preprocessor variable
+  build_extension.py passes, and payload.wxs, which it writes, lists the files.
+
+  The application records its folder in a JSON configuration file under the
+  account's roaming application data. FindHostFolder (hostfolder.c, an
+  immediate custom action in both sequences) reads it before the launch
+  conditions and sets HostFolder to <folder>\<subfolder>\. Install places the
+  extension's files in HostFolder\<name>, and records HostFolder under
+  HKCU\Software\OpenAbstractions\Extensions\<id>; a repair, change or
+  uninstall reads it back from there, so the folder the files went to is the
+  folder they leave. Uninstall removes the extension's files, the Python
+  bytecode folders beside them, the files and folders the extension declares it
+  writes, and the folders once they are empty. An extension that declares a
+  Python setup script has it run by its host's venv after install (see
+  RunExtensionSetup). Nothing else is written or removed: no file of the
+  application, no setting of it or of its extension manager.
+
+  Without the application's configuration, a local folder in it, or with a
+  folder of that name already present and not installed by this package, the
+  package refuses with one sentence and installs nothing. It never downloads
+  or installs the application. Without OpenAbstractions it refuses and names
+  the release page, as app.wxs does.
+-->
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
+  <Package Name="$(var.Title)"
+           Manufacturer="$(var.Publisher)"
+           Version="$(var.Version)"
+           UpgradeCode="$(var.UpgradeCode)"
+           Scope="perUser"
+           InstallerVersion="500"
+           Compressed="yes">
+    <MajorUpgrade AllowSameVersionUpgrades="yes"
+                  DowngradeErrorMessage="A newer $(var.Title) is already installed." />
+    <MediaTemplate EmbedCab="yes" />
+
+<?if $(var.RequireOpenAbstractions) = "yes" ?>
+    <!-- The same search as app.wxs: only the registry names the Panel. -->
+    <SetProperty Id="OAPANEL_USER" Action="ClearOaPanelUser" Value="[OaNoValue]" Before="AppSearch" Sequence="both" />
+    <SetProperty Id="OAPANEL_MACHINE" Action="ClearOaPanelMachine" Value="[OaNoValue]" Before="AppSearch" Sequence="both" />
+    <Property Id="OAPANEL_USER">
+      <RegistrySearch Root="HKCU" Key="Software\OpenAbstractions\Abstraction\Panel" Name="program" Type="raw" />
+    </Property>
+    <Property Id="OAPANEL_MACHINE">
+      <RegistrySearch Root="HKLM" Key="Software\OpenAbstractions\Abstraction\Panel" Name="program" Type="raw" Bitness="always64" />
+    </Property>
+    <SetProperty Id="OaPanel" Action="SetOaPanelMachine" Value="[OAPANEL_MACHINE]" After="AppSearch" Condition="OAPANEL_MACHINE" Sequence="both" />
+    <SetProperty Id="OaPanel" Action="SetOaPanelUser" Value="[OAPANEL_USER]" After="SetOaPanelMachine" Condition="NOT OaPanel AND OAPANEL_USER" Sequence="both" />
+    <Launch Condition="OaPanel OR Installed" Message="$(var.Title) needs OpenAbstractions, which is not installed. Download it from https://github.com/openabstractions/redist/releases/latest, install it, then run this installer again." />
+<?endif?>
+
+    <!-- The folder an earlier install recorded. The search property is
+         public, as Windows Installer requires, and cleared before AppSearch
+         like the Panel's, so only the registry fills it. -->
+    <SetProperty Id="OAEXTENSION_FOLDER" Action="ClearExtensionFolder" Value="[OaNoValue]" Before="AppSearch" Sequence="both" />
+    <Property Id="OAEXTENSION_FOLDER">
+      <RegistrySearch Root="HKCU" Key="Software\OpenAbstractions\Extensions\$(var.ExtensionId)" Name="folder" Type="raw" />
+    </Property>
+    <SetProperty Id="HostFolder" Action="SetRecordedHostFolder" Value="[OAEXTENSION_FOLDER]" After="AppSearch"
+                 Condition="Installed AND OAEXTENSION_FOLDER" Sequence="both" />
+
+    <Property Id="OaHostKey" Value="$(var.HostKey)" />
+    <Property Id="OaHostSubfolder" Value="$(var.HostSubfolder)" />
+    <Property Id="OaExtensionName" Value="$(var.Folder)" />
+    <SetProperty Id="OaHostConfig" Action="SetHostConfig" Value="$(var.HostConfig)" Before="AppSearch" Sequence="both" />
+    <Binary Id="HostFolderAction" SourceFile="$(var.HostFolderDll)" />
+    <CustomAction Id="FindHostFolder" BinaryRef="HostFolderAction" DllEntry="FindHostFolder"
+                  Execute="immediate" Return="check" />
+    <InstallUISequence>
+      <Custom Action="FindHostFolder" After="SetRecordedHostFolder" Condition="NOT Installed" />
+    </InstallUISequence>
+    <InstallExecuteSequence>
+      <Custom Action="FindHostFolder" After="SetRecordedHostFolder" Condition="NOT Installed" />
+    </InstallExecuteSequence>
+    <Launch Condition="Installed OR OaHostFound" Message="$(var.MissingHost)" />
+    <Launch Condition="Installed OR NOT OaHostTaken" Message="$(var.TakenFolder)" />
+
+    <!-- HostFolder's place before FindHostFolder or the record set it; the
+         launch conditions refuse an install without either, so no file is
+         ever placed here. -->
+    <StandardDirectory Id="LocalAppDataFolder">
+      <Directory Id="HostFolder" Name="OpenAbstractions-extension-unset">
+        <Directory Id="ExtensionFolder" Name="$(var.Folder)" />
+      </Directory>
+    </StandardDirectory>
+
+    <ComponentGroup Id="ExtensionRecord" Directory="ExtensionFolder">
+      <Component Id="ExtensionRecord">
+        <RegistryValue Root="HKCU" Key="Software\OpenAbstractions\Extensions\$(var.ExtensionId)"
+                       Name="folder" Type="string" Value="[HostFolder]" KeyPath="yes" />
+        <RemoveRegistryKey Root="HKCU" Key="Software\OpenAbstractions\Extensions\$(var.ExtensionId)" Action="removeOnUninstall" />
+      </Component>
+    </ComponentGroup>
+
+<?if $(var.PythonSetup) = "yes" ?>
+    <!-- The extension's setup script, run with the pythonw.exe of the venv in
+         the host's folder once the files are in place, as the installing
+         account. Its outcome is ignored: without the venv the install goes
+         on, and the extension does the same work when it first runs. The
+         script bounds its own run, so this synchronous step cannot hold the
+         install. -->
+    <CustomAction Id="RunExtensionSetup" Directory="ExtensionFolder"
+                  ExeCommand="&quot;[HostFolder]$(var.SetupProgram)&quot; -I -B &quot;[ExtensionFolder]$(var.SetupScript)&quot;"
+                  Execute="deferred" Impersonate="yes" Return="$(var.SetupReturn)" />
+<?if $(var.RegisterApplication) = "yes" ?>
+    <SetProperty Id="ValidatePreparedHost" Action="SetValidatePreparedHost" Value="[HostFolder]" Before="ValidatePreparedHost" Sequence="execute" />
+    <CustomAction Id="ValidatePreparedHost" BinaryRef="HostFolderAction" DllEntry="ValidatePreparedHost"
+                  Execute="deferred" Impersonate="yes" Return="check" />
+    <SetProperty Id="RecordPreparedTarget" Action="SetRecordPreparedTarget" Value="[HostFolder]" Before="RecordPreparedTarget" Sequence="execute" />
+    <CustomAction Id="RecordPreparedTarget" BinaryRef="HostFolderAction" DllEntry="RecordPreparedTarget"
+                  Execute="deferred" Impersonate="yes" Return="check" />
+    <CustomAction Id="PrepareTargetRollback" BinaryRef="HostFolderAction" DllEntry="PrepareTargetRollback"
+                  Execute="immediate" Return="check" />
+    <CustomAction Id="RollbackPreparedTarget" BinaryRef="HostFolderAction" DllEntry="RollbackPreparedTarget"
+                  Execute="rollback" Impersonate="yes" Return="check" />
+    <SetProperty Id="ValidateRecordedTarget" Action="SetValidateRecordedTarget" Value="[HostFolder]" Before="ValidateRecordedTarget" Sequence="execute" />
+    <CustomAction Id="ValidateRecordedTarget" BinaryRef="HostFolderAction" DllEntry="ValidateRecordedTarget"
+                  Execute="deferred" Impersonate="yes" Return="check" />
+    <CustomAction Id="ValidateRegistrationHost" BinaryRef="HostFolderAction" DllEntry="ValidateRegistrationHost"
+                  Execute="immediate" Return="check" />
+    <!-- As app.wxs: this requests the person's Panel confirmation. It conveys
+         no registration success, readiness or permission grant to the MSI. -->
+    <CustomAction Id="RegisterApplication" Property="OaPanel"
+                  ExeCommand="--register-application &quot;[ExtensionFolder]application-manifest.json&quot;"
+                  Execute="immediate" Return="asyncNoWait" />
+    <CustomAction Id="CheckRemovalRegistration" BinaryRef="HostFolderAction" DllEntry="CheckRemovalRegistration"
+                  Execute="immediate" Return="check" />
+    <CustomAction Id="RemoveApplication" Property="OaPanel"
+                  ExeCommand="--remove-application $(var.ExtensionId)"
+                  Execute="immediate" Return="asyncNoWait" />
+<?endif?>
+    <InstallExecuteSequence>
+<?if $(var.RegisterApplication) = "yes" ?>
+      <Custom Action="ValidatePreparedHost" After="InstallFiles" Condition="NOT REMOVE" />
+      <Custom Action="PrepareTargetRollback" After="ValidatePreparedHost" Condition="NOT REMOVE" />
+      <Custom Action="RollbackPreparedTarget" After="PrepareTargetRollback" Condition="NOT REMOVE" />
+      <Custom Action="RecordPreparedTarget" After="RollbackPreparedTarget" Condition="NOT REMOVE" />
+      <Custom Action="RunExtensionSetup" After="RecordPreparedTarget" Condition="NOT REMOVE" />
+      <Custom Action="ValidateRegistrationHost" After="InstallFinalize" Condition="NOT REMOVE AND NOT UPGRADINGPRODUCTCODE" />
+      <Custom Action="RegisterApplication" After="ValidateRegistrationHost" Condition="OaPanel AND NOT REMOVE AND NOT UPGRADINGPRODUCTCODE" />
+      <Custom Action="CheckRemovalRegistration" Before="RemoveApplication" Condition="REMOVE=&quot;ALL&quot; AND NOT UPGRADINGPRODUCTCODE" />
+      <Custom Action="ValidateRecordedTarget" Before="RemoveFiles" Condition="REMOVE OR Installed" />
+      <Custom Action="RemoveApplication" Before="RemoveFiles" Condition="OaPanel AND OaRemovalRegistrationOwned AND REMOVE=&quot;ALL&quot; AND NOT UPGRADINGPRODUCTCODE" />
+<?else?>
+      <Custom Action="RunExtensionSetup" After="InstallFiles" Condition="NOT REMOVE" />
+<?endif?>
+    </InstallExecuteSequence>
+<?endif?>
+
+    <Feature Id="Extension" Title="$(var.Title)" AllowAbsent="no">
+      <ComponentGroupRef Id="ExtensionFiles" />
+      <ComponentGroupRef Id="ExtensionRecord" />
+    </Feature>
+  </Package>
+</Wix>

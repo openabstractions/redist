@@ -7,29 +7,44 @@ registers the same per-user runtime host for interactive accounts.
 
 Release availability, signatures and qualification belong to the selected
 redist release. This page describes the source candidate's two MSI layouts,
-`abstraction-x64.msi` and `abstraction-arm64.msi`. Qualification evidence, the
+`abstraction-x64.msi` and `abstraction-arm64.msi` as signed build intermediates.
+Public releases after 0.4.0 name these payloads with the release version, for
+example `abstraction-0.8.0-x64.msi` and `abstraction-0.8.0-arm64.msi`.
+Qualification evidence, the
 build steps and the validation checks for this package are in
 [QUALIFICATION.md](QUALIFICATION.md).
+
+## Reset saved settings before a fresh installation
+
+After uninstalling OA and closing the runtime and Panel, keep the native
+`openabstractions.exe` tool from the distribution. Run `openabstractions.exe
+factory-reset` to inspect the exact current-account plan. Run it with
+`factory-reset --apply` to move the listed settings to reversible backups.
+The tool prints the manifest and exact restore command. Use `factory-reset --all`
+to preview all OA-owned current-account local state and native credential
+deletions, and `factory-reset --all --apply` to perform that scope. OS secret
+deletion is irreversible and partial effects are reported; no plaintext secrets
+are exported. Default mode preserves models, downloads,
+content, jobs, outputs, caches and OS credential values are preserved. No
+development tools are needed. Machine configuration and other accounts are
+outside this reset. Setup installation receipts are retained.
 
 ## What you get
 
     OpenAbstractions\
       tools\      openabstractions.exe, openabstractionsw.exe, the panel — the one folder on PATH
                   inventoryd.exe, modelhostd.exe, lemonaded.exe and openabstractions-mcp.exe, when their features are ticked
-        declarations\  the four default host declarations, and local-stores.json and lemonade-image.json with their features
+        declarations\  local-stores.json and lemonade-image.json with their provider features
         engines\       reduced llama.cpp b10825 Windows x64 bundle, derivation receipt and license notices with ModelHost
       examples\   three folders, each one runnable .cmd
       dev\        USING.txt, and the curl adapter header when packed
 
-`tools\declarations\` holds the declaration files the installation places
-beside the runtime executable: Lemonade, LM Studio, Ollama and ComfyUI at
-their documented local ports, as `abstraction.facade/registry@1` declarations
-of role `host`. The runtime reads them at start and lists them as declared by
-the installation. An operator who removes one has that removal recorded in
-the runtime's own state, so this package writing the file again on a repair
-or an upgrade does not bring the host back. `installer/posix/declarations/`
-ships the same four files into `~/.local/bin/declarations`, and a serve test
-holds both copies to the router's `Installed()`.
+`tools\declarations\` holds the installed OA providers' declaration files,
+such as local-stores with its inventoryd program and the optional Lemonade image
+provider with lemonaded. Core installation registers no third-party server merely
+at its documented default port. Product endpoint records and explicit operator
+entries supply those model servers; an explicitly saved offline server remains
+registered. The POSIX package follows the same rule.
 
 `payload.tsv`'s `path` column is that layout: `validate.py` fails a package that
 installs a file anywhere else, fails an executable in a folder no `PATH` entry
@@ -60,9 +75,9 @@ kill-on-close job object, restarts it after 2 s, 10 s and 30 s, and exits with
 failure on the fourth consecutive failure. It exits cleanly when a runtime
 already answers the user's endpoint, so every activation below is idempotent.
 `openabstractionsw.exe` is the same program linked with no console, and it is
-the image every automatic start runs. `serve host` is the old name of the
-command, accepted for one release so that a Startup shortcut or service template
-written by an earlier version keeps working.
+the image every automatic start runs. In 0.8, `serve supervisor` replaces the
+one-release `serve host` alias; Setup's shortcut and service template already
+use the canonical command.
 
 **Installed for everyone: a per-user service.** A template registered with
 `SERVICE_USER_OWN_PROCESS`, which the operating system clones into every
@@ -235,9 +250,11 @@ feature stays at level 0 and hidden until that delegator becomes a program.
 package and, as one optional step, the showcase applications' own per-user
 MSIs (VISION 2026-10-06). `apps/build_app.py` builds an application MSI from
 the release's application ZIP and `adopters/<app>/application-manifest.json`;
-it installs to `%LOCALAPPDATA%\OpenAbstractions\apps\<id>` and starts the
+it installs to `%LOCALAPPDATA%\Programs\OpenAbstractions\apps\<id>` and starts the
 Panel the core package records, where the person confirms the registration.
 It reads that Panel only from the registry, never from the command line.
+The application's MSI owns these program and manifest files independently of
+the runtime's resettable state under `%LOCALAPPDATA%\openabstractions`.
 Without OpenAbstractions it refuses and names the release page,
 https://github.com/openabstractions/redist/releases/latest; it downloads
 nothing.
@@ -408,3 +425,14 @@ everything else runs. Move the `asks` folder aside with the others, for
 example to `asks-0.4`, with no runtime installed; the older runtime starts a
 new one. Moving it back before installing this version again returns the
 pending questions and the answer record.
+
+For 0.8, the same file is written as `asks-application@12`. Version `@10`
+added program fingerprints; `@11` keeps a typed responder's actual answering
+program; `@12` records canonical native ownership for new application, choice
+and notification admissions. Existing records retain their original ownership.
+Canonical versions `@1` through `@11` remain readable and migrate on
+their next edit. A runtime that understands only an earlier profile refuses
+the newer file and starts without its question service. Before downgrading,
+move `asks` aside with the other folders as above, for example to `asks-0.8`,
+with no runtime installed. Moving it back before installing 0.8 again returns
+the retained questions and answer record.

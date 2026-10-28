@@ -75,3 +75,33 @@ def check_installed_declarations(paths, placed, authored, root, declarations):
                        f"{beside}. The feature that declares a provider installs it, so removing the "
                        f"feature takes the declaration and the program together")
     return bad
+
+
+def check_login_source(wxs, host_source=None):
+    """Check package login lifetime and, when supplied, its private Go source.
+
+    The published Windows packager receives WiX source only. The private
+    source lifecycle receiver also supplies the service template owner.
+    """
+    import xml.etree.ElementTree as ET
+    ns = {"w": "http://wixtoolset.org/schemas/v4/wxs"}
+    root = ET.fromstring(wxs)
+    for old in ("LogonStart", "PanelTrayLogonStart"):
+        if root.find(".//w:ComponentGroup[@Id='" + old + "']", ns) is not None or root.find(".//w:ComponentGroupRef[@Id='" + old + "']", ns) is not None:
+            raise ValueError("unconditional login component survives: " + old)
+    action = root.find(".//w:CustomAction[@Id='RemoveUserLogin']", ns)
+    expected = dict(Id="RemoveUserLogin", BinaryRef="UpgradeSupervisorCode",
+                    ExeCommand='service remove-login --user "[ToolsFolder]."',
+                    Execute="commit", Impersonate="yes", Return="ignore")
+    if action is None or action.attrib != expected:
+        raise ValueError("login cleanup must use original-account Binary-table commit")
+    row = root.find(".//w:InstallExecuteSequence/w:Custom[@Action='RemoveUserLogin']", ns)
+    if row is None or row.attrib != dict(Action="RemoveUserLogin", Before="RemoveFiles",
+            Condition='REMOVE="ALL" AND NOT UPGRADINGPRODUCTCODE AND NOT (AdminUser AND NOT ALLUSERS)'):
+        raise ValueError("login cleanup must run only on final removal in supported account context")
+    if host_source is not None and ("windows.SERVICE_AUTO_START" in host_source or host_source.count("windows.SERVICE_DEMAND_START") != 2):
+        raise ValueError("fresh and repaired service templates must use demand start")
+    result = {"legacy_login_components": 0, "cleanup": "commit"}
+    if host_source is not None:
+        result["service_start"] = "demand"
+    return result

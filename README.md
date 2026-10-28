@@ -9,19 +9,25 @@ See [Releases](https://github.com/openabstractions/redist/releases) for availabl
 downloads and their release-specific verification. Draft builds are not releases.
 Each release lists its included capabilities, platform verification and signing state.
 
+Public core MSI filenames after 0.4.0 include the release version, for example
+`abstraction-0.8.0-x64.msi` and `abstraction-0.8.0-arm64.msi`. Their signed bytes
+are the verified candidate's MSI bytes. Promotion updates the asset names,
+release notes and `SHA256SUMS` together. Older release URLs keep their original names.
+
 ## For people installing
 
-### Available now: 0.3.0
+### Available now: 0.4.0
 
-Download [Open Abstractions 0.3.0](https://github.com/openabstractions/redist/releases/tag/v0.3.0).
-The release adds provider admission and credential protections, resource and
-rights contracts, expanded inference APIs, `inventoryd`, `modelhostd`, an
-optional MCP gateway, and the Windows Panel. Windows and Linux packages are
-unsigned; ARM64 packages are cross-built. The macOS universal package is signed
-and notarized. Its exact package passed installation, runtime/XPC readiness,
-same-version reinstall, removal and postflight checks on macOS 26.6.2 arm64.
-This acceptance does not establish crash-recovery behavior or older-system
-qualification. See the release notes for package contents and signing details.
+Download [Open Abstractions 0.4.0](https://github.com/openabstractions/redist/releases/tag/v0.4.0).
+The release includes the shared runtime and tools built from pinned module versions.
+Both Windows MSIs and OpenAbstractions-Setup-0.4.0.exe are signed with SHA-256
+Authenticode and an RFC 3161 SHA-256 timestamp. Linux tarballs are unsigned.
+The macOS universal package is Developer ID signed, notarised and stapled.
+Signed Setup verification, Windows x64 signed-MSI automated acceptance and
+macOS arm64 automated installed XPC acceptance passed. Earlier platform lifecycle
+receipts retain their original release scope. Windows/Linux ARM64 installation
+and Intel Mac execution remain untested. Manual Setup and human demonstrations
+remain deferred. See the release notes for exact assets, checksums and evidence.
 
 ### Installing
 
@@ -41,11 +47,11 @@ Compare downloads against the release's `SHA256SUMS`:
 
     sha256sum -c SHA256SUMS
 
-**Check the release-specific signing notes.** Windows MSI and Linux tarball
-assets are unsigned in the current workflow; macOS assets are attached only
-after its signing and notarization gates. A checksum is not a signature.
+**Check the release-specific signing notes.** Release 0.4.0 has signed Windows
+MSIs and Setup, unsigned Linux tarballs, and a signed, notarised and stapled
+macOS package. A checksum is not a signature.
 
-The 0.3.0 CLI provides:
+The 0.4.0 CLI provides:
 
     openabstractions status --json
     openabstractions probe --json
@@ -53,7 +59,7 @@ The 0.3.0 CLI provides:
 
 `status` reports service readiness. `probe` performs bounded reads and prints
 typed outcomes. `applications list` shows the caller's permission-filtered local
-application directory. The 0.3.0 installers register the shared runtime,
+application directory. The 0.4.0 installers register the shared runtime,
 which supervises configured capabilities.
 Windows per-user installation starts it immediately and registers a windowless
 Startup launcher. Check `openabstractions status --json` for readiness. Consult

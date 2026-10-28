@@ -74,7 +74,7 @@ valid_path() (
         "$HOME/.local/bin/openabstractions"|"$HOME/.config/systemd/user/abstraction-runtime.service"|"$HOME/.local/share/abstraction/"*) ;;
         # The installation's declaration files and the optional providers'
         # programs, beside the runtime where it reads them.
-        "$HOME/.local/bin/declarations/"*|"$HOME/.local/bin/inventoryd"|"$HOME/.local/bin/modelhostd"|"$HOME/.local/bin/openabstractions-mcp") ;;
+        "$HOME/.local/bin/declarations/"*|"$HOME/.local/bin/inventoryd"|"$HOME/.local/bin/modelhostd"|"$HOME/.local/bin/modelpack"|"$HOME/.local/bin/openabstractions-mcp") ;;
         # Retired by 0.2.0 (docs/REMOVED.md). A predecessor's ledger still names
         # them, and they are removed only when their recorded bytes match.
         "$HOME/.local/bin/jobd"|"$HOME/.local/bin/jobctl"|"$HOME/.local/bin/dl"|"$HOME/.config/systemd/user/abstraction-jobd.service"|"$HOME/.config/systemd/user/abstraction-jobd.timer") ;;
@@ -108,6 +108,18 @@ validate_manifest() {
         esac
     done < "$manifest"
 }
+# Exact predecessor package bytes only, including its LF and CRLF forms.
+# Changed endpoint records belong to the person and remain untouched.
+retired_default_host() {
+    case "$1:$2" in
+        comfyui.json:3ea792ffa92b857fd72560562894b080e9d63cfd48d3bb0a489adba9d7ec48c6|comfyui.json:5e2b293cad42b4f1df5c30b39a5f19d56a868eb29ba0bbea3d0e47c2cfdb43d2) return 0;;
+        lemonade.json:beb97c82132d806cd9ce18381a8590399ea283a75e5b0ebffb129303e4a0ca2c|lemonade.json:28ea4da85a22e35932b1a18d60b1157a8df1ca6fcec1cd832ed6f2de93058e6d) return 0;;
+        lmstudio.json:b4e0808006e2494577db016219f02d302096f7c22ec4ed5afb53792c2650a885|lmstudio.json:8ab6e76b9a52bd6d9418a2d5e8fb702707f4ef5e44c1f608b16f0b9ac44f80ce) return 0;;
+        ollama.json:37890f65cdd55fb0162104ebc718d5fafd5995afe13a4d5d5cc7bbc81068628b|ollama.json:80b9f420b68f5c4feb72a46ed73b04754cd266c979190a274a6ae884af4e1594) return 0;;
+    esac
+    return 1
+}
+
 file_hash() (
     output=$(sha256sum < "$1") || { echo "checksum failed; payload retained" >&2; exit 1; }
     digest=${output%% *}
@@ -226,6 +238,18 @@ if [ -f "$manifest" ]; then
         esac
         rel=${path#"$HOME/"}
         if ! grep -F -x -- "$rel" "$stage/files" >/dev/null; then
+            # Retire the package's former default registrations during upgrade,
+            # before the runtime can read them. Reuse replacement rollback.
+            case "$rel" in .local/bin/declarations/comfyui.json|.local/bin/declarations/lemonade.json|.local/bin/declarations/lmstudio.json|.local/bin/declarations/ollama.json)
+                if [ -f "$path" ] && retired_default_host "${path##*/}" "$(file_hash "$path")"; then
+                    mkdir -p "$stage/backup/$(dirname -- "$rel")"
+                    cp -p -- "$path" "$stage/backup/$rel"
+                    printf '%s\n' "$rel" >> "$stage/changed"
+                    rm -f -- "$path"
+                    echo "ok    removed retired default $path"
+                    continue
+                fi;;
+            esac
             printf 'retired %s %s\n' "$hash" "$path" >> "$stage/MANIFEST"
         fi
     done < "$manifest"

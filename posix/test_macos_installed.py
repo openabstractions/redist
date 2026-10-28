@@ -32,27 +32,32 @@ def automated_acceptance(request):
 
 RECEIPTS = tuple('com.openabstractions.abstraction' + suffix for suffix in
                  ('', '.localstores', '.modelhost', '.mcpgateway'))
-LABELS = ('com.openabstractions.runtime', 'com.openabstractions.panel', 'com.openabstractions.jobd')
+LABELS = ('com.openabstractions.runtime', 'com.openabstractions.panel', 'com.openabstractions.runtime-login', 'com.openabstractions.jobd')
 DATA = ('.abstraction', 'Library/Application Support/abstraction',
         'Library/Application Support/openabstractions/runtime-v1', 'Library/Caches/openabstractions')
 KNOWN = ('.local/share/abstraction/LICENSE', '.local/share/abstraction/dev/USING.txt',
          '.local/share/abstraction/com.openabstractions.runtime.plist', '.local/share/abstraction/FILES',
          '.local/share/abstraction/uninstall.sh', '.local/share/abstraction/com.openabstractions.panel.plist',
+         '.local/share/abstraction/com.openabstractions.runtime-login.plist',
          '.local/bin/Abstraction Panel.app/Contents/Info.plist',
          '.local/bin/Abstraction Panel.app/Contents/Resources/AppIcon.icns',
+         '.local/bin/Abstraction Panel.app/Contents/Resources/OA_APPLICATION_MANIFEST.json',
          '.local/bin/Abstraction Panel.app/Contents/MacOS/panel',
          '.local/bin/Abstraction Panel.app/Contents/MacOS/Abstraction Panel',
          '.local/bin/Abstraction Panel.app/Contents/_CodeSignature/CodeResources',
          '.local/bin/openabstractions', '.local/share/abstraction/lifecycle.sh',
-         '.local/bin/declarations/lemonade.json', '.local/bin/declarations/lmstudio.json',
-         '.local/bin/declarations/ollama.json', '.local/bin/declarations/comfyui.json',
          '.local/bin/openabstractions-mcp', '.local/share/abstraction/MANIFEST',
          'Library/LaunchAgents/com.openabstractions.runtime.plist',
          'Library/LaunchAgents/com.openabstractions.panel.plist',
+         'Library/LaunchAgents/com.openabstractions.runtime-login.plist',
+         'Library/LaunchAgents/com.openabstractions.runtime-login.plist.lock',
+         'Library/LaunchAgents/com.openabstractions.panel.plist.lock',
          'Library/LaunchAgents/com.openabstractions.jobd.plist',
          '.local/share/abstraction/com.openabstractions.jobd.plist', '.local/bin/jobd', '.local/bin/dl',
-         '.local/bin/jobctl', '.local/bin/inventoryd', '.local/bin/declarations/local-stores.json', '.local/bin/modelhostd')
-AGENTS = tuple('Library/LaunchAgents/' + name + '.plist' for name in LABELS[:2])
+         '.local/bin/jobctl', '.local/bin/inventoryd', '.local/bin/declarations/local-stores.json', '.local/bin/modelhostd',
+         '.local/bin/modelpack')
+AGENTS = tuple('Library/LaunchAgents/' + name + '.plist' for name in LABELS[:3])
+LOGIN_LOCKS = tuple('Library/LaunchAgents/' + name + '.plist.lock' for name in ('com.openabstractions.runtime-login', 'com.openabstractions.panel'))
 
 
 def now():
@@ -226,7 +231,7 @@ class Journey:
         if path.is_symlink() or not path.is_file():
             raise ValueError('removal ledger is absent or redirected; preserve payload')
         entries = path.read_text(encoding='utf-8').splitlines()
-        allowed = {str(self.home / row['path']) for row in self.request['expected_payload']} | {str(self.home / name) for name in AGENTS}
+        allowed = {str(self.home / row['path']) for row in self.request['expected_payload']} | {str(self.home / name) for name in (*AGENTS, *LOGIN_LOCKS)}
         if not entries or len(entries) != len(set(entries)) or not set(entries) <= allowed:
             raise ValueError('unknown/duplicate manifest member; preserve payload')
         return entries
@@ -252,7 +257,7 @@ class Journey:
             if path.stat().st_mode & 0o777 != row['mode'] or path.stat().st_uid != self.request['uid']:
                 raise ValueError('installed mode/owner differs: ' + row['path'])
             selected.add(str(path))
-        wanted = selected | {str(self.home / name) for name in AGENTS}
+        wanted = selected | {str(self.home / name) for name in (*AGENTS, *LOGIN_LOCKS)}
         if set(self.manifest()) != wanted:
             raise ValueError('installed removal ledger differs from default payload/jobs')
         files = (self.home / '.local/share/abstraction/FILES').read_text(encoding='utf-8').splitlines()

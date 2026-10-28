@@ -1,0 +1,15 @@
+{
+  "version": "applications@3",
+  "name": "comfyui",
+  "title": "ComfyUI — OA build",
+  "description": "Open this sealed ComfyUI backend and inspect or edit the bounded built-in KSampler steps view. Startup and integration readiness remain separate.",
+  "offers": {"version":"appmodel@1","commands":[{"name":"node.set_widget","class":"edit"}]},
+  "host": {"arguments":["owned-host"],"readiness_timeout_ms":30000},
+  "script_host": true,
+  "requests": [],
+  "network": {"hosts":[]},
+  "needs": {"files":[],"models":[{"profile":"image","required_features":[],"minimum_context":0,"placement":"any","reserve":0}]},
+  "profiles": {"entries":[{"name":"oa-image-default","profile":"image"}]},
+  "purpose": "",
+  "verbs": [{"name":"open","class":"reveal","input_schema":{"type":"object","properties":{},"additionalProperties":false}}]
+}

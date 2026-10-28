@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
 <installer-gui-script minSpecVersion="2">
-	<title>Abstraction</title>
+	<title>OpenAbstractions</title>
 	<organization>com.openabstractions</organization>
 	<domains enable_anywhere="false" enable_currentUserHome="true" enable_localSystem="false"/>
 	<!-- customize="allow": the shared runtime is the package and is not a

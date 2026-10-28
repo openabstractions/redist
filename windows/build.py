@@ -19,6 +19,7 @@ from pytorch_engine import (BUNDLE_NAME as PYTORCH_INPUT_NAME,
 HERE = Path(__file__).resolve().parent
 GOARCH = {"x64": "amd64", "arm64": "arm64"}
 GATE = {"tools/Abstraction Panel.exe": "Panel",
+        "tools/abstraction_facade_appmodel.dll": "Panel",
         "dev/include/abstraction/download/over_curl.hpp": "Cpp",
         "tools/inventoryd.exe": "LocalStores",
         "tools/modelhostd.exe": "ModelHost",
@@ -70,7 +71,37 @@ def windows_go_environment(base):
     return sdk.sdk_environment(receipt, base), sdk, receipt
 
 
+def included_payload(path, feature, arch, pytorch_program, host_program):
+    """Existing architecture/provider-presence exclusions for one payload row."""
+    if path in PYTORCH_PAYLOAD and (arch != 'x64' or not pytorch_program):
+        return False
+    if path in MODELHOST_ENGINE_PAYLOAD and (arch != 'x64' or not host_program):
+        return False
+    if feature in {'lemonadeimage', 'thenoiseimage'} and arch != 'x64':
+        return False
+    return True
+
+
+def panel_appmodel_input(src, arch, binaries):
+    """Admit the Panel's selected native component before staging any file."""
+    selected = prebuilt(binaries, "gobuild", "tools/Abstraction Panel.exe") is not None or "panel" in src
+    directory = src.get("appmodellibrary")
+    library = directory / "abstraction_facade_appmodel.dll" if directory is not None else None
+    if selected and (library is None or not library.is_file()):
+        raise ValueError("Panel requires its selected-architecture shared AppModel library")
+    if library is not None and library.is_file():
+        helper = HERE.parent / "scripts/windows_native.py"
+        if not helper.is_file():
+            raise ValueError("Panel native library requires the carried Windows dependency owner")
+        spec = importlib.util.spec_from_file_location("oa_panel_native_dependencies", helper)
+        owner = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(owner)
+        owner.validate_portable_windows_dll(library, "win32-" + arch)
+    return library
+
+
 def stage(src, out, arch, binaries=None):
+    panel_appmodel_input(src, arch, binaries)
     go_env = None
     sdk = receipt = None
     pytorch_program = prebuilt(binaries, "gobuild", "tools/pytorchd.exe") is not None or "pytorchimage" in src
@@ -106,13 +137,7 @@ def stage(src, out, arch, binaries=None):
                                  f"crlf={notice_bytes.count(bytes([13, 10]))} lf={notice_bytes.count(bytes([10]))}")
     dropped = []
     for feature, path, kind, source, frm, _, subsystem in rows("payload.tsv"):
-        if path in PYTORCH_PAYLOAD and (arch != "x64" or not pytorch_program):
-            dropped.append(path)
-            continue
-        if path in MODELHOST_ENGINE_PAYLOAD and (arch != "x64" or not host_program):
-            dropped.append(path)
-            continue
-        if feature in {"lemonadeimage", "thenoiseimage"} and arch != "x64":
+        if not included_payload(path, feature, arch, pytorch_program, host_program):
             dropped.append(path)
             continue
         ready = prebuilt(binaries, kind, path)

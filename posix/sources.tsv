@@ -26,3 +26,4 @@ id		repo					tag		commit
 charter	openabstractions/abstractions	serve/v0.1.0	3ef816c8bbd62a9e1da21c8e51ce69f99b70af41
 localstores	openabstractions/abstraction-storage-over-local-stores	-	-
 modelhost	openabstractions/abstraction-provider-modelhost	-	-
+modelpack	openabstractions/abstraction-provider-kit	-	-

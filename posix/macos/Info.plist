@@ -5,9 +5,9 @@
 	<key>CFBundleIdentifier</key>
 	<string>org.openabstractions.panel</string>
 	<key>CFBundleName</key>
-	<string>Abstraction Panel</string>
+	<string>OpenAbstractions Panel</string>
 	<key>CFBundleDisplayName</key>
-	<string>Abstraction Panel</string>
+	<string>OpenAbstractions Panel</string>
 	<key>CFBundleExecutable</key>
 	<string>Abstraction Panel</string>
 	<key>CFBundleIconFile</key>

@@ -54,7 +54,14 @@ class InstalledOwnerTests(unittest.TestCase):
         with patch.object(self.journey, 'call', side_effect=answer):
             self.journey.presence()
         self.assertEqual(calls.count('receipt-absence'), 8)
-        self.assertEqual(calls.count('job-absence'), 3)
+        self.assertEqual(calls.count('job-absence'), 4)
+
+    def test_late_login_triggers_are_in_the_owned_ledger_even_when_absent(self):
+        entries = ['.local/share/abstraction/uninstall.sh', *owner.AGENTS, *owner.LOGIN_LOCKS]
+        self.file(entries[0])
+        self.ledger(entries)
+        self.assertEqual(set(self.journey.manifest()), {str(self.home / name) for name in entries})
+        self.assertFalse(any((self.home / name).exists() for name in owner.AGENTS))
 
     def test_unknown_or_duplicate_ledger_refuses_removal(self):
         self.file('.local/share/abstraction/uninstall.sh')

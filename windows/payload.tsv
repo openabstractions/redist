@@ -70,9 +70,16 @@
 > by the release workflow; no second build exists. Windows ARM64 has no build
 > of it, so its row is gated (IpcLibrary). It is not an Authenticode target
 > here: its bytes stay the wheel's.
+>
+> The Panel carries the facade-owned AppModel native core beside its executable.
+> appmodellibrary is the same candidate-selected native component the language
+> packages consume, with an architecture-specific DLL and no runtime fallback.
+> A selected Panel without that component refuses before staging; an absent
+> optional Panel gates both files out together.
 
 feature		path						kind		source		from						sign	subsystem
 tools		tools/Abstraction Panel.exe			gobuild		panel		monitor						yes	windows
+tools	tools/abstraction_facade_appmodel.dll	copy	appmodellibrary	abstraction_facade_appmodel.dll	yes	-
 tools		examples/README.txt					authored	installer	examples/README.txt				no	-
 tools		examples/what-this-machine-does/run.cmd		authored	installer	examples/what-this-machine-does/run.cmd		no	-
 tools		examples/job-lifecycle/run.cmd			authored	installer	examples/job-lifecycle/run.cmd			no	-
@@ -80,12 +87,9 @@ tools		examples/download-a-file/run.cmd		authored	installer	examples/download-a-
 developer	dev/USING.txt					authored	installer	dev/USING.txt					no	-
 developer	dev/include/abstraction/download/over_curl.hpp	copy		UNRESOLVED	include/abstraction/download/over_curl.hpp	no	-
 service	tools/openabstractions.exe	gobuild	charter	serve	yes	console
+service	tools/modelpack.exe	gobuild	modelpack	go/cmd/modelpack	yes	console
 service	tools/openabstractionsw.exe	gobuild	charter	serve	yes	windows
 service	tools/openabstractions-system.exe	gobuild	charter	serve/system	yes	windows
-service	tools/declarations/lemonade.json	authored	installer	declarations/lemonade.json	no	-
-service	tools/declarations/lmstudio.json	authored	installer	declarations/lmstudio.json	no	-
-service	tools/declarations/ollama.json	authored	installer	declarations/ollama.json	no	-
-service	tools/declarations/comfyui.json	authored	installer	declarations/comfyui.json	no	-
 localstores	tools/inventoryd.exe	gobuild	localstores	go/cmd/inventoryd	yes	console
 localstores	tools/declarations/local-stores.json	authored	installer	declarations/local-stores.json	no	-
 modelhost	tools/modelhostd.exe	gobuild	modelhost	go/cmd/modelhostd	yes	console

@@ -54,6 +54,12 @@ if [ ! -f "$manifest" ]; then
 fi
 . "$share/lifecycle.sh"
 
+# The ledger covers these fixed paths even when they were absent at install.
+# Validate both before stopping anything or deleting any payload.
+for label in com.openabstractions.runtime-login com.openabstractions.panel; do
+    login_trigger_check "$label" || fail "conditional login trigger ownership refused; payload retained"
+done
+
 # Reads paths on standard input. Every directory between a removed file and the
 # home directory, deepest first, so an empty tree three levels deep goes away
 # instead of one level of it. rmdir refuses a directory that is not empty, which
@@ -90,7 +96,7 @@ agent_state() {
 # Panel is part of the base package (like the Windows Tools feature), and its
 # label is absent, not present, on an install that never built it — that is
 # not a failure to verify here, only nothing to boot out.
-for label in com.openabstractions.runtime com.openabstractions.panel; do
+for label in com.openabstractions.runtime com.openabstractions.runtime-login com.openabstractions.panel; do
     service=gui/$uid/$label
     recovery="from Terminal in this user's desktop session: launchctl bootout $service; $rerun"
     state=$(agent_state "$label") || state=unknown
@@ -102,6 +108,12 @@ for label in com.openabstractions.runtime com.openabstractions.panel; do
     fi
     [ "$state" = absent ] || fail "LaunchAgent registration state is $state for $label; payload retained"
     echo "ok    LaunchAgent absence verified for $label (graceful exit is not independently established)"
+done
+
+# The running watcher may have completed an edit while launchd stopped it.
+# Recheck current bytes before forgetting receipts or deleting any payload.
+for label in com.openabstractions.runtime-login com.openabstractions.panel; do
+    login_trigger_check "$label" || fail "conditional login trigger changed during shutdown; payload retained"
 done
 
 # The package installs into the current user's home domain, and its receipt is
@@ -144,7 +156,7 @@ recovery="from Terminal in this user's desktop session: $rerun"
 failed=0
 while IFS= read -r f; do
     case "$f" in /*) ;; *) continue;; esac
-    case "$f" in "$self"|"$share/lifecycle.sh"|"$manifest") continue;; esac
+    case "$f" in "$self"|"$share/lifecycle.sh"|"$share/com.openabstractions.runtime-login.plist"|"$share/com.openabstractions.panel.plist"|"$manifest") continue;; esac
     rm -f -- "$f" 2>/dev/null || :
     if [ -e "$f" ] || [ -L "$f" ]; then echo "uninstall.sh: could not remove $f" >&2; failed=1; fi
 done < "$manifest"
@@ -172,7 +184,7 @@ done
 echo "ok    removed runtime socket lock files"
 
 recovery="rm -f -- $(quote "$share/lifecycle.sh") $(quote "$manifest") $(quote "$self")"
-rm -f -- "$share/lifecycle.sh" "$manifest" "$self"
+rm -f -- "$share/com.openabstractions.runtime-login.plist" "$share/com.openabstractions.panel.plist" "$share/lifecycle.sh" "$manifest" "$self"
 printf '%s\n' "$share/." | prune
 
 echo "ok    removed installed payload, registration and package receipt"

@@ -20,7 +20,10 @@ COMPILER_RUNTIME = re.compile(
     r"ucrtbased|libgcc[^.]*|libstdc\+\+[^.]*|libwinpthread[^.]*)\.dll$",
     re.IGNORECASE,
 )
-SYSTEM_IMPORTS = {"advapi32.dll", "kernel32.dll", "msi.dll"}
+# The canonical native link requirements include Shell32/Ole32 for
+# SHGetKnownFolderPath/CoTaskMemFree. UUID supplies static GUID definitions;
+# it does not imply an allowed uuid.dll dependency.
+SYSTEM_IMPORTS = {"advapi32.dll", "kernel32.dll", "msi.dll", "shell32.dll", "ole32.dll"}
 # MinGW's statically linked C++ runtime still uses Windows' UCRT API sets.
 # These are Windows 10 system contracts, not bundled compiler DLLs.
 SYSTEM_API_SET = {f"api-ms-win-crt-{name}-l1-1-0.dll" for name in (

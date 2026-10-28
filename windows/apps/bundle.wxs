@@ -6,10 +6,14 @@
   names none.
 
   The chain is the core MSI first, then ShowcaseApplications, the package
-  group build_bundle.py writes into apps.wxs: one MsiPackage per application
-  MSI (installer/apps/build_app.py), each optional, not vital, outside the
+  group build_bundle.py writes into apps.wxs: an optional official host EXE
+  followed by its application MSI (installer/apps/build_app.py), outside the
   bundle's own container and installed only when its checkbox
-  (InstallApp_<id>) is ticked. The core comes first because each application
+  (InstallApp_<id>) is ticked. Each selected application has a vital rollback
+  boundary and vital packages: failure remains visible while the completed
+  core stays installed. An official host keeps its own removal ownership;
+  removing the integration removes its OA payload and registrations.
+  The core comes first because each application
   MSI finds the Panel the core package records and refuses to install without
   it.
 
@@ -43,6 +47,11 @@
                                               ThemeFile="$(var.ThemeFile)"
                                               SuppressOptionsUI="$(var.SuppressOptionsUI)"
                                               LicenseUrl="https://github.com/openabstractions/redist/blob/main/LICENSE" />
+<?ifdef BundleActions?>
+      <!-- Existing WixStdBA loads this own signed native extension. It changes
+           requested states at the supported per-package callback only. -->
+      <Payload SourceFile="$(var.BundleActions)" Name="oa_bundle_actions.dll" bal:BAFunctions="yes" />
+<?endif?>
     </BootstrapperApplication>
 
     <Chain>
