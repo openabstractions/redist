@@ -5,7 +5,7 @@ on:
   workflow_dispatch:
     inputs:
       diagnostic_host_sign_only:
-        description: Sign only the exact reviewed Comfy h3 host copy; no build or release
+        description: Sign only the exact reviewed ComfySelf1829 host copy; no build or release
         type: boolean
         default: false
       diagnostic_input_release_id:
@@ -121,7 +121,7 @@ jobs:
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         id: artifact
         with:
-          name: diagnostic-comfy-h3-unsigned-${{ github.run_attempt }}
+          name: diagnostic-comfy-self1829-unsigned-${{ github.run_attempt }}
           path: diagnostic-host/
           if-no-files-found: error
   diagnostic-host-sign:
@@ -152,7 +152,7 @@ jobs:
           ARTIFACT_DIGEST: ${{ needs.diagnostic-host-intake.outputs.artifact-digest }}
         run: >-
           python3 windows/windows_signing.py consume --artifact-id "$ARTIFACT_ID"
-          --digest "$ARTIFACT_DIGEST" --name "diagnostic-comfy-h3-unsigned-$GITHUB_RUN_ATTEMPT"
+          --digest "$ARTIFACT_DIGEST" --name "diagnostic-comfy-self1829-unsigned-$GITHUB_RUN_ATTEMPT"
           --source "$GITHUB_SHA" --run-id "$GITHUB_RUN_ID" --attempt "$GITHUB_RUN_ATTEMPT" --out diagnostic-host
       - name: revalidate exact unsigned host before credentials
         run: >-
@@ -186,7 +186,7 @@ jobs:
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         id: artifact
         with:
-          name: diagnostic-comfy-h3-signed-${{ github.run_attempt }}
+          name: diagnostic-comfy-self1829-signed-${{ github.run_attempt }}
           path: diagnostic-host/
           if-no-files-found: error
   diagnostic-host-verify:
@@ -210,7 +210,7 @@ jobs:
           ARTIFACT_DIGEST: ${{ needs.diagnostic-host-sign.outputs.artifact-digest }}
         run: >-
           python3 windows/windows_signing.py consume --artifact-id "$ARTIFACT_ID"
-          --digest "$ARTIFACT_DIGEST" --name "diagnostic-comfy-h3-signed-$GITHUB_RUN_ATTEMPT"
+          --digest "$ARTIFACT_DIGEST" --name "diagnostic-comfy-self1829-signed-$GITHUB_RUN_ATTEMPT"
           --source "$GITHUB_SHA" --run-id "$GITHUB_RUN_ID" --attempt "$GITHUB_RUN_ATTEMPT" --out diagnostic-host
       - name: exact pinned Microsoft signature tools
         run: python3 windows/windows_signing.py prepare-tools --root "$RUNNER_TEMP/signing-tools" --github-env "$GITHUB_ENV"
@@ -220,7 +220,7 @@ jobs:
           --source "$GITHUB_SHA" --policy windows/certum_simplysign.json --signtool "$SIGNTOOL"
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
-          name: diagnostic-comfy-h3-verified-${{ github.run_attempt }}
+          name: diagnostic-comfy-self1829-verified-${{ github.run_attempt }}
           path: diagnostic-host/
           if-no-files-found: error
   train-graph:
