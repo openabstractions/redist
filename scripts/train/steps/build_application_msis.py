@@ -37,6 +37,8 @@ def release_completed_stage(parent,name):
 
 def load_owner(path, name, *, source_bytes=None, admitted_boundary_pin=None):
     path=pathlib.Path(path)
+    sibling_root=str(path.resolve().parent)
+    if sibling_root not in sys.path:sys.path.insert(0,sibling_root)
     spec=importlib.util.spec_from_file_location(name,path)
     owner=importlib.util.module_from_spec(spec)
     if admitted_boundary_pin is not None:owner._admitted_boundary_pin=admitted_boundary_pin
@@ -966,7 +968,7 @@ def local_package_only(app, owner, raw, binding, closure, destination, wix, vers
 
 def prepare_comfy_source_pair(owner,inputs,producer,destination):
     """Reuse the source archive owner while still in the uncredentialed job."""
-    package=load_owner('scripts/package_comfyui_app.py','application_corresponding_source_owner')
+    package=load_owner('sources/abstractions/scripts/package_comfyui_app.py','application_corresponding_source_owner')
     pair=load_owner('scripts/app_pair_receipt.py','application_corresponding_source_receiver')
     native=native_archive_selected(owner)
     desktop=None if native else owner.desktop_source_policy()[0]
@@ -1490,7 +1492,7 @@ def application_bind(required,version):
         receipt=json.loads((directory/'installer-receipt.json').read_bytes())
         if app=='comfyui' and native_archive_selected(owner):
             pair=load_owner('scripts/app_pair_receipt.py','native_catalog_binding_owner')
-            package=load_owner('scripts/package_comfyui_app.py','native_catalog_assembly_owner')
+            package=load_owner('sources/abstractions/scripts/package_comfyui_app.py','native_catalog_assembly_owner')
             resource=pair.validate_backend_resource(json.loads(closure_file(inputs,'backend/desktop-backend.json').read_bytes()))
             runtime=json.loads(closure_file(inputs,'backend-manifest.json').read_bytes())
             embedded=receipt['embedded_integration']
