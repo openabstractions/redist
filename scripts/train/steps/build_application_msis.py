@@ -1407,6 +1407,7 @@ def application_package(required,version):
         shutil.copytree(out,provenance)
         shutil.copytree(base/'comfy-extension-inputs',provenance/'inputs')
     packages=relay.bundle_owner().chain_packages
+    chain['apps'].sort(key=lambda row:row['id'])
     retain_installer_chain(chain,'setup',packages=packages)
     if 'comfyui' in owners:
         prepare_comfy_source_pair(owners['comfyui'],inputs,producer,

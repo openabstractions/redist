@@ -696,6 +696,15 @@ jobs:
         if: inputs.producer_mode == 'train'
         run: python3 windows/windows_signing.py prepare-tools --root "$RUNNER_TEMP/signing-tools" --github-env "$GITHUB_ENV"
 
+      - name: pinned WiX packages for Panel predecessor extraction
+        if: inputs.producer_mode == 'train'
+        run: python3 windows/wix_packages.py --dest wix-packages --env "$GITHUB_ENV"
+      - name: select pinned WiX before Panel predecessor extraction
+        if: inputs.producer_mode == 'train'
+        run: |
+          dotnet tool install --global wix --version "$WIX_VERSION" --configfile "$WIX_NUGET_CONFIG"
+          echo "$HOME/.dotnet/tools" >> "$GITHUB_PATH"
+
       - name: receive completed application delivery and generate Panel catalogue input
         if: inputs.producer_mode == 'train' && needs.candidate.outputs.native-comfyui == 'true'
         env:
@@ -719,14 +728,6 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           CANDIDATE_SHA: ${{ needs.candidate.outputs.sha }}
         run: python3 scripts/train/steps/build_application_msis.py --phase panel-inputs
-      - name: pinned WiX packages for Panel predecessor extraction
-        if: inputs.producer_mode == 'train'
-        run: python3 windows/wix_packages.py --dest wix-packages --env "$GITHUB_ENV"
-      - name: select pinned WiX before Panel predecessor extraction
-        if: inputs.producer_mode == 'train'
-        run: |
-          dotnet tool install --global wix --version "$WIX_VERSION" --configfile "$WIX_NUGET_CONFIG"
-          echo "$HOME/.dotnet/tools" >> "$GITHUB_PATH"
       - name: consume and revalidate immutable installer predecessor input before Panel compilation
         if: inputs.producer_mode == 'train'
         env:
@@ -1967,6 +1968,8 @@ jobs:
           python3 windows/windows_signing.py consume --artifact-id "$ARTIFACT_ID" --digest "$ARTIFACT_DIGEST" \
             --name "windows-app-helpers-signed-$ARTIFACT_ATTEMPT" --source "$CANDIDATE_SHA" \
             --run-id "$GITHUB_RUN_ID" --attempt "$ARTIFACT_ATTEMPT" --out app-native --receipt app-native/artifact-intake.json
+      - name: exact pinned Microsoft signature tools
+        run: python3 windows/windows_signing.py prepare-tools --root "$RUNNER_TEMP/signing-tools" --github-env "$GITHUB_ENV"
       - name: application MSIs from exact app producer binaries
         run: |
           python3 scripts/train/steps/build_application_msis.py --phase package
@@ -2359,8 +2362,8 @@ jobs:
           GH_REPO: ${{ github.repository }}
           PRODUCER_MODE: ${{ inputs.producer_mode }}
         run: |
-          gh api "repos/$GH_REPO/actions/runs/$GITHUB_RUN_ID/jobs?filter=all&per_page=100" > sdk-jobs.json
-          gh api "repos/$GH_REPO/actions/runs/$GITHUB_RUN_ID/artifacts?per_page=100" > sdk-artifacts.json
+          gh api --paginate --slurp "repos/$GH_REPO/actions/runs/$GITHUB_RUN_ID/jobs?filter=all&per_page=100" --jq '{jobs: [.[].jobs[]]}' > sdk-jobs.json
+          gh api --paginate --slurp "repos/$GH_REPO/actions/runs/$GITHUB_RUN_ID/artifacts?per_page=100" --jq '{artifacts: [.[].artifacts[]]}' > sdk-artifacts.json
           provenance_options=()
           node_options=()
           if [ "$PRODUCER_MODE" = train ]; then
@@ -4527,6 +4530,10 @@ jobs:
     permissions:
       contents: read
       actions: read
+    outputs:
+      artifact-attempt: ${{ github.run_attempt }}
+      artifact-id: ${{ steps.artifact.outputs.artifact-id }}
+      artifact-digest: ${{ steps.artifact.outputs.artifact-digest }}
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
         with:
@@ -4767,6 +4774,7 @@ jobs:
           (cd verified-release && sha256sum -c SHA256SUMS)
 
       - name: retain the verified release for promotion
+        id: artifact
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: verified-release-${{ github.run_attempt }}
@@ -4822,9 +4830,13 @@ jobs:
       - name: fetch the verified release
         env:
           GH_TOKEN: ${{ github.token }}
-          GH_REPO: ${{ github.repository }}
+          ARTIFACT_ID: ${{ needs.draft.outputs.artifact-id }}
+          ARTIFACT_DIGEST: ${{ needs.draft.outputs.artifact-digest }}
+          ARTIFACT_ATTEMPT: ${{ needs.draft.outputs.artifact-attempt }}
         run: |
-          gh run download "$GITHUB_RUN_ID" -n "verified-release-$GITHUB_RUN_ATTEMPT" -D verified-release
+          python3 windows/windows_signing.py consume --artifact-id "$ARTIFACT_ID" --digest "$ARTIFACT_DIGEST" \
+            --name "verified-release-$ARTIFACT_ATTEMPT" --source "$CANDIDATE_SHA" \
+            --run-id "$GITHUB_RUN_ID" --attempt "$ARTIFACT_ATTEMPT" --out verified-release --receipt verified-release/artifact-intake.json
           (cd verified-release && sha256sum -c SHA256SUMS)
 
       # The same checked packages as the windows job: WixToolset.Bal.wixext

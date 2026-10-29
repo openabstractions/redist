@@ -2,6 +2,7 @@
 
 import argparse
 import json
+import re
 from pathlib import Path
 
 
@@ -20,20 +21,32 @@ def select(jobs, artifacts, source, run_id, current_attempt, *, local_provenance
         matching = [job for job in jobs if job.get("name") == job_name]
         if not matching or any(type(job.get("run_attempt")) is not int for job in matching):
             raise ValueError("missing producing job attempt: " + job_name)
-        attempt = max(job["run_attempt"] for job in matching)
-        latest = [job for job in matching if job["run_attempt"] == attempt]
-        if (attempt > current_attempt or len(latest) != 1
-                or latest[0].get("head_sha") != source
-                or latest[0].get("status") != "completed"
-                or latest[0].get("conclusion") != "success"):
-            raise ValueError("ambiguous or unsuccessful producing job: " + job_name)
-        name = prefix + str(attempt)
-        found = [artifact for artifact in artifacts if artifact.get("name") == name]
-        if (len(found) != 1 or found[0].get("expired") is not False
-                or found[0].get("workflow_run", {}).get("id") != run_id
-                or found[0].get("workflow_run", {}).get("head_sha") != source):
-            raise ValueError("missing or mismatched producer artifact: " + name)
-        result[variable] = name
+        if any(job["run_attempt"] < 1 or job["run_attempt"] > current_attempt for job in matching):
+            raise ValueError("invalid producing job attempt: " + job_name)
+        successful = [job for job in matching if job.get("run_id") == run_id
+                      and job.get("head_sha") == source and job.get("status") == "completed"
+                      and job.get("conclusion") == "success"]
+        if not successful:
+            raise ValueError("missing or unsuccessful producing job: " + job_name)
+        # A downstream retry may have newer skipped/failed jobs, or a newer
+        # successful job whose short-lived artifact has already expired.
+        for attempt in sorted({job["run_attempt"] for job in successful}, reverse=True):
+            name = prefix + str(attempt)
+            found = [artifact for artifact in artifacts if artifact.get("name") == name]
+            if not found or (len(found) == 1 and found[0].get("expired") is True):
+                continue
+            if (len(found) != 1 or sum(job["run_attempt"] == attempt for job in successful) != 1
+                    or found[0].get("expired") is not False
+                    or type(found[0].get("id")) is not int or found[0]["id"] < 1
+                    or not isinstance(found[0].get("digest"), str)
+                    or not re.fullmatch(r"sha256:[0-9a-f]{64}", found[0]["digest"])
+                    or found[0].get("workflow_run", {}).get("id") != run_id
+                    or found[0].get("workflow_run", {}).get("head_sha") != source):
+                raise ValueError("missing or mismatched producer artifact: " + name)
+            result[variable] = name
+            break
+        else:
+            raise ValueError("missing or mismatched producer artifact: " + prefix)
     return result
 
 

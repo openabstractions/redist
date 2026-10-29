@@ -40,6 +40,7 @@
 
 path	module	package	feature	subsystem
 Abstraction Panel.exe	github.com/openabstractions/abstractions/monitor@v0.8.0	.	tools	windows
+OpenAbstractions Presenter.exe	github.com/openabstractions/abstractions/monitor@v0.8.0	.	tools	windows
 inventoryd.exe	github.com/openabstractions/abstraction-storage-over-local-stores/go@v0.8.0	cmd/inventoryd	localstores	console
 lemonaded.exe	github.com/openabstractions/abstraction-provider-lemonade/go@v0.8.0	cmd/lemonaded	lemonadeimage	console
 modelhostd.exe	github.com/openabstractions/abstraction-provider-modelhost/go@v0.8.0	cmd/modelhostd	modelhost	console

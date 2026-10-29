@@ -2,6 +2,7 @@
 /windows/certum_simplysign.json text eol=lf
 /.github/workflows/candidate.yml text eol=lf
 /windows/engines/BoringSSL-LICENSE.txt text eol=lf
+/scripts/module_provenance.py text eol=lf
 
 # Source admission reads these inputs with ambient Git config disabled.
 *.tsv text eol=lf

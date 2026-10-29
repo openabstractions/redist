@@ -66,6 +66,16 @@ def panel_native_source_roster(sdk_roster, provenance):
     return 'package\trepository\tcommit\tdirectory\n' + ''.join('\t'.join(row) + '\n' for row in rows)
 
 
+def program_tags(name, module, package, subsystem):
+    # The existing monitor owner builds its Asks presenter from the same module
+    # with this fixed tag (installer/build.py GO_TAGS). No roster-supplied flags.
+    if name != 'OpenAbstractions Presenter.exe':
+        return []
+    if module != PANEL_MODULE or package != '.' or subsystem != 'windows':
+        raise ValueError('Presenter requires the selected monitor root and Windows subsystem')
+    return ['-tags', 'presenter']
+
+
 def runtime_program(row):
     return _windows_build_owner().shipped_program_role(row[1].rsplit('@', 1)[0], row[2]) == 'runtime'
 
@@ -474,7 +484,8 @@ def _observe_windows_builds(tools: Path, output: Path, provenance: Path,
                 (package != '.' and any(not re.fullmatch(r'[A-Za-z0-9_-]+', p) for p in package.split('/'))) or
                 subsystem not in ('console', 'windows')):
             raise ValueError('invalid observed Windows program roster')
-    panel_rows = [row for row in rows if row[1].rsplit('@',1)[0] == PANEL_MODULE]
+    panel_rows = [row for row in rows if row[1].rsplit('@',1)[0] == PANEL_MODULE
+                  and row[0] == 'Abstraction Panel.exe']
     if panel_rows and (panel_source is None or any(row[2] != '.' for row in panel_rows)):
         raise ValueError('Windows amd64 Panel requires authenticated generated catalogue source')
     output = output.resolve()
@@ -518,8 +529,11 @@ def _observe_windows_builds(tools: Path, output: Path, provenance: Path,
     graph_files = {r['path']: r for r in graph['files']}
     # A published library module does not establish that a new command exists
     # in that version. Admit each roster package before any install/build call.
-    for _, module_version, package, _, _ in rows:
+    for name, module_version, package, _, subsystem in rows:
         module, version = module_version.rsplit('@', 1)
+        tags = program_tags(name, module, package, subsystem)
+        if tags and tags != ['-tags', _windows_build_owner().GO_TAGS['tools/' + name]]:
+            raise ValueError('Presenter build tag differs from existing monitor owner')
         if module not in expected or expected[module]['version'] != version:
             raise ValueError('program module differs from prepared graph')
         member = escape_module(module) + '/@v/' + version + '.zip'
@@ -545,7 +559,7 @@ def _observe_windows_builds(tools: Path, output: Path, provenance: Path,
                     flags += ' -X main.shippedProviderImages=' + records[arch]
                 destination = output / pass_name / arch / name
                 destination.parent.mkdir(parents=True, exist_ok=True)
-                projected = module == PANEL_MODULE and arch == 'amd64'
+                projected = module == PANEL_MODULE and arch == 'amd64' and name == 'Abstraction Panel.exe'
                 projection = None
                 if projected:
                     source = owned / (pass_name + '-panel-source')
@@ -561,7 +575,7 @@ def _observe_windows_builds(tools: Path, output: Path, provenance: Path,
                     link = command([go,'-C',str(source),'build','-ldflags',flags,'-o',str(destination),'.'],selected)
                     verify_panel_source(source,projection,module_zip=module_zip,catalogue_path=catalogue_path,**arguments)
                 else:
-                    link = command([go, 'install', '-ldflags', flags, target], selected)
+                    link = command([go, 'install', *program_tags(name, module, package, subsystem), '-ldflags', flags, target], selected)
                     binary = Path(selected['GOPATH']) / 'bin'
                     if [info['GOHOSTOS'], info['GOHOSTARCH']] != ['windows', arch]:
                         binary /= 'windows_' + arch
@@ -784,7 +798,7 @@ def admit_observed_windows_builds(original_bytes: bytes, observed_bytes: bytes, 
     for index, (program, (pass_name, arch, row)) in enumerate(zip(build['programs'], wanted)):
         name, module_version, package, feature, subsystem = row
         module, version = module_version.rsplit('@', 1)
-        projected = module == PANEL_MODULE and arch == 'amd64'
+        projected = module == PANEL_MODULE and arch == 'amd64' and name == 'Abstraction Panel.exe'
         if projected and (expected_panel_source is None or program.get('panel_source') != expected_panel_source):
             fail('missing or different generated Panel source')
         if (set(program) != {'pass', 'arch', 'name', 'module', 'package', 'feature', 'subsystem', 'link', 'metadata', 'artifact', 'consumed'} | ({'panel_source'} if projected else set()) or
@@ -804,7 +818,7 @@ def admit_observed_windows_builds(original_bytes: bytes, observed_bytes: bytes, 
             if len(link) != 9 or not remote(link[2]).endswith(suffix_source):fail('Panel source link path')
             command(program['link'],[go,'-C',link[2],'build','-ldflags',flags,'-o',program['artifact']['path'],'.'])
         else:
-            command(program['link'], [go, 'install', '-ldflags', flags, target])
+            command(program['link'], [go, 'install', *program_tags(name, module, package, subsystem), '-ldflags', flags, target])
         artifact = program['artifact']; artifact_pin = pin(artifact)
         suffix = '/' + pass_name + '/' + arch + '/' + name
         if not remote(artifact['path']).endswith(suffix): fail('output path observation')

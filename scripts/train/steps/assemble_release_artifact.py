@@ -11,6 +11,32 @@ def fact_owner():
     return module
 
 
+def copy_runtime_asset(directory, destination):
+    """Carry the selected app-local runtime ZIP into the final release."""
+    import types
+    target = pathlib.Path('windows/modelhost_engine.py')
+    pin = pathlib.Path('windows/vc-runtime.json')
+    if not target.is_file():
+        root = pathlib.Path(__file__).resolve().parents[3]
+        target = root / 'installer/modelhost_engine.py'
+        pin = root / 'monitor/internal/setup/vc_runtime_asset.json'
+    owner = types.ModuleType('oa_release_runtime_asset'); owner.__file__ = str(target.resolve())
+    exec(compile(target.read_bytes(), str(target), 'exec'), owner.__dict__)
+    asset = owner.runtime_asset(pin)
+    source = pathlib.Path(directory) / asset['archive']['name']
+    destination = pathlib.Path(destination) / source.name
+    if source.is_symlink() or source.is_junction() or not source.is_file():
+        raise ValueError('release runtime ZIP is not an ordinary file')
+    owner.runtime_asset_bytes(source, asset)
+    with source.open('rb') as reader, destination.open('xb') as writer:
+        shutil.copyfileobj(reader, writer)
+    try:
+        owner.runtime_asset_bytes(destination, asset)
+    except BaseException:
+        destination.unlink()
+        raise
+
+
 def producer_facts(candidate, directory, *, diagnostic=False):
     """Read the existing checksum roster and measured signed package bytes."""
     import re
@@ -213,6 +239,8 @@ def main():
     preview = os.environ['PREVIEW'].lower()
     if preview not in ('true', 'false'):
         raise SystemExit('preview must be a boolean')
+    if tuple(map(int, os.environ['RELEASE_VERSION'].removeprefix('v').split('-')[0].split('.'))) >= (0, 8, 0):
+        copy_runtime_asset('dist', 'verified-release')
     apps = json.loads((pathlib.Path(os.environ['RUNNER_TEMP']) / 'apps.json').read_text(encoding='utf-8'))
     copy_app_assets(apps,'dist','verified-release')
     candidate = {'schema': 1, 'source': os.environ['CANDIDATE_SHA'],

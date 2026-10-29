@@ -277,6 +277,18 @@ def included_payload(path, feature, arch, pytorch_program, host_program):
     return True
 
 
+def require_admitted_panel(src, binaries):
+    """A receipt-backed train package carries the complete existing Panel group."""
+    required = [Path(path).name for path, feature in GATE.items()
+                if feature == 'Panel' and path.endswith('.exe')]
+    missing = [name for name in required if binaries is None or not (binaries / name).is_file()]
+    native = src.get('appmodellibrary')
+    if native is None or not (native / 'abstraction_facade_appmodel.dll').is_file():
+        missing.append('abstraction_facade_appmodel.dll')
+    if missing:
+        raise ValueError('admitted train package requires complete Panel payload: ' + ', '.join(missing))
+
+
 def panel_appmodel_input(src, arch, binaries):
     """Admit the Panel's selected native component before staging any file."""
     selected = prebuilt(binaries, "gobuild", "tools/Abstraction Panel.exe") is not None or "panel" in src
@@ -1355,6 +1367,7 @@ def main():
         if hashlib.sha256(raw).hexdigest() != a.producer_receipt_sha256:
             ap.error('producer receipt differs from admitted input')
         program_proof = json.loads(raw)['program_proof']
+        require_admitted_panel(src, a.bin)
 
     if subprocess.run([sys.executable, str(HERE / "validate.py")]).returncode:
         return 1
