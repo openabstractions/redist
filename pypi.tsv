@@ -18,7 +18,7 @@
 > published to PyPI: that needs the owner's PyPI organization and consent.
 
 package	repository	commit	directory
-abstraction-ipc	openabstractions/abstraction-identity	9570f30244a6f984a0523e5ec595b0a963daf2db	py
+abstraction-ipc	openabstractions/abstraction-identity	24b9c57fad7ca9934d527b776752da87cbd48758	py
 abstraction-asks-protocol	openabstractions/abstraction-asks	7b845fd7412873491aa252a0031e991688ad963f	py
 abstraction-config-protocol	openabstractions/abstraction-config	8461ef1c79eeea6329b5d170fe63fce8762709f5	py
 abstraction-download-request-protocol	openabstractions/abstraction-download	72999c6ca49282047a5dffcf03ceffe1966c7a8a	py
