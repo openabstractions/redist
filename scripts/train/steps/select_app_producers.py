@@ -45,12 +45,26 @@ def delivery_context(environment):
         raise ValueError('final Comfy delivery requires exact hosted source/run/attempt context')
 
 
+def core_only_execution(environment):
+    value=environment.get('CORE_ONLY','false')
+    if value not in ('true','false'):raise ValueError('core_only must be an explicit boolean')
+    if value=='false':return False
+    if (environment.get('PRODUCER_MODE')!='train'
+            or environment.get('APP_PRODUCER_ONLY','none')!='none'
+            or environment.get('APP_DELIVERY_ONLY','none')!='none'
+            or environment.get('SIGNING_PROBE_ONLY','false')!='false'
+            or environment.get('DIAGNOSTIC_HOST_SIGN_ONLY','false')!='false'):
+        raise ValueError('core-only diagnostic requires the normal train without app or signing-probe selectors')
+    return True
+
+
 def main():
     sys.path.insert(0, 'scripts')
     from app_assets import optional_app_sources, roster, predecessor_pins
     from release_facts import validate_public_admission
     document = json.loads(pathlib.Path('apps.json').read_text(encoding='utf-8'))
     required = required_products(document, os.environ['RELEASE_VERSION'], validate_public_admission)
+    core_only=core_only_execution(os.environ)
     rows = roster('apps.json')
     optional_app_sources('app-sources.tsv', rows, required_products=required)
     component = os.environ.get('APP_DELIVERY_ONLY', 'none')
@@ -60,8 +74,12 @@ def main():
     if component != 'none':
         delivery_context(os.environ)
     archives = {row['id'] for row in rows}
+    if core_only:
+        required=()
+        archives=set()
     selected = archives | set(required)
     predecessors = predecessor_pins(os.environ['APP_PRODUCERS'])
+    if core_only and predecessors:raise ValueError('core-only diagnostic cannot select application predecessors')
     if component == 'comfyui':
         # Source policy still owns the complete capsule; this execution has a
         # single explicit effect roster and cannot build another application.
@@ -83,6 +101,7 @@ def main():
         raise SystemExit('no installer producer for required products: ' + ', '.join(sorted(selected - supported)))
     with pathlib.Path(os.environ['GITHUB_OUTPUT']).open('a', encoding='utf-8') as output:
         output.write('required-products=' + json.dumps(required, separators=(',', ':')) + '\n')
+        output.write('execution-scope=' + ('core-only-diagnostic' if core_only else 'full') + '\n')
         for app in sorted(supported):
             # The existing Comfy flag remains the legacy archive producer's
             # input. Installer obligations get their own receiving output.

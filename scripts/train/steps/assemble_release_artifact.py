@@ -11,7 +11,7 @@ def fact_owner():
     return module
 
 
-def producer_facts(candidate, directory):
+def producer_facts(candidate, directory, *, diagnostic=False):
     """Read the existing checksum roster and measured signed package bytes."""
     import re
     directory = pathlib.Path(directory); assets = []; seen = set()
@@ -33,7 +33,7 @@ def producer_facts(candidate, directory):
                 raise ValueError('final MSI asset differs from its authenticated signing proof')
             fact_owner().public_msi_members(proofs[0].get('msi_members'))
         assets.append({'name': match[2], 'artifact': {'sha256': match[1], 'bytes': size}})
-    return fact_owner().producer_record(candidate, assets, unsigned_platforms=['linux'])
+    return assets if diagnostic else fact_owner().producer_record(candidate, assets, unsigned_platforms=['linux'])
 
 
 def received_windows_proofs(directory, *, source, run_id, attempt, artifact):
@@ -208,6 +208,8 @@ def copy_app_assets(apps,directory,destination):
 
 
 def main():
+    from select_app_producers import core_only_execution
+    core_only=core_only_execution(os.environ)
     preview = os.environ['PREVIEW'].lower()
     if preview not in ('true', 'false'):
         raise SystemExit('preview must be a boolean')
@@ -218,13 +220,21 @@ def main():
         'run_attempt': int(os.environ['GITHUB_RUN_ATTEMPT']), 'preview': preview == 'true',
         'kind': 'release-candidate', 'windows_signing': None,
         'macos': os.environ['MACOS_STATE'], 'apps': apps}
+    if core_only:
+        if apps:raise ValueError('core-only diagnostic cannot contain application assets')
+        candidate.update(kind='core-only-diagnostic',promotable=False)
     if tuple(map(int, candidate['version'].removeprefix('v').split('-')[0].split('.'))) >= (0, 8, 0):
         sys.path.insert(0, str(pathlib.Path('scripts').resolve()))
         from app_assets import roster
         from release_facts import validate_public_admission
         rows = roster('apps.json')
-        candidate['release_admission'] = validate_public_admission(rows.admission,
-            candidate['version'].removeprefix('v'), rows, candidate['source'])
+        if core_only:
+            validate_public_admission(rows.admission,candidate['version'].removeprefix('v'),rows,require_delivery=False)
+            candidate['omitted_applications']=sorted(row['id'] for row in rows.admission['outcomes']['adopters']
+                                                     if row['target']=='windows-x64')
+        else:
+            candidate['release_admission'] = validate_public_admission(rows.admission,
+                candidate['version'].removeprefix('v'), rows, candidate['source'])
         candidate['app_roster_sha256'] = hashlib.sha256(pathlib.Path('apps.json').read_bytes()).hexdigest()
         document = json.loads(pathlib.Path('apps.json').read_text(encoding='utf-8'))
         proof, chain, context = received_windows_proofs(os.environ['RUNNER_TEMP'], source=candidate['source'],
@@ -251,14 +261,24 @@ def main():
             if (len(rows)!=1 or any(rows[0].get(key)!=delivery['delivery'].get(key) for key in ('binary','source'))):
                 raise ValueError('final catalog application differs from authenticated native delivery')
         candidate['windows_signing'] = proof
-        candidate['installers'] = required_signed_installers(document,candidate['version'].removeprefix('v'),
-            candidate['windows_signing'],validate_public_admission,candidate['source'],
-            chain=chain,catalog=catalog)
+        if core_only:
+            if chain['apps'] or context['expected_producers'] or context['sources'] or catalog:
+                raise ValueError('core-only diagnostic carries application producer evidence')
+            candidate['installers']=[]
+        else:
+            candidate['installers'] = required_signed_installers(document,candidate['version'].removeprefix('v'),
+                candidate['windows_signing'],validate_public_admission,candidate['source'],
+                chain=chain,catalog=catalog)
     else:
         candidate['windows_signing'] = json.loads((pathlib.Path(os.environ['RUNNER_TEMP']) / 'windows-signatures.json').read_bytes())
-    candidate['release_facts'] = producer_facts(candidate, pathlib.Path('verified-release'))
     notes = pathlib.Path('verified-release/NOTES.md')
-    notes.write_text(fact_owner().render_notes(notes.read_text(encoding='utf-8'), candidate['release_facts']), encoding='utf-8')
+    if core_only:
+        producer_facts(candidate,pathlib.Path('verified-release'),diagnostic=True)
+        notes.write_text('OpenAbstractions core-only signed installer diagnostic.\n\n'
+                         'Application delivery is excluded. This artifact cannot be promoted as the 0.8.0 release.\n',encoding='utf-8')
+    else:
+        candidate['release_facts'] = producer_facts(candidate, pathlib.Path('verified-release'))
+        notes.write_text(fact_owner().render_notes(notes.read_text(encoding='utf-8'), candidate['release_facts']), encoding='utf-8')
     pathlib.Path('verified-release/candidate.json').write_text(json.dumps(candidate, indent=2) + '\n', encoding='utf-8')
 
 

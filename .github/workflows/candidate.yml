@@ -1,9 +1,13 @@
 name: verified release candidate
-run-name: candidate ${{ inputs.version }} [oa-job:${{ inputs.oa_job_intent }}]${{ inputs.producer_mode == 'train-graph' && ' [oa-mode:train-graph]' || inputs.producer_mode == 'train' && ' [oa-mode:train]' || '' }}${{ inputs.app_delivery_only == 'comfyui' && ' [oa-app-delivery:comfyui]' || '' }}
+run-name: candidate ${{ inputs.version }} [oa-job:${{ inputs.oa_job_intent }}]${{ inputs.producer_mode == 'train-graph' && ' [oa-mode:train-graph]' || inputs.producer_mode == 'train' && ' [oa-mode:train]' || '' }}${{ inputs.app_delivery_only == 'comfyui' && ' [oa-app-delivery:comfyui]' || '' }}${{ inputs.core_only && ' [core-only diagnostic; nonpromotable]' || '' }}
 
 on:
   workflow_dispatch:
     inputs:
+      core_only:
+        description: Core-only signed installer diagnostic; excludes all applications and cannot be promoted
+        type: boolean
+        default: false
       diagnostic_host_sign_only:
         description: Sign only the exact reviewed ComfySelf1829 host copy; no build or release
         type: boolean
@@ -96,6 +100,7 @@ env:
   # C declares P here only after real producer review. Empty means the strict
   # legacy same-run path. IDs/digests/inputs and derived evidence are literal
   # reviewed source inputs, never downloaded sidecar authority.
+  CORE_ONLY: ${{ inputs.core_only && 'true' || 'false' }}
   APP_PRODUCERS: '{}'
   APP_PRODUCER_ONLY: ${{ inputs.app_producer_only || 'none' }}
   APP_DELIVERY_ONLY: ${{ inputs.app_delivery_only || 'none' }}
@@ -401,7 +406,7 @@ jobs:
           compression-level: 0
           if-no-files-found: error
   windows-app-delivery:
-    if: ${{ needs.source-guard.result == 'success' && (!inputs.diagnostic_host_sign_only && (inputs.producer_mode == 'train' && !inputs.signing_probe_only && needs.candidate.outputs.installer-comfyui == 'true')) }}
+    if: ${{ needs.source-guard.result == 'success' && (!inputs.core_only && !inputs.diagnostic_host_sign_only && (inputs.producer_mode == 'train' && !inputs.signing_probe_only && needs.candidate.outputs.installer-comfyui == 'true')) }}
     needs: [source-guard, candidate, windows-app-sign]
     runs-on: windows-latest
     permissions:
@@ -451,7 +456,7 @@ jobs:
 
 
   backend-data:
-    if: ${{ needs.source-guard.result == 'success' && (inputs.producer_mode == 'train' && needs.candidate.outputs.installer-comfyui == 'true' && needs.windows-app-delivery.result == 'success' && needs.app_comfyui.result == 'success' && !inputs.diagnostic_host_sign_only && !inputs.signing_probe_only && inputs.app_producer_only == 'none') }}
+    if: ${{ needs.source-guard.result == 'success' && (!inputs.core_only && inputs.producer_mode == 'train' && needs.candidate.outputs.installer-comfyui == 'true' && needs.windows-app-delivery.result == 'success' && needs.app_comfyui.result == 'success' && !inputs.diagnostic_host_sign_only && !inputs.signing_probe_only && inputs.app_producer_only == 'none') }}
     needs: [source-guard, candidate, windows-app-delivery, app_comfyui]
     runs-on: ubuntu-latest
     permissions:
@@ -479,7 +484,7 @@ jobs:
         run: python3 scripts/train/steps/build_application_msis.py --phase publish-data
 
   windows-app-catalogue:
-    if: ${{ needs.source-guard.result == 'success' && (needs.backend-data.result == 'success' && !inputs.diagnostic_host_sign_only && inputs.producer_mode == 'train' && !inputs.signing_probe_only && inputs.app_producer_only == 'none' && inputs.app_delivery_only == 'comfyui' && needs.candidate.outputs.installer-comfyui == 'true') }}
+    if: ${{ needs.source-guard.result == 'success' && (!inputs.core_only && needs.backend-data.result == 'success' && !inputs.diagnostic_host_sign_only && inputs.producer_mode == 'train' && !inputs.signing_probe_only && inputs.app_producer_only == 'none' && inputs.app_delivery_only == 'comfyui' && needs.candidate.outputs.installer-comfyui == 'true') }}
     needs: [source-guard, candidate, windows-app-delivery, backend-data]
     runs-on: ubuntu-latest
     permissions:
@@ -552,7 +557,7 @@ jobs:
           if-no-files-found: error
 
   windows-build:
-    if: ${{ needs.source-guard.result == 'success' && (inputs.app_delivery_only != 'comfyui' && (!inputs.diagnostic_host_sign_only && (!cancelled() && needs.candidate.result == 'success' && needs.pytorch-input.result == 'success' && needs.installer-prior-input.result == 'success' && ((inputs.producer_mode == 'train' && needs.candidate.outputs.installer-comfyui == 'true' && needs.windows-app-delivery.result == 'success' && needs.backend-data.result == 'success') || ((inputs.producer_mode != 'train' || needs.candidate.outputs.installer-comfyui != 'true') && needs.windows-app-delivery.result == 'skipped' && needs.backend-data.result == 'skipped')) && inputs.producer_mode != 'train-graph' && (!inputs.signing_probe_only && (inputs.app_producer_only == 'none' || inputs.app_producer_only == ''))))) }}
+    if: ${{ needs.source-guard.result == 'success' && ((inputs.core_only && !cancelled() && inputs.producer_mode == 'train' && !inputs.signing_probe_only && !inputs.diagnostic_host_sign_only && inputs.app_producer_only == 'none' && inputs.app_delivery_only == 'none' && needs.candidate.result == 'success' && needs.pytorch-input.result == 'success' && needs.installer-prior-input.result == 'success') || (!inputs.core_only && (inputs.app_delivery_only != 'comfyui' && (!inputs.diagnostic_host_sign_only && (!cancelled() && needs.candidate.result == 'success' && needs.pytorch-input.result == 'success' && needs.installer-prior-input.result == 'success' && ((inputs.producer_mode == 'train' && needs.candidate.outputs.installer-comfyui == 'true' && needs.windows-app-delivery.result == 'success' && needs.backend-data.result == 'success') || ((inputs.producer_mode != 'train' || needs.candidate.outputs.installer-comfyui != 'true') && needs.windows-app-delivery.result == 'skipped' && needs.backend-data.result == 'skipped')) && inputs.producer_mode != 'train-graph' && (!inputs.signing_probe_only && (inputs.app_producer_only == 'none' || inputs.app_producer_only == ''))))))) }}
     needs: [source-guard, candidate, pytorch-input, installer-prior-input, windows-app-delivery, windows-app-sign, backend-data]
     runs-on: windows-latest
     permissions:
@@ -1449,8 +1454,114 @@ jobs:
   # So: each leg names its scope on the command line, and asserts what the
   # install did rather than what the package promised. A manifest is checked by
   # windows/validate.py, before anything is built; nothing below reads one.
+  core-bundle-native-build:
+    if: ${{ needs.source-guard.result == 'success' && (inputs.core_only && !cancelled() && needs.candidate.result == 'success') }}
+    needs: [source-guard, candidate]
+    runs-on: windows-latest
+    permissions:
+      contents: read
+      actions: read
+    env:
+      CANDIDATE_SHA: ${{ needs.candidate.outputs.sha }}
+      CANDIDATE_VERSION: ${{ needs.candidate.outputs.version }}
+    outputs:
+      artifact-attempt: ${{ github.run_attempt }}
+      artifact-id: ${{ steps.artifact.outputs.artifact-id }}
+      artifact-digest: ${{ steps.artifact.outputs.artifact-digest }}
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
+        with:
+          ref: ${{ github.sha }}
+      - uses: actions/setup-python@e797f83bcb11b83ae66e0230d6156d7c80228e7c
+        with:
+          python-version: '3.12'
+      - name: select the existing core-only compiler owner
+        run: python3 scripts/train/steps/build_application_msis.py --phase inputs
+      - name: compile the source-owned core-only bundle token minter
+        shell: cmd
+        run: |
+          call "%OA_APP_VCVARS%"
+          if errorlevel 1 exit /b %errorlevel%
+          python scripts/train/steps/build_application_msis.py --phase prepare-native
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        id: artifact
+        with:
+          name: core-bundle-native-raw-${{ github.run_attempt }}
+          path: app-native/
+          include-hidden-files: true
+          if-no-files-found: error
+
+  core-bundle-native-sign:
+    if: ${{ needs.source-guard.result == 'success' && (inputs.core_only && !inputs.diagnostic_host_sign_only && (inputs.producer_mode != 'train-graph' && (always() && !inputs.signing_probe_only && needs.core-bundle-native-build.result == 'success' && github.repository == 'openabstractions/redist' && github.event_name == 'workflow_dispatch' && (inputs.producer_mode == 'train' && github.ref == 'refs/heads/release/0.8.0' && github.ref == format('refs/heads/release/{0}', needs.candidate.outputs.version)) && github.actor == 'ReinisLusis' && github.triggering_actor == 'ReinisLusis'))) }}
+    needs: [source-guard, candidate, core-bundle-native-build]
+    runs-on: windows-latest
+    environment: signing
+    permissions:
+      contents: read
+      actions: read
+    env:
+      CANDIDATE_SHA: ${{ needs.candidate.outputs.sha }}
+      CANDIDATE_VERSION: ${{ needs.candidate.outputs.version }}
+      GH_TOKEN: ${{ github.token }}
+      OA_CERTUM_SIGNING_ONLY: '1'
+    outputs:
+      artifact-attempt: ${{ github.run_attempt }}
+      artifact-id: ${{ steps.artifact.outputs.artifact-id }}
+      artifact-digest: ${{ steps.artifact.outputs.artifact-digest }}
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
+        with:
+          ref: ${{ github.sha }}
+      - uses: actions/setup-python@e797f83bcb11b83ae66e0230d6156d7c80228e7c
+        with:
+          python-version: '3.12'
+      - name: consume exact core-bundle-native-raw producer bytes
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ARTIFACT_ID: ${{ needs.core-bundle-native-build.outputs.artifact-id }}
+          ARTIFACT_DIGEST: ${{ needs.core-bundle-native-build.outputs.artifact-digest }}
+          ARTIFACT_ATTEMPT: ${{ needs.core-bundle-native-build.outputs.artifact-attempt }}
+        run: |
+          python3 windows/windows_signing.py consume --artifact-id "$ARTIFACT_ID" --digest "$ARTIFACT_DIGEST" \
+            --name "core-bundle-native-raw-$ARTIFACT_ATTEMPT" --source "$CANDIDATE_SHA" \
+            --run-id "$GITHUB_RUN_ID" --attempt "$ARTIFACT_ATTEMPT" --out app-native
+      - name: exact pinned Microsoft signature tools
+        run: python3 windows/windows_signing.py prepare-tools --root "$RUNNER_TEMP/signing-tools" --github-env "$GITHUB_ENV"
+      - name: download pinned SimplySign Desktop installer
+        shell: pwsh
+        run: |
+          $policy = Get-Content windows/certum_simplysign.json -Raw | ConvertFrom-Json
+          Invoke-WebRequest -Uri $policy.installer.url -OutFile "$env:RUNNER_TEMP/simplysign.msi"
+      - name: connect exact reviewed signing identity
+        shell: pwsh
+        env:
+          CERTUM_USERNAME: ${{ secrets.CERTUM_USERNAME }}
+          CERTUM_OTP_URI: ${{ secrets.CERTUM_OTP_URI }}
+        run: >-
+          ./windows/certum_simplysign.ps1 -Mode Connect
+          -InstallerPath "$env:RUNNER_TEMP/simplysign.msi"
+          -SessionPath "$env:RUNNER_TEMP/signing-session.json"
+      - name: sign the source-owned core-only bundle DLL
+        id: native-signature
+        run: python3 scripts/train/steps/build_application_msis.py --phase sign-native
+      - name: disconnect owned signing session
+        if: always()
+        shell: pwsh
+        run: >-
+          ./windows/certum_simplysign.ps1 -Mode Disconnect
+          -SessionPath "$env:RUNNER_TEMP/signing-session.json"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        id: artifact
+        with:
+          name: core-bundle-native-signed-${{ github.run_attempt }}
+          path: |
+            app-native/
+            !app-native/native/comfyui/backend-launch-build/
+          include-hidden-files: true
+          if-no-files-found: error
+
   windows-app-native-build:
-    if: ${{ needs.source-guard.result == 'success' && (!inputs.diagnostic_host_sign_only && (always() && needs.candidate.result == 'success' && inputs.producer_mode == 'train' && !inputs.signing_probe_only && (inputs.app_producer_only == 'none' || inputs.app_producer_only == '') && (needs.candidate.outputs.required-products == '[]' || (needs.javascript.result == 'success' && needs.python.result == 'success' && needs.windows-sdk-sign.result == 'success' && needs.app_comfyui.result == 'success')))) }}
+    if: ${{ needs.source-guard.result == 'success' && (!inputs.core_only && !inputs.diagnostic_host_sign_only && (always() && needs.candidate.result == 'success' && inputs.producer_mode == 'train' && !inputs.signing_probe_only && (inputs.app_producer_only == 'none' || inputs.app_producer_only == '') && (needs.candidate.outputs.required-products == '[]' || (needs.javascript.result == 'success' && needs.python.result == 'success' && needs.windows-sdk-sign.result == 'success' && needs.app_comfyui.result == 'success')))) }}
     needs: [source-guard, candidate, javascript, python, windows-sdk-sign, app_comfyui]
     runs-on: windows-latest
     permissions:
@@ -1535,7 +1646,7 @@ jobs:
           if-no-files-found: error
 
   windows-app-native-sign:
-    if: ${{ needs.source-guard.result == 'success' && (!inputs.diagnostic_host_sign_only && (inputs.producer_mode != 'train-graph' && (always() && !inputs.signing_probe_only && needs.windows-app-native-build.result == 'success' && github.repository == 'openabstractions/redist' && github.event_name == 'workflow_dispatch' && (inputs.producer_mode == 'train' && github.ref == 'refs/heads/release/0.8.0' && github.ref == format('refs/heads/release/{0}', needs.candidate.outputs.version)) && github.actor == 'ReinisLusis' && github.triggering_actor == 'ReinisLusis'))) }}
+    if: ${{ needs.source-guard.result == 'success' && (!inputs.core_only && !inputs.diagnostic_host_sign_only && (inputs.producer_mode != 'train-graph' && (always() && !inputs.signing_probe_only && needs.windows-app-native-build.result == 'success' && github.repository == 'openabstractions/redist' && github.event_name == 'workflow_dispatch' && (inputs.producer_mode == 'train' && github.ref == 'refs/heads/release/0.8.0' && github.ref == format('refs/heads/release/{0}', needs.candidate.outputs.version)) && github.actor == 'ReinisLusis' && github.triggering_actor == 'ReinisLusis'))) }}
     needs: [source-guard, candidate, windows-app-native-build]
     runs-on: windows-latest
     environment: signing
@@ -1606,7 +1717,7 @@ jobs:
           if-no-files-found: error
 
   windows-app-helpers-build:
-    if: ${{ needs.source-guard.result == 'success' && (!inputs.diagnostic_host_sign_only && (needs.windows-app-native-sign.result == 'success' && inputs.producer_mode == 'train' && !inputs.signing_probe_only && (inputs.app_producer_only == 'none' || inputs.app_producer_only == '') && needs.candidate.outputs.required-products != '[]')) }}
+    if: ${{ needs.source-guard.result == 'success' && (!inputs.core_only && !inputs.diagnostic_host_sign_only && (needs.windows-app-native-sign.result == 'success' && inputs.producer_mode == 'train' && !inputs.signing_probe_only && (inputs.app_producer_only == 'none' || inputs.app_producer_only == '') && needs.candidate.outputs.required-products != '[]')) }}
     needs: [source-guard, candidate, windows-app-native-sign]
     runs-on: windows-latest
     permissions:
@@ -1677,7 +1788,7 @@ jobs:
           if-no-files-found: error
 
   windows-app-helpers-sign:
-    if: ${{ needs.source-guard.result == 'success' && (!inputs.diagnostic_host_sign_only && (inputs.producer_mode != 'train-graph' && (always() && !inputs.signing_probe_only && needs.windows-app-helpers-build.result == 'success' && github.repository == 'openabstractions/redist' && github.event_name == 'workflow_dispatch' && (inputs.producer_mode == 'train' && github.ref == 'refs/heads/release/0.8.0' && github.ref == format('refs/heads/release/{0}', needs.candidate.outputs.version)) && github.actor == 'ReinisLusis' && github.triggering_actor == 'ReinisLusis'))) }}
+    if: ${{ needs.source-guard.result == 'success' && (!inputs.core_only && !inputs.diagnostic_host_sign_only && (inputs.producer_mode != 'train-graph' && (always() && !inputs.signing_probe_only && needs.windows-app-helpers-build.result == 'success' && github.repository == 'openabstractions/redist' && github.event_name == 'workflow_dispatch' && (inputs.producer_mode == 'train' && github.ref == 'refs/heads/release/0.8.0' && github.ref == format('refs/heads/release/{0}', needs.candidate.outputs.version)) && github.actor == 'ReinisLusis' && github.triggering_actor == 'ReinisLusis'))) }}
     needs: [source-guard, candidate, windows-app-helpers-build]
     runs-on: windows-latest
     environment: signing
@@ -1756,7 +1867,7 @@ jobs:
           if-no-files-found: error
 
   windows-app-msi:
-    if: ${{ needs.source-guard.result == 'success' && (!inputs.diagnostic_host_sign_only && (always() && needs.candidate.result == 'success' && (needs.app_comfyui.result == 'success' || needs.app_comfyui.result == 'skipped') && (inputs.producer_mode != 'train' || needs.candidate.outputs.required-products == '[]' || needs.windows-app-helpers-sign.result == 'success') && inputs.producer_mode != 'train-graph' && (!inputs.signing_probe_only && (inputs.app_producer_only == 'none' || inputs.app_producer_only == '')))) }}
+    if: ${{ needs.source-guard.result == 'success' && (!inputs.core_only && !inputs.diagnostic_host_sign_only && (always() && needs.candidate.result == 'success' && (needs.app_comfyui.result == 'success' || needs.app_comfyui.result == 'skipped') && (inputs.producer_mode != 'train' || needs.candidate.outputs.required-products == '[]' || needs.windows-app-helpers-sign.result == 'success') && inputs.producer_mode != 'train-graph' && (!inputs.signing_probe_only && (inputs.app_producer_only == 'none' || inputs.app_producer_only == '')))) }}
     needs: [source-guard, candidate, app_comfyui, windows-app-helpers-sign]
     runs-on: windows-latest
     permissions:
@@ -1839,7 +1950,7 @@ jobs:
           if-no-files-found: error
 
   windows-app-sign:
-    if: ${{ needs.source-guard.result == 'success' && (!inputs.diagnostic_host_sign_only && (inputs.producer_mode != 'train-graph' && (!inputs.signing_probe_only && (inputs.app_producer_only == 'none' || inputs.app_producer_only == '') && github.repository == 'openabstractions/redist' && github.event_name == 'workflow_dispatch' && (inputs.producer_mode == 'train' && github.ref == 'refs/heads/release/0.8.0' && github.ref == format('refs/heads/release/{0}', needs.candidate.outputs.version)) && github.actor == 'ReinisLusis' && github.triggering_actor == 'ReinisLusis'))) }}
+    if: ${{ needs.source-guard.result == 'success' && (!inputs.core_only && !inputs.diagnostic_host_sign_only && (inputs.producer_mode != 'train-graph' && (!inputs.signing_probe_only && (inputs.app_producer_only == 'none' || inputs.app_producer_only == '') && github.repository == 'openabstractions/redist' && github.event_name == 'workflow_dispatch' && (inputs.producer_mode == 'train' && github.ref == 'refs/heads/release/0.8.0' && github.ref == format('refs/heads/release/{0}', needs.candidate.outputs.version)) && github.actor == 'ReinisLusis' && github.triggering_actor == 'ReinisLusis'))) }}
     needs: [source-guard, candidate, windows-sdk-sign, windows-app-msi]
     runs-on: windows-latest
     timeout-minutes: 20
@@ -1954,7 +2065,7 @@ jobs:
           if-no-files-found: error
 
   windows-msi-sign:
-    if: ${{ needs.source-guard.result == 'success' && (inputs.app_delivery_only != 'comfyui' && (!inputs.diagnostic_host_sign_only && (inputs.producer_mode != 'train-graph' && (!inputs.signing_probe_only && (inputs.app_producer_only == 'none' || inputs.app_producer_only == '') && github.repository == 'openabstractions/redist' && github.event_name == 'workflow_dispatch' && (inputs.producer_mode == 'train' && github.ref == 'refs/heads/release/0.8.0' && github.ref == format('refs/heads/release/{0}', needs.candidate.outputs.version)) && github.actor == 'ReinisLusis' && github.triggering_actor == 'ReinisLusis')))) }}
+    if: ${{ needs.source-guard.result == 'success' && (!cancelled() && (inputs.app_delivery_only != 'comfyui' && (!inputs.diagnostic_host_sign_only && (inputs.producer_mode != 'train-graph' && (!inputs.signing_probe_only && (inputs.app_producer_only == 'none' || inputs.app_producer_only == '') && github.repository == 'openabstractions/redist' && github.event_name == 'workflow_dispatch' && (inputs.producer_mode == 'train' && github.ref == 'refs/heads/release/0.8.0' && github.ref == format('refs/heads/release/{0}', needs.candidate.outputs.version)) && github.actor == 'ReinisLusis' && github.triggering_actor == 'ReinisLusis')))) && needs.candidate.result == 'success' && needs.windows-pe-sign.result == 'success' && needs.windows.result == 'success' && (inputs.core_only || (!inputs.core_only && needs.windows-app-sign.result == 'success'))) }}
     needs: [source-guard, candidate, windows-pe-sign, windows, windows-app-sign]
     runs-on: windows-latest
     timeout-minutes: 20
@@ -1973,7 +2084,7 @@ jobs:
       desktop-signer-attempt: ${{ needs.windows-app-sign.outputs.desktop-signer-attempt }}
       artifact-attempt: ${{ github.run_attempt }}
       package-artifact: abstraction-windows-${{ github.run_attempt }}
-      app-producer-attempt: ${{ needs.windows-app-sign.outputs.app-producer-attempt }}
+      app-producer-attempt: ${{ inputs.core_only && github.run_attempt || needs.windows-app-sign.outputs.app-producer-attempt }}
       package-artifact-id: ${{ steps.packages.outputs.artifact-id }}
       package-artifact-digest: ${{ steps.packages.outputs.artifact-digest }}
       artifact-id: ${{ steps.artifact.outputs.artifact-id }}
@@ -1996,7 +2107,8 @@ jobs:
           python3 windows/windows_signing.py consume --artifact-id "$ARTIFACT_ID" --digest "$ARTIFACT_DIGEST" \
             --name "windows-msi-raw-$ARTIFACT_ATTEMPT" --source "$CANDIDATE_SHA" \
             --run-id "$GITHUB_RUN_ID" --attempt "$ARTIFACT_ATTEMPT" --out signed/core
-      - name: consume exact windows-app-signed producer bytes
+      - if: ${{ !inputs.core_only }}
+        name: consume exact windows-app-signed producer bytes
         env:
           GH_TOKEN: ${{ github.token }}
           ARTIFACT_ID: ${{ needs.windows-app-sign.outputs.artifact-id }}
@@ -2013,6 +2125,12 @@ jobs:
           if [ -f retained-apps/app-native-signatures.json ]; then
             cp retained-apps/app-native-signatures.json signed/app-native-signatures.json
           fi
+      - if: inputs.core_only
+        name: retain the explicit empty application signing context
+        env:
+          CANDIDATE_SHA: ${{ needs.candidate.outputs.sha }}
+          CANDIDATE_VERSION: ${{ needs.candidate.outputs.version }}
+        run: python3 scripts/train/steps/build_application_msis.py --phase core-context
       - name: pinned WiX packages
         run: python3 windows/wix_packages.py --dest wix-packages --env "$GITHUB_ENV"
       - name: wix
@@ -2047,19 +2165,19 @@ jobs:
       - name: sign MSI containers after payload verification
         env:
           PRODUCER_MODE: ${{ inputs.producer_mode }}
-          APP_INSTALLER_ARTIFACT_ATTEMPT: ${{ needs.windows-app-sign.outputs.app-producer-attempt }}
+          APP_INSTALLER_ARTIFACT_ATTEMPT: ${{ inputs.core_only && github.run_attempt || needs.windows-app-sign.outputs.app-producer-attempt }}
           CANDIDATE_SHA: ${{ needs.candidate.outputs.sha }}
         run: |
           args=()
-          if [ "$PRODUCER_MODE" = train ]; then
+          if [ "$PRODUCER_MODE" = train ] && [ "$CORE_ONLY" != true ]; then
             args+=(--producer-bindings signed/apps/producer-bindings.json --source "$CANDIDATE_SHA" --run-id "$GITHUB_RUN_ID" --run-attempt "$APP_INSTALLER_ARTIFACT_ATTEMPT")
           fi
           python3 windows/windows_signing.py sign-msi --scope core --retained-signatures signed/app-msi-signatures.json --policy windows/certum_simplysign.json --signtool "$SIGNTOOL" --root signed --receipt signed/signatures.json --native-roster pypi.tsv "${args[@]}"
-      - if: inputs.producer_mode == 'train'
+      - if: inputs.producer_mode == 'train' && !inputs.core_only
         name: retain verified application external helper proofs
         env:
           CANDIDATE_SHA: ${{ needs.candidate.outputs.sha }}
-          APP_INSTALLER_ARTIFACT_ATTEMPT: ${{ needs.windows-app-sign.outputs.app-producer-attempt }}
+          APP_INSTALLER_ARTIFACT_ATTEMPT: ${{ inputs.core_only && github.run_attempt || needs.windows-app-sign.outputs.app-producer-attempt }}
           CANDIDATE_VERSION: ${{ needs.candidate.outputs.version }}
         run: python3 scripts/train/steps/build_application_msis.py --phase seal-native
       - name: checksum final signed core packages
@@ -4238,7 +4356,7 @@ jobs:
   # The runner is named here, so the reviewed workflow digest covers it; no
   # repository variable can send the candidate source to another machine.
   app_comfyui:
-    if: ${{ needs.source-guard.result == 'success' && (!inputs.diagnostic_host_sign_only && (inputs.producer_mode != 'train-graph')) }}
+    if: ${{ needs.source-guard.result == 'success' && (!inputs.core_only && !inputs.diagnostic_host_sign_only && (inputs.producer_mode != 'train-graph')) }}
     needs: [source-guard, candidate, python]
     runs-on: windows-latest
     permissions:
@@ -4372,7 +4490,7 @@ jobs:
           if-no-files-found: error
 
   draft:
-    if: ${{ needs.source-guard.result == 'success' && (inputs.app_delivery_only != 'comfyui' && (!inputs.diagnostic_host_sign_only && (!cancelled() && needs.candidate.result == 'success' && needs.windows-msi-sign.result == 'success' && needs.verify.result == 'success' && needs.linux.result == 'success' && needs.linux-verify.result == 'success' && needs.macos.result == 'success' && needs.app_comfyui.result == 'success' && ((inputs.producer_mode == 'train' && needs.candidate.outputs.installer-comfyui == 'true' && needs.windows-app-delivery.result == 'success') || ((inputs.producer_mode != 'train' || needs.candidate.outputs.installer-comfyui != 'true') && needs.windows-app-delivery.result == 'skipped')) && inputs.producer_mode != 'train-graph' && (!inputs.signing_probe_only && (inputs.app_producer_only == 'none' || inputs.app_producer_only == ''))))) }}
+    if: ${{ needs.source-guard.result == 'success' && ((inputs.core_only && !cancelled() && inputs.producer_mode == 'train' && !inputs.signing_probe_only && !inputs.diagnostic_host_sign_only && inputs.app_producer_only == 'none' && inputs.app_delivery_only == 'none' && needs.candidate.result == 'success' && needs.windows-msi-sign.result == 'success' && needs.verify.result == 'success' && needs.linux.result == 'success' && needs.linux-verify.result == 'success' && needs.macos.result == 'success') || (!inputs.core_only && (inputs.app_delivery_only != 'comfyui' && (!inputs.diagnostic_host_sign_only && (!cancelled() && needs.candidate.result == 'success' && needs.windows-msi-sign.result == 'success' && needs.verify.result == 'success' && needs.linux.result == 'success' && needs.linux-verify.result == 'success' && needs.macos.result == 'success' && needs.app_comfyui.result == 'success' && ((inputs.producer_mode == 'train' && needs.candidate.outputs.installer-comfyui == 'true' && needs.windows-app-delivery.result == 'success') || ((inputs.producer_mode != 'train' || needs.candidate.outputs.installer-comfyui != 'true') && needs.windows-app-delivery.result == 'skipped')) && inputs.producer_mode != 'train-graph' && (!inputs.signing_probe_only && (inputs.app_producer_only == 'none' || inputs.app_producer_only == ''))))))) }}
     needs: [source-guard, candidate, windows-msi-sign, verify, linux, linux-verify, macos, app_comfyui, windows-app-delivery]
     runs-on: ubuntu-latest
     permissions:
@@ -4463,7 +4581,10 @@ jobs:
           COMFY_FINAL_ARTIFACT_ATTEMPT: ${{ needs.windows-app-delivery.outputs.comfyui-artifact-attempt }}
         run: |
           mkdir -p app-inputs dist
-          if [ "$PRODUCER_MODE" = train ] && [ "$INSTALLER_COMFYUI" = true ]; then
+          if [ "$CORE_ONLY" = true ]; then
+            printf '[]\n' > "$RUNNER_TEMP/apps.json"
+            : > dist/SHA256SUMS.apps
+          elif [ "$PRODUCER_MODE" = train ] && [ "$INSTALLER_COMFYUI" = true ]; then
             python3 scripts/train/steps/build_application_msis.py --phase stage-final
           else
             python3 scripts/train/steps/verify_adopter_pairs.py
@@ -4615,8 +4736,8 @@ jobs:
   # outer Setup after this build, followed by independent Windows verification.
   # Promotion consumes that exact setup-bundle-<attempt> and its final receipt.
   bundle:
-    if: ${{ needs.source-guard.result == 'success' && (inputs.app_delivery_only != 'comfyui' && (!inputs.diagnostic_host_sign_only && (inputs.producer_mode != 'train-graph' && (!inputs.signing_probe_only && (inputs.app_producer_only == 'none' || inputs.app_producer_only == ''))))) }}
-    needs: [source-guard, candidate, draft, windows-msi-sign, windows-app-native-sign]
+    if: ${{ needs.source-guard.result == 'success' && (!cancelled() && (inputs.app_delivery_only != 'comfyui' && (!inputs.diagnostic_host_sign_only && (inputs.producer_mode != 'train-graph' && (!inputs.signing_probe_only && (inputs.app_producer_only == 'none' || inputs.app_producer_only == ''))))) && needs.candidate.result == 'success' && needs.draft.result == 'success' && needs.windows-msi-sign.result == 'success' && ((inputs.core_only && needs.core-bundle-native-sign.result == 'success') || (!inputs.core_only && needs.windows-app-native-sign.result == 'success'))) }}
+    needs: [source-guard, candidate, draft, windows-msi-sign, windows-app-native-sign, core-bundle-native-sign]
     runs-on: windows-latest
     permissions:
       contents: read
@@ -4628,9 +4749,9 @@ jobs:
       APP_CONTEXT_ARTIFACT_ID: ${{ needs.windows-msi-sign.outputs.artifact-id }}
       APP_CONTEXT_ARTIFACT_DIGEST: ${{ needs.windows-msi-sign.outputs.artifact-digest }}
       APP_CONTEXT_ARTIFACT_ATTEMPT: ${{ needs.windows-msi-sign.outputs.artifact-attempt }}
-      CORE_NATIVE_ARTIFACT_ID: ${{ needs.windows-app-native-sign.outputs.artifact-id }}
-      CORE_NATIVE_ARTIFACT_DIGEST: ${{ needs.windows-app-native-sign.outputs.artifact-digest }}
-      CORE_NATIVE_ARTIFACT_ATTEMPT: ${{ needs.windows-app-native-sign.outputs.artifact-attempt }}
+      CORE_NATIVE_ARTIFACT_ID: ${{ inputs.core_only && needs.core-bundle-native-sign.outputs.artifact-id || needs.windows-app-native-sign.outputs.artifact-id }}
+      CORE_NATIVE_ARTIFACT_DIGEST: ${{ inputs.core_only && needs.core-bundle-native-sign.outputs.artifact-digest || needs.windows-app-native-sign.outputs.artifact-digest }}
+      CORE_NATIVE_ARTIFACT_ATTEMPT: ${{ inputs.core_only && needs.core-bundle-native-sign.outputs.artifact-attempt || needs.windows-app-native-sign.outputs.artifact-attempt }}
     outputs:
       artifact-attempt: ${{ github.run_attempt }}
       artifact-id: ${{ steps.artifact.outputs.artifact-id }}

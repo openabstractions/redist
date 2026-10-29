@@ -58,6 +58,9 @@ def installer_scope(version, *, policy_root=None, validate=None):
     document=json.loads((pathlib.Path(policy_root or '.')/'apps.json').read_bytes())
     capsule=validate(document.get('release_admission'),version,document['apps'],require_delivery=False)
     required={row['id'] for row in capsule['outcomes']['adopters'] if row['target']=='windows-x64'}
+    if policy_root is None and os.environ.get('CORE_ONLY','false')!='false':
+        selector=load_owner('scripts/train/steps/select_app_producers.py','core_only_execution_scope')
+        if selector.core_only_execution(os.environ):return set()
     component='none' if policy_root is not None else os.environ.get('APP_DELIVERY_ONLY','none')
     if component!='none':
         selector=load_owner('scripts/train/steps/select_app_producers.py','application_component_selection')
@@ -1973,7 +1976,7 @@ def application_bundle(required,version):
         attempt=int(os.environ['CORE_NATIVE_ARTIFACT_ATTEMPT'])
         intake=relay.consume_artifact(int(os.environ['CORE_NATIVE_ARTIFACT_ID']),
             os.environ['CORE_NATIVE_ARTIFACT_DIGEST'].removeprefix('sha256:'),
-            'windows-app-native-signed-'+str(attempt),os.environ['CANDIDATE_SHA'],
+            ('core-bundle-native-signed-' if os.environ.get('CORE_ONLY')=='true' else 'windows-app-native-signed-')+str(attempt),os.environ['CANDIDATE_SHA'],
             int(os.environ['GITHUB_RUN_ID']),attempt,root,receipt=root/relay.INTAKE_RECEIPT)
         name='shared-bundle/bundle-actions-receipt.json'
         selected=[row for row in intake['files'] if row['name']==name]
@@ -2165,6 +2168,22 @@ def application_panel_inputs(required,version):
     (destination/'panel-catalogue-input.json').write_bytes(descriptor)
 
 
+def core_only_signing_context(version):
+    """The existing empty application chain for explicit core-only signing."""
+    if installer_scope(version):raise ValueError('core-only signing cannot carry application obligations')
+    selector=load_owner('scripts/train/steps/select_app_producers.py','core_only_signing_scope')
+    if not selector.core_only_execution(os.environ):raise ValueError('core-only signing requires its explicit diagnostic scope')
+    root=pathlib.Path('signed');apps=root/'apps'
+    retain_installer_chain({'version':version,'apps':[]},apps)
+    (apps/'producer-bindings.json').write_text('{}\n')
+    policy=closure_file(pathlib.Path('.'),'windows/certum_simplysign.json').read_bytes()
+    (root/'app-msi-signatures.json').write_text(json.dumps(dict(schema=1,result='pass',
+        policy_sha256=hashlib.sha256(policy).hexdigest(),files=[]),sort_keys=True)+'\n')
+    (root/'app-chain-context.json').write_text(json.dumps(dict(version=version,
+        source=os.environ['CANDIDATE_SHA'],run_id=int(os.environ['GITHUB_RUN_ID']),
+        run_attempt=int(os.environ['GITHUB_RUN_ATTEMPT']),sources={},expected_producers={}),sort_keys=True)+'\n')
+
+
 def received_installer_chain(required, inputs, expected_producers, version, verify, *, packages=None):
     """Join owning receipts after immutable intake, before any chain effects.
 
@@ -2276,7 +2295,7 @@ def pin(path):
 
 def main(argv=None):
     parser=argparse.ArgumentParser(description='Existing application producer and immutable installer intake owner')
-    parser.add_argument('--phase',choices=('backend-inputs','control-inputs','inputs','prepare-native','sign-native','prepare-helpers','sign-helpers','package','sign-host','bind','seal-native','assemble-final','publish-data','stage-final','panel-inputs','bundle'),default='package')
+    parser.add_argument('--phase',choices=('backend-inputs','control-inputs','inputs','prepare-native','sign-native','prepare-helpers','sign-helpers','package','sign-host','bind','seal-native','assemble-final','publish-data','stage-final','panel-inputs','core-context','bundle'),default='package')
     args=parser.parse_args(argv)
     version=os.environ['CANDIDATE_VERSION'].removeprefix('v')
     if tuple(map(int,version.split('-')[0].split('.')))<(0,8,0):
@@ -2285,6 +2304,7 @@ def main(argv=None):
         # published artifacts and history stay as they are.
         raise ValueError('pre-0.8.0 application packages are published history; this producer builds 0.8.0 and later')
     required=installer_scope(version)
+    if args.phase=='core-context':return core_only_signing_context(version)
     if args.phase=='bundle':return application_bundle(required,version)
     if args.phase=='assemble-final':return application_final_capsule(required,version)
     if args.phase=='publish-data':return application_stage_final(required,version,publish_data=True)
