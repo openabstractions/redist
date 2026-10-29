@@ -273,7 +273,11 @@ def materialize_lemonade_inputs(native,helper,selected,inputs,tools):
         raise ValueError('reconstructed native tree differs')
     npm_cache=acquisition/'cache';npm_cache.mkdir()
     evidence=acquisition/'npm-acquisition.json'
-    helper.prime_native_npm_cache(source,manifest['web']['lock_file'],manifest['web']['sha256'],
+    # The selected Git tree owns the acquisition bytes. Historical web hashes
+    # can describe a Windows checkout's line endings rather than this blob.
+    lock=manifest['web']['lock_file']
+    lock_bytes=subprocess.check_output([tools['git'],'-C',str(source),'cat-file','blob',tree+':'+lock],env=environment)
+    helper.prime_native_npm_cache(source,lock,hashlib.sha256(lock_bytes).hexdigest(),
         tools['npm'],npm_cache,acquisition/'install',evidence)
     wix=load_owner('windows/wix_packages.py','application_ui_input_policy')
     package=pathlib.Path('wix-packages')/wix.PACKAGES['WixToolset.UI.wixext']['file']
