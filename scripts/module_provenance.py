@@ -344,6 +344,34 @@ def verify_panel_source(output, provenance, *, module_zip, catalogue_path, modul
     if directories != implied:raise ValueError('Panel projection directories differ')
 
 
+def go_cached_info(raw):
+    """Exact RevInfo encoding written by the pinned Go module cache owner."""
+    def unique(pairs):
+        result = {}
+        for key, value in pairs:
+            if key in result: raise ValueError('duplicate module info field')
+            result[key] = value
+        return result
+    value = json.loads(raw, object_pairs_hook=unique)
+    if (not isinstance(value, dict) or set(value) - {'Version', 'Time', 'Origin'} or
+            not isinstance(value.get('Version'), str) or not isinstance(value.get('Time'), str)):
+        raise ValueError('unsupported Go module info')
+    result = {'Version': value['Version'], 'Time': value['Time']}
+    if 'Origin' in value:
+        origin = value['Origin']
+        keys = ('VCS', 'URL', 'Subdir', 'Hash', 'TagPrefix', 'TagSum', 'Ref', 'RepoSum')
+        if (not isinstance(origin, dict) or set(origin) - set(keys) or
+                any(not isinstance(item, str) for item in origin.values())):
+            raise ValueError('unsupported Go module origin')
+        result['Origin'] = {key: origin[key] for key in keys if origin.get(key)}
+    # encoding/json.Marshal's compact object encoding and HTML-safe strings.
+    encoded = json.dumps(result, ensure_ascii=False, separators=(',', ':'))
+    for character, escaped in (('&', r'\u0026'), ('<', r'\u003c'), ('>', r'\u003e'),
+                               ('\u2028', r'\u2028'), ('\u2029', r'\u2029')):
+        encoded = encoded.replace(character, escaped)
+    return encoded.encode('utf-8')
+
+
 def observed_file(path: Path) -> dict:
     if path.is_symlink() or not path.is_file():
         raise ValueError('observed build input/output must be an ordinary file: ' + str(path))
@@ -567,18 +595,28 @@ def _observe_windows_builds(tools: Path, output: Path, provenance: Path,
                         continue
                     prefix = escape_module(path) + '/@v/' + actual_version
                     cached = []
+                    info_source = None
                     for extension in ('.zip', '.mod', '.info'):
                         pin = observed_file(Path(info['GOMODCACHE']) / 'cache/download' / (prefix + extension))
                         wanted = graph_files['proxy/' + prefix + extension]
                         if any(pin[k] != wanted[k] for k in ('sha256', 'bytes')):
-                            raise ValueError('consumed cached module differs from prepared bytes')
+                            if extension != '.info':
+                                raise ValueError('consumed cached module differs from prepared bytes')
+                            source_raw, source_pin = observed_input(prepared_proxy / (prefix + extension))
+                            if any(source_pin[k] != wanted[k] for k in ('sha256', 'bytes')):
+                                raise ValueError('prepared module info changed')
+                            normalized = go_cached_info(source_raw)
+                            if (pin['bytes'], pin['sha256']) != (len(normalized), hashlib.sha256(normalized).hexdigest()):
+                                raise ValueError('consumed cached module info differs from prepared fields')
+                            info_source = source_raw.decode('utf-8')
                         cached.append(pin)
                     ziphash = Path(info['GOMODCACHE']) / 'cache/download' / (prefix + '.ziphash')
                     if ziphash.read_text(encoding='utf-8').strip() != actual_sum:
                         raise ValueError('cached Go h1 differs from embedded module')
                     consumed.append({'module': path, 'version': actual_version, 'sum': actual_sum,
                                      'gomodsum': row['gomodsum'], 'cache_files': cached,
-                                     'ziphash': observed_file(ziphash)})
+                                     'ziphash': observed_file(ziphash),
+                                     **({'info_source': info_source} if info_source is not None else {})})
                 if not consumed or consumed[0]['module'] != module:
                     raise ValueError('observed root module is missing or differs')
                 program = {'pass': pass_name, 'arch': arch, 'name': name, 'module': module_version,
@@ -801,13 +839,22 @@ def admit_observed_windows_builds(original_bytes: bytes, observed_bytes: bytes, 
                         consumed['panel_source'] != expected_panel_source): fail('projected root source')
                 continue
             if (selected is None or (actual_version, actual_sum) != (selected['version'], selected['sum']) or
-                    set(consumed) != {'module', 'version', 'sum', 'gomodsum', 'cache_files', 'ziphash'} or
+                    set(consumed) not in ({'module', 'version', 'sum', 'gomodsum', 'cache_files', 'ziphash'},
+                                          {'module', 'version', 'sum', 'gomodsum', 'cache_files', 'ziphash', 'info_source'}) or
                     [consumed[k] for k in ('module', 'version', 'sum', 'gomodsum')] !=
                     [path, actual_version, actual_sum, selected['gomodsum']] or len(consumed['cache_files']) != 3): fail('consumed module')
             cache_prefix = escape_module(path) + '/@v/' + actual_version
             for cached, extension in zip(consumed['cache_files'], ('.zip', '.mod', '.info')):
                 expected = graph_files.get('proxy/' + cache_prefix + extension)
-                if (not expected or pin(cached) != {k: expected[k] for k in ('sha256', 'bytes')} or
+                wanted = {k: expected[k] for k in ('sha256', 'bytes')} if expected else None
+                if extension == '.info' and 'info_source' in consumed:
+                    raw = consumed['info_source']
+                    if not isinstance(raw, str) or len(raw) > 65536: fail('module info source')
+                    raw = raw.encode('utf-8')
+                    if wanted != {'bytes': len(raw), 'sha256': hashlib.sha256(raw).hexdigest()}: fail('module info source pin')
+                    normalized = go_cached_info(raw)
+                    wanted = {'bytes': len(normalized), 'sha256': hashlib.sha256(normalized).hexdigest()}
+                if (not expected or pin(cached) != wanted or
                         remote(cached['path']) != remote(env['GOMODCACHE']) + '/cache/download/' + cache_prefix + extension): fail('consumed cache pin')
             # The producer checks stripped text against h1. Retain the ziphash pin
             # as an observation; its bytes are not supplied by this small proof.
