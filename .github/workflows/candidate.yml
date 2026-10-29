@@ -4268,8 +4268,8 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
         run: |
-          mkdir -p app-build-inputs/wheels
-          gh run download "$GITHUB_RUN_ID" -n "$WHEEL_ARTIFACT" -D app-build-inputs/wheels
+          mkdir sdk-wheels
+          gh run download "$GITHUB_RUN_ID" -n "$WHEEL_ARTIFACT" -D sdk-wheels
       - name: fetch exact source-selected ComfyUI inputs
         if: (needs.candidate.outputs.comfyui == 'true' || needs.candidate.outputs.installer-comfyui == 'true') && needs.candidate.outputs.comfyui-predecessor != 'true' && (inputs.producer_mode != 'train' || needs.candidate.outputs.installer-comfyui != 'true')
         run: |

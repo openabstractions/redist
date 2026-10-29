@@ -190,7 +190,7 @@ def application_control_inputs(required,version):
         integration['bytes'],integration['sha256'],control,candidate_source=os.environ['CANDIDATE_SHA'],
         run_id=int(os.environ['GITHUB_RUN_ID']),run_attempt=int(os.environ['WHEEL_ATTEMPT']),
         integration_options=dict(producer_receipt_path=receipt,
-            wheel_receipt_path=closure_file(inputs,'wheels/wheel-inputs.json'),
+            wheel_receipt_path=closure_file(pathlib.Path('sdk-wheels'),'wheel-inputs.json'),
             expected_redist_source_commit=os.environ['CANDIDATE_SHA'],
             expected_run_id=int(os.environ['GITHUB_RUN_ID']),expected_run_attempt=int(os.environ['WHEEL_ATTEMPT'])),
         adapter=pathlib.Path(owner.__file__).with_name('oa_native_host.py'),public_sources=sources)

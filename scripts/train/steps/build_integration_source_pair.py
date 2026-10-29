@@ -24,7 +24,9 @@ output = pathlib.Path('app-output')
 output.mkdir()
 charter = subprocess.check_output(['git', '-C', str(root), 'rev-parse', 'HEAD'], text=True,
                                   env=source_git_environment()).strip()
-wheels = inputs / 'wheels'
+# The backend descriptor owns app-build-inputs/wheels. The public SDK artifact
+# has its own exact inventory and must remain outside that staged backend tree.
+wheels = pathlib.Path('sdk-wheels')
 receipt = wheels / 'wheel-inputs.json'
 integration = inputs / 'integration.zip'
 sidecar = inputs / 'integration-producer.json'
