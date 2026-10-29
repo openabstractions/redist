@@ -710,7 +710,7 @@ def public_asset_names(directory, assets, version):
 
 
 def setup_catalog_files(archive, receipt, version, run):
-    """Bind the separate release package and close the private distribution."""
+    """Bind the Catalog MSI, external chain MSIs and private inventory."""
     def metadata(name, limit):
         if name not in archive.namelist() or archive.getinfo(name).file_size > limit:
             raise ValueError('Setup Catalog metadata is missing or too large: ' + name)
@@ -770,7 +770,11 @@ def setup_catalog_files(archive, receipt, version, run):
                     raise ValueError('duplicate Setup Catalog distribution member')
                 files[member_name] = pin(member)
     files.update({signer.APP_DISTRIBUTION_CHAIN: None, 'app-chain-context.json': None})
-    return name, files
+    # Physical application MSIs are uncompressed Burn payloads carried beside Setup.
+    external_msis = {Path(package['file']).name
+                     for _, kind, package, app in owner.chain_packages(physical)
+                     if app is not None and kind == 'MsiPackage'}
+    return name, files, external_msis
 
 
 def unpack_setup(blob, digest, destination, version, packages, *, receipt_sink=None, run=None):
@@ -816,7 +820,7 @@ def unpack_setup(blob, digest, destination, version, packages, *, receipt_sink=N
             raise ValueError('Setup receipt has no package chain')
         split = 'catalog_opencode' in receipt
         if split:
-            catalog, internal = setup_catalog_files(archive, receipt, version, run)
+            catalog, internal, external_msis = setup_catalog_files(archive, receipt, version, run)
             cores = [row for row in chain if (row.get('id'), row.get('name')) == SETUP_CORE]
             if len(cores) != 1:
                 raise ValueError('the Setup receipt lacks exactly one core MSI')
@@ -836,13 +840,18 @@ def unpack_setup(blob, digest, destination, version, packages, *, receipt_sink=N
             if catalog in packages:
                 raise ValueError('Setup Catalog MSI collides with a verified release package')
             published[catalog] = internal.pop(catalog)
-        for entry in ([] if split else chain[1:]):
+        for entry in chain[1:]:
             name = entry.get('name')
+            if split and name not in external_msis:
+                continue
             if (not isinstance(name, str)
-                    or not re.fullmatch(r'[a-z0-9][a-z0-9_-]{0,63}-' + re.escape(version[1:]) + r'\.msi', name)
+                    or (not split and not re.fullmatch(
+                        r'[a-z0-9][a-z0-9_-]{0,63}-' + re.escape(version[1:]) + r'\.msi', name))
                     or name in published or name in packages):
                 raise ValueError('Setup receipt names an unexpected application package')
             published[name] = (entry.get('sha256'), entry.get('bytes'))
+            if split and internal.pop(name, None) != published[name]:
+                raise ValueError('Setup external MSI differs from its admitted distribution pin')
         if set(names) != set(published) | set(internal) | {SETUP_RECEIPT, SETUP_SUMS}:
             raise ValueError('Setup artifact file set differs from its receipt')
         if directories - {parent.as_posix() for name in internal for parent in PurePosixPath(name).parents

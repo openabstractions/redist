@@ -1,55 +1,43 @@
-Open Abstractions 0.4.0 includes the shared runtime and tools built from pinned
-module versions. The appended build record identifies delivered assets, signing
-status, package verification and tested architectures.
+OpenAbstractions 0.8.0 includes the shared runtime, the Panel and tools built
+from pinned module versions. The appended build record identifies delivered
+assets, signing status, package verification and tested architectures.
 
-## Release 0.4.0
+## Release 0.8.0
 
-- **Keep a preferred model choice across providers.** A named selection policy
-  can try ordered model candidates, with fallback only when the preferred route
-  is known unavailable before dispatch. The OA operation record identifies the
-  host and model that answered; credential, rights and uncertain-execution
-  failures remain explicit.
-- **Find newly available local models without restarting OpenCode.** The optional
-  OpenCode adopter refreshes the running model list while preserving configured
-  defaults and custom models. Model context is an observed estimate; the selected
-  host decides whether a request fits.
-- **Prepare a ComfyUI workflow with verified assets and approval.** The optional
-  adopter checks required files and asks before replacing the current canvas.
-  The demonstration loaded an editable FLUX.2 Klein workflow and produced a
-  512 × 512 image.
-- **Share GPU resources between cooperating applications.** ComfyUI can wait
-  while Lemonade is busy, cancel its own waiting request, then continue after an
-  idle Lemonade model yields. The tested Windows run recorded memory release
-  and a ComfyUI render.
-- **Provisional provider-held wake.** GPU providers hold wake for the work they
-  serve. The current default permits a declared card provider to hold `awake`;
-  the platform display request lives only beside that provider's card lease.
-  Requester-owned wake and its per-application policy remain pending research.
-- **Keep provider keys out of OpenCode.** A guided Panel flow stores a named
-  DeepSeek credential and requests scoped access for an identified application.
-  OpenCode uses the credential name while the key remains in Open Abstractions.
-- **Approve operation-log access before sharing details.** The optional OpenCode
-  source-watch tool asks before reading a source and separately before sending
-  event contents to the current model.
+Changes since 0.4.0.
 
-**Demonstration scope.** The OpenCode API demonstration routed two requests
-through one saved Lemonade-to-Ollama preference; a separate rendered picker check
-selected a synthetic local model. The ComfyUI render began with all three assets
-already present, so empty-store setup and download-step savings were not measured.
-The guided credential flow used a synthetic key, and source-watch used synthetic
-records; no real DeepSeek request, native host logs or hosted log-sharing route
-was tested. The GPU handover was demonstrated on one Windows machine. Its original
-run had a final measurement assertion failure after rendering; a focused fix was
-reviewed, but the full run was not repeated. First-use effort, support on every
-platform and every provider combination require separate qualification. The
-OpenCode and ComfyUI integrations are optional adopter packages with their own
-version and setup requirements. The OA package carries the OpenCode patches but
-does not apply them to an installed OpenCode binary; running inventory refresh
-and detailed source-watch approval dialogs require a patched OpenCode 1.18.31
-build.
+- **Add apps from the Panel.** On Windows, the Panel's Apps Catalog installs or
+  repairs OpenCode and installs the OpenAbstractions integration for ComfyUI.
+  ComfyUI itself comes from its official source.
+- **Message between agents.** Claude and OpenCode chats can exchange messages and
+  reconnect to their existing inboxes after OpenAbstractions restarts.
+- **Let agents use applications.** Through application MCP, agents can discover
+  which actions an app supports, see their inputs and open supported actions.
+- **See what each model supports.** The model list shows model capabilities. Chat
+  can request a reasoning level or budget and accept an image when the selected
+  model supports it.
+- **Work on a ComfyUI canvas with an agent.** Open a workflow through
+  OpenAbstractions. When an agent asks to edit, choose **Allow once**, **Always
+  allow** or **Not now**. A saved approval covers canvas edits by the enrolled
+  agent in the approved ComfyUI app.
+- **Manage storage.** The Panel's Device page shows storage by type, available
+  free space, the largest reported items and verified duplicates, and lets you
+  browse committed items. **Remove** offers removal for eligible items. In
+  Activity, **Restore** retrieves eligible removed items from the download archive.
+- **Upgrade in one pass.** During an interactive Windows upgrade, Setup's
+  **Finish** step can update approved OpenCode and ComfyUI integrations when a
+  verified newer package is available. If OpenCode is running, close it and choose
+  **Retry**, or choose **Later** to finish from OpenAbstractions. Setup can complete
+  an upgrade without restarting Windows when supported apps are using
+  OpenAbstractions.
 
-The redistributable carries native programs only. Python wheels, Rust crates and
-npm packages have separate source versions and publication status.
+**Known limits.** Agent messaging took about 1-2 seconds under load in observed
+runs. **Remove** cannot delete files that require Administrator access. An OpenCode
+update took about 65 seconds in an observed run.
+
+The redistributable carries native programs and the Windows app packages named in
+the appended record. Python wheels, Rust crates and npm packages have separate
+source versions and publication status.
 
 ## Updating application code
 
@@ -84,8 +72,17 @@ features delivered in each asset.
 
 ## Installing
 
-**Windows.** Choose the x64 or arm64 MSI for your machine and compare it with
-`SHA256SUMS`. The default *Just me* scope installs under
+**Windows.** Compare `OpenAbstractions-Setup-0.8.0.exe` with `SHA256SUMS`, then
+run it. Setup installs the runtime and the Panel. The Panel's Apps Catalog adds
+and maintains application integrations. The optional Windows packages are
+`opencode-0.8.0.msi`, `lemonade-2026.43.3-oa-0.8.0-windows-x64.msi` and
+`comfyui-0.8.0.msi`. Keep the Lemonade and ComfyUI MSI files beside Setup when
+selecting their optional packages.
+For ComfyUI, install ComfyUI from its official source first, and the catalog adds
+the OpenAbstractions integration to that installation.
+
+The direct core installers are `abstraction-0.8.0-x64.msi` and
+`abstraction-0.8.0-arm64.msi`. For an MSI, the default *Just me* scope installs under
 `%LOCALAPPDATA%\Programs\OpenAbstractions` without administrator rights.
 *Everyone* installs under `%ProgramFiles%\OpenAbstractions` and requires
 elevation. Programs live in `tools\`; runnable examples live in `examples\`.
@@ -119,8 +116,8 @@ In the folder containing the assets and checksum file:
 
 In PowerShell, a single-file comparison can use:
 
-    (Get-FileHash abstraction-x64.msi -Algorithm SHA256).Hash.ToLower()
-    Select-String abstraction-x64.msi SHA256SUMS
+    (Get-FileHash abstraction-0.8.0-x64.msi -Algorithm SHA256).Hash.ToLower()
+    Select-String abstraction-0.8.0-x64.msi SHA256SUMS
 
 Checksums establish agreement with the published checksum file, not independent
 proof of origin. Signing, notarisation, attached assets and platform verification
