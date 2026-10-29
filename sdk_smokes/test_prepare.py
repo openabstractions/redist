@@ -8,6 +8,7 @@ import os
 import shutil
 import subprocess
 import sys
+import zipfile
 from unittest.mock import patch
 
 import prepare
@@ -43,6 +44,69 @@ def fixture():
 
 
 class SDKPrepare(unittest.TestCase):
+    def test_rights_sources_use_the_selected_graph_and_preserve_older_graphs(self):
+        evidence = fixture()
+        self.assertNotIn('abstraction-rights', prepare.pins(self.check(evidence)))
+        rights = row(prepare.MODULES['abstraction-rights'], 'v0.7.3', 'c' * 40)
+        evidence['modules'][-1]['selected'].append(rights)
+        self.assertEqual(prepare.pins(self.check(evidence))['abstraction-rights'], rights)
+
+    @unittest.skipUnless(os.name == 'nt', 'Windows SDK wheel preparation')
+    def test_python_release_wheels_resolve_rights_offline_and_keep_legacy_sources(self):
+        with tempfile.TemporaryDirectory(prefix='oa-sdk-python-') as temporary:
+            root = Path(temporary); wheels = root/'wheels'; wheels.mkdir()
+            def wheel(name, module, code, dependencies=(), tag='any'):
+                filename = wheels/(name+'-0.8.0-py3-none-'+tag+'.whl')
+                info = name+'-0.8.0.dist-info/'
+                with zipfile.ZipFile(filename, 'w') as archive:
+                    archive.writestr(module, code)
+                    archive.writestr(info+'METADATA', 'Metadata-Version: 2.1\nName: '+name.replace('_','-')+'\nVersion: 0.8.0\n'
+                        + ''.join('Requires-Dist: '+item+'==0.8.0\n' for item in dependencies))
+                    archive.writestr(info+'WHEEL', 'Wheel-Version: 1.0\nGenerator: inert-sdk-fixture\nRoot-Is-Purelib: true\nTag: py3-none-'+tag+'\n')
+                    archive.writestr(info+'RECORD', '')
+                return filename
+            wheel('abstraction_ipc', 'abstraction/__init__.py', '', tag='win_amd64')
+            rights = wheel('abstraction_rights_protocol', 'abstraction/rights/api/__init__.py', 'value="admitted-rights"\n')
+            facade = wheel('abstraction_facade_client', 'abstraction/facade/__init__.py',
+                'from abstraction.rights.api import value\n', ['abstraction-rights-protocol'])
+            config = wheel('abstraction_config_protocol', 'abstraction/config/__init__.py',
+                'from abstraction.rights.api import value\n', ['abstraction-rights-protocol'])
+            sources = root/'sources'
+            for name in ('facade','config'):
+                package=sources/('abstraction-'+name)/'py/abstraction'/name
+                package.mkdir(parents=True);(package/'__init__.py').write_text('legacy=True\n')
+            env=dict(os.environ,PIP_CONFIG_FILE=os.devnull,PIP_CACHE_DIR=str(root/'cache'),PYTHONNOUSERSITE='1')
+            with patch.dict(os.environ,env,clear=True):
+                out=root/'current';out.mkdir();prepare.prepare_python(out,sources,wheels)
+                subprocess.run([sys.executable,'-I','-c', 'import sys;sys.path.insert(0,'+repr(str(out/'python'))+');'
+                    'import abstraction.config,abstraction.facade;assert abstraction.config.value=="admitted-rights"'],check=True,timeout=30)
+                rights.unlink();missing=root/'missing';missing.mkdir()
+                with self.assertRaises(subprocess.CalledProcessError):prepare.prepare_python(missing,sources,wheels)
+                facade.unlink();config.unlink();legacy=root/'legacy';legacy.mkdir()
+                prepare.prepare_python(legacy,sources,wheels)
+                self.assertEqual((legacy/'python/abstraction/config/__init__.py').read_text(),'legacy=True\n')
+
+    @unittest.skipUnless(os.name == 'nt' and os.environ.get('OA_SDK_PREPARE_SOURCE_ROOT')
+                         and os.environ.get('OA_SDK_PREPARE_CPP_PREFIX'), 'explicit owned current C++ source/prefix fixture')
+    def test_actual_config_cmake_requires_installed_rights(self):
+        sources=Path(os.environ['OA_SDK_PREPARE_SOURCE_ROOT'])
+        prefix=Path(os.environ['OA_SDK_PREPARE_CPP_PREFIX'])
+        cmake,generator=prepare.msvc_cmake()
+        with tempfile.TemporaryDirectory(prefix='oa-sdk-rights-cmake-') as temporary:
+            root=Path(temporary);source=root/'config'
+            shutil.copytree(sources/'abstraction-config/cpp',source)
+            without=root/'without-rights'
+            shutil.copytree(prefix,without,ignore=lambda directory,names:
+                ['abstraction_rights'] if Path(directory).name=='cmake' and 'abstraction_rights' in names else [])
+            def configure(build,selected):
+                return subprocess.run([str(cmake),'-S',str(source),'-B',str(build),'-G',generator,'-A','x64',
+                    '-DCMAKE_PREFIX_PATH='+str(selected)],capture_output=True,text=True,timeout=60)
+            refused=configure(root/'missing',without)
+            self.assertNotEqual(refused.returncode,0)
+            self.assertIn('Install abstraction_rights or provide sibling abstraction-rights',refused.stdout+refused.stderr)
+            accepted=configure(root/'complete',prefix)
+            self.assertEqual(accepted.returncode,0,accepted.stdout+accepted.stderr)
+
     def test_private_frontend_corpus_skips_in_published_layout_before_process(self):
         with tempfile.TemporaryDirectory(prefix='oa-sdk-public-') as temporary:
             root=Path(temporary)
@@ -115,6 +179,49 @@ class SDKPrepare(unittest.TestCase):
                 cwd=stage, capture_output=True, text=True, timeout=30,
                 env={key:value for key,value in os.environ.items() if key not in ('NODE_OPTIONS','ABSTRACTION_RUNTIME_ENDPOINT','ABSTRACTION_IPC_NODE')})
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    @unittest.skipUnless(os.name == "nt", "Windows installed-SDK preparation uses native node.exe")
+    def test_javascript_installs_release_config_offline_and_keeps_source_fallback(self):
+        import io
+        import tarfile
+        node = shutil.which('node.exe')
+        self.assertTrue(node, 'native setup Node is required')
+        for candidate in (True, False):
+            with self.subTest(candidate_config=candidate), tempfile.TemporaryDirectory(prefix='oa-sdk-config-') as tmp:
+                root = Path(tmp); npm = root/'npm'; npm.mkdir()
+                out = root/'out'; out.mkdir(); temporary = root/'temporary'; temporary.mkdir()
+                names = ('ipc', 'ipc-win32-x64', 'facade', 'inference', 'router', 'rights')
+                if candidate:names += ('config',)
+                for name in names:
+                    metadata = dict(name='@openabstractions/'+name, version='0.8.0')
+                    if name in ('config','facade'):metadata['dependencies']={'@openabstractions/rights':'0.8.0'}
+                    data = json.dumps(metadata).encode()
+                    with tarfile.open(npm/(name+'.tgz'), 'w:gz') as archive:
+                        entry=tarfile.TarInfo('package/package.json');entry.size=len(data)
+                        archive.addfile(entry,io.BytesIO(data))
+                source = root/'sources/abstraction-config/javascript';source.mkdir(parents=True)
+                original=json.dumps(dict(name='@openabstractions/config',version='0.0.0',
+                    dependencies={'@openabstractions/rights':'0.0.0' if candidate else '0.8.0'}))
+                (source/'package.json').write_text(original)
+                calls=[]; actual=prepare.checked
+                def checked(*args, **kwargs):
+                    calls.append(tuple(map(str,args)))
+                    return actual(*args, **kwargs)
+                # Only unrelated probe copying is omitted; npm pack/install use
+                # the production commands, fresh cache and real native Node.
+                with patch.object(prepare,'checked',side_effect=checked):
+                    with patch.object(prepare,'copy_probe',side_effect=lambda name,target:(target/name).write_text('')):
+                        prepare.prepare_javascript(out,root/'sources',npm,temporary)
+                installed=json.loads((out/'node_modules/@openabstractions/config/package.json').read_text())
+                self.assertEqual(installed['version'],'0.8.0' if candidate else '0.0.0')
+                self.assertEqual((source/'package.json').read_text(),original)
+                if candidate:
+                    (npm/'rights.tgz').unlink()
+                    with self.assertRaisesRegex(RuntimeError,'candidate npm artifact missing: @openabstractions/rights'):
+                        prepare.prepare_javascript(out,root/'sources',npm,temporary)
+                self.assertEqual(any('pack' in call for call in calls),not candidate)
+                self.assertTrue(all('--offline' in call and '--ignore-scripts' in call
+                    for call in calls if 'install' in call or 'pack' in call))
 
     def test_cpp_install_builds_current_and_older_package_closures(self):
         for available in ({'abstraction_ipc'}, {'abstraction_ipc', 'abstraction_fileid'}):
@@ -206,7 +313,7 @@ class SDKPrepare(unittest.TestCase):
         rows = self.check(fixture())
         selected = prepare.pins(rows)
         graph = "\n".join(f"{path}@{rows[path]['version']}"
-                          for path in set(prepare.MODULES.values()) | {CORE})
+                          for path in (set(prepare.MODULES.values()) | {CORE}) & rows.keys())
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             with patch.object(prepare, "checked") as checked, \

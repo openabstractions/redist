@@ -27,6 +27,7 @@ MODULES = {
     "abstraction-config": "github.com/openabstractions/abstraction-config/go",
     "abstraction-inference": "github.com/openabstractions/abstraction-inference/go",
     "abstraction-router": "github.com/openabstractions/abstraction-router/go",
+    "abstraction-rights": "github.com/openabstractions/abstraction-rights/go",
 }
 SERVICE_MODULE = "github.com/openabstractions/abstractions/serve"
 SERVICE_PROGRAMS = {"openabstractions.exe", "openabstractionsw.exe"}
@@ -127,10 +128,11 @@ def provenance_rows(record: Path, tools: Path, *, expected_producer=None) -> dic
     if (not service or service.get("version") != version
             or service.get("expected_commit") != graph["input"].get("expected_commit")):
         raise RuntimeError("installed service graph contradicts its input pin")
-    required = set(MODULES.values()) | {GO_CORE}
+    rights = MODULES['abstraction-rights']
+    required = (set(MODULES.values()) - {rights}) | {GO_CORE}
     if not required.issubset(rows):
         raise RuntimeError("candidate service graph lacks identity, facade, config or facade core SDK pin")
-    for path in required:
+    for path in required | ({rights} if rights in rows else set()):
         row = rows[path]
         if (not row.get("expected_commit") or not row.get("tag")
                 or row.get("origin_hash") != row["expected_commit"]
@@ -140,7 +142,10 @@ def provenance_rows(record: Path, tools: Path, *, expected_producer=None) -> dic
 
 
 def pins(rows: dict[str, dict[str, str]]) -> dict[str, dict[str, str]]:
-    return {name: rows[module] for name, module in MODULES.items()}
+    # Older service graphs predate config's Rights dependency. Current prepared
+    # graphs require the complete roster in prepared_provenance_rows above.
+    return {name: rows[module] for name, module in MODULES.items()
+            if module in rows or name != "abstraction-rights"}
 
 
 def checkout_sources(root: Path, selected: dict[str, dict[str, str]]) -> None:
@@ -166,14 +171,23 @@ def prepare_python(out: Path, sources: Path, wheel_dir: Path) -> None:
     if len(wheel) != 1:
         raise RuntimeError("one candidate Windows x64 abstraction-ipc wheel required")
     target = out / "python"
-    checked("python", "-m", "pip", "install", "--disable-pip-version-check", "--no-deps",
-            "--no-index", "--target", target, wheel[0])
-    for name in ("abstraction-facade", "abstraction-config"):
-        package = sources / name / "py" / "abstraction"
-        if not package.is_dir():
-            raise RuntimeError("pinned Python source missing: " + str(package))
-        shutil.copytree(package, target / "abstraction", dirs_exist_ok=True,
-                        ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
+    released = [list(wheel_dir.glob(pattern)) for pattern in
+                ("abstraction_facade_client-*.whl", "abstraction_config_protocol-*.whl")]
+    if any(released):
+        if any(len(matches) != 1 for matches in released):
+            raise RuntimeError("one candidate facade and config Python wheel required")
+        checked("python", "-m", "pip", "install", "--disable-pip-version-check",
+                "--no-index", "--find-links", wheel_dir, "--target", target,
+                wheel[0], *(matches[0] for matches in released))
+    else:
+        checked("python", "-m", "pip", "install", "--disable-pip-version-check", "--no-deps",
+                "--no-index", "--target", target, wheel[0])
+        for name in ("abstraction-facade", "abstraction-config"):
+            package = sources / name / "py" / "abstraction"
+            if not package.is_dir():
+                raise RuntimeError("pinned Python source missing: " + str(package))
+            shutil.copytree(package, target / "abstraction", dirs_exist_ok=True,
+                            ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
     copy_probe("python_probe.py", out)
     checked("python", "-m", "py_compile", out / "python_probe.py")
 
@@ -236,9 +250,9 @@ def prepare_javascript(out: Path, sources: Path, npm_dir: Path, temporary: Path,
             raise RuntimeError("duplicate candidate npm package: " + metadata["name"])
         by_name[metadata["name"]] = package
         metadata_by_name[metadata['name']] = metadata
-    chosen = javascript_archive_closure(by_name, metadata_by_name, names)
-    packed = temporary / "npm-pack"
-    packed.mkdir()
+    candidate_config = "@openabstractions/config" in by_name
+    chosen = javascript_archive_closure(by_name, metadata_by_name,
+        (*names, "@openabstractions/config") if candidate_config else names)
     npm_env = dict(node_environment(), NPM_CONFIG_CACHE=str(temporary / "npm-cache"))
     setup_node = shutil.which("node.exe")
     if not setup_node:
@@ -247,13 +261,19 @@ def prepare_javascript(out: Path, sources: Path, npm_dir: Path, temporary: Path,
     if not npm_cli.is_file():
         raise RuntimeError("setup-node did not provide its matching npm CLI")
     node = j1_node or setup_node
-    checked(node, npm_cli, "pack", "--offline", "--ignore-scripts", "--pack-destination", packed,
-            sources / "abstraction-config" / "javascript", env=npm_env)
-    config = list(packed.glob("openabstractions-config-*.tgz"))
-    if len(config) != 1:
-        raise RuntimeError("pinned config source produced no npm package")
+    config = []
+    if not candidate_config:
+        # Older SDK artifacts supplied config only through the pinned source.
+        # Current artifacts carry its release-versioned dependency closure.
+        packed = temporary / "npm-pack"
+        packed.mkdir()
+        checked(node, npm_cli, "pack", "--offline", "--ignore-scripts", "--pack-destination", packed,
+                sources / "abstraction-config" / "javascript", env=npm_env)
+        config = list(packed.glob("openabstractions-config-*.tgz"))
+        if len(config) != 1:
+            raise RuntimeError("pinned config source produced no npm package")
     checked(node, npm_cli, "install", "--offline", "--ignore-scripts", "--no-audit", "--no-fund",
-            "--no-package-lock", "--prefix", out, *chosen, config[0], env=npm_env)
+            "--no-package-lock", "--prefix", out, *chosen, *config, env=npm_env)
     for name in ('javascript_probe.mjs', 'j1_selection_probe.mjs', 'j1_application_probe.mjs',
                  'j1_comfy_frontend.test.mjs'):
         copy_probe(name, out)
@@ -334,9 +354,10 @@ def prepare_cpp(out: Path, sources: Path, temporary: Path) -> Path:
     prefix = temporary / "cpp-prefix"
     for name, extra in (
         ("abstraction-identity", ["-DBUILD_SHARED_LIBS=OFF", "-DABSTRACTION_IPC_BUILD_TESTS=OFF"]),
-        ("abstraction-config", []),
         ("abstraction-facade", ["-DABSTRACTION_FACADE_BUILD_AGGREGATE=OFF",
                                 "-DABSTRACTION_FACADE_BUILD_RESOLUTION=ON"]),
+        *([("abstraction-rights", [])] if (sources / "abstraction-rights" / "cpp").is_dir() else []),
+        ("abstraction-config", []),
     ):
         build = temporary / ("build-" + name)
         checked(cmake, "-S", sources / name / "cpp", "-B", build, "-G", generator, "-A", "x64",
