@@ -3281,9 +3281,12 @@ jobs:
           MACOSX_DEPLOYMENT_TARGET="$(python3 -c 'import sys; sys.path.insert(0,"posix"); import build; print(build.package_minimum_macos())')"
           export MACOSX_DEPLOYMENT_TARGET
           root=$PWD
-          # Reuse the SDK's full repository source assembly and exact pins.
-          # Go module zips contain no sibling C++ identity/header closure.
-          python3 scripts/release_tsv_rows.py pypi.tsv --output native-pypi.rows
+          # Panel's native closure follows its verified Go inputs. Language
+          # SDK sources keep their independent pins in the original pypi.tsv.
+          mkdir panel-native
+          python3 -c 'import json,sys; from pathlib import Path; sys.path.insert(0,"scripts"); from module_provenance import panel_native_source_roster; Path(sys.argv[3]).write_text(panel_native_source_roster(Path(sys.argv[1]).read_text(encoding="utf-8"), json.loads(Path(sys.argv[2]).read_bytes())), encoding="utf-8")' \
+            pypi.tsv module-provenance.json panel-native/pypi.tsv
+          python3 scripts/release_tsv_rows.py panel-native/pypi.tsv --output native-pypi.rows
           while IFS= read -r -d '' package && IFS= read -r -d '' repository &&
                 IFS= read -r -d '' commit && IFS= read -r -d '' directory; do
             case "$repository" in
@@ -3322,7 +3325,7 @@ jobs:
             mkdir -p "$root/thin/$arch"
             python3 "$module_dir/macos/build_launcher.py" --arch "$swiftarch" --minimum 12.0 \
               --output "$root/thin/$arch/Abstraction Panel" --native-source-root "$root/native-sources" \
-              --native-source-roster "$root/pypi.tsv" --native-provenance "$root/module-provenance.json"
+              --native-source-roster "$root/panel-native/pypi.tsv" --native-provenance "$root/module-provenance.json"
             cp "$root/thin/$arch/Abstraction Panel.native-inputs.json" "$root/module-native-inputs-$arch.json"
           done
           lipo -create -output "universal/Abstraction Panel" \
@@ -3399,7 +3402,9 @@ jobs:
             sign=(--sign-app-identity "$APP_SIGNING_IDENTITY" --signing-keychain "$SIGNING_KEYCHAIN")
           fi
           python3 posix/build.py --platform macos --version "$version" \
-            --out dist --bin universal --license LICENSE "${sign[@]}"
+            --out dist --bin universal --license LICENSE "${sign[@]}" \
+            --native-source-root "$PWD/native-sources" \
+            --native-source-roster "$PWD/panel-native/pypi.tsv" --native-provenance "$PWD/module-provenance.json"
           (cd dist && shasum -a 256 ./*.pkg | sed 's#\./##' | tee SHA256SUMS.macos)
 
       # A .pkg takes the Installer certificate, which is a different certificate

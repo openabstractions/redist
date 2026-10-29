@@ -36,6 +36,34 @@ PANEL_INSTALLER_RESOURCE = 'internal/panelres/rsrc_windows_amd64.syso'
 RUNTIME_MODULE = 'github.com/openabstractions/abstractions/serve'
 
 
+def panel_native_source_roster(sdk_roster, provenance):
+    """Select Panel's native readset from its already-verified Go inputs.
+
+    Language SDK producers retain their independent source pins. The unchanged
+    Panel launcher checks these rows against the same selected Go provenance.
+    """
+    required = {'https://github.com/openabstractions/abstraction-' + name
+                for name in ('identity', 'facade', 'download', 'router', 'rights')}
+    if provenance.get('kind') == 'prepared-module-provenance':
+        records = [(row.get('repository'), row.get('commit'))
+                   for row in provenance.get('graph', {}).get('modules', [])]
+    else:
+        records = [(row.get('repository'), row.get('expected_commit'))
+                   for module in provenance.get('modules', []) for row in module.get('selected', [])]
+    selected = {}
+    for repository in required:
+        matches = {commit for repo, commit in records if repo == repository}
+        if len(matches) != 1 or not re.fullmatch('[0-9a-f]{40}', next(iter(matches)) or ''):
+            raise ValueError('Panel native repository lacks one selected Go commit: ' + repository)
+        selected[repository.removeprefix('https://github.com/')] = next(iter(matches))
+    rows = [tuple([package, repository, selected[repository], directory])
+            for package, repository, _, directory in release_rows(sdk_roster, 'pypi.tsv')
+            if repository in selected]
+    if {row[1] for row in rows} != set(selected):
+        raise ValueError('Panel native source roster lacks its complete repository closure')
+    return 'package\trepository\tcommit\tdirectory\n' + ''.join('\t'.join(row) + '\n' for row in rows)
+
+
 def runtime_program(row):
     return _windows_build_owner().shipped_program_role(row[1].rsplit('@', 1)[0], row[2]) == 'runtime'
 
