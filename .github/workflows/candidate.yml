@@ -1171,7 +1171,7 @@ jobs:
           path: signed/
           if-no-files-found: error
   windows-runtime-build:
-    if: ${{ needs.source-guard.result == 'success' && (!inputs.diagnostic_host_sign_only && inputs.producer_mode == 'train' && needs.windows-pe-sign.result == 'success') }}
+    if: ${{ needs.source-guard.result == 'success' && !cancelled() && needs.candidate.result == 'success' && (!inputs.diagnostic_host_sign_only && inputs.producer_mode == 'train' && needs.windows-pe-sign.result == 'success') }}
     needs: [source-guard, candidate, windows-pe-sign]
     runs-on: windows-latest
     env:
@@ -1748,7 +1748,7 @@ jobs:
           if-no-files-found: error
 
   windows-app-helpers-build:
-    if: ${{ needs.source-guard.result == 'success' && (!inputs.core_only && !inputs.diagnostic_host_sign_only && (needs.windows-app-native-sign.result == 'success' && inputs.producer_mode == 'train' && !inputs.signing_probe_only && (inputs.app_producer_only == 'none' || inputs.app_producer_only == '') && needs.candidate.outputs.required-products != '[]')) }}
+    if: ${{ needs.source-guard.result == 'success' && !cancelled() && needs.candidate.result == 'success' && (!inputs.core_only && !inputs.diagnostic_host_sign_only && (needs.windows-app-native-sign.result == 'success' && inputs.producer_mode == 'train' && !inputs.signing_probe_only && (inputs.app_producer_only == 'none' || inputs.app_producer_only == '') && needs.candidate.outputs.required-products != '[]')) }}
     needs: [source-guard, candidate, windows-app-native-sign]
     runs-on: windows-latest
     permissions:
@@ -1981,7 +1981,7 @@ jobs:
           if-no-files-found: error
 
   windows-app-sign:
-    if: ${{ needs.source-guard.result == 'success' && (!inputs.core_only && !inputs.diagnostic_host_sign_only && (inputs.producer_mode != 'train-graph' && (!inputs.signing_probe_only && (inputs.app_producer_only == 'none' || inputs.app_producer_only == '') && github.repository == 'openabstractions/redist' && github.event_name == 'workflow_dispatch' && (inputs.producer_mode == 'train' && github.ref == 'refs/heads/release/0.8.0' && github.ref == format('refs/heads/release/{0}', needs.candidate.outputs.version)) && github.actor == 'ReinisLusis' && github.triggering_actor == 'ReinisLusis'))) }}
+    if: ${{ needs.source-guard.result == 'success' && !cancelled() && needs.candidate.result == 'success' && needs.windows-sdk-sign.result == 'success' && needs.windows-app-msi.result == 'success' && (!inputs.core_only && !inputs.diagnostic_host_sign_only && (inputs.producer_mode != 'train-graph' && (!inputs.signing_probe_only && (inputs.app_producer_only == 'none' || inputs.app_producer_only == '') && github.repository == 'openabstractions/redist' && github.event_name == 'workflow_dispatch' && (inputs.producer_mode == 'train' && github.ref == 'refs/heads/release/0.8.0' && github.ref == format('refs/heads/release/{0}', needs.candidate.outputs.version)) && github.actor == 'ReinisLusis' && github.triggering_actor == 'ReinisLusis'))) }}
     needs: [source-guard, candidate, windows-sdk-sign, windows-app-msi]
     runs-on: windows-latest
     timeout-minutes: 20
@@ -2243,7 +2243,7 @@ jobs:
           path: packages/
           if-no-files-found: error
   verify:
-    if: ${{ needs.source-guard.result == 'success' && (inputs.app_delivery_only != 'comfyui' && (!inputs.diagnostic_host_sign_only && (inputs.producer_mode != 'train-graph' && (!inputs.signing_probe_only && (inputs.app_producer_only == 'none' || inputs.app_producer_only == ''))))) }}
+    if: ${{ needs.source-guard.result == 'success' && !cancelled() && needs.candidate.result == 'success' && needs.windows-msi-sign.result == 'success' && needs.windows-pe-sign.result == 'success' && needs.javascript.result == 'success' && needs.python.result == 'success' && (inputs.app_delivery_only != 'comfyui' && (!inputs.diagnostic_host_sign_only && (inputs.producer_mode != 'train-graph' && (!inputs.signing_probe_only && (inputs.app_producer_only == 'none' || inputs.app_producer_only == ''))))) }}
     needs: [source-guard, candidate, windows-msi-sign, windows-pe-sign, javascript, python]
     runs-on: windows-latest
     permissions:
@@ -4521,7 +4521,7 @@ jobs:
           if-no-files-found: error
 
   draft:
-    if: ${{ needs.source-guard.result == 'success' && ((inputs.core_only && !cancelled() && inputs.producer_mode == 'train' && !inputs.signing_probe_only && !inputs.diagnostic_host_sign_only && inputs.app_producer_only == 'none' && inputs.app_delivery_only == 'none' && needs.candidate.result == 'success' && needs.windows-msi-sign.result == 'success' && needs.verify.result == 'success' && needs.linux.result == 'success' && needs.linux-verify.result == 'success' && needs.macos.result == 'success') || (!inputs.core_only && (inputs.app_delivery_only != 'comfyui' && (!inputs.diagnostic_host_sign_only && (!cancelled() && needs.candidate.result == 'success' && needs.windows-msi-sign.result == 'success' && needs.verify.result == 'success' && needs.linux.result == 'success' && needs.linux-verify.result == 'success' && needs.macos.result == 'success' && (needs.app_comfyui.result == 'success' || (needs.candidate.outputs.native-comfyui != 'true' && needs.app_comfyui.result == 'skipped')) && ((inputs.producer_mode == 'train' && needs.candidate.outputs.native-comfyui == 'true' && needs.windows-app-delivery.result == 'success') || ((inputs.producer_mode != 'train' || needs.candidate.outputs.native-comfyui != 'true') && needs.windows-app-delivery.result == 'skipped')) && inputs.producer_mode != 'train-graph' && (!inputs.signing_probe_only && (inputs.app_producer_only == 'none' || inputs.app_producer_only == ''))))))) }}
+    if: ${{ needs.source-guard.result == 'success' && needs.installer-prior-input.result == 'success' && ((inputs.core_only && !cancelled() && inputs.producer_mode == 'train' && !inputs.signing_probe_only && !inputs.diagnostic_host_sign_only && inputs.app_producer_only == 'none' && inputs.app_delivery_only == 'none' && needs.candidate.result == 'success' && needs.windows-msi-sign.result == 'success' && needs.verify.result == 'success' && needs.linux.result == 'success' && needs.linux-verify.result == 'success' && needs.macos.result == 'success') || (!inputs.core_only && (inputs.app_delivery_only != 'comfyui' && (!inputs.diagnostic_host_sign_only && (!cancelled() && needs.candidate.result == 'success' && needs.windows-msi-sign.result == 'success' && needs.verify.result == 'success' && needs.linux.result == 'success' && needs.linux-verify.result == 'success' && needs.macos.result == 'success' && (needs.app_comfyui.result == 'success' || (needs.candidate.outputs.native-comfyui != 'true' && needs.app_comfyui.result == 'skipped')) && ((inputs.producer_mode == 'train' && needs.candidate.outputs.native-comfyui == 'true' && needs.windows-app-delivery.result == 'success') || ((inputs.producer_mode != 'train' || needs.candidate.outputs.native-comfyui != 'true') && needs.windows-app-delivery.result == 'skipped')) && inputs.producer_mode != 'train-graph' && (!inputs.signing_probe_only && (inputs.app_producer_only == 'none' || inputs.app_producer_only == ''))))))) }}
     needs: [source-guard, candidate, windows-msi-sign, verify, linux, linux-verify, macos, app_comfyui, windows-app-delivery, installer-prior-input]
     runs-on: ubuntu-latest
     permissions:
@@ -4871,7 +4871,7 @@ jobs:
           path: setup-dist/
           if-no-files-found: error
   windows-bundle-sign:
-    if: ${{ needs.source-guard.result == 'success' && (inputs.app_delivery_only != 'comfyui' && (!inputs.diagnostic_host_sign_only && (inputs.producer_mode != 'train-graph' && (!inputs.signing_probe_only && (inputs.app_producer_only == 'none' || inputs.app_producer_only == '') && github.repository == 'openabstractions/redist' && github.event_name == 'workflow_dispatch' && (inputs.producer_mode == 'train' && github.ref == 'refs/heads/release/0.8.0' && github.ref == format('refs/heads/release/{0}', needs.candidate.outputs.version)) && github.actor == 'ReinisLusis' && github.triggering_actor == 'ReinisLusis')))) }}
+    if: ${{ needs.source-guard.result == 'success' && !cancelled() && needs.candidate.result == 'success' && needs.bundle.result == 'success' && needs.windows-msi-sign.result == 'success' && (inputs.app_delivery_only != 'comfyui' && (!inputs.diagnostic_host_sign_only && (inputs.producer_mode != 'train-graph' && (!inputs.signing_probe_only && (inputs.app_producer_only == 'none' || inputs.app_producer_only == '') && github.repository == 'openabstractions/redist' && github.event_name == 'workflow_dispatch' && (inputs.producer_mode == 'train' && github.ref == 'refs/heads/release/0.8.0' && github.ref == format('refs/heads/release/{0}', needs.candidate.outputs.version)) && github.actor == 'ReinisLusis' && github.triggering_actor == 'ReinisLusis')))) }}
     needs: [source-guard, candidate, bundle, windows-msi-sign]
     runs-on: windows-latest
     timeout-minutes: 20
@@ -5054,7 +5054,7 @@ jobs:
           if-no-files-found: error
 
   windows-bundle-verify:
-    if: ${{ needs.source-guard.result == 'success' && (inputs.app_delivery_only != 'comfyui' && (!inputs.diagnostic_host_sign_only && (inputs.producer_mode != 'train-graph' && (!inputs.signing_probe_only && (inputs.app_producer_only == 'none' || inputs.app_producer_only == ''))))) }}
+    if: ${{ needs.source-guard.result == 'success' && !cancelled() && needs.candidate.result == 'success' && needs.windows-bundle-sign.result == 'success' && (inputs.app_delivery_only != 'comfyui' && (!inputs.diagnostic_host_sign_only && (inputs.producer_mode != 'train-graph' && (!inputs.signing_probe_only && (inputs.app_producer_only == 'none' || inputs.app_producer_only == ''))))) }}
     needs: [source-guard, candidate, windows-bundle-sign]
     runs-on: windows-latest
     permissions:
