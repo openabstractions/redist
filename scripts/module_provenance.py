@@ -561,6 +561,10 @@ def _observe_windows_builds(tools: Path, output: Path, provenance: Path,
                     row = expected.get(path)
                     if not row or (actual_version, actual_sum) != (row['version'], row['sum']):
                         raise ValueError('linked module differs from prepared closure')
+                    if projected and fields[0] == 'mod':
+                        consumed.append({'module': path, 'version': actual_version, 'sum': actual_sum,
+                                         'gomodsum': row['gomodsum'], 'panel_source': projection})
+                        continue
                     prefix = escape_module(path) + '/@v/' + actual_version
                     cached = []
                     for extension in ('.zip', '.mod', '.info'):
@@ -597,7 +601,8 @@ def _observe_windows_builds(tools: Path, output: Path, provenance: Path,
     for program in programs:
         retained.append(program['artifact'])
         for module in program['consumed']:
-            retained.extend([*module['cache_files'], module['ziphash']])
+            if 'panel_source' not in module:
+                retained.extend([*module['cache_files'], module['ziphash']])
     if any(pin != observed_file(Path(pin['path'])) for pin in retained):
         raise ValueError('consumed input or output changed during observed builds')
     result = dict(evidence, observed_windows_builds={'schema': 1, 'status': 'complete', 'producer': producer,
@@ -788,6 +793,13 @@ def admit_observed_windows_builds(original_bytes: bytes, observed_bytes: bytes, 
                 len(program['consumed']) != len(embedded)): fail('linked module inventory')
         for consumed, (path, actual_version, actual_sum) in zip(program['consumed'], embedded):
             selected = modules.get(path)
+            if 'panel_source' in consumed:
+                if (not projected or path != module or set(consumed) != {'module', 'version', 'sum', 'gomodsum', 'panel_source'} or
+                        selected is None or
+                        [consumed[k] for k in ('module', 'version', 'sum', 'gomodsum')] !=
+                        [module, version, selected['sum'], selected['gomodsum']] or
+                        consumed['panel_source'] != expected_panel_source): fail('projected root source')
+                continue
             if (selected is None or (actual_version, actual_sum) != (selected['version'], selected['sum']) or
                     set(consumed) != {'module', 'version', 'sum', 'gomodsum', 'cache_files', 'ziphash'} or
                     [consumed[k] for k in ('module', 'version', 'sum', 'gomodsum')] !=
