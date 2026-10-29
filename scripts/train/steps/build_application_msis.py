@@ -399,7 +399,7 @@ def application_inputs(required, version):
             os.environ['CANDIDATE_SHA'],int(os.environ['GITHUB_RUN_ID']),attempt,backend)
         assets=load_owner('scripts/app_assets.py','application_backend_receiving')
         archive_owner=load_owner('sources/abstractions/scripts/package_comfyui_app.py','application_backend_archive_owner')
-        archive_tool=helper.comfy_archive_tool(pathlib.Path('app-build-inputs'),archive_owner)
+        archive_tool=helper.comfy_archive_tool(pathlib.Path('app-build-inputs'),archive_owner,acquire=True)
         metadata={}
         received_backend,resource=assets.receive_backend_resources(backend,intake,expected_artifact=expected,
             expected_input=policy['build_inputs']['backend'],candidate_source=os.environ['CANDIDATE_SHA'],
