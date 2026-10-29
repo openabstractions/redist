@@ -1939,6 +1939,9 @@ jobs:
       - uses: actions/setup-python@e797f83bcb11b83ae66e0230d6156d7c80228e7c
         with:
           python-version: '3.12'
+      - uses: actions/setup-node@2028fbc5c25fe9cf00d9f06a71cc4710d4507903 # v6.0.0
+        with:
+          node-version: '22.23.3'
       - name: pinned WiX packages
         run: python3 windows/wix_packages.py --dest wix-packages --env "$GITHUB_ENV"
       - name: wix
