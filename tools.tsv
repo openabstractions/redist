@@ -20,7 +20,7 @@
 >		not packages: asking it for .../go/cmd/dl answers 404 whatever the
 >		version, and a check that cannot tell that from a deleted tag is
 >		not a check
-> feature	service | tools | localstores | modelhost | lemonadeimage | mcpgateway — the
+> feature	service | tools | localstores | modelhost | lemonadeimage | pytorchimage | mcpgateway — the
 >		installer feature that installs it; optional feature defaults stay
 >		in the Windows and POSIX package definitions
 > subsystem	console | windows. "windows" appends -H=windowsgui to the link,
@@ -49,3 +49,4 @@ openabstractions-mcp.exe	github.com/openabstractions/abstractions/mcp-gateway@v0
 openabstractions.exe	github.com/openabstractions/abstractions/serve@v0.8.0	.	service	console
 openabstractionsw.exe	github.com/openabstractions/abstractions/serve@v0.8.0	.	service	windows
 openabstractions-system.exe	github.com/openabstractions/abstractions/serve@v0.8.0	system	service	windows
+pytorchd.exe	github.com/openabstractions/abstraction-provider-pytorch/go@v0.8.0	cmd/pytorchd	pytorchimage	console

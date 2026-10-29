@@ -1172,9 +1172,28 @@ def panel_pin_document(source_document, produced_rows, *, expected_apps):
 OPENCODE_UPGRADE_CODE = '{8E0B8005-0E00-5720-9556-E5B984F15A96}'
 
 
+def pytorch_catalogue_row():
+    """Keep the retained engine input separate from application producers."""
+    import types
+    target = Path(__file__).resolve().parent.parent / 'windows/pytorch_engine.py'
+    if not target.is_file():
+        target = Path(__file__).resolve().parents[3] / 'installer/pytorch_engine.py'
+    owner = types.ModuleType('oa_panel_pytorch_owner'); owner.__file__ = str(target)
+    exec(compile(target.read_bytes(), str(target), 'exec'), owner.__dict__)
+    return owner.catalogue_row()
+
+
 def panel_catalogue_rows(raw):
     """Validate the compiled projection independently of the source roster."""
     document = json.loads(raw, object_pairs_hook=strict_object)
+    if (not isinstance(document,dict) or not isinstance(document.get('apps'),list)
+            or any(not isinstance(row,dict) for row in document['apps'])):
+        raise ValueError('invalid Panel catalogue app rows')
+    engines = [row for row in document['apps'] if row.get('id') == 'pytorch']
+    if engines:
+        if document['release_tag'] != 'v0.8.0' or engines != [pytorch_catalogue_row()]:
+            raise ValueError('Panel PyTorch engine differs from the retained release input pin')
+        document['apps'] = [row for row in document['apps'] if row.get('id') != 'pytorch']
     if 'extensions' in document:
         if document['schema'] != 2:
             raise ValueError('Panel extension pins require schema 2')
@@ -1215,12 +1234,16 @@ def panel_pin_input(source_document, produced_rows, *, expected_apps, producer, 
             any(type(producer[key]) is not int or producer[key] <= 0 for key in ('run_id','run_attempt'))):
         raise ValueError('Panel catalogue requires exact current producer identity')
     raw = panel_pin_document(source_document,produced_rows,expected_apps=expected_apps)
+    document = json.loads(raw)
+    if document['release_tag'] == 'v0.8.0':
+        document['apps'].append(pytorch_catalogue_row())
+        raw = (json.dumps(document, sort_keys=True) + '\n').encode('utf-8')
     extensions = [pin for pin in (opencode, comfyui) if pin is not None]
     if extensions:
         document = json.loads(raw)
         document.update(schema=2, extensions=extensions)
         raw = (json.dumps(document, sort_keys=True) + '\n').encode('utf-8')
-        panel_catalogue_rows(raw)
+    panel_catalogue_rows(raw)
     def pin(value):return dict(bytes=len(value),sha256=hashlib.sha256(value).hexdigest())
     source = source_document.encode('utf-8') if isinstance(source_document,str) else source_document
     descriptor = dict(schema=1,kind='monitor-compiled-catalogue-input',producer=dict(producer),

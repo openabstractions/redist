@@ -606,21 +606,37 @@ def verify(path, policy, signtool):
 
 
 def _verify_signature(path, expected, signtool, signature):
-    if (signature.get('status') != 'Valid'
-            or any(signature.get(key) != expected[key] for key in ('sha1', 'sha256', 'subject', 'issuer'))
-            or CODE_SIGNING not in signature.get('eku', []) or signature.get('chain_valid') is not True
-            or signature.get('chain_status') != [] or signature.get('timestamp_chain_status') != []
-            or not isinstance(signature.get('chain'), list) or len(signature['chain']) < 2
-            or signature['chain'][0] != expected['sha256']
-            or not re.fullmatch('[0-9a-f]{64}', str(signature.get('timestamp_sha256')))
-            or TIME_STAMPING not in signature.get('timestamp_eku', [])
-            or signature.get('timestamp_chain_valid') is not True
-            or signature.get('file_digest_oid') != '2.16.840.1.101.3.4.2.1'
-            or signature.get('cms_digest_oid') != '2.16.840.1.101.3.4.2.1'
-            or signature.get('timestamp_digest_oid') != '2.16.840.1.101.3.4.2.1'
-            or signature.get('cms_leaf_sha256') != expected['sha256']
-            or signature.get('cms_timestamp_sha256') != signature.get('timestamp_sha256')):
-        raise ValueError('required Windows signature policy refused; operation=verify; format=' + artifact_format(path) + '; category=signature-criteria')
+    criteria = (
+        ('status', lambda: signature.get('status') == 'Valid'),
+        *(("leaf-" + key, lambda key=key: signature.get(key) == expected[key])
+          for key in ('sha1', 'sha256', 'subject', 'issuer')),
+        ('code-signing-eku', lambda: CODE_SIGNING in signature.get('eku', [])),
+        ('leaf-chain-valid', lambda: signature.get('chain_valid') is True),
+        ('leaf-chain-status', lambda: signature.get('chain_status') == []),
+        ('timestamp-chain-status', lambda: signature.get('timestamp_chain_status') == []),
+        ('leaf-chain-roster', lambda: isinstance(signature.get('chain'), list) and len(signature['chain']) >= 2),
+        ('leaf-chain-leaf', lambda: signature['chain'][0] == expected['sha256']),
+        ('timestamp-certificate', lambda: re.fullmatch('[0-9a-f]{64}', str(signature.get('timestamp_sha256')))),
+        ('timestamp-eku', lambda: TIME_STAMPING in signature.get('timestamp_eku', [])),
+        ('timestamp-chain-valid', lambda: signature.get('timestamp_chain_valid') is True),
+        ('file-digest', lambda: signature.get('file_digest_oid') == '2.16.840.1.101.3.4.2.1'),
+        ('cms-digest', lambda: signature.get('cms_digest_oid') == '2.16.840.1.101.3.4.2.1'),
+        ('timestamp-digest', lambda: signature.get('timestamp_digest_oid') == '2.16.840.1.101.3.4.2.1'),
+        ('cms-leaf', lambda: signature.get('cms_leaf_sha256') == expected['sha256']),
+        ('cms-timestamp', lambda: signature.get('cms_timestamp_sha256') == signature.get('timestamp_sha256')),
+    )
+    failed = []
+    for name, accepted in criteria:
+        try:
+            if not accepted(): failed.append(name)
+        except (TypeError, KeyError, IndexError):
+            # Malformed public inspection fields remain a refusal, with no values logged.
+            failed.append(name)
+    if failed:
+        basename = str(path).replace('\\', '/').rsplit('/', 1)[-1]
+        basename = re.sub(r'[^A-Za-z0-9_. -]', '_', basename)[:128] or 'unnamed'
+        raise ValueError('required Windows signature policy refused; operation=verify; format=' + artifact_format(path)
+                         + '; category=signature-criteria; file=' + basename + '; failed=' + ','.join(failed))
     output = run([signtool, 'verify', '/pa', '/all', '/tw', '/v', path], operation='verify', artifact=artifact_format(path))
     data = path.read_bytes()
     return {'name': path.name, 'sha256': hashlib.sha256(data).hexdigest(), 'bytes': len(data),

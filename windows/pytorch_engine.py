@@ -10,6 +10,7 @@ import hashlib
 import json
 from pathlib import Path
 import re
+import shutil
 import struct
 import sys
 import zipfile
@@ -17,6 +18,7 @@ import zipfile
 
 BUNDLE_NAME = "pytorch-2.11.0-rocm7.13.0-cpython3.12.10-gfx1151-inputs.zip"
 MANIFEST_NAME = BUNDLE_NAME.removesuffix(".zip") + ".manifest.json"
+SOURCE_NAME = BUNDLE_NAME.removesuffix("-inputs.zip") + "-source.zip"
 SHA = re.compile(r"[0-9a-f]{64}\Z")
 BLOCK_SIZE = 1 << 20
 
@@ -194,7 +196,62 @@ INPUT_PINS = {
                   "sha256": "f8260fd18d204793d8971a0e91a6e7ed1d15c6f8a2113ad8c5f1344e4218e4f6"},
     MANIFEST_NAME: {"size_bytes": 88994,
                     "sha256": "ba3c4c1dfd0a5ea3d7a5276771e2c68bfd3906c53b0972405d9d7ff385182c8e"},
+    SOURCE_NAME: {"size_bytes": 44252,
+                  "sha256": "2dc411095e511ac05bb449acb4f488afe0af4d0b7c2fdab39eca3d7d204b2ee6"},
 }
+
+
+def release_assets(version: str) -> dict:
+    """The retained runtime inputs keep their exact final release URLs."""
+    if version != 'v0.8.0':
+        raise ValueError('PyTorch runtime release differs from the frozen v0.8.0 inputs')
+    return {name: dict(pin, url='https://github.com/openabstractions/redist/releases/download/' + version + '/' + name)
+            for name, pin in INPUT_PINS.items()}
+
+
+def catalogue_row() -> dict:
+    """The retained R54 engine row; source identifies its archived inputs."""
+    return dict(id='pytorch', binary_zip=BUNDLE_NAME,
+        binary_sha256=INPUT_PINS[BUNDLE_NAME]['sha256'], binary_bytes=INPUT_PINS[BUNDLE_NAME]['size_bytes'],
+        source_zip=SOURCE_NAME, source_sha256=INPUT_PINS[SOURCE_NAME]['sha256'],
+        source_bytes=INPUT_PINS[SOURCE_NAME]['size_bytes'],
+        source_commit='6ba0c4d0a388eb00020a87b4be9266bcada26eb9',
+        source_url='https://github.com/openabstractions/abstractions/commit/6ba0c4d0a388eb00020a87b4be9266bcada26eb9',
+        signer='unsigned', version='2.11.0', platform='windows/amd64', peak_bytes=3221225472,
+        license='PSF-2.0, BSD-3-Clause and bundled notices', publisher='OpenAbstractions',
+        install_identity='pt', action='archive_per_user')
+
+
+def verify_release_inputs(directory: Path) -> dict:
+    directory = Path(directory)
+    for name, pin in INPUT_PINS.items():
+        path = directory / name
+        if path.is_symlink() or path.is_junction() or not path.is_file():
+            raise ValueError('PyTorch release input is not an ordinary file: ' + name)
+        if measured(path) != (pin['size_bytes'], pin['sha256']):
+            raise ValueError('PyTorch release input differs from the frozen size/hash: ' + name)
+    manifest = load_manifest(directory / MANIFEST_NAME)
+    if verify_bundle(directory / BUNDLE_NAME, manifest) != dict(name=BUNDLE_NAME, **INPUT_PINS[BUNDLE_NAME]):
+        raise ValueError('PyTorch runtime ZIP differs from its reviewed complete owner manifest')
+    return {name: dict(pin) for name, pin in INPUT_PINS.items()}
+
+
+def copy_release_inputs(directory: Path, destination: Path) -> dict:
+    """Copy the verified pair through the existing draft/release assembly."""
+    pins = verify_release_inputs(directory)
+    created = []
+    try:
+        for name in pins:
+            target = Path(destination) / name
+            with (Path(directory) / name).open('rb') as reader, target.open('xb') as writer:
+                created.append(target)
+                shutil.copyfileobj(reader, writer, length=BLOCK_SIZE)
+        verify_release_inputs(destination)
+    except BaseException:
+        for target in reversed(created):
+            target.unlink()
+        raise
+    return pins
 
 
 def prepare(pytorchd: Path, python_home: Path, wheels: list[Path], source_repo: Path,
@@ -278,7 +335,7 @@ def input_assets(release: dict, source: str, version: str, owner: str,
             or release.get("tag_name") != tag or release.get("target_commitish") != source
             or not isinstance(release.get("body"), str)
             or release["body"].replace("\r\n", "\n") != body
-            or not isinstance(release.get("assets"), list) or len(release["assets"]) > 2):
+            or not isinstance(release.get("assets"), list) or len(release["assets"]) > len(INPUT_PINS)):
         raise ValueError("PyTorch input origin must be this source's unmodified draft")
     selected = {}
     ids = set()
@@ -373,11 +430,13 @@ def receive_assets(output: Path, repository: str, assets: dict, *, fetch, downlo
 def intake_inputs(output: Path, sources: Path, source: str, version: str,
                   release_id: int, bundle_id: int, manifest_id: int,
                   run_id: int, attempt: int, *, fetch, optional_fetch, download,
-                  environment: dict) -> dict:
-    """Read two exact draft assets and attest byte intake in the genuine current CI run."""
+                  environment: dict, source_id=None) -> dict:
+    """Read the exact draft assets and attest byte intake in the genuine current CI run."""
     input_environment(environment, source, run_id, attempt)
     if any(type(value) is not int or value < 1 for value in (release_id, bundle_id, manifest_id)):
         raise ValueError("PyTorch input seed requires positive exact IDs")
+    if SOURCE_NAME in INPUT_PINS and (type(source_id) is not int or source_id < 1):
+        raise ValueError('PyTorch source archive requires a positive exact asset ID')
     owner = input_source(sources)
     tag, _ = input_seed(source, version, owner)
     input_run(fetch(f"repos/{INPUT_REPOSITORY}/actions/runs/{run_id}"), run_id, source, attempt)
@@ -385,6 +444,8 @@ def intake_inputs(output: Path, sources: Path, source: str, version: str,
     assets = input_assets(release, source, version, owner, complete=True)
     if release["id"] != release_id or (assets[BUNDLE_NAME]["id"], assets[MANIFEST_NAME]["id"]) != (bundle_id, manifest_id):
         raise ValueError("PyTorch input asset IDs differ from the reviewed seed")
+    if SOURCE_NAME in assets and assets[SOURCE_NAME]['id'] != source_id:
+        raise ValueError('PyTorch source archive asset ID differs from the reviewed seed')
     input_tag(optional_fetch(f"repos/{INPUT_REPOSITORY}/git/ref/tags/{tag}"), source)
     output = Path(output)
     if output.exists():
@@ -416,13 +477,15 @@ def intake_inputs(output: Path, sources: Path, source: str, version: str,
 
 def consume_inputs(output: Path, sources: Path, source: str, version: str,
                    release_id: int, bundle_id: int, manifest_id: int, artifact_id: int,
-                   run_id: int, attempt: int, *, publication, environment: dict) -> dict:
+                   run_id: int, attempt: int, *, publication, environment: dict, source_id=None) -> dict:
     """Bind the newest intake job and exact immutable artifact before Windows packaging."""
     import shutil
     import tempfile
     input_environment(environment, source, run_id, attempt)
     if any(type(value) is not int or value < 1 for value in (release_id, bundle_id, manifest_id, artifact_id)):
         raise ValueError("PyTorch input consumer requires positive exact IDs")
+    if SOURCE_NAME in INPUT_PINS and (type(source_id) is not int or source_id < 1):
+        raise ValueError('PyTorch source archive requires a positive exact asset ID')
     owner = input_source(sources)
     run, jobs, artifacts = publication.inspect(INPUT_REPOSITORY, run_id)
     input_run(run, run_id, source, attempt)
@@ -445,12 +508,16 @@ def consume_inputs(output: Path, sources: Path, source: str, version: str,
             or artifact.get("workflow_run", {}).get("id") != run_id
             or artifact.get("workflow_run", {}).get("head_sha") != source):
         raise ValueError("PyTorch input artifact identity, digest or retention differs")
-    assets = {name: {"id": identity, "name": name, **INPUT_PINS[name]}
-              for name, identity in ((BUNDLE_NAME, bundle_id), (MANIFEST_NAME, manifest_id))}
+    identities = [(BUNDLE_NAME, bundle_id), (MANIFEST_NAME, manifest_id)]
+    if SOURCE_NAME in INPUT_PINS:
+        identities.append((SOURCE_NAME, source_id))
+    if len({identity for _, identity in identities}) != len(identities):
+        raise ValueError('PyTorch input asset IDs must be distinct')
+    assets = {name: {"id": identity, "name": name, **INPUT_PINS[name]} for name, identity in identities}
     output = Path(output)
     if output.exists():
         raise FileExistsError("PyTorch consumer output already exists")
-    expected_files = {BUNDLE_NAME, MANIFEST_NAME, "pytorch-input-receipt.json"}
+    expected_files = {*INPUT_PINS, "pytorch-input-receipt.json"}
     created = []
     output.mkdir(parents=True)
     try:
@@ -461,8 +528,8 @@ def consume_inputs(output: Path, sources: Path, source: str, version: str,
                 raise ValueError("PyTorch input artifact bytes differ from GitHub digest")
             with zipfile.ZipFile(blob) as archive:
                 entries = archive.infolist()
-                if len(entries) != 3 or {item.filename for item in entries} != expected_files:
-                    raise ValueError("PyTorch input artifact requires exactly three root-level files")
+                if len(entries) != len(expected_files) or {item.filename for item in entries} != expected_files:
+                    raise ValueError("PyTorch input artifact requires exactly the pinned root-level files and receipt")
                 for item in entries:
                     size_ok = (item.file_size == INPUT_PINS[item.filename]["size_bytes"]
                                if item.filename in INPUT_PINS else item.file_size <= 1024 * 1024)
@@ -478,6 +545,9 @@ def consume_inputs(output: Path, sources: Path, source: str, version: str,
         manifest = load_manifest(output / MANIFEST_NAME)
         if verify_bundle(output / BUNDLE_NAME, manifest) != {"name": BUNDLE_NAME, **INPUT_PINS[BUNDLE_NAME]}:
             raise ValueError("PyTorch input artifact bundle differs")
+        if SOURCE_NAME in INPUT_PINS and measured(output / SOURCE_NAME) != (
+                INPUT_PINS[SOURCE_NAME]['size_bytes'], INPUT_PINS[SOURCE_NAME]['sha256']):
+            raise ValueError('PyTorch input source archive differs from its reviewed pin')
         expected = input_receipt(source, version, owner, run_id, intake_attempt, release_id, assets, manifest)
         if json.loads((output / "pytorch-input-receipt.json").read_text(encoding="utf-8")) != expected:
             raise ValueError("PyTorch intake receipt differs from the exact source/run/seed bytes")
@@ -546,6 +616,7 @@ def main(argv=None):
         intake.add_argument("--release-id", type=int, required=True)
         intake.add_argument("--bundle-asset-id", type=int, required=True)
         intake.add_argument("--manifest-asset-id", type=int, required=True)
+        intake.add_argument("--source-asset-id", type=int)
         intake.add_argument("--run-id", type=int, required=True)
         intake.add_argument("--attempt", type=int, required=True)
         intake.add_argument("--output", type=Path, required=True)
@@ -563,12 +634,12 @@ def main(argv=None):
                                args.release_id, args.bundle_asset_id, args.manifest_asset_id,
                                args.run_id, args.attempt, fetch=publication.api,
                                optional_fetch=publication.optional_api, download=publication.download,
-                               environment=dict(os.environ))
+                               environment=dict(os.environ), source_id=args.source_asset_id)
         else:
             result = consume_inputs(args.output, args.sources, args.source, args.version,
                                     args.release_id, args.bundle_asset_id, args.manifest_asset_id,
                                     args.artifact_id, args.run_id, args.attempt,
-                                    publication=publication, environment=dict(os.environ))
+                                    publication=publication, environment=dict(os.environ), source_id=args.source_asset_id)
         print(json.dumps(result, sort_keys=True))
         return
     if args.operation == "prepare":

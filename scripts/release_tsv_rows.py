@@ -43,14 +43,38 @@ def rows(text: str, name: str) -> list[tuple[str, ...]]:
     return result
 
 
+def platform_tools(parsed, platform, architecture=None):
+    """Keep the existing PyTorch provider's Windows-x64 payload boundary."""
+    if platform not in ('windows', 'linux', 'macos') or (platform == 'windows' and architecture not in ('amd64', 'arm64')):
+        raise ValueError('tool selection requires an exact supported platform')
+    selected = []
+    for row in parsed:
+        if row[0] == 'pytorchd.exe' or row[3] == 'pytorchimage':
+            if (row[0] != 'pytorchd.exe'
+                    or not row[1].startswith('github.com/openabstractions/abstraction-provider-pytorch/go@')
+                    or row[2:] != ('cmd/pytorchd', 'pytorchimage', 'console')):
+                raise ValueError('PyTorch executable has an unexpected owning module or feature')
+            if platform != 'windows' or architecture != 'amd64':
+                continue
+        selected.append(row)
+    return selected
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("roster", type=Path)
+    parser.add_argument('--platform', choices=('windows', 'linux', 'macos'))
+    parser.add_argument('--architecture', choices=('amd64', 'arm64'))
     destination = parser.add_mutually_exclusive_group(required=True)
     destination.add_argument("--output", type=Path, help="write exact NUL-delimited columns")
     destination.add_argument("--console-names", action="store_true", help="print tools.tsv console program names")
     args = parser.parse_args(argv)
     parsed = rows(args.roster.read_text(encoding="utf-8"), args.roster.name)
+    if args.platform is not None:
+        if args.roster.name != 'tools.tsv':parser.error('--platform requires tools.tsv')
+        parsed = platform_tools(parsed, args.platform, args.architecture)
+    elif args.architecture is not None:
+        parser.error('--architecture requires --platform')
     if args.console_names:
         if args.roster.name != "tools.tsv":
             parser.error("--console-names requires tools.tsv")

@@ -21,7 +21,7 @@ from urllib.request import url2pathname
 from typing import Callable
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from release_tsv_rows import rows as release_rows
+from release_tsv_rows import rows as release_rows, platform_tools
 
 ORG = "github.com/openabstractions/"
 VERSION = re.compile(r"v(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)$")
@@ -549,7 +549,7 @@ def _observe_windows_builds(tools: Path, output: Path, provenance: Path,
     for pass_name in ('a', 'b'):
         for arch in ('amd64', 'arm64'):
             selected = dict(env, GOARCH=arch)
-            for name, module_version, package, feature, subsystem in rows:
+            for name, module_version, package, feature, subsystem in platform_tools(rows, 'windows', arch):
                 module, version = module_version.rsplit('@', 1)
                 if module not in expected or expected[module]['version'] != version:
                     raise ValueError('program module differs from prepared graph')
@@ -642,8 +642,8 @@ def _observe_windows_builds(tools: Path, output: Path, provenance: Path,
                     verify_panel_source(source,projection,module_zip=module_zip,catalogue_path=catalogue_path,**arguments)
                     program['panel_source'] = projection
                 programs.append(program)
-    for name, *_ in rows:
-        for arch in ('amd64', 'arm64'):
+    for arch in ('amd64', 'arm64'):
+        for name, *_ in platform_tools(rows, 'windows', arch):
             if not filecmp.cmp(output / 'a' / arch / name, output / 'b' / arch / name, shallow=False):
                 raise ValueError('observed Windows builds are not byte-identical: ' + name)
     if compiler['executable'] != observed_file(Path(go)) or any(
@@ -788,7 +788,8 @@ def admit_observed_windows_builds(original_bytes: bytes, observed_bytes: bytes, 
     if (not rows or len({r[0].lower() for r in rows}) != len(rows) or
             any(not re.fullmatch(r'[A-Za-z0-9_. -]+\.exe', r[0]) or r[0] in ('.exe', '..exe')
                 for r in rows)): fail('roster collision or invalid output')
-    wanted = [(p, arch, row) for p in ('a', 'b') for arch in ('amd64', 'arm64') for row in rows]
+    wanted = [(p, arch, row) for p in ('a', 'b') for arch in ('amd64', 'arm64')
+              for row in platform_tools(rows, 'windows', arch)]
     if len(build['programs']) != len(wanted): fail('program inventory')
     commands = build['commands']
     if len(commands) != 2 + len(wanted) * 2: fail('command inventory')

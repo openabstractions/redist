@@ -37,6 +37,16 @@ def copy_runtime_asset(directory, destination):
         raise
 
 
+def copy_pytorch_assets(directory, destination):
+    import types
+    target = pathlib.Path('windows/pytorch_engine.py')
+    if not target.is_file():
+        target = pathlib.Path(__file__).resolve().parents[3] / 'installer/pytorch_engine.py'
+    owner = types.ModuleType('oa_release_pytorch_asset'); owner.__file__ = str(target.resolve())
+    exec(compile(target.read_bytes(), str(target), 'exec'), owner.__dict__)
+    owner.copy_release_inputs(pathlib.Path(directory), pathlib.Path(destination))
+
+
 def producer_facts(candidate, directory, *, diagnostic=False):
     """Read the existing checksum roster and measured signed package bytes."""
     import re
@@ -241,6 +251,7 @@ def main():
         raise SystemExit('preview must be a boolean')
     if tuple(map(int, os.environ['RELEASE_VERSION'].removeprefix('v').split('-')[0].split('.'))) >= (0, 8, 0):
         copy_runtime_asset('dist', 'verified-release')
+        copy_pytorch_assets('dist', 'verified-release')
     apps = json.loads((pathlib.Path(os.environ['RUNNER_TEMP']) / 'apps.json').read_text(encoding='utf-8'))
     copy_app_assets(apps,'dist','verified-release')
     candidate = {'schema': 1, 'source': os.environ['CANDIDATE_SHA'],

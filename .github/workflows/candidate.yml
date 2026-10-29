@@ -59,6 +59,11 @@ on:
         type: string
         required: false
         default: ''
+      pytorch_input_source_asset_id:
+        description: Exact retained corresponding-source ZIP asset ID in that draft
+        type: string
+        required: false
+        default: ''
       app_producer_only:
         description: Explicit first app producer; measures artifacts without enabling Setup or drafting a release
         type: choice
@@ -372,6 +377,7 @@ jobs:
     outputs:
       artifact-attempt: ${{ github.run_attempt }}
       artifact-id: ${{ steps.inputs.outputs.artifact-id }}
+      artifact-digest: ${{ steps.inputs.outputs.artifact-digest }}
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
         with:
@@ -393,11 +399,12 @@ jobs:
           INPUT_RELEASE_ID: ${{ inputs.pytorch_input_release_id }}
           INPUT_BUNDLE_ID: ${{ inputs.pytorch_input_bundle_asset_id }}
           INPUT_MANIFEST_ID: ${{ inputs.pytorch_input_manifest_asset_id }}
+          INPUT_SOURCE_ID: ${{ inputs.pytorch_input_source_asset_id }}
         run: |
           python3 windows/pytorch_engine.py intake --sources windows/sources.tsv \
             --source "$CANDIDATE_SHA" --version "$CANDIDATE_VERSION" \
             --release-id "$INPUT_RELEASE_ID" --bundle-asset-id "$INPUT_BUNDLE_ID" \
-            --manifest-asset-id "$INPUT_MANIFEST_ID" --run-id "$GITHUB_RUN_ID" \
+            --manifest-asset-id "$INPUT_MANIFEST_ID" --source-asset-id "$INPUT_SOURCE_ID" --run-id "$GITHUB_RUN_ID" \
             --attempt "$GITHUB_RUN_ATTEMPT" --output pytorch-input
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         id: inputs
@@ -614,11 +621,12 @@ jobs:
           INPUT_RELEASE_ID: ${{ inputs.pytorch_input_release_id }}
           INPUT_BUNDLE_ID: ${{ inputs.pytorch_input_bundle_asset_id }}
           INPUT_MANIFEST_ID: ${{ inputs.pytorch_input_manifest_asset_id }}
+          INPUT_SOURCE_ID: ${{ inputs.pytorch_input_source_asset_id }}
         run: |
           python3 windows/pytorch_engine.py consume --sources windows/sources.tsv \
             --source "$CANDIDATE_SHA" --version "$CANDIDATE_VERSION" \
             --release-id "$INPUT_RELEASE_ID" --bundle-asset-id "$INPUT_BUNDLE_ID" \
-            --manifest-asset-id "$INPUT_MANIFEST_ID" --artifact-id "$INPUT_ARTIFACT_ID" \
+            --manifest-asset-id "$INPUT_MANIFEST_ID" --source-asset-id "$INPUT_SOURCE_ID" --artifact-id "$INPUT_ARTIFACT_ID" \
             --run-id "$GITHUB_RUN_ID" --attempt "$GITHUB_RUN_ATTEMPT" --output pytorch-input
 
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -2992,7 +3000,7 @@ jobs:
           GOOS: linux
           GOFLAGS: -trimpath
         run: |
-          python3 scripts/release_tsv_rows.py tools.tsv --output tools.rows
+          python3 scripts/release_tsv_rows.py tools.tsv --platform linux --output tools.rows
           root=$PWD
           for arch in amd64 arm64; do
             while IFS= read -r -d '' path && IFS= read -r -d '' module &&
@@ -3422,7 +3430,7 @@ jobs:
         run: |
           MACOSX_DEPLOYMENT_TARGET="$(python3 -c 'import sys; sys.path.insert(0,"posix"); import build; print(build.package_minimum_macos())')"
           export MACOSX_DEPLOYMENT_TARGET
-          python3 scripts/release_tsv_rows.py tools.tsv --output tools.rows
+          python3 scripts/release_tsv_rows.py tools.tsv --platform macos --output tools.rows
           root=$PWD
           mkdir -p universal
           while IFS= read -r -d '' path && IFS= read -r -d '' module &&
@@ -3525,7 +3533,7 @@ jobs:
       # their Darwin implementation only when cgo is enabled.
       - name: verify native cgo in every macOS Go image
         run: |
-          names=$(python3 scripts/release_tsv_rows.py tools.tsv --console-names)
+          names=$(python3 scripts/release_tsv_rows.py tools.tsv --platform macos --console-names)
           test -n "$names" || { printf 'FAIL  no macOS Go programs in tools.tsv\n'; exit 1; }
           for arch in amd64 arm64; do
             for name in $names panel; do
@@ -4524,8 +4532,8 @@ jobs:
           if-no-files-found: error
 
   draft:
-    if: ${{ needs.source-guard.result == 'success' && needs.installer-prior-input.result == 'success' && ((inputs.core_only && !cancelled() && inputs.producer_mode == 'train' && !inputs.signing_probe_only && !inputs.diagnostic_host_sign_only && inputs.app_producer_only == 'none' && inputs.app_delivery_only == 'none' && needs.candidate.result == 'success' && needs.windows-msi-sign.result == 'success' && needs.verify.result == 'success' && needs.linux.result == 'success' && needs.linux-verify.result == 'success' && needs.macos.result == 'success') || (!inputs.core_only && (inputs.app_delivery_only != 'comfyui' && (!inputs.diagnostic_host_sign_only && (!cancelled() && needs.candidate.result == 'success' && needs.windows-msi-sign.result == 'success' && needs.verify.result == 'success' && needs.linux.result == 'success' && needs.linux-verify.result == 'success' && needs.macos.result == 'success' && (needs.app_comfyui.result == 'success' || (needs.candidate.outputs.native-comfyui != 'true' && needs.app_comfyui.result == 'skipped')) && ((inputs.producer_mode == 'train' && needs.candidate.outputs.native-comfyui == 'true' && needs.windows-app-delivery.result == 'success') || ((inputs.producer_mode != 'train' || needs.candidate.outputs.native-comfyui != 'true') && needs.windows-app-delivery.result == 'skipped')) && inputs.producer_mode != 'train-graph' && (!inputs.signing_probe_only && (inputs.app_producer_only == 'none' || inputs.app_producer_only == ''))))))) }}
-    needs: [source-guard, candidate, windows-msi-sign, verify, linux, linux-verify, macos, app_comfyui, windows-app-delivery, installer-prior-input]
+    if: ${{ needs.source-guard.result == 'success' && needs.installer-prior-input.result == 'success' && needs.pytorch-input.result == 'success' && ((inputs.core_only && !cancelled() && inputs.producer_mode == 'train' && !inputs.signing_probe_only && !inputs.diagnostic_host_sign_only && inputs.app_producer_only == 'none' && inputs.app_delivery_only == 'none' && needs.candidate.result == 'success' && needs.windows-msi-sign.result == 'success' && needs.verify.result == 'success' && needs.linux.result == 'success' && needs.linux-verify.result == 'success' && needs.macos.result == 'success') || (!inputs.core_only && (inputs.app_delivery_only != 'comfyui' && (!inputs.diagnostic_host_sign_only && (!cancelled() && needs.candidate.result == 'success' && needs.windows-msi-sign.result == 'success' && needs.verify.result == 'success' && needs.linux.result == 'success' && needs.linux-verify.result == 'success' && needs.macos.result == 'success' && (needs.app_comfyui.result == 'success' || (needs.candidate.outputs.native-comfyui != 'true' && needs.app_comfyui.result == 'skipped')) && ((inputs.producer_mode == 'train' && needs.candidate.outputs.native-comfyui == 'true' && needs.windows-app-delivery.result == 'success') || ((inputs.producer_mode != 'train' || needs.candidate.outputs.native-comfyui != 'true') && needs.windows-app-delivery.result == 'skipped')) && inputs.producer_mode != 'train-graph' && (!inputs.signing_probe_only && (inputs.app_producer_only == 'none' || inputs.app_producer_only == ''))))))) }}
+    needs: [source-guard, candidate, windows-msi-sign, verify, linux, linux-verify, macos, app_comfyui, windows-app-delivery, installer-prior-input, pytorch-input]
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -4644,6 +4652,19 @@ jobs:
             --name "vc-runtime-input-$RUNTIME_ARTIFACT_ATTEMPT" --source "$CANDIDATE_SHA" \
             --run-id "$GITHUB_RUN_ID" --attempt "$RUNTIME_ARTIFACT_ATTEMPT" --out runtime-release-input --receipt runtime-release-input/artifact-intake.json
           python3 -c 'import shutil,sys; sys.path.insert(0,"windows"); import modelhost_engine as owner; from pathlib import Path; asset=owner.runtime_asset(Path("windows/vc-runtime.json")); archive=asset["archive"]; source=Path("runtime-release-input")/archive["name"]; owner.runtime_asset_bytes(source,asset); target=Path("dist")/archive["name"]; shutil.copyfile(source,target); owner.runtime_asset_bytes(target,asset); Path("dist/SHA256SUMS.runtime").write_text(archive["sha256"]+"  "+archive["name"]+"\n",encoding="utf-8")'
+
+      - name: retain the exact PyTorch runtime pair as final release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CANDIDATE_SHA: ${{ needs.candidate.outputs.sha }}
+          INPUT_ARTIFACT_ID: ${{ needs.pytorch-input.outputs.artifact-id }}
+          INPUT_ARTIFACT_DIGEST: ${{ needs.pytorch-input.outputs.artifact-digest }}
+          INPUT_ARTIFACT_ATTEMPT: ${{ needs.pytorch-input.outputs.artifact-attempt }}
+        run: |
+          python3 windows/windows_signing.py consume --artifact-id "$INPUT_ARTIFACT_ID" --digest "$INPUT_ARTIFACT_DIGEST" \
+            --name "abstraction-pytorch-inputs-$INPUT_ARTIFACT_ATTEMPT" --source "$CANDIDATE_SHA" \
+            --run-id "$GITHUB_RUN_ID" --attempt "$INPUT_ARTIFACT_ATTEMPT" --out pytorch-release-input --receipt pytorch-release-input/artifact-intake.json
+          python3 -c 'import sys; sys.path.insert(0,"windows"); import pytorch_engine as owner; from pathlib import Path; pins=owner.copy_release_inputs(Path("pytorch-release-input"),Path("dist")); Path("dist/SHA256SUMS.pytorch").write_text("".join(pin["sha256"]+"  "+name+"\n" for name,pin in pins.items()),encoding="utf-8")'
 
       # Each line was computed by the job that made the bytes. Joining them is
       # not recomputing them, so the file is checked once more here against what

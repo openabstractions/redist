@@ -125,6 +125,36 @@ def verify_runtime_url(version, *, open_url=None):
         raw = response.read(pin['size_bytes'] + 1)
     if (len(raw), hashlib.sha256(raw).hexdigest()) != (pin['size_bytes'], pin['sha256']):
         raise ValueError('published runtime URL differs from the frozen source size/hash')
+    verify_pytorch_urls(version, open_url=open_url)
+
+
+def pytorch_release_assets(archive, version):
+    """Admit only the retained runtime ZIP and its exact owner manifest."""
+    owner = pytorch_inputs_module()
+    pins = owner.release_assets(version)
+    with tempfile.TemporaryDirectory(prefix='oa-pytorch-release-') as temporary:
+        directory = Path(temporary)
+        for name, pin in pins.items():
+            if archive.getinfo(name).file_size != pin['size_bytes']:
+                raise ValueError('final PyTorch runtime input size differs from its source pin')
+            with archive.open(name) as reader, (directory / name).open('xb') as writer:
+                shutil.copyfileobj(reader, writer, length=1024 * 1024)
+        owner.verify_release_inputs(directory)
+    return set(pins)
+
+
+def verify_pytorch_urls(version, *, open_url=None):
+    """Stream the frozen anonymous URLs without buffering the 1.7 GB ZIP."""
+    for name, pin in pytorch_inputs_module().release_assets(version).items():
+        size = 0; checksum = hashlib.sha256()
+        with (open_url or urllib.request.urlopen)(pin['url'], timeout=30) as response:
+            while size <= pin['size_bytes']:
+                chunk = response.read(min(1024 * 1024, pin['size_bytes'] + 1 - size))
+                if not chunk:
+                    break
+                checksum.update(chunk); size += len(chunk)
+        if (size, checksum.hexdigest()) != (pin['size_bytes'], pin['sha256']):
+            raise ValueError('published PyTorch runtime URL differs from the frozen source size/hash: ' + name)
 
 
 def windows_signing_owner():
@@ -935,6 +965,7 @@ def unpack_verified(blob, digest, destination, run, version):
             # validates the declaration; completed delivery remains external.
             validate_public_admission(app_rows.admission, number, app_rows, run['head_sha'])
             packages.add(runtime_release_asset(archive, version))
+            packages.update(pytorch_release_assets(archive, version))
         if any(row['release_tag'] != version for row in app_rows):
             raise ValueError('optional app pin release tag differs from candidate')
         app_packages = validate_release(app_rows, metadata.get('apps', []), archive.open)
@@ -1069,7 +1100,7 @@ def owned_input_draft(repository, tag, source, identity, title, *, fetch=api, mu
 
 def seed_pytorch_inputs(directory, sources, source, version, *, fetch=api,
                         optional_fetch=optional_api, mutate=command, engine=None):
-    """Create or resume one owned draft containing only the retained native input pair."""
+    """Create or resume one owned draft containing only the retained input roster."""
     engine = engine or pytorch_inputs_module()
     owner = engine.input_source(sources)
     tag, identity = engine.input_seed(source, version, owner)
@@ -1084,6 +1115,9 @@ def seed_pytorch_inputs(directory, sources, source, version, *, fetch=api,
             engine.INPUT_PINS[engine.MANIFEST_NAME]["size_bytes"],
             engine.INPUT_PINS[engine.MANIFEST_NAME]["sha256"]):
         raise ValueError("retained PyTorch owner manifest differs")
+    if engine.SOURCE_NAME in engine.INPUT_PINS and engine.measured(directory / engine.SOURCE_NAME) != (
+            engine.INPUT_PINS[engine.SOURCE_NAME]['size_bytes'], engine.INPUT_PINS[engine.SOURCE_NAME]['sha256']):
+        raise ValueError('retained PyTorch source archive differs')
     prefix = f"repos/{engine.INPUT_REPOSITORY}"
     tag_state = optional_fetch(prefix + "/git/ref/tags/" + tag)
     engine.input_tag(tag_state, source, required=False)
