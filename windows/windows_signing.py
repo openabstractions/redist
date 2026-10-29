@@ -34,17 +34,17 @@ SDK_SHA256 = '1628c77d21ed187c4db998b37b18e267a7f092ae755589e21110c14260b14960'
 SIGNTOOL_SHA256 = 'e7b517a6a2828af2d1fba3da60ae1e322a95141bfae192622725329630caa2b3'
 
 # One reviewed diagnostic input, never a caller-selected signing target.
-DIAGNOSTIC_HOST = dict(name='launch-helper.exe', bytes=31233536,
-    sha256='bde5f82b9e1ad0bd0b768142c9eaa49a30ac27a2c463ca7087e1f22fc79cc4d0',
-    producer_source='73fce69327a4cec05f3560b3850b19ac55da375f',
-    native_inputs_sha256='dee2082462f45b2cd2268131b7beddcb396dd7136eb5b8162aea8df528af976e')
-DIAGNOSTIC_TAG = 'diagnostic-sign-comfy-self1829-bde5f82b9e1a'
+DIAGNOSTIC_HOST = dict(name='launch-helper.exe', bytes=31267328,
+    sha256='f6c58cd0d4ed18111778c62615185e0ce01efad5c06d27598ae3f16f418b2466',
+    producer_source='c2f54bb18db109ebdb4e059269e5763dd150ce97',
+    native_inputs_sha256='b21a76e136b28912065691b2cb09b1e61127b437e6359b18eba074cff8f063c1')
+DIAGNOSTIC_TAG = 'diagnostic-sign-comfy-self1888-f6c58cd0d4ed'
 
 
 def diagnostic_origin(source):
     if not re.fullmatch('[0-9a-f]{40}', source):
         raise ValueError('diagnostic source must be an exact commit')
-    return dict(schema=1, kind='reviewed-comfy-self1829-sign-copy', source=source, **DIAGNOSTIC_HOST)
+    return dict(schema=1, kind='reviewed-comfy-self1888-sign-copy', source=source, **DIAGNOSTIC_HOST)
 
 
 def diagnostic_json(data):
@@ -125,7 +125,7 @@ def diagnostic_input(path):
 
 
 def diagnostic_main(argv):
-    parser = argparse.ArgumentParser(description='One reviewed ComfySelf1829 diagnostic signing copy')
+    parser = argparse.ArgumentParser(description='One reviewed ComfySelf1888 diagnostic signing copy')
     parser.add_argument('phase', choices=('intake', 'check', 'sign', 'verify'))
     parser.add_argument('--root', type=Path, required=True)
     parser.add_argument('--source', required=True)
