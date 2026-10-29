@@ -250,6 +250,42 @@ def receive_native_control(inputs,relay):
     return intake
 
 
+def materialize_lemonade_inputs(native,helper,selected,inputs,tools):
+    """Acquire the selected web lock before the offline materializer receives it."""
+    cache=pathlib.Path('app-native-git-cache')
+    environment=load_owner('scripts/git_env.py','application_cache_git_environment').source_git_environment()
+    for name,url,commit in native.local_source_inputs():
+        helper.checkout('native/'+name,commit,cache,remote_url=url,env=environment)
+    acquisition=pathlib.Path('app-native-npm-acquisition');acquisition.mkdir()
+    hooks=acquisition/'empty-git-hooks';hooks.mkdir()
+    environment=native.selected_git_environment(pathlib.Path('sources').resolve(),hooks.resolve())
+    manifest=native.read_json(pathlib.Path(native.__file__).parent/'native-inputs.json')
+    patch=native.regular(pathlib.Path(native.__file__).parent/manifest['oa_delta']['file'],
+        [pathlib.Path(native.__file__).parent])
+    if native.pin(patch)['sha256']!=manifest['oa_delta']['sha256']:
+        raise ValueError('native source patch differs')
+    source=acquisition/'source'
+    native.local_checkout(tools['git'],cache/'upstream',source,
+        manifest['upstream']['commit'],manifest['upstream']['tree'],env=environment)
+    subprocess.run([tools['git'],'-C',str(source),'apply','--index',str(patch)],check=True,env=environment)
+    tree=subprocess.check_output([tools['git'],'-C',str(source),'write-tree'],text=True,env=environment).strip()
+    if tree!=manifest['oa_delta']['expected_tree']:
+        raise ValueError('reconstructed native tree differs')
+    npm_cache=acquisition/'cache';npm_cache.mkdir()
+    evidence=acquisition/'npm-acquisition.json'
+    helper.prime_native_npm_cache(source,manifest['web']['lock_file'],manifest['web']['sha256'],
+        tools['npm'],npm_cache,acquisition/'install',evidence)
+    wix=load_owner('windows/wix_packages.py','application_ui_input_policy')
+    package=pathlib.Path('wix-packages')/wix.PACKAGES['WixToolset.UI.wixext']['file']
+    command=[sys.executable,str(pathlib.Path(native.__file__).resolve()),'materialize','--pins',str(selected.resolve()),
+        '--sources-root',str(pathlib.Path('sources').resolve()),'--git-cache-root',str(cache.resolve()),
+        '--inputs-root',str(inputs.resolve()),'--npm-cache',str(npm_cache.resolve()),
+        '--wix-ui-package',str(package.resolve()),'--wix-ui-extension',os.environ['WIX_UI_EXT'],
+        '--python',sys.executable,*[item for name,path in tools.items() for item in ('--'+name,path)]]
+    subprocess.run(command,check=True)
+    shutil.copyfile(evidence,inputs/'npm-acquisition.json')
+
+
 def application_inputs(required, version):
     if not required:
         # The core-only chain still needs its source-owned BA token minter.
@@ -307,23 +343,7 @@ def application_inputs(required, version):
         '--canonical',str(sdk/'canonical/native'),'--policy','windows/certum_simplysign.json',
         '--signtool',os.environ['SIGNTOOL']],check=True)
     if 'lemonade' in owners:
-        native=owners['lemonade']
-        cache=pathlib.Path('app-native-git-cache')
-        environment=load_owner('scripts/git_env.py','application_cache_git_environment').clean_git_environment()
-        for name,url,commit in native.local_source_inputs():
-            helper.checkout('native/'+name,commit,cache,remote_url=url,env=environment)
-        empty=pathlib.Path('app-native-empty-cache');empty.mkdir()
-        wix=load_owner('windows/wix_packages.py','application_ui_input_policy')
-        package=pathlib.Path('wix-packages')/wix.PACKAGES['WixToolset.UI.wixext']['file']
-        command=[sys.executable,str(pathlib.Path(native.__file__).resolve()),'materialize','--pins',str(selected.resolve()),
-            '--sources-root',str(pathlib.Path('sources').resolve()),'--git-cache-root',str(cache.resolve()),
-            '--inputs-root',str(inputs.resolve()),'--npm-cache',str(empty.resolve()),
-            '--wix-ui-package',str(package.resolve()),'--wix-ui-extension',os.environ['WIX_UI_EXT'],
-            '--python',sys.executable,*[item for name,path in tools.items() for item in ('--'+name,path)]]
-        subprocess.run(command,check=True)
-        manifest=json.loads((pathlib.Path(native.__file__).parent/'native-inputs.json').read_bytes())
-        helper.prime_native_npm_cache(inputs/'upstream/lemonade',manifest['web']['lock_file'],manifest['web']['sha256'],
-            tools['npm'],inputs/'npm-cache',pathlib.Path('app-native-npm-acquisition'),inputs/'npm-acquisition.json')
+        materialize_lemonade_inputs(owners['lemonade'],helper,selected,inputs,tools)
     else:
         inputs.mkdir()
         selector=load_owner('sources/redist/sdk_smokes/prepare.py','application_host_tool_selection')
