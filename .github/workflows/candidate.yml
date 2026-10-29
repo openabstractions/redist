@@ -751,7 +751,8 @@ jobs:
               --source "$GITHUB_SHA" --run-id "$GITHUB_RUN_ID" --attempt "$INPUT_ARTIFACT_ATTEMPT" \
               --out "$RUNNER_TEMP/panel-catalogue/installer-priors"
             python3 windows/windows_signing.py check-installer-priors \
-              --prior-descriptor installer-priors.json --root "$RUNNER_TEMP/panel-catalogue/installer-priors"
+              --prior-descriptor installer-priors.json --root "$RUNNER_TEMP/panel-catalogue/installer-priors" \
+              --artifact-attempt "$INPUT_ARTIFACT_ATTEMPT"
           fi
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         id: panel-catalogue

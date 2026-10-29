@@ -977,14 +977,16 @@ def receive_installer_priors(descriptor, destination, *, fetch, download, enviro
     return receipt
 
 
-def check_installer_prior_intake(descriptor, destination, *, environment, authority=None):
+def check_installer_prior_intake(descriptor, destination, *, artifact_attempt, environment, authority=None):
     """Revalidate same-run intake and original members after immutable artifact consumption."""
     installer_prior_descriptor(descriptor, authority=authority)
     expected = dict(source=environment['GITHUB_SHA'], run_id=int(environment['GITHUB_RUN_ID']),
-                    run_attempt=int(environment['GITHUB_RUN_ATTEMPT']))
+                    run_attempt=artifact_attempt)
+    consumer_attempt = int(environment['GITHUB_RUN_ATTEMPT'])
     if (environment.get('GITHUB_ACTIONS') != 'true'
             or environment.get('GITHUB_REPOSITORY') != 'openabstractions/redist'
             or not re.fullmatch('[0-9a-f]{40}', expected['source'])
+            or type(artifact_attempt) is not int or not 0 < artifact_attempt <= consumer_attempt
             or min(expected['run_id'], expected['run_attempt']) < 1):
         raise ValueError('installer predecessor consumption requires actual same-repository CI context')
     destination = Path(destination)
@@ -3290,10 +3292,10 @@ def phase_main(argv):
                         help='select additional native families from the candidate Python source roster')
     args = parser.parse_args(argv)
     if args.operation == 'check-installer-priors':
-        if args.prior_descriptor is None or args.root is None:
-            parser.error('installer predecessor consumption requires descriptor and retained root')
+        if args.prior_descriptor is None or args.root is None or args.artifact_attempt is None:
+            parser.error('installer predecessor consumption requires descriptor, retained root and producer artifact attempt')
         check_installer_prior_intake(json.loads(args.prior_descriptor.read_bytes()), args.root,
-            environment=os.environ)
+            artifact_attempt=args.artifact_attempt, environment=os.environ)
         return
     if args.operation == 'intake-installer-priors':
         if args.prior_descriptor is None or args.out is None:
