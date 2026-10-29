@@ -450,9 +450,37 @@ jobs:
           if-no-files-found: error
 
 
+  backend-data:
+    if: ${{ needs.source-guard.result == 'success' && (inputs.producer_mode == 'train' && needs.candidate.outputs.installer-comfyui == 'true' && needs.windows-app-delivery.result == 'success' && needs.app_comfyui.result == 'success' && !inputs.diagnostic_host_sign_only && !inputs.signing_probe_only && inputs.app_producer_only == 'none') }}
+    needs: [source-guard, candidate, windows-app-delivery, app_comfyui]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      actions: read
+    env:
+      CANDIDATE_SHA: ${{ needs.candidate.outputs.sha }}
+      CANDIDATE_VERSION: ${{ needs.candidate.outputs.version }}
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      COMFY_FINAL_ARTIFACT_ID: ${{ needs.windows-app-delivery.outputs.comfyui-artifact-id }}
+      COMFY_FINAL_ARTIFACT_DIGEST: ${{ needs.windows-app-delivery.outputs.comfyui-artifact-digest }}
+      COMFY_FINAL_ARTIFACT_ATTEMPT: ${{ needs.windows-app-delivery.outputs.comfyui-artifact-attempt }}
+      COMFY_BACKEND_ARTIFACT_ID: ${{ needs.app_comfyui.outputs.artifact-id }}
+      COMFY_BACKEND_ARTIFACT_DIGEST: ${{ needs.app_comfyui.outputs.artifact-digest }}
+      COMFY_BACKEND_ARTIFACT_ATTEMPT: ${{ needs.app_comfyui.outputs.artifact-attempt }}
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
+        with:
+          ref: ${{ github.sha }}
+      - uses: actions/setup-python@e797f83bcb11b83ae66e0230d6156d7c80228e7c
+        with:
+          python-version: '3.12'
+      - name: publish exact DATA parts after signed application producer verification
+        run: python3 scripts/train/steps/build_application_msis.py --phase publish-data
+
   windows-app-catalogue:
-    if: ${{ needs.source-guard.result == 'success' && (!inputs.diagnostic_host_sign_only && inputs.producer_mode == 'train' && !inputs.signing_probe_only && inputs.app_producer_only == 'none' && inputs.app_delivery_only == 'comfyui' && needs.candidate.outputs.installer-comfyui == 'true') }}
-    needs: [source-guard, candidate, windows-app-delivery]
+    if: ${{ needs.source-guard.result == 'success' && (needs.backend-data.result == 'success' && !inputs.diagnostic_host_sign_only && inputs.producer_mode == 'train' && !inputs.signing_probe_only && inputs.app_producer_only == 'none' && inputs.app_delivery_only == 'comfyui' && needs.candidate.outputs.installer-comfyui == 'true') }}
+    needs: [source-guard, candidate, windows-app-delivery, backend-data]
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -524,8 +552,8 @@ jobs:
           if-no-files-found: error
 
   windows-build:
-    if: ${{ needs.source-guard.result == 'success' && (inputs.app_delivery_only != 'comfyui' && (!inputs.diagnostic_host_sign_only && (!cancelled() && needs.candidate.result == 'success' && needs.pytorch-input.result == 'success' && needs.installer-prior-input.result == 'success' && ((inputs.producer_mode == 'train' && needs.candidate.outputs.installer-comfyui == 'true' && needs.windows-app-delivery.result == 'success') || ((inputs.producer_mode != 'train' || needs.candidate.outputs.installer-comfyui != 'true') && needs.windows-app-delivery.result == 'skipped')) && inputs.producer_mode != 'train-graph' && (!inputs.signing_probe_only && (inputs.app_producer_only == 'none' || inputs.app_producer_only == ''))))) }}
-    needs: [source-guard, candidate, pytorch-input, installer-prior-input, windows-app-delivery, windows-app-sign]
+    if: ${{ needs.source-guard.result == 'success' && (inputs.app_delivery_only != 'comfyui' && (!inputs.diagnostic_host_sign_only && (!cancelled() && needs.candidate.result == 'success' && needs.pytorch-input.result == 'success' && needs.installer-prior-input.result == 'success' && ((inputs.producer_mode == 'train' && needs.candidate.outputs.installer-comfyui == 'true' && needs.windows-app-delivery.result == 'success' && needs.backend-data.result == 'success') || ((inputs.producer_mode != 'train' || needs.candidate.outputs.installer-comfyui != 'true') && needs.windows-app-delivery.result == 'skipped' && needs.backend-data.result == 'skipped')) && inputs.producer_mode != 'train-graph' && (!inputs.signing_probe_only && (inputs.app_producer_only == 'none' || inputs.app_producer_only == ''))))) }}
+    needs: [source-guard, candidate, pytorch-input, installer-prior-input, windows-app-delivery, windows-app-sign, backend-data]
     runs-on: windows-latest
     permissions:
       contents: read

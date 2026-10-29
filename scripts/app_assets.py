@@ -614,7 +614,7 @@ def receive_backend(directory, intake, *, expected_artifact, expected_input,
 def receive_backend_resources(directory, intake, *, archive_owner, archive_tool, metadata, **context):
     """Join API authority, full corresponding source and the signed resource DATA."""
     from app_pair_receipt import (ArchiveSetReader, checked_zip, validate_backend_resource,
-                                  validate_data_release, _archive_pin, BACKEND_RUNTIME_ENTRIES)
+                                  validate_data_release, backend_data_release, _archive_pin, BACKEND_RUNTIME_ENTRIES)
     if type(metadata) is not dict or metadata: raise ValueError('backend metadata destination must be empty')
     observed = {}
     receipt = receive_backend(directory, intake, archive_owner=archive_owner, archive_tool=archive_tool,
@@ -624,7 +624,7 @@ def receive_backend_resources(directory, intake, *, archive_owner, archive_tool,
         return receipt, None
     policy_raw = archive_owner.BACKEND_POLICY.read_bytes()
     policy = json.loads(policy_raw, object_pairs_hook=strict_object)
-    release = validate_data_release(policy.get('data_release'))
+    release = validate_data_release(policy.get('data_release'), expected=backend_data_release(receipt['archive']))
     directory = Path(directory)
     with ArchiveSetReader(directory, receipt['source_pair'], format='zip') as stream, checked_zip(stream, bounded_members=True,
             expanded_limit=archive_owner.backend_limits()['expanded_bytes']) as sources:

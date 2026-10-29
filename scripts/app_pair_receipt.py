@@ -218,6 +218,19 @@ def validate_data_release(value, *, expected=None):
     return value
 
 
+def backend_data_release(archive):
+    """Name immutable DATA from policy-independent runtime archive parts.
+
+    Both corresponding-source sets embed this policy and are excluded from
+    the tag hash. Their complete pinned union remains mandatory at publication.
+    """
+    validate_archive_set(archive, format='7z')
+    rows = ''.join(f"{part['name']}:{part['sha256']}:{part['bytes']}\n"
+                   for part in sorted(archive['parts'], key=lambda part: part['name']))
+    return {'repository': 'openabstractions/redist',
+            'tag': 'comfyui-data-win-amd-' + hashlib.sha256(rows.encode('utf-8')).hexdigest()[:12]}
+
+
 def data_part_url(release, name):
     validate_data_release(release)
     _archive_pin(dict(name=name, bytes=1, sha256='0' * 64))

@@ -2049,7 +2049,40 @@ def panel_opencode_pin(required, version):
     return dict(id='opencode',file=filename,sha256=actual['sha256'],bytes=actual['bytes'],**properties)
 
 
-def application_stage_final(required,version):
+def publish_verified_backend_data(assets,relay,row,destination,artifact,intake,selected,expected):
+    """Publish DATA only after the existing signed producer and pair checks."""
+    source=os.environ['CANDIDATE_SHA'];run_id=int(os.environ['GITHUB_RUN_ID'])
+    assets.verify_producer(row,destination,source,run_id,artifact,final_intake=intake,
+        selected_sources=selected,desktop_inputs=expected,repo=os.environ['GH_REPO'])
+    manifest=json.loads(closure_file(destination,'app.json').read_bytes())
+    assets.validate_pair(row,manifest,lambda name:closure_file(destination,name).open('rb'))
+    publisher=load_owner('scripts/promote.py','application_backend_data_publisher')
+    pair=load_owner('scripts/app_pair_receipt.py','application_backend_data_parts')
+    attempt=int(os.environ['COMFY_BACKEND_ARTIFACT_ATTEMPT'])
+    with tempfile.TemporaryDirectory(prefix='oa-backend-data-') as temporary:
+        root=pathlib.Path(temporary);backend=root/'backend'
+        relay.consume_artifact(int(os.environ['COMFY_BACKEND_ARTIFACT_ID']),
+            os.environ['COMFY_BACKEND_ARTIFACT_DIGEST'].removeprefix('sha256:'),
+            'oa-backend-comfyui-'+str(attempt),source,run_id,attempt,backend)
+        files={part['name']:closure_file(destination,part['name'],part)
+               for part in row['corresponding_source']['archive']['parts']}
+        for key in ('archive','corresponding_source'):
+            archive=row['backend'][key]
+            logical=closure_file(backend,archive['name'],archive)
+            if archive['parts']==[{name:archive[name] for name in ('name','bytes','sha256')}]:
+                files[archive['name']]=logical
+            else:
+                parts=root/key;parts.mkdir()
+                actual=pair.copy_archive_set(logical,parts,format=archive['format'],
+                    volume_bytes=archive['parts'][0]['bytes'],name=archive['name'])
+                if actual!=archive:raise ValueError('backend DATA split differs from signed resource')
+                files.update({part['name']:closure_file(parts,part['name'],part) for part in archive['parts']})
+        proof=publisher.publish_backend_data(row,files,source)
+        print(json.dumps(proof,sort_keys=True),flush=True)
+        return proof
+
+
+def application_stage_final(required,version,*,publish_data=False):
     """Receive the successful verify job's final pair on the existing draft leg."""
     if 'comfyui' not in required:raise ValueError('final Desktop staging requires the accepted installer scope')
     relay=load_owner('windows/windows_signing.py','application_final_api_intake')
@@ -2097,6 +2130,9 @@ def application_stage_final(required,version):
         {key:value for key,value in row.items() if key!='release_tag'}]
     if modern:document['schema']=2
     rows=assets.roster_text(json.dumps(document))
+    if publish_data:
+        if not modern:raise ValueError('backend DATA publication requires the multipart signed app producer')
+        return publish_verified_backend_data(assets,relay,row,destination,artifact,intake,selected,expected)
     produced=assets.stage(rows,'app-inputs','dist',pathlib.Path(os.environ['RUNNER_TEMP'])/'apps.json',
         candidate_source=os.environ['CANDIDATE_SHA'],run_id=int(os.environ['GITHUB_RUN_ID']),
         outputs={'comfyui':{'artifact':artifact,'source_commit':commit}},
@@ -2240,7 +2276,7 @@ def pin(path):
 
 def main(argv=None):
     parser=argparse.ArgumentParser(description='Existing application producer and immutable installer intake owner')
-    parser.add_argument('--phase',choices=('backend-inputs','control-inputs','inputs','prepare-native','sign-native','prepare-helpers','sign-helpers','package','sign-host','bind','seal-native','assemble-final','stage-final','panel-inputs','bundle'),default='package')
+    parser.add_argument('--phase',choices=('backend-inputs','control-inputs','inputs','prepare-native','sign-native','prepare-helpers','sign-helpers','package','sign-host','bind','seal-native','assemble-final','publish-data','stage-final','panel-inputs','bundle'),default='package')
     args=parser.parse_args(argv)
     version=os.environ['CANDIDATE_VERSION'].removeprefix('v')
     if tuple(map(int,version.split('-')[0].split('.')))<(0,8,0):
@@ -2251,6 +2287,7 @@ def main(argv=None):
     required=installer_scope(version)
     if args.phase=='bundle':return application_bundle(required,version)
     if args.phase=='assemble-final':return application_final_capsule(required,version)
+    if args.phase=='publish-data':return application_stage_final(required,version,publish_data=True)
     if args.phase=='stage-final':return application_stage_final(required,version)
     if args.phase=='panel-inputs':return application_panel_inputs(required,version)
     if not required:

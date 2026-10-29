@@ -410,6 +410,141 @@ def local_release_draft(basis, state, save, mutate, *, fetch=api, lookup=optiona
     return dict(release_id=state['release_id'], assets=assets)
 
 
+def publish_backend_data(row, files, source, *, fetch=api, lookup=optional_api, mutate=command, read_url=None):
+    """Publish the exact DATA parts of an already verified signed app producer.
+
+    The caller verifies the signed producer before this step; the unchanged
+    app-assets stage verifies the published DATA release afterwards.
+    """
+    from app_pair_receipt import (validate_backend_resource, validate_corresponding_source,
+                                 data_part_url, backend_data_release)
+
+    if row.get('id') != 'comfyui' or not _app_assets.multipart_row(row):
+        raise ValueError('backend DATA requires the multipart ComfyUI producer')
+    backend = validate_backend_resource(row['backend'])
+    offer = validate_corresponding_source(row['corresponding_source'])
+    location = backend['data_release']
+    expected_location = backend_data_release(backend['archive'])
+    tag = expected_location['tag']
+    if (location != expected_location
+            or offer['data_release'] != location or not re.fullmatch(r'[0-9a-f]{40}', source)):
+        raise ValueError('backend DATA differs from the source-selected release locator')
+    expected = {}
+    aliases = {}
+    for archive in (backend['archive'], backend['corresponding_source'], offer['archive']):
+        for part in archive['parts']:
+            name = part['name']
+            if name.casefold() in aliases and (aliases[name.casefold()] != name or expected[name] != part):
+                raise ValueError('backend DATA parts alias different identities')
+            aliases[name.casefold()] = name
+            expected[name] = part
+    if not isinstance(files, dict) or set(files) != set(expected):
+        raise ValueError('backend DATA local file roster differs')
+    for name, pin in expected.items():
+        path = Path(files[name]).absolute()
+        if path.name != name:
+            raise ValueError('backend DATA local part name differs')
+        assert_local_release_file(path, pin)
+    identity = dict(kind='comfyui-backend-data', backend=backend, corresponding_source=offer)
+    body = json.dumps(identity, sort_keys=True) + '\n'
+    title = tag
+    prefix = 'repos/' + LOCAL_RELEASE_REPO
+    releases = [item for item in pages(prefix + '/releases', None, fetch) if item.get('tag_name') == tag]
+    if len(releases) > 1:
+        raise ValueError('backend DATA release identity is ambiguous')
+    release = releases[0] if releases else None
+
+    def check_tag(commit):
+        current = lookup(prefix + '/git/ref/tags/' + tag)
+        if (not isinstance(current, dict) or current.get('ref') != 'refs/tags/' + tag
+                or current.get('object', {}).get('type') != 'commit'
+                or current['object'].get('sha') != commit):
+            raise ValueError('backend DATA tag differs from its original release commit')
+
+    def read(release_id, commit):
+        check_tag(commit)
+        current = fetch(prefix + '/releases/' + str(release_id))
+        endpoint = f'https://uploads.github.com/{prefix}/releases/{release_id}/assets'
+        if (not isinstance(current, dict) or current.get('id') != release_id
+                or current.get('tag_name') != tag or current.get('target_commitish') != commit
+                or current.get('name') != title or current.get('prerelease') is not True
+                or type(current.get('draft')) is not bool
+                or current.get('body', '').replace('\r\n', '\n') != body
+                or current.get('upload_url') != endpoint + '{?name,label}'):
+            raise ValueError('backend DATA release differs from its original content identity')
+        assets, ids = {}, set()
+        for asset in pages(prefix + f'/releases/{release_id}/assets', None, fetch):
+            name, asset_id = asset.get('name'), asset.get('id')
+            pin = expected.get(name)
+            if (pin is None or name in assets or type(asset_id) is not int or asset_id < 1 or asset_id in ids
+                    or asset.get('state') != 'uploaded' or asset.get('size') != pin['bytes']
+                    or asset.get('digest') != 'sha256:' + pin['sha256']
+                    or asset.get('browser_download_url') != data_part_url(location, name)):
+                raise ValueError('backend DATA release asset differs from the exact part roster')
+            assets[name] = asset_id
+            ids.add(asset_id)
+        return current, assets, endpoint
+
+    if release is None:
+        if lookup(prefix + '/git/ref/tags/' + tag) is not None:
+            raise ValueError('backend DATA tag already exists without its owned release')
+        created = json.loads(mutate(['api', '--method', 'POST', prefix + '/git/refs',
+                                     '-f', 'ref=refs/tags/' + tag, '-f', 'sha=' + source]))
+        if (created.get('ref') != 'refs/tags/' + tag or created.get('object', {}).get('type') != 'commit'
+                or created['object'].get('sha') != source):
+            raise ValueError('backend DATA tag creation returned a different identity')
+        check_tag(source)
+        release = owned_input_draft(LOCAL_RELEASE_REPO, tag, source, identity, title,
+                                    fetch=fetch, mutate=mutate)
+    commit = release.get('target_commitish')
+    release_id = release.get('id')
+    if (not isinstance(commit, str) or not re.fullmatch(r'[0-9a-f]{40}', commit)
+            or type(release_id) is not int or release_id < 1):
+        raise ValueError('backend DATA release lacks its exact original commit and ID')
+    current, assets, endpoint = read(release_id, commit)
+    if not current['draft'] and set(assets) != set(expected):
+        raise ValueError('published backend DATA release omits required parts')
+    for name, pin in expected.items():
+        if name in assets:
+            continue
+        if read(release_id, commit)[:2] != (current, assets):
+            raise ValueError('backend DATA release changed before upload')
+        assert_local_release_file(Path(files[name]).absolute(), pin)
+        uploaded = json.loads(mutate(['api', '--method', 'POST', endpoint + '?name=' + name,
+                                     '-H', 'Content-Type: application/octet-stream',
+                                     '--input', str(Path(files[name]).absolute())], timeout=1200))
+        observed, next_assets, _ = read(release_id, commit)
+        if (set(next_assets) != set(assets) | {name}
+                or any(next_assets[key] != value for key, value in assets.items())
+                or next_assets.get(name) != uploaded.get('id') or observed['draft'] is not True):
+            raise ValueError('backend DATA upload readback differs')
+        current, assets = observed, next_assets
+    if current['draft']:
+        if read(release_id, commit)[:2] != (current, assets):
+            raise ValueError('backend DATA release changed before publication')
+        mutate(['api', '--method', 'PATCH', prefix + '/releases/' + str(release_id),
+                '-F', 'draft=false', '-F', 'prerelease=true', '-f', 'make_latest=false'])
+    final, final_assets, _ = read(release_id, commit)
+    if final['draft'] or final_assets != assets:
+        raise ValueError('backend DATA publication readback differs')
+    proof = _app_assets.verify_data_release(row, fetch)
+    if read_url is None:
+        from urllib.request import urlopen
+        read_url = lambda url: urlopen(url, timeout=120)
+    for name, part in expected.items():
+        with read_url(data_part_url(location, name)) as reader:
+            checksum=hashlib.sha256();size=0
+            while raw:=reader.read(1<<20):
+                size+=len(raw)
+                if size>part['bytes']:raise ValueError('published backend DATA URL exceeds its exact part size')
+                checksum.update(raw)
+            if (size,checksum.hexdigest())!=(part['bytes'],part['sha256']):
+                raise ValueError('published backend DATA URL bytes differ: '+name)
+    if _app_assets.verify_data_release(row, fetch)!=proof:
+        raise ValueError('backend DATA release changed during URL readback')
+    return dict(proof, parts=[dict(expected[name], url=data_part_url(location, name)) for name in sorted(expected)])
+
+
 def inspect(repo, run_id, fetch=api):
     root = f'repos/{repo}/actions/runs/{run_id}'
     run = fetch(root)
