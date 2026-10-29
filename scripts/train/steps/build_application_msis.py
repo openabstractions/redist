@@ -51,6 +51,35 @@ def load_owner(path, name, *, source_bytes=None, admitted_boundary_pin=None):
     return owner
 
 
+def official_comfy(required=None):
+    if os.environ.get('COMFYUI_DELIVERY','native')=='native':return False
+    selector=load_owner('scripts/train/steps/select_app_producers.py','comfy_delivery_selection')
+    return selector.official_comfy_delivery(os.environ) and (required is None or 'comfyui' in required)
+
+
+def extension_owner():
+    return load_owner('scripts/train/steps/build_comfy_extension.py','official_comfy_extension')
+
+
+def extension_arguments(pins,base):
+    return (pathlib.Path('.'),pathlib.Path('sources'),pins,base/'comfy-extension-inputs',base/'native/comfyui')
+
+
+def receive_extension_originals(raw,intake_files):
+    """Authenticate retained extension originals before their source receiver."""
+    raw=pathlib.Path(raw);native=raw/'provenance/comfyui'
+    admitted={row['name']:row for row in intake_files}
+    for path in sorted(native.rglob('*')):
+        if path.is_file():
+            name=path.relative_to(raw).as_posix()
+            if name not in admitted:raise ValueError('extension original is absent from authenticated API inventory')
+            if name=='provenance/comfyui/go-sdk-archive.zip' or admitted[name]['bytes']==0:
+                closure_file(raw,name,admitted[name])
+            else:
+                bound_bytes(raw,name,admitted[name])
+    return native
+
+
 def installer_scope(version, *, policy_root=None, validate=None):
     if validate is None:
         sys.path.insert(0,str(pathlib.Path('scripts').resolve()))
@@ -116,6 +145,7 @@ def producer_owners(required,*,sources_root=pathlib.Path('sources'),shared_root=
            'comfyui':'adopter-comfyui/.installer/build_installer.py'}
     owners,errors={},[]
     for app in sorted(required):
+        if app=='comfyui' and official_comfy():continue
         try:
             owner=load_owner(pathlib.Path(sources_root)/paths[app],'selected_producer_'+app)
             if not callable(getattr(owner,'source_roles',None)):
@@ -359,6 +389,9 @@ def application_inputs(required, version):
             owner.custom_desktop_policy()
             owner.desktop_tool_inputs(pathlib.Path('app-build-inputs'))
     base=pathlib.Path('app-native');base.mkdir()
+    if official_comfy(required):
+        extension_inputs=base/'comfy-extension-inputs';extension_inputs.mkdir()
+        shutil.copyfile(closure_file(pathlib.Path('sources/adopter-comfyui'),'.installer/extension.json'),extension_inputs/'extension.json')
     inputs=base/'inputs'
     selected=base/'selected-sources.json';selected.write_text(json.dumps(pins,sort_keys=True)+'\n')
     tools={name:shutil.which(name) for name in ('git','node','npm','wix')}
@@ -553,6 +586,10 @@ def application_native_prepare(required,version):
         subprocess.run([canonical_tool(sys.executable),str(pathlib.Path(owner.__file__).resolve()),*arguments],check=True)
     if helper.pinned_input_receipt(pins,'sources',inputs)!=received:
         raise ValueError('application preparation changed selected inputs')
+    if official_comfy(required):
+        receipt=pathlib.Path(os.environ['OA_WINDOWS_GO_SDK_RECEIPT'])
+        go=json.loads(receipt.read_bytes())['go']
+        extension_owner().prepare(*extension_arguments(pins,base),version,canonical_tool(go),compiler['cl.exe'],receipt)
     for out,original in completed_native:
         if (json.loads(closure_file(out,'native-host-receipt.json').read_bytes())!=original or
                 any(pin(closure_file(out,'launch-helper.exe'))[key]!=original['build']['native'][key] for key in ('bytes','sha256'))):
@@ -698,6 +735,10 @@ def application_native_sign(required,version):
                 original=pin(closure_file(root,'native-host-receipt.json')),
                 signatures=pin(closure_file(root,receipt_name)),native=files['launch-helper.exe']),sort_keys=True)+'\n',encoding='utf-8')
         elif app=='comfyui':seal_signed_desktop(root,version,relay,owners[app])
+    if official_comfy(required):
+        pins=selected_sources(required,version)[1]
+        policy=json.loads(pathlib.Path('windows/certum_simplysign.json').read_bytes())
+        extension_owner().sign_native(*extension_arguments(pins,base),version,policy,os.environ['SIGNTOOL'])
     chain_required=installer_chain_scope(required,owners)
     sign_bundle_actions(chain_required,base,relay,catalog_maintenance=bool(required-chain_required))
 
@@ -799,6 +840,7 @@ def signed_desktop_arguments(out,base,relay,expected_sources):
 
 
 def application_helpers_prepare(required,version):
+    if official_comfy(required):return
     if 'comfyui' not in required:return
     helper,owners,base,inputs=native_context(required,version,checkout=True)
     relay=load_owner('windows/windows_signing.py','application_helper_intake')
@@ -820,7 +862,7 @@ def application_helpers_prepare(required,version):
 
 def application_helpers_sign(required,version):
     """Sign the fixed helper outputs using authenticated prior source observation."""
-    if 'comfyui' not in required:return
+    if 'comfyui' not in required or official_comfy(required):return
     if native_archive_selected(producer_owners({'comfyui'})['comfyui']):return
     base=pathlib.Path('app-native');out=base/'native/comfyui'
     selected=selected_sources(required,version)[1]
@@ -1353,6 +1395,17 @@ def application_package(required,version):
             shutil.copyfile(path,target_file)
         receipt=target/'installer-receipt.json'
         if not receipt.is_file():raise ValueError('producer omitted final installer receipt: '+app)
+    if official_comfy(required):
+        pins=selected_sources(required,version)[1]
+        extension=extension_owner()
+        extension.package(*extension_arguments(pins,base),version,selected['tools']['wix']['path'],policy,os.environ['SIGNTOOL'])
+        out=base/'native/comfyui';target=out/'package'
+        row=json.loads(closure_file(target,'bundle-app.json').read_bytes())
+        row['file']=str(closure_file(target,pathlib.Path(row['file']).name).resolve())
+        chain['apps'].append(row)
+        provenance=pathlib.Path('setup/provenance/comfyui')
+        shutil.copytree(out,provenance)
+        shutil.copytree(base/'comfy-extension-inputs',provenance/'inputs')
     packages=relay.bundle_owner().chain_packages
     retain_installer_chain(chain,'setup',packages=packages)
     if 'comfyui' in owners:
@@ -1511,6 +1564,7 @@ def raw_installer_intake(raw,relay):
 
 
 def application_sign_host(required,version):
+    if official_comfy(required):return
     if 'comfyui' not in required:return
     helper,pins=selected_sources(required,version,checkout=True)
     owners=producer_owners(required);relay=load_owner('windows/windows_signing.py','application_outer_host_signer')
@@ -1665,6 +1719,14 @@ def application_bind(required,version):
             if any(pin(relay.member(root,final))[key]!=proof[key] for key in ('sha256','bytes')):
                 raise ValueError('external app native member differs from admitted signed producer bytes')
             external_proofs.append(dict(proof,name=final))
+    if official_comfy(required):
+        native=receive_extension_originals(raw,intake['files'])
+        expected=extension_owner().expected_payload(pathlib.Path('.'),pathlib.Path('sources'),pins,
+            native/'inputs',native,version,policy,os.environ['SIGNTOOL'])
+        expected=dict(expected,msi=dict(expected['msi'],name='apps/comfyui/'+pathlib.Path(expected['msi']['name']).name))
+        bindings['comfyui']=dict(source=os.environ['CANDIDATE_SHA'],run_id=int(os.environ['GITHUB_RUN_ID']),
+            run_attempt=int(os.environ['APP_INSTALLER_ARTIFACT_ATTEMPT']),artifact=expected_artifact,
+            intake=intake,expected_payload=expected)
     def verify(chain,expected):
         relay.producer_hosts(chain,expected,source=os.environ['CANDIDATE_SHA'],run_id=int(os.environ['GITHUB_RUN_ID']),
                              run_attempt=int(os.environ['APP_INSTALLER_ARTIFACT_ATTEMPT']),delivery_root=root)
@@ -1801,6 +1863,7 @@ def assemble_desktop_pair(directory,native,binding,package,signatures,source,ver
 
 
 def application_final_capsule(required,version):
+    if official_comfy(required):return
     if 'comfyui' not in required:return
     relay=load_owner('windows/windows_signing.py','application_final_capsule_receiving')
     selected=selected_sources(required,version)[1]
@@ -2052,6 +2115,36 @@ def panel_opencode_pin(required, version):
     return dict(id='opencode',file=filename,sha256=actual['sha256'],bytes=actual['bytes'],**properties)
 
 
+def panel_comfy_pin(required,version):
+    if not official_comfy(required):return None
+    relay=load_owner('windows/windows_signing.py','panel_comfy_signed_intake')
+    root=pathlib.Path('panel-signed-msis');attempt=int(os.environ['OPENCODE_SIGNED_ATTEMPT'])
+    source=os.environ['CANDIDATE_SHA'];run_id=int(os.environ['GITHUB_RUN_ID'])
+    artifact_id=int(os.environ['OPENCODE_SIGNED_ID']);digest=os.environ['OPENCODE_SIGNED_DIGEST'].removeprefix('sha256:')
+    name='windows-app-signed-'+str(attempt)
+    if not root.exists():
+        relay.consume_artifact(artifact_id,digest,name,source,run_id,attempt,root,receipt=root/relay.INTAKE_RECEIPT)
+    binding,_=relay.retained_application_context(root,root/'app-chain-context.json',
+        source=source,run_id=run_id,artifact_id=artifact_id,artifact_name=name,artifact_digest=digest,
+        artifact_attempt=attempt,version=version,required=required,sources=selected_sources(required,version)[1])
+    policy_raw=closure_file(pathlib.Path('.'),'windows/certum_simplysign.json').read_bytes();policy=json.loads(policy_raw)
+    proof=relay.verify_receipt(json.loads(closure_file(root,'app-msi-signatures.json').read_bytes()),policy,
+        policy_sha256=hashlib.sha256(policy_raw).hexdigest())
+    relative='apps/apps/comfyui/comfyui-'+version+'.msi'
+    rows=[row for row in proof['files'] if row['name']==relative]
+    if len(rows)!=1:raise ValueError('authenticated signer receipt has no exact ComfyUI extension MSI')
+    expected=relay.validate_expected_payload(binding['expected_producers']['comfyui']['expected_payload'])
+    if (expected['msi']['name']!=relative.removeprefix('apps/')
+            or rows[0].get('msi_members')!=relay.final_msi_members(expected)):
+        raise ValueError('signed ComfyUI extension inventory differs from authenticated producer')
+    path=closure_file(root,relative,rows[0])
+    relay.verify_msi_payload(path,policy,os.environ['SIGNTOOL'],expected_payload=expected,container_proof=rows[0])
+    connector=[row for row in expected['files'] if row['path'].endswith('/comfyui-connector.exe')]
+    if len(connector)!=1:raise ValueError('ComfyUI extension requires one signed connector')
+    return dict(id='comfyui',file=path.name,version=version,**{key:rows[0][key] for key in ('sha256','bytes')},
+        connector_sha256=connector[0]['sha256'],connector_bytes=connector[0]['bytes'])
+
+
 def publish_verified_backend_data(assets,relay,row,destination,artifact,intake,selected,expected):
     """Publish DATA only after the existing signed producer and pair checks."""
     source=os.environ['CANDIDATE_SHA'];run_id=int(os.environ['GITHUB_RUN_ID'])
@@ -2156,10 +2249,12 @@ def application_stage_final(required,version,*,publish_data=False):
 def application_panel_inputs(required,version):
     """Create the explicit passive catalogue input for an empty app selection."""
     assets=load_owner('scripts/app_assets.py','application_empty_panel_catalogue')
-    expected=assets.panel_app_ids(required)
+    expected=assets.panel_app_ids(set(required)-({'comfyui'} if official_comfy(required) else set()))
     if expected:raise ValueError('selected Panel applications require completed delivery intake')
+    extensions=dict(opencode=panel_opencode_pin(required,version))
+    if official_comfy(required):extensions['comfyui']=panel_comfy_pin(required,version)
     catalogue,descriptor=assets.panel_pin_input(pathlib.Path('apps.json').read_bytes(),[],
-        expected_apps=expected,opencode=panel_opencode_pin(required,version),
+        expected_apps=expected,**extensions,
         producer=dict(source=os.environ['CANDIDATE_SHA'],
             run_id=int(os.environ['GITHUB_RUN_ID']),run_attempt=int(os.environ['GITHUB_RUN_ATTEMPT'])))
     destination=pathlib.Path(os.environ['RUNNER_TEMP'])/'panel-catalogue'

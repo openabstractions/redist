@@ -101,6 +101,7 @@ env:
   # legacy same-run path. IDs/digests/inputs and derived evidence are literal
   # reviewed source inputs, never downloaded sidecar authority.
   CORE_ONLY: ${{ inputs.core_only && 'true' || 'false' }}
+  COMFYUI_DELIVERY: official-extension
   APP_PRODUCERS: '{}'
   APP_PRODUCER_ONLY: ${{ inputs.app_producer_only || 'none' }}
   APP_DELIVERY_ONLY: ${{ inputs.app_delivery_only || 'none' }}
@@ -315,6 +316,7 @@ jobs:
       lemonade: ${{ steps.optional-apps.outputs.lemonade }}
       required-products: ${{ steps.optional-apps.outputs.required-products }}
       installer-comfyui: ${{ steps.optional-apps.outputs.installer-comfyui }}
+      native-comfyui: ${{ steps.optional-apps.outputs.native-comfyui }}
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
         with:
@@ -406,7 +408,7 @@ jobs:
           compression-level: 0
           if-no-files-found: error
   windows-app-delivery:
-    if: ${{ needs.source-guard.result == 'success' && (!inputs.core_only && !inputs.diagnostic_host_sign_only && (inputs.producer_mode == 'train' && !inputs.signing_probe_only && needs.candidate.outputs.installer-comfyui == 'true')) }}
+    if: ${{ needs.source-guard.result == 'success' && (!inputs.core_only && !inputs.diagnostic_host_sign_only && (inputs.producer_mode == 'train' && !inputs.signing_probe_only && needs.candidate.outputs.native-comfyui == 'true')) }}
     needs: [source-guard, candidate, windows-app-sign]
     runs-on: windows-latest
     permissions:
@@ -431,7 +433,7 @@ jobs:
         run: python3 windows/windows_signing.py prepare-tools --root "$RUNNER_TEMP/signing-tools" --github-env "$GITHUB_ENV"
       - name: assemble authenticated application delivery before Panel compilation
         id: comfy-final
-        if: inputs.producer_mode == 'train' && needs.candidate.outputs.installer-comfyui == 'true'
+        if: inputs.producer_mode == 'train' && needs.candidate.outputs.native-comfyui == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
           CANDIDATE_SHA: ${{ needs.candidate.outputs.sha }}
@@ -448,7 +450,7 @@ jobs:
           python3 scripts/train/steps/build_application_msis.py --phase assemble-final
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         id: comfy-artifact
-        if: inputs.producer_mode == 'train' && needs.candidate.outputs.installer-comfyui == 'true'
+        if: inputs.producer_mode == 'train' && needs.candidate.outputs.native-comfyui == 'true'
         with:
           name: ${{ steps.comfy-final.outputs.artifact }}
           path: final-apps/comfyui/
@@ -456,7 +458,7 @@ jobs:
 
 
   backend-data:
-    if: ${{ needs.source-guard.result == 'success' && (!inputs.core_only && inputs.producer_mode == 'train' && needs.candidate.outputs.installer-comfyui == 'true' && needs.windows-app-delivery.result == 'success' && needs.app_comfyui.result == 'success' && !inputs.diagnostic_host_sign_only && !inputs.signing_probe_only && inputs.app_producer_only == 'none') }}
+    if: ${{ needs.source-guard.result == 'success' && (!inputs.core_only && inputs.producer_mode == 'train' && needs.candidate.outputs.native-comfyui == 'true' && needs.windows-app-delivery.result == 'success' && (needs.app_comfyui.result == 'success' || (needs.candidate.outputs.native-comfyui != 'true' && needs.app_comfyui.result == 'skipped')) && !inputs.diagnostic_host_sign_only && !inputs.signing_probe_only && inputs.app_producer_only == 'none') }}
     needs: [source-guard, candidate, windows-app-delivery, app_comfyui]
     runs-on: ubuntu-latest
     permissions:
@@ -484,7 +486,7 @@ jobs:
         run: python3 scripts/train/steps/build_application_msis.py --phase publish-data
 
   windows-app-catalogue:
-    if: ${{ needs.source-guard.result == 'success' && (!inputs.core_only && needs.backend-data.result == 'success' && !inputs.diagnostic_host_sign_only && inputs.producer_mode == 'train' && !inputs.signing_probe_only && inputs.app_producer_only == 'none' && inputs.app_delivery_only == 'comfyui' && needs.candidate.outputs.installer-comfyui == 'true') }}
+    if: ${{ needs.source-guard.result == 'success' && (!inputs.core_only && needs.backend-data.result == 'success' && !inputs.diagnostic_host_sign_only && inputs.producer_mode == 'train' && !inputs.signing_probe_only && inputs.app_producer_only == 'none' && inputs.app_delivery_only == 'comfyui' && needs.candidate.outputs.native-comfyui == 'true') }}
     needs: [source-guard, candidate, windows-app-delivery, backend-data]
     runs-on: ubuntu-latest
     permissions:
@@ -557,7 +559,7 @@ jobs:
           if-no-files-found: error
 
   windows-build:
-    if: ${{ needs.source-guard.result == 'success' && ((inputs.core_only && !cancelled() && inputs.producer_mode == 'train' && !inputs.signing_probe_only && !inputs.diagnostic_host_sign_only && inputs.app_producer_only == 'none' && inputs.app_delivery_only == 'none' && needs.candidate.result == 'success' && needs.pytorch-input.result == 'success' && needs.installer-prior-input.result == 'success') || (!inputs.core_only && (inputs.app_delivery_only != 'comfyui' && (!inputs.diagnostic_host_sign_only && (!cancelled() && needs.candidate.result == 'success' && needs.pytorch-input.result == 'success' && needs.installer-prior-input.result == 'success' && ((inputs.producer_mode == 'train' && needs.candidate.outputs.installer-comfyui == 'true' && needs.windows-app-delivery.result == 'success' && needs.backend-data.result == 'success') || ((inputs.producer_mode != 'train' || needs.candidate.outputs.installer-comfyui != 'true') && needs.windows-app-delivery.result == 'skipped' && needs.backend-data.result == 'skipped')) && inputs.producer_mode != 'train-graph' && (!inputs.signing_probe_only && (inputs.app_producer_only == 'none' || inputs.app_producer_only == ''))))))) }}
+    if: ${{ needs.source-guard.result == 'success' && ((inputs.core_only && !cancelled() && inputs.producer_mode == 'train' && !inputs.signing_probe_only && !inputs.diagnostic_host_sign_only && inputs.app_producer_only == 'none' && inputs.app_delivery_only == 'none' && needs.candidate.result == 'success' && needs.pytorch-input.result == 'success' && needs.installer-prior-input.result == 'success') || (!inputs.core_only && (inputs.app_delivery_only != 'comfyui' && (!inputs.diagnostic_host_sign_only && (!cancelled() && needs.candidate.result == 'success' && needs.pytorch-input.result == 'success' && needs.installer-prior-input.result == 'success' && ((inputs.producer_mode == 'train' && needs.candidate.outputs.native-comfyui == 'true' && needs.windows-app-delivery.result == 'success' && needs.backend-data.result == 'success') || ((inputs.producer_mode != 'train' || needs.candidate.outputs.native-comfyui != 'true') && needs.windows-app-delivery.result == 'skipped' && needs.backend-data.result == 'skipped')) && inputs.producer_mode != 'train-graph' && (!inputs.signing_probe_only && (inputs.app_producer_only == 'none' || inputs.app_producer_only == ''))))))) }}
     needs: [source-guard, candidate, pytorch-input, installer-prior-input, windows-app-delivery, windows-app-sign, backend-data]
     runs-on: windows-latest
     permissions:
@@ -675,7 +677,7 @@ jobs:
         run: python3 windows/windows_signing.py prepare-tools --root "$RUNNER_TEMP/signing-tools" --github-env "$GITHUB_ENV"
 
       - name: receive completed application delivery and generate Panel catalogue input
-        if: inputs.producer_mode == 'train' && needs.candidate.outputs.installer-comfyui == 'true'
+        if: inputs.producer_mode == 'train' && needs.candidate.outputs.native-comfyui == 'true'
         env:
           PANEL_OPENCODE_SIGNED: '1'
           OPENCODE_SIGNED_ID: ${{ needs.windows-app-sign.outputs.artifact-id }}
@@ -689,7 +691,7 @@ jobs:
           COMFY_FINAL_ARTIFACT_ATTEMPT: ${{ needs.windows-app-delivery.outputs.comfyui-artifact-attempt }}
         run: python3 scripts/train/steps/build_application_msis.py --phase stage-final
       - name: generate explicit passive Panel catalogue input
-        if: inputs.producer_mode == 'train' && needs.candidate.outputs.installer-comfyui != 'true'
+        if: inputs.producer_mode == 'train' && needs.candidate.outputs.native-comfyui != 'true'
         env:
           OPENCODE_SIGNED_ID: ${{ needs.windows-app-sign.outputs.artifact-id }}
           OPENCODE_SIGNED_DIGEST: ${{ needs.windows-app-sign.outputs.artifact-digest }}
@@ -739,7 +741,7 @@ jobs:
           PRODUCER_MODE: ${{ inputs.producer_mode }}
           GOOS: windows
           GOFLAGS: -trimpath
-          PANEL_APPS: ${{ needs.candidate.outputs.installer-comfyui == 'true' && '["comfyui"]' || '[]' }}
+          PANEL_APPS: ${{ needs.candidate.outputs.native-comfyui == 'true' && '["comfyui"]' || '[]' }}
         run: |
           python3 scripts/module_provenance.py --tools tools.tsv --observe-windows-builds . \
             --provenance module-provenance.json --output windows-build-observation.json --build-phase providers \
@@ -1561,7 +1563,7 @@ jobs:
           if-no-files-found: error
 
   windows-app-native-build:
-    if: ${{ needs.source-guard.result == 'success' && (!inputs.core_only && !inputs.diagnostic_host_sign_only && (always() && needs.candidate.result == 'success' && inputs.producer_mode == 'train' && !inputs.signing_probe_only && (inputs.app_producer_only == 'none' || inputs.app_producer_only == '') && (needs.candidate.outputs.required-products == '[]' || (needs.javascript.result == 'success' && needs.python.result == 'success' && needs.windows-sdk-sign.result == 'success' && needs.app_comfyui.result == 'success')))) }}
+    if: ${{ needs.source-guard.result == 'success' && (!inputs.core_only && !inputs.diagnostic_host_sign_only && (always() && needs.candidate.result == 'success' && inputs.producer_mode == 'train' && !inputs.signing_probe_only && (inputs.app_producer_only == 'none' || inputs.app_producer_only == '') && (needs.candidate.outputs.required-products == '[]' || (needs.javascript.result == 'success' && needs.python.result == 'success' && needs.windows-sdk-sign.result == 'success' && (needs.app_comfyui.result == 'success' || (needs.candidate.outputs.native-comfyui != 'true' && needs.app_comfyui.result == 'skipped')))))) }}
     needs: [source-guard, candidate, javascript, python, windows-sdk-sign, app_comfyui]
     runs-on: windows-latest
     permissions:
@@ -1867,7 +1869,7 @@ jobs:
           if-no-files-found: error
 
   windows-app-msi:
-    if: ${{ needs.source-guard.result == 'success' && (!inputs.core_only && !inputs.diagnostic_host_sign_only && (always() && needs.candidate.result == 'success' && (needs.app_comfyui.result == 'success' || needs.app_comfyui.result == 'skipped') && (inputs.producer_mode != 'train' || needs.candidate.outputs.required-products == '[]' || needs.windows-app-helpers-sign.result == 'success') && inputs.producer_mode != 'train-graph' && (!inputs.signing_probe_only && (inputs.app_producer_only == 'none' || inputs.app_producer_only == '')))) }}
+    if: ${{ needs.source-guard.result == 'success' && (!inputs.core_only && !inputs.diagnostic_host_sign_only && (always() && needs.candidate.result == 'success' && ((needs.app_comfyui.result == 'success' || (needs.candidate.outputs.native-comfyui != 'true' && needs.app_comfyui.result == 'skipped')) || needs.app_comfyui.result == 'skipped') && (inputs.producer_mode != 'train' || needs.candidate.outputs.required-products == '[]' || needs.windows-app-helpers-sign.result == 'success') && inputs.producer_mode != 'train-graph' && (!inputs.signing_probe_only && (inputs.app_producer_only == 'none' || inputs.app_producer_only == '')))) }}
     needs: [source-guard, candidate, app_comfyui, windows-app-helpers-sign]
     runs-on: windows-latest
     permissions:
@@ -4356,7 +4358,7 @@ jobs:
   # The runner is named here, so the reviewed workflow digest covers it; no
   # repository variable can send the candidate source to another machine.
   app_comfyui:
-    if: ${{ needs.source-guard.result == 'success' && (!inputs.core_only && !inputs.diagnostic_host_sign_only && (inputs.producer_mode != 'train-graph')) }}
+    if: ${{ needs.source-guard.result == 'success' && (!inputs.core_only && !inputs.diagnostic_host_sign_only && inputs.producer_mode != 'train-graph' && (needs.candidate.outputs.comfyui == 'true' || needs.candidate.outputs.native-comfyui == 'true')) }}
     needs: [source-guard, candidate, python]
     runs-on: windows-latest
     permissions:
@@ -4366,7 +4368,7 @@ jobs:
       CANDIDATE_SHA: ${{ needs.candidate.outputs.sha }}
       CANDIDATE_VERSION: ${{ needs.candidate.outputs.version }}
       PRODUCER_MODE: ${{ inputs.producer_mode }}
-      INSTALLER_COMFYUI: ${{ needs.candidate.outputs.installer-comfyui }}
+      INSTALLER_COMFYUI: ${{ needs.candidate.outputs.native-comfyui }}
     outputs:
       artifact: ${{ steps.identity.outputs.artifact }}
       source_commit: ${{ steps.identity.outputs.source_commit }}
@@ -4381,21 +4383,21 @@ jobs:
         with:
           ref: ${{ github.sha }}
       - uses: actions/setup-python@e797f83bcb11b83ae66e0230d6156d7c80228e7c # v6.0.0
-        if: (needs.candidate.outputs.comfyui == 'true' || needs.candidate.outputs.installer-comfyui == 'true')
+        if: (needs.candidate.outputs.comfyui == 'true' || needs.candidate.outputs.native-comfyui == 'true')
         with:
           python-version: '3.12'
       - name: verify and check out exact public app sources
-        if: (needs.candidate.outputs.comfyui == 'true' || needs.candidate.outputs.installer-comfyui == 'true') && (inputs.producer_mode != 'train' || needs.candidate.outputs.installer-comfyui != 'true')
+        if: (needs.candidate.outputs.comfyui == 'true' || needs.candidate.outputs.native-comfyui == 'true') && (inputs.producer_mode != 'train' || needs.candidate.outputs.native-comfyui != 'true')
         run: |
           python3 scripts/train/steps/check_out_app_sources.py
       - name: measure disposable producer volumes and selected work root
-        if: (needs.candidate.outputs.comfyui == 'true' || needs.candidate.outputs.installer-comfyui == 'true')
+        if: (needs.candidate.outputs.comfyui == 'true' || needs.candidate.outputs.native-comfyui == 'true')
         shell: pwsh
         run: |
           Get-PSDrive -PSProvider FileSystem | Select-Object Name, Root, Free, Used | ConvertTo-Json -Compress
           Write-Output "ComfyUI work root: $((Resolve-Path -LiteralPath $env:GITHUB_WORKSPACE).Path)"
       - name: refuse undersized disposable producer before asset downloads
-        if: (needs.candidate.outputs.comfyui == 'true' || needs.candidate.outputs.installer-comfyui == 'true') && (needs.candidate.outputs.comfyui-predecessor != 'true' || (inputs.producer_mode == 'train' && needs.candidate.outputs.installer-comfyui == 'true'))
+        if: (needs.candidate.outputs.comfyui == 'true' || needs.candidate.outputs.native-comfyui == 'true') && (needs.candidate.outputs.comfyui-predecessor != 'true' || (inputs.producer_mode == 'train' && needs.candidate.outputs.native-comfyui == 'true'))
         run: |
           if [ "$PRODUCER_MODE" = train ] && [ "$INSTALLER_COMFYUI" = true ]; then
             python3 scripts/train/steps/build_application_msis.py --phase backend-inputs
@@ -4405,7 +4407,7 @@ jobs:
           python3 scripts/app_producer_inputs.py preflight --app comfyui "${extra[@]}" --minimum-free-gib 1 \
             --candidate-source "$CANDIDATE_SHA" --run-id "$GITHUB_RUN_ID" --run-attempt "$GITHUB_RUN_ATTEMPT"
       - name: select this run's successful Windows Python wheel set
-        if: (needs.candidate.outputs.comfyui == 'true' || needs.candidate.outputs.installer-comfyui == 'true') && (needs.candidate.outputs.comfyui-predecessor != 'true' || (inputs.producer_mode == 'train' && needs.candidate.outputs.installer-comfyui == 'true'))
+        if: (needs.candidate.outputs.comfyui == 'true' || needs.candidate.outputs.native-comfyui == 'true') && (needs.candidate.outputs.comfyui-predecessor != 'true' || (inputs.producer_mode == 'train' && needs.candidate.outputs.native-comfyui == 'true'))
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
@@ -4413,7 +4415,7 @@ jobs:
         run: |
           python3 scripts/train/steps/select_windows_wheel_set.py
       - name: fetch this run's successful Windows Python wheel set
-        if: (needs.candidate.outputs.comfyui == 'true' || needs.candidate.outputs.installer-comfyui == 'true') && (needs.candidate.outputs.comfyui-predecessor != 'true' || (inputs.producer_mode == 'train' && needs.candidate.outputs.installer-comfyui == 'true'))
+        if: (needs.candidate.outputs.comfyui == 'true' || needs.candidate.outputs.native-comfyui == 'true') && (needs.candidate.outputs.comfyui-predecessor != 'true' || (inputs.producer_mode == 'train' && needs.candidate.outputs.native-comfyui == 'true'))
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
@@ -4421,12 +4423,12 @@ jobs:
           mkdir sdk-wheels
           gh run download "$GITHUB_RUN_ID" -n "$WHEEL_ARTIFACT" -D sdk-wheels
       - name: fetch exact source-selected ComfyUI inputs
-        if: (needs.candidate.outputs.comfyui == 'true' || needs.candidate.outputs.installer-comfyui == 'true') && needs.candidate.outputs.comfyui-predecessor != 'true' && (inputs.producer_mode != 'train' || needs.candidate.outputs.installer-comfyui != 'true')
+        if: (needs.candidate.outputs.comfyui == 'true' || needs.candidate.outputs.native-comfyui == 'true') && needs.candidate.outputs.comfyui-predecessor != 'true' && (inputs.producer_mode != 'train' || needs.candidate.outputs.native-comfyui != 'true')
         run: |
           extra=(); if [ "$APP_PRODUCER_ONLY" = "comfyui" ]; then extra=(--producer-only --adopter-commit "$COMFYUI_PRODUCER_ADOPTER_COMMIT"); fi
           python3 scripts/app_producer_inputs.py download-comfy --app comfyui "${extra[@]}"
       - name: build exact public integration and source-selected app/backend output
-        if: (needs.candidate.outputs.comfyui == 'true' || needs.candidate.outputs.installer-comfyui == 'true') && (needs.candidate.outputs.comfyui-predecessor != 'true' || (inputs.producer_mode == 'train' && needs.candidate.outputs.installer-comfyui == 'true'))
+        if: (needs.candidate.outputs.comfyui == 'true' || needs.candidate.outputs.native-comfyui == 'true') && (needs.candidate.outputs.comfyui-predecessor != 'true' || (inputs.producer_mode == 'train' && needs.candidate.outputs.native-comfyui == 'true'))
         env:
           CANDIDATE_SHA: ${{ needs.candidate.outputs.sha }}
           CANDIDATE_VERSION: ${{ needs.candidate.outputs.version }}
@@ -4434,7 +4436,7 @@ jobs:
           python3 scripts/train/steps/build_integration_source_pair.py
       - name: assemble complete source-bound native control Python
         id: control
-        if: inputs.producer_mode == 'train' && needs.candidate.outputs.installer-comfyui == 'true'
+        if: inputs.producer_mode == 'train' && needs.candidate.outputs.native-comfyui == 'true'
         run: python3 scripts/train/steps/build_application_msis.py --phase control-inputs
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         id: control-artifact
@@ -4444,7 +4446,7 @@ jobs:
           path: app-control-output/
           if-no-files-found: error
       - name: bind reviewed pair to this producer attempt
-        if: (needs.candidate.outputs.comfyui == 'true' || needs.candidate.outputs.installer-comfyui == 'true')
+        if: (needs.candidate.outputs.comfyui == 'true' || needs.candidate.outputs.native-comfyui == 'true')
         id: identity
         env:
           CANDIDATE_SHA: ${{ needs.candidate.outputs.sha }}
@@ -4483,14 +4485,14 @@ jobs:
           printf 'source_commit=40c4fcdf513a4523e39d54a9d391908af8df8171\n' >> "$GITHUB_OUTPUT"
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         id: artifact
-        if: (needs.candidate.outputs.comfyui == 'true' || needs.candidate.outputs.installer-comfyui == 'true')
+        if: (needs.candidate.outputs.comfyui == 'true' || needs.candidate.outputs.native-comfyui == 'true')
         with:
           name: ${{ steps.identity.outputs.artifact }}
           path: app-output/
           if-no-files-found: error
 
   draft:
-    if: ${{ needs.source-guard.result == 'success' && ((inputs.core_only && !cancelled() && inputs.producer_mode == 'train' && !inputs.signing_probe_only && !inputs.diagnostic_host_sign_only && inputs.app_producer_only == 'none' && inputs.app_delivery_only == 'none' && needs.candidate.result == 'success' && needs.windows-msi-sign.result == 'success' && needs.verify.result == 'success' && needs.linux.result == 'success' && needs.linux-verify.result == 'success' && needs.macos.result == 'success') || (!inputs.core_only && (inputs.app_delivery_only != 'comfyui' && (!inputs.diagnostic_host_sign_only && (!cancelled() && needs.candidate.result == 'success' && needs.windows-msi-sign.result == 'success' && needs.verify.result == 'success' && needs.linux.result == 'success' && needs.linux-verify.result == 'success' && needs.macos.result == 'success' && needs.app_comfyui.result == 'success' && ((inputs.producer_mode == 'train' && needs.candidate.outputs.installer-comfyui == 'true' && needs.windows-app-delivery.result == 'success') || ((inputs.producer_mode != 'train' || needs.candidate.outputs.installer-comfyui != 'true') && needs.windows-app-delivery.result == 'skipped')) && inputs.producer_mode != 'train-graph' && (!inputs.signing_probe_only && (inputs.app_producer_only == 'none' || inputs.app_producer_only == ''))))))) }}
+    if: ${{ needs.source-guard.result == 'success' && ((inputs.core_only && !cancelled() && inputs.producer_mode == 'train' && !inputs.signing_probe_only && !inputs.diagnostic_host_sign_only && inputs.app_producer_only == 'none' && inputs.app_delivery_only == 'none' && needs.candidate.result == 'success' && needs.windows-msi-sign.result == 'success' && needs.verify.result == 'success' && needs.linux.result == 'success' && needs.linux-verify.result == 'success' && needs.macos.result == 'success') || (!inputs.core_only && (inputs.app_delivery_only != 'comfyui' && (!inputs.diagnostic_host_sign_only && (!cancelled() && needs.candidate.result == 'success' && needs.windows-msi-sign.result == 'success' && needs.verify.result == 'success' && needs.linux.result == 'success' && needs.linux-verify.result == 'success' && needs.macos.result == 'success' && (needs.app_comfyui.result == 'success' || (needs.candidate.outputs.native-comfyui != 'true' && needs.app_comfyui.result == 'skipped')) && ((inputs.producer_mode == 'train' && needs.candidate.outputs.native-comfyui == 'true' && needs.windows-app-delivery.result == 'success') || ((inputs.producer_mode != 'train' || needs.candidate.outputs.native-comfyui != 'true') && needs.windows-app-delivery.result == 'skipped')) && inputs.producer_mode != 'train-graph' && (!inputs.signing_probe_only && (inputs.app_producer_only == 'none' || inputs.app_producer_only == ''))))))) }}
     needs: [source-guard, candidate, windows-msi-sign, verify, linux, linux-verify, macos, app_comfyui, windows-app-delivery]
     runs-on: ubuntu-latest
     permissions:
@@ -4575,7 +4577,7 @@ jobs:
           CANDIDATE_SHA: ${{ needs.candidate.outputs.sha }}
           CANDIDATE_VERSION: ${{ needs.candidate.outputs.version }}
           PRODUCER_MODE: ${{ inputs.producer_mode }}
-          INSTALLER_COMFYUI: ${{ needs.candidate.outputs.installer-comfyui }}
+          INSTALLER_COMFYUI: ${{ needs.candidate.outputs.native-comfyui }}
           COMFY_FINAL_ARTIFACT_ID: ${{ needs.windows-app-delivery.outputs.comfyui-artifact-id }}
           COMFY_FINAL_ARTIFACT_DIGEST: ${{ needs.windows-app-delivery.outputs.comfyui-artifact-digest }}
           COMFY_FINAL_ARTIFACT_ATTEMPT: ${{ needs.windows-app-delivery.outputs.comfyui-artifact-attempt }}

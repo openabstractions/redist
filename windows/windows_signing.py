@@ -2439,6 +2439,27 @@ def _admit_and_verify_setup_catalog_transition(previous_root, root, policy, sign
         previous_version=previous_intake['version'], version=candidate_intake['version'], **verification)
 
 
+def opencode_catalog_extension(document, version):
+    """Select OpenCode's exact row beside the existing Comfy connector pin."""
+    extensions = document.get('extensions') if isinstance(document, dict) else None
+    if (not isinstance(document, dict) or document.get('schema') != 2
+            or document.get('release_tag') != 'v' + version
+            or not isinstance(extensions, list) or not 1 <= len(extensions) <= 2
+            or any(not isinstance(row, dict) or row.get('id') not in ('opencode', 'comfyui') for row in extensions)
+            or len({row['id'] for row in extensions}) != len(extensions)):
+        raise ValueError('Catalog document lacks its unique versioned OpenCode extension')
+    for row in extensions:
+        if row['id'] == 'comfyui' and (set(row) != {'id','file','sha256','bytes','version','connector_sha256','connector_bytes'}
+                or row['file'] != 'comfyui-' + version + '.msi' or row['version'] != version
+                or any(not re.fullmatch('[0-9a-f]{64}', str(row[key])) for key in ('sha256','connector_sha256'))
+                or any(type(row[key]) is not int or not 0 < row[key] < 2 << 30 for key in ('bytes','connector_bytes'))):
+            raise ValueError('Catalog ComfyUI connector projection differs')
+    rows = [row for row in extensions if row['id'] == 'opencode']
+    if len(rows) != 1:
+        raise ValueError('Catalog document lacks its unique versioned OpenCode extension')
+    return rows[0]
+
+
 def signed_setup_upgrade_opencode(root, policy, signtool, *, policy_sha256, candidate_intake, catalog_path):
     """Receive the signed candidate Catalog without requiring an earlier Catalog."""
     binding, artifact = _admit_setup_catalog_artifact(root, **candidate_intake)
@@ -2453,9 +2474,8 @@ def signed_setup_upgrade_opencode(root, policy, signtool, *, policy_sha256, cand
     if (receipt['bundle']['name'] != f'OpenAbstractions-Setup-{version}.exe'
             or 'chain_context' not in receipt or any(row['id'] == 'App_opencode' for row in receipt['chain'])
             or not app or app['version'] != version or 'package_code' not in app
-            or not isinstance(document, dict) or document.get('schema') != 2 or document.get('release_tag') != 'v' + version
-            or document.get('extensions') != [{'id': 'opencode', 'file': app['name'],
-                **{key: app[key] for key in ('sha256', 'bytes', 'version', 'product_code', 'upgrade_code', 'package_code')}}]):
+            or opencode_catalog_extension(document, version) != {'id': 'opencode', 'file': app['name'],
+                **{key: app[key] for key in ('sha256', 'bytes', 'version', 'product_code', 'upgrade_code', 'package_code')}}):
         raise ValueError('signed Setup upgrade requires its exact embedded OpenCode Catalog package')
     owner = bundle_owner()
     chain = owner.read_chain_context(receipt['chain_context'], root)
@@ -2493,10 +2513,7 @@ def signed_setup_catalog_transition(previous_root, root, policy, signtool, *, po
     catalog_pin = dict(name=catalog_path.name, bytes=len(catalog_document),
                        sha256=hashlib.sha256(catalog_document).hexdigest())
     catalog = json.loads(catalog_document)
-    extensions = catalog.get('extensions')
-    if (catalog.get('schema') != 2 or catalog.get('release_tag') != 'v' + version
-            or not isinstance(extensions, list) or len(extensions) != 1):
-        raise ValueError('Catalog document lacks its single versioned extension')
+    extension = opencode_catalog_extension(catalog, version)
     previous, old_installed = check_bundle(previous_root, policy, signtool, signing=False,
         policy_sha256=policy_sha256, installed_readback=True, **previous_binding)
     candidate, installed = check_bundle(root, policy, signtool, signing=False,
@@ -2514,7 +2531,7 @@ def signed_setup_catalog_transition(previous_root, root, policy, signtool, *, po
     inputs = setup_catalog_transition_inputs(
         dict(bundle=previous['bundle'], opencode=old_installed['opencode']),
         dict(bundle=candidate['bundle'], opencode=installed['opencode']),
-        extensions[0], installed['runtime'], installed['panel'], fixture, version=version, model=model, **identity)
+        extension, installed['runtime'], installed['panel'], fixture, version=version, model=model, **identity)
     # The retained producer inventories were checked against the signed MSI
     # members by check_bundle. The producer's unsigned container pin is not
     # the signed package pin that the guest must open.

@@ -45,6 +45,13 @@ def delivery_context(environment):
         raise ValueError('final Comfy delivery requires exact hosted source/run/attempt context')
 
 
+def official_comfy_delivery(environment):
+    value=environment.get('COMFYUI_DELIVERY','native')
+    if value not in ('native','official-extension'):
+        raise ValueError('unknown source-selected ComfyUI delivery')
+    return value=='official-extension'
+
+
 def core_only_execution(environment):
     value=environment.get('CORE_ONLY','false')
     if value not in ('true','false'):raise ValueError('core_only must be an explicit boolean')
@@ -78,6 +85,10 @@ def main():
         required=()
         archives=set()
     selected = archives | set(required)
+    official=official_comfy_delivery(os.environ)
+    if official and component!='none':
+        raise ValueError('official ComfyUI extension uses the ordinary MSI chain')
+    if official:archives.discard('comfyui')
     predecessors = predecessor_pins(os.environ['APP_PRODUCERS'])
     if core_only and predecessors:raise ValueError('core-only diagnostic cannot select application predecessors')
     if component == 'comfyui':
@@ -102,6 +113,7 @@ def main():
     with pathlib.Path(os.environ['GITHUB_OUTPUT']).open('a', encoding='utf-8') as output:
         output.write('required-products=' + json.dumps(required, separators=(',', ':')) + '\n')
         output.write('execution-scope=' + ('core-only-diagnostic' if core_only else 'full') + '\n')
+        output.write('native-comfyui='+str('comfyui' in required and not official).lower()+'\n')
         for app in sorted(supported):
             # The existing Comfy flag remains the legacy archive producer's
             # input. Installer obligations get their own receiving output.

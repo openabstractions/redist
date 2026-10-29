@@ -1180,33 +1180,45 @@ def panel_catalogue_rows(raw):
             raise ValueError('Panel extension pins require schema 2')
         extensions = document.pop('extensions')
         version = document['release_tag'].removeprefix('v')
-        if not isinstance(extensions, list) or len(extensions) != 1:
-            raise ValueError('expected one signed OpenCode extension')
-        row = extensions[0]
-        if (not isinstance(row, dict) or set(row) != {'id','file','sha256','bytes','version','product_code','upgrade_code'}
-                or row['id'] != 'opencode' or row['file'] != f'opencode-{version}.msi' or row['version'] != version
+        if not isinstance(extensions, list) or not extensions or len(extensions) > 2:
+            raise ValueError('expected signed selected extensions')
+        ids = set()
+        for row in extensions:
+            if not isinstance(row, dict) or row.get('id') not in ('opencode', 'comfyui') or row['id'] in ids:
+                raise ValueError('invalid or duplicate signed extension projection')
+            ids.add(row['id'])
+            app = row['id']
+            specific = {'product_code','upgrade_code'} if app == 'opencode' else {'connector_sha256','connector_bytes'}
+            if (set(row) != {'id','file','sha256','bytes','version', *specific}
+                or row['file'] != f'{app}-{version}.msi' or row['version'] != version
                 or not isinstance(row['sha256'], str) or not SHA.fullmatch(row['sha256'])
-                or type(row['bytes']) is not int or not 0 < row['bytes'] < MAX_RELEASE_ASSET_BYTES
-                or not isinstance(row['product_code'], str)
+                or type(row['bytes']) is not int or not 0 < row['bytes'] < MAX_RELEASE_ASSET_BYTES):
+                raise ValueError('invalid signed ' + ('OpenCode' if app == 'opencode' else 'ComfyUI') + ' extension projection')
+            if app == 'opencode' and (not isinstance(row['product_code'], str)
                 or not re.fullmatch(r'\{[0-9A-F]{8}(?:-[0-9A-F]{4}){3}-[0-9A-F]{12}\}', row['product_code'])
                 or row['upgrade_code'] != OPENCODE_UPGRADE_CODE):
-            raise ValueError('invalid signed OpenCode extension projection')
+                raise ValueError('invalid signed OpenCode extension projection')
+            if app == 'comfyui' and (not isinstance(row['connector_sha256'], str)
+                    or not SHA.fullmatch(row['connector_sha256']) or type(row['connector_bytes']) is not int
+                    or not 0 < row['connector_bytes'] < MAX_RELEASE_ASSET_BYTES):
+                raise ValueError('invalid signed ComfyUI extension projection')
         # Legacy archive rows retain their exact source roster representation.
         if document['apps'] and not multipart_row(document['apps'][0]):
             document['schema'] = 1
     return roster_text(json.dumps(document))
 
 
-def panel_pin_input(source_document, produced_rows, *, expected_apps, producer, opencode=None):
+def panel_pin_input(source_document, produced_rows, *, expected_apps, producer, opencode=None, comfyui=None):
     """Bind generated build data to the already authenticated stage producer."""
     if (not isinstance(producer,dict) or set(producer) != {'source','run_id','run_attempt'} or
             not re.fullmatch('[0-9a-f]{40}',str(producer['source'])) or
             any(type(producer[key]) is not int or producer[key] <= 0 for key in ('run_id','run_attempt'))):
         raise ValueError('Panel catalogue requires exact current producer identity')
     raw = panel_pin_document(source_document,produced_rows,expected_apps=expected_apps)
-    if opencode is not None:
+    extensions = [pin for pin in (opencode, comfyui) if pin is not None]
+    if extensions:
         document = json.loads(raw)
-        document.update(schema=2, extensions=[opencode])
+        document.update(schema=2, extensions=extensions)
         raw = (json.dumps(document, sort_keys=True) + '\n').encode('utf-8')
         panel_catalogue_rows(raw)
     def pin(value):return dict(bytes=len(value),sha256=hashlib.sha256(value).hexdigest())
