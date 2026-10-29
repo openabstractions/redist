@@ -3992,8 +3992,10 @@ jobs:
               exit 1
             fi
             name=${repository#*/}
-            [ -d "sources/$name" ] || git clone --quiet "https://github.com/$repository.git" "sources/$name"
-            git -C "sources/$name" checkout --quiet "$commit"
+            # Wheels preserve Python and license bytes exactly. Match the
+            # isolated source reader across Windows and POSIX checkouts.
+            [ -d "sources/$name" ] || git -c core.autocrlf=false -c core.eol=lf clone --quiet "https://github.com/$repository.git" "sources/$name"
+            git -C "sources/$name" -c core.autocrlf=false -c core.eol=lf checkout --quiet "$commit"
             head=$(git -C "sources/$name" rev-parse HEAD)
             if [ "$head" != "$commit" ]; then
               printf 'FAIL  %s checked out %s, not %s\n' "$repository" "$head" "$commit"
@@ -4140,7 +4142,7 @@ jobs:
           python3 scripts/py_wheels.py --version "$CANDIDATE_VERSION" --platform "$PLATFORM" \
             --library "$IPC_LIBRARY" --output pypi \
             --package sources/abstraction-identity/py \
-            --license LICENSE
+            --license sources/abstraction-identity/LICENSE
           n=$(ls pypi/*.whl | wc -l)
           if [ "$n" -ne 1 ]; then
             printf 'FAIL  built %s wheels, expected 1\n' "$n"
