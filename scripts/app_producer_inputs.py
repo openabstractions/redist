@@ -468,14 +468,12 @@ def _go_source_owner(path, raw, rows=None):
     return module
 
 
-def materialize_desktop_go(pins, source_root, input_root, sdk_receipt):
-    """Produce the existing role from source-owned public graph and canonical SDK.
-
-    The returned digest is measured input DATA, awaiting independent policy
-    admission. Neither caller JSON nor an ambient module cache supplies a graph.
-    """
+def _desktop_go_role(pins, source_root, input_root, sdk_receipt=None, *, receive=False):
+    """Derive the complete role from committed source and the canonical SDK."""
     from git_env import source_git_environment
-    source_root, input_root, sdk_receipt = (Path(p).absolute() for p in (source_root,input_root,sdk_receipt))
+    source_root, input_root = (Path(p).absolute() for p in (source_root,input_root))
+    desktop=input_root/'desktop-inputs';target=desktop/'go';descriptor=desktop/'go.json'
+    sdk_receipt=desktop/'windows-go-sdk-receipt.json' if receive else Path(sdk_receipt).absolute()
     def ordinary(path, *, file=False):
         for parent in (path, *path.parents):
             if parent.is_symlink() or parent.is_junction(): raise ValueError('linked Go input')
@@ -528,16 +526,26 @@ def materialize_desktop_go(pins, source_root, input_root, sdk_receipt):
     ordinary(sdk_receipt,file=True)
     if sdk_receipt.stat().st_size > 1 << 20: raise ValueError('Go SDK receipt exceeds bound')
     receipt_raw = sdk_receipt.read_bytes();receipt = json.loads(receipt_raw)
-    sdk.validate_sdk_receipt(receipt)
-    if not boundary.same_existing_file(sdk_receipt,Path(receipt['receipt_path'])):
-        raise ValueError('Go SDK receipt moved from its canonical owner')
-    sdk_root = Path(receipt['goroot']); archive = sdk_root.parent/'archive.zip'
+    if receive:
+        if (not isinstance(receipt,dict) or set(receipt)!={'schema','go','goroot','receipt_path','source_identity'}
+                or receipt['schema']!=1 or any(not isinstance(receipt[key],str) or not receipt[key] or '\0' in receipt[key]
+                    for key in ('go','goroot','receipt_path'))
+                or Path(receipt['go'])!=Path(receipt['goroot'])/'bin/go.exe'
+                or Path(receipt['receipt_path'])!=Path(receipt['goroot']).parent/'receipt.json'):
+            raise ValueError('carried Go SDK receipt differs')
+        archive=target/'archive.zip'
+    else:
+        sdk.validate_sdk_receipt(receipt)
+        if not boundary.same_existing_file(sdk_receipt,Path(receipt['receipt_path'])):
+            raise ValueError('Go SDK receipt moved from its canonical owner')
+        archive=Path(receipt['goroot']).parent/'archive.zip'
     ordinary(archive,file=True)
     if sha_file(archive) != sdk.ARCHIVE_SHA256: raise ValueError('Go SDK archive differs')
     # Reuse the SDK owner's authenticated archive+patch derivation for every
     # copied SDK byte, rather than trusting a second filesystem traversal.
     sdk_files = sdk._archive_files(archive)
-    if sdk._identity(sdk_files) != receipt['source_identity']:raise ValueError('Go SDK derivation differs')
+    identity=sdk._identity(sdk_files)
+    if identity != receipt['source_identity']:raise ValueError('Go SDK derivation differs')
     sidecar, capsule = redist/'public-go-graph.json',redist/'public-go-graph.zip'
     for path in (sidecar,capsule): ordinary(path,file=True)
     if sidecar.stat().st_size > 1 << 20 or capsule.stat().st_size >= 80 << 20:
@@ -550,12 +558,12 @@ def materialize_desktop_go(pins, source_root, input_root, sdk_receipt):
     if len(selected) != 1: raise ValueError('prepared provider-kit module missing')
     row = selected[0]
     prefix = 'proxy/' + graph_owner.escape_module(module) + '/@v/' + row['version']
-    desktop = input_root/'desktop-inputs'; ordinary(desktop)
-    target, descriptor = desktop/'go',desktop/'go.json'
-    if target.exists() or target.is_symlink() or descriptor.exists() or descriptor.is_symlink():
+    ordinary(desktop)
+    if not receive and (target.exists() or target.is_symlink() or descriptor.exists() or descriptor.is_symlink()):
         raise ValueError('Go role requires fresh output paths')
-    desktop.mkdir(parents=True,exist_ok=True)
-    created = False; descriptor_created = False; files = {}; seen = set(); directories = {}
+    if receive:ordinary(target);ordinary(descriptor,file=True)
+    else:desktop.mkdir(parents=True,exist_ok=True)
+    created = False; descriptor_created = False; receipt_created=False; files = {}; seen = set(); directories = {}
     def member(name):
         parts = name.split('/')
         if (not name or '\\' in name or ':' in name or any(ord(c)<32 for c in name)
@@ -570,19 +578,25 @@ def materialize_desktop_go(pins, source_root, input_root, sdk_receipt):
         return target.joinpath(*parts)
     def copy(name, reader, size):
         digest=hashlib.sha256();total=0
+        path = member(name)
+        if receive:ordinary(path,file=True)
+        else:path.parent.mkdir(parents=True,exist_ok=True)
         with reader:
-            path = member(name);path.parent.mkdir(parents=True,exist_ok=True)
-            with path.open('xb') as writer:
+            with path.open('rb' if receive else 'xb') as writer:
                 while True:
                     chunk=reader.read(min(1<<20,size-total+1))
                     if not chunk:break
                     total+=len(chunk)
                     if total>size:raise ValueError('Go input changed during materialization')
-                    digest.update(chunk);writer.write(chunk)
+                    digest.update(chunk)
+                    if receive:
+                        if writer.read(len(chunk))!=chunk:raise ValueError('Go role differs from selected source: '+name)
+                    else:writer.write(chunk)
+                if receive and writer.read(1):raise ValueError('Go role has trailing bytes: '+name)
         if total!=size:raise ValueError('Go input truncated during materialization')
         files[name]={'bytes':total,'sha256':digest.hexdigest()}
     try:
-        target.mkdir();created=True
+        if not receive:target.mkdir();created=True
         with zipfile.ZipFile(io.BytesIO(payload)) as capsule:
             with zipfile.ZipFile(io.BytesIO(capsule.read(prefix+'.zip'))) as module_zip:
                 module_prefix=module+'@'+row['version']+'/'
@@ -603,19 +617,59 @@ def materialize_desktop_go(pins, source_root, input_root, sdk_receipt):
         for name,raw in sdk_files.items():copy('go/'+name,io.BytesIO(raw),len(raw))
         copy('archive.zip',archive.open('rb'),archive.stat().st_size)
         if files['archive.zip']['sha256'] != sdk.ARCHIVE_SHA256:raise ValueError('Go SDK archive changed during copy')
-        copy('sdk-receipt.json',io.BytesIO(receipt_raw),len(receipt_raw))
-        sdk.validate_sdk_receipt(receipt);sources()
+        # Source identity is machine-neutral DATA already defined by the SDK
+        # owner. Actual locator receipt bytes remain separately bound by the
+        # existing producer-input receipt, outside this content descriptor.
+        identity_raw=(json.dumps(identity,sort_keys=True)+'\n').encode('utf-8')
+        copy('sdk-source-identity.json',io.BytesIO(identity_raw),len(identity_raw))
+        if not receive:
+            carried=desktop/'windows-go-sdk-receipt.json'
+            if carried.exists():raise ValueError('Go SDK locator receipt requires a fresh path')
+            with carried.open('xb') as writer:receipt_created=True;writer.write(receipt_raw)
+            sdk.validate_sdk_receipt(receipt)
+        sources()
         if files['go/bin/go.exe']['sha256'] != receipt['source_identity']['go_exe_sha256']:
             raise ValueError('materialized Go compiler differs from canonical SDK')
         value={'schema':1,'entry':'go/bin/go.exe','files':files}
         raw=(json.dumps(value,sort_keys=True)+'\n').encode('utf-8')
         if len(raw)>4<<20:raise ValueError('Go role descriptor exceeds consumer bound')
-        with descriptor.open('xb') as writer:descriptor_created=True;writer.write(raw)
+        if receive:
+            if descriptor.stat().st_size!=len(raw) or descriptor.read_bytes()!=raw:
+                raise ValueError('Go descriptor differs from selected source derivation')
+            actual=set();pending=[(target,'')]
+            while pending:
+                directory,prefix=pending.pop()
+                for path in directory.iterdir():
+                    ordinary(path);name=prefix+path.name
+                    if path.is_dir():pending.append((path,name+'/'))
+                    else:ordinary(path,file=True);actual.add(name)
+            if actual!=set(files):raise ValueError('Go role contains foreign or missing members')
+        else:
+            with descriptor.open('xb') as writer:descriptor_created=True;writer.write(raw)
         return {'name':'desktop-inputs/go.json','bytes':len(raw),'sha256':hashlib.sha256(raw).hexdigest()}
     except BaseException:
         if descriptor_created:descriptor.unlink()
+        if receipt_created:(desktop/'windows-go-sdk-receipt.json').unlink()
         if created:boundary.remove_tree(target)
         raise
+
+
+def materialize_desktop_go(pins, source_root, input_root, sdk_receipt):
+    """Produce the current source-owned graph/SDK role; return measured DATA."""
+    return _desktop_go_role(pins,source_root,input_root,sdk_receipt)
+
+
+def verify_desktop_go(pins, source_root, input_root, *, expected=None):
+    """Independently receive every role byte from selected graph/SDK content.
+
+    Host locator fields never supply content authority. Signers use this same
+    derivation and the existing authenticated producer-input descriptor pin.
+    """
+    derived=_desktop_go_role(pins,source_root,input_root,receive=True)
+    selected={key:derived[key] for key in ('bytes','sha256')}
+    if expected is not None and expected!=selected:
+        raise ValueError('Go descriptor differs from authenticated producer input')
+    return selected
 
 
 def preflight(app, charter, destination, minimum_free_gib, *, candidate_source=None, run_id=None, run_attempt=None):

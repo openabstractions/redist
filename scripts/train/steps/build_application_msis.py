@@ -145,6 +145,12 @@ def application_backend_inputs(required,version):
     helper.comfy_archive_tool(inputs,package,acquire=True)
 
 
+def native_go_tools(owner,helper,pins,inputs,*,expected=None):
+    """Receive current source/SDK content before the strict whole-role check."""
+    derived=helper.verify_desktop_go(pins,pathlib.Path('sources'),inputs,expected=expected)
+    return owner.native_host_tool_inputs(inputs,go_descriptor_pin=derived)
+
+
 def native_archive_selected(owner):
     """Select the explicit source-owned route before acquiring tool roles."""
     source=getattr(owner,'__file__',None)
@@ -268,11 +274,11 @@ def application_inputs(required, version):
         if native_archive_selected(owner):
             receipt=os.environ.get('OA_WINDOWS_GO_SDK_RECEIPT')
             if not receipt:raise ValueError('native Comfy inputs require the canonical Windows Go SDK receipt')
-            # Production measures the role; the selected source policy below
-            # independently admits its descriptor and every materialized byte.
+            # Production and receiving independently derive the current role
+            # from the selected graph and canonical SDK content.
             helper.materialize_desktop_go(pins,pathlib.Path('sources'),pathlib.Path('app-build-inputs'),
                 pathlib.Path(receipt))
-            owner.native_host_tool_inputs(pathlib.Path('app-build-inputs'),go_descriptor_pin=owner.native_input_pins()['go'])
+            native_go=native_go_tools(owner,helper,pins,pathlib.Path('app-build-inputs'))
         else:
             owner.custom_desktop_policy()
             owner.desktop_tool_inputs(pathlib.Path('app-build-inputs'))
@@ -330,7 +336,7 @@ def application_inputs(required, version):
         native=native_archive_selected(owners['comfyui'])
         if native:
             owners['comfyui'].stage_native_host_tools(pathlib.Path('app-build-inputs'),inputs,
-                go_descriptor_pin=owners['comfyui'].native_input_pins()['go'])
+                go_descriptor_pin=native_go['go']['pin'])
         else:owners['comfyui'].stage_desktop_tools(pathlib.Path('app-build-inputs'),inputs)
         shutil.copyfile(pathlib.Path(owners['comfyui'].__file__),inputs/'producer-comfyui.py')
         shutil.copyfile(pathlib.Path(owners['comfyui'].__file__).with_name('file_boundary.py'),inputs/'file_boundary.py')
@@ -402,7 +408,7 @@ def application_inputs(required, version):
         # Validate the complete staged trees before invoking any supplier code.
         if native:
             receive_native_control(inputs,relay)
-            owners['comfyui'].native_host_tool_inputs(inputs,go_descriptor_pin=policy['build_inputs']['go'])
+            owners['comfyui'].native_host_tool_inputs(inputs,go_descriptor_pin=native_go['go']['pin'])
             application=pathlib.Path(owners['comfyui'].__file__).parent/'backendlaunch/application-manifest.json'
             closure_file(application.parent,application.name,policy['build_inputs']['application_manifest'])
             shutil.copyfile(application,inputs/'application-manifest.json')
@@ -455,7 +461,8 @@ def application_native_prepare(required,version):
                 '--bootstrap',str((inputs/'opencode-bootstrap').resolve()),'--ripgrep',str((inputs/'opencode-ripgrep.zip').resolve()),
                 '--out',str(out),'--version',version,'--cl',compiler['cl.exe']]
         elif app=='comfyui' and native_archive_selected(owner):
-            tools=owner.native_host_tool_inputs(inputs,go_descriptor_pin=owner.native_input_pins()['go'])
+            tools=native_go_tools(owner,helper,pins,inputs,
+                expected=received['build_inputs']['desktop-inputs/go.json'])
             out.mkdir(parents=True)
             built=owner.build_native_host(tools,pathlib.Path('windows/apps').resolve(),out,
                 out,backend_manifest=closure_file(inputs,'backend-manifest.json'),
@@ -532,7 +539,11 @@ def native_context(required,version,*,checkout):
     received=json.loads((base/'producer-inputs.json').read_bytes())
     if helper.pinned_input_receipt(pins,'sources',inputs)!=received:
         raise ValueError('received app native inputs differ from selected source/SDK bytes')
-    return helper,producer_owners(required),base,inputs
+    owners=producer_owners(required)
+    if 'comfyui' in owners and native_archive_selected(owners['comfyui']):
+        native_go_tools(owners['comfyui'],helper,pins,inputs,
+            expected=received['build_inputs']['desktop-inputs/go.json'])
+    return helper,owners,base,inputs
 
 
 def source_roles(app,owner,out,inputs,payload=None):
@@ -1004,7 +1015,9 @@ def prepare_comfy_source_pair(owner,inputs,producer,destination):
                 package._append_git_source(combined,pathlib.Path('sources')/repository.split('/',1)[1],
                     ('Native-Producer-' if native else 'Desktop-Producer-')+repository.split('/',1)[1],commit,work)
             if native:
-                role=owner.native_host_tool_inputs(inputs,go_descriptor_pin=owner.native_input_pins()['go'])['go']
+                helper=load_owner('scripts/app_producer_inputs.py','native_source_go_receiving')
+                role=native_go_tools(owner,helper,producer['sources'],inputs,
+                    expected=producer['build_inputs']['desktop-inputs/go.json'])['go']
                 # The admitted Go SDK archive retains its complete source tree;
                 # proxy module ZIPs retain the exact compiler dependency source.
                 names=[name for name in role['files'] if name.endswith('.zip') or
