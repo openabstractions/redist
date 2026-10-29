@@ -5,7 +5,7 @@ import base64
 import zipfile
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[2]))
-from file_boundary import plain_path, extended_path, remove_tree
+from file_boundary import plain_path, extended_path, remove_tree, ordinary_path
 
 
 def canonical_tool(path):
@@ -639,6 +639,12 @@ def sign_bundle_actions(required,base,relay,*,catalog_maintenance=False):
 def native_context(required,version,*,checkout):
     helper,pins=selected_sources(required,version,checkout=checkout)
     base=pathlib.Path('app-native');inputs=base/'inputs'
+    if 'lemonade' in required:
+        ordinary_path(inputs,kind='directory')
+        hooks=ordinary_path(inputs/'upstream/empty-git-hooks',kind='directory',allow_missing=True)
+        hooks.mkdir(parents=True,exist_ok=True)
+        ordinary_path(hooks,kind='directory')
+        if any(hooks.iterdir()):raise ValueError('received Lemonade Git hooks directory must be empty')
     received=json.loads((base/'producer-inputs.json').read_bytes())
     if helper.pinned_input_receipt(pins,'sources',inputs)!=received:
         raise ValueError('received app native inputs differ from selected source/SDK bytes')
