@@ -319,7 +319,7 @@ def prepare_opencode_plugin_inputs(helper, owner, inputs):
     if opencode.resolve()!=pathlib.Path(owner.__file__).resolve().parent.parent:
         raise ValueError('OpenCode cache source differs from the selected installer owner')
     cache_owner=load_owner(opencode/'test/run_node_tests.py','application_opencode_dependency_cache')
-    cache_owner.prepare_dependency_cache(opencode,root,inputs/'opencode-dependencies',
+    cache_owner.prepare_dependency_cache(opencode,root,(inputs/'opencode-dependencies').resolve(),
         linked=tuple(linked[name] for name in sorted(linked)))
 
 
