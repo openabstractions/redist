@@ -13,6 +13,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import urllib.request
 
 
 AUDITWHEEL_VERSION = '6.8.2'
@@ -32,6 +33,45 @@ POLICY = 'manylinux_2_28_x86_64'
 
 class Refused(ValueError):
     pass
+
+
+def check_manylinux_image(inspection, reference, config, *, manifest=None):
+    """Bind both Docker stores to the same pinned manifest and config bytes.
+
+    Moby's containerd image store reports target.Digest as image Id; the
+    classic store reports the config digest. Moby's implementation is at
+    https://github.com/moby/moby/blob/master/daemon/containerd/image_inspect.go.
+    The producer's immutable reference and config pin remain authoritative.
+    """
+    match = re.fullmatch(r'quay\.io/pypa/manylinux_2_28_x86_64@sha256:([0-9a-f]{64})', reference)
+    if not match or not re.fullmatch(r'sha256:[0-9a-f]{64}', config):
+        raise Refused('manylinux manifest/config pins are invalid')
+    manifest_id = 'sha256:' + match[1]
+    if manifest is None:
+        request = urllib.request.Request(
+            'https://quay.io/v2/pypa/manylinux_2_28_x86_64/manifests/' + manifest_id,
+            headers={'Accept': 'application/vnd.docker.distribution.manifest.v2+json,application/vnd.oci.image.manifest.v1+json'})
+        with urllib.request.urlopen(request, timeout=30) as response:
+            manifest = response.read(1024 * 1024 + 1)
+    if len(manifest) > 1024 * 1024 or hashlib.sha256(manifest).hexdigest() != match[1]:
+        raise Refused('manylinux raw manifest differs from its immutable digest')
+    selected = json.loads(manifest)
+    if (not isinstance(selected, dict) or selected.get('schemaVersion') != 2
+            or not isinstance(selected.get('config'), dict)
+            or selected['config'].get('digest') != config):
+        raise Refused('manylinux manifest config differs from its source pin')
+    if not isinstance(inspection, list) or len(inspection) != 1 or not isinstance(inspection[0], dict):
+        raise Refused('manylinux Docker inspection must select exactly one image')
+    image = inspection[0]
+    actual = image.get('Id')
+    if (actual not in (config, manifest_id) or image.get('Os') != 'linux'
+            or image.get('Architecture') != 'amd64'
+            or not isinstance(image.get('RepoDigests'), list) or reference not in image['RepoDigests']):
+        raise Refused('manylinux Docker identity mismatch: actual Id=' + repr(actual)[:100]
+                      + ', expected config=' + config + ', expected manifest=' + manifest_id
+                      + ', reference=' + reference)
+    print('manylinux image identity verified: actual Id=' + actual)
+    return manifest
 
 
 def digest(path):

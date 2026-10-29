@@ -3715,8 +3715,9 @@ jobs:
             # One compatible baseline builds both native families; the mounted
             # source/header closure is read without network access by the compiler.
             docker pull "$CLIENT_MANYLINUX_IMAGE"
-            test "$(docker image inspect --format '{{.Id}}' "$CLIENT_MANYLINUX_IMAGE")" = "$CLIENT_MANYLINUX_CONFIG"
             docker image inspect "$CLIENT_MANYLINUX_IMAGE" > build/native-inputs/manylinux-image.json
+            python3 -c 'import json,sys; from pathlib import Path; from scripts.posix_native import check_manylinux_image; p=Path(sys.argv[1]); p.with_name("manylinux-manifest.json").write_bytes(check_manylinux_image(json.loads(p.read_bytes()), sys.argv[2], sys.argv[3]))' \
+              build/native-inputs/manylinux-image.json "$CLIENT_MANYLINUX_IMAGE" "$CLIENT_MANYLINUX_CONFIG"
             docker run --rm --network none -v "$PWD:$PWD" -w "$PWD" \
               -e RUNNER_OS -e ARCHITECTURES -e OA_FACADE_NATIVE -e NODE_INCLUDE_DIR \
               "$CLIENT_MANYLINUX_IMAGE" /bin/bash -e -o pipefail -c \
@@ -4072,8 +4073,9 @@ jobs:
             # One compatible baseline builds both native families; the mounted
             # source/header closure is read without network access by the compiler.
             docker pull "$CLIENT_MANYLINUX_IMAGE"
-            test "$(docker image inspect --format '{{.Id}}' "$CLIENT_MANYLINUX_IMAGE")" = "$CLIENT_MANYLINUX_CONFIG"
             docker image inspect "$CLIENT_MANYLINUX_IMAGE" > build/native-inputs/manylinux-image.json
+            python3 -c 'import json,sys; from pathlib import Path; from scripts.posix_native import check_manylinux_image; p=Path(sys.argv[1]); p.with_name("manylinux-manifest.json").write_bytes(check_manylinux_image(json.loads(p.read_bytes()), sys.argv[2], sys.argv[3]))' \
+              build/native-inputs/manylinux-image.json "$CLIENT_MANYLINUX_IMAGE" "$CLIENT_MANYLINUX_CONFIG"
             docker run --rm --network none -v "$PWD:$PWD" -w "$PWD" \
               -e RUNNER_OS -e ARCHITECTURES -e OA_FACADE_NATIVE -e NODE_INCLUDE_DIR \
               "$CLIENT_MANYLINUX_IMAGE" /bin/bash -e -o pipefail -c \

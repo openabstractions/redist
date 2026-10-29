@@ -585,8 +585,10 @@ def resolve_packed_dependencies(packed, target, environment, packages):
             (optional if entry.get('optional') else dependencies)[name] = entry['version']
     write_package(target, {'name':'oa-owned-packed-receiving', 'version':'0.0.0', 'private':True,
                            'dependencies':dependencies, 'optionalDependencies':optional})
+    # cwd already selects this project. npm 10 on Windows treats a repeated
+    # --prefix as an implicit local install and adds the project as a self-link.
     result = subprocess.run(['npm', 'install', '--package-lock-only', '--offline', '--ignore-scripts',
-                             '--no-audit', '--no-fund', '--prefix', str(target)],
+                             '--no-audit', '--no-fund'],
                             cwd=target, env=environment, capture_output=True, text=True, shell=os.name == 'nt')
     if result.returncode:
         raise Refused('offline locked dependency resolution failed: ' + (result.stderr.strip() or result.stdout.strip()))
@@ -665,7 +667,7 @@ def test_packed_packages(packed, identity, dependency_cache=None):
                 raise Refused('dependency cache admission failed: ' + str(error)) from error
             own_versions = resolve_packed_dependencies(receiving, target, environment, packages)
             admitted_root = {name:(target / name).read_bytes() for name in ('package.json','package-lock.json')}
-        install_args = (['npm', 'install', '--offline', '--ignore-scripts', '--no-save', '--no-audit', '--no-fund', '--prefix', str(target)]
+        install_args = (['npm', 'install', '--offline', '--ignore-scripts', '--no-save', '--no-audit', '--no-fund']
                         if dependency_cache is not None else
                         ['npm', 'install', '--offline', '--ignore-scripts', '--no-audit', '--no-fund',
                          '--no-package-lock', '--prefix', str(target), *(str(path) for _, path, _ in receiving)])

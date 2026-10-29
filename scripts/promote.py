@@ -1232,8 +1232,6 @@ def main(argv=None):
     if not args.status and (not re.fullmatch(r'v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)', args.version or '')
                             or not re.fullmatch(r'[0-9a-f]{40}', args.source or '')):
         parser.error('promotion needs --version vMAJOR.MINOR.PATCH and --source full lowercase SHA')
-    if not args.status and tuple(map(int, args.version[1:].split('.'))) >= (0, 8, 0):
-        raise ValueError('final promotion pending authenticated external installed-admission producer intake; build declaration is pending qualification')
     run, jobs, artifacts = inspect(args.repo, args.run)
     if args.status:
         status(args.repo, args.run, run, jobs, artifacts)
