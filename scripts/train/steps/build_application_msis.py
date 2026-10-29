@@ -8,6 +8,11 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[2]))
 from file_boundary import plain_path, extended_path, remove_tree
 
 
+def canonical_tool(path):
+    """Resolve selected host locators before the receiving owner's checks."""
+    return str(pathlib.Path(path).resolve(strict=True))
+
+
 def release_completed_stage(parent,name):
     """Release the caller's two fixed disposable stages after their last reader."""
     if name not in ('backend-launch-build','app-control-stage'):
@@ -281,11 +286,12 @@ def materialize_lemonade_inputs(native,helper,selected,inputs,tools):
         tools['npm'],npm_cache,acquisition/'install',evidence)
     wix=load_owner('windows/wix_packages.py','application_ui_input_policy')
     package=pathlib.Path('wix-packages')/wix.PACKAGES['WixToolset.UI.wixext']['file']
-    command=[sys.executable,str(pathlib.Path(native.__file__).resolve()),'materialize','--pins',str(selected.resolve()),
+    python=canonical_tool(sys.executable)
+    command=[python,str(pathlib.Path(native.__file__).resolve()),'materialize','--pins',str(selected.resolve()),
         '--sources-root',str(pathlib.Path('sources').resolve()),'--git-cache-root',str(cache.resolve()),
         '--inputs-root',str(inputs.resolve()),'--npm-cache',str(npm_cache.resolve()),
         '--wix-ui-package',str(package.resolve()),'--wix-ui-extension',os.environ['WIX_UI_EXT'],
-        '--python',sys.executable,*[item for name,path in tools.items() for item in ('--'+name,path)]]
+        '--python',python,*[item for name,path in tools.items() for item in ('--'+name,path)]]
     subprocess.run(command,check=True)
     shutil.copyfile(evidence,inputs/'npm-acquisition.json')
 
@@ -355,7 +361,7 @@ def application_inputs(required, version):
     tools={name:shutil.which(name) for name in ('git','node','npm','wix')}
     if not all(tools.values()) or sys.version_info[:2]!=(3,12):
         raise ValueError('installer inputs require selected Git/Node/npm/WiX and Python3.12')
-    tools={name:str(pathlib.Path(path).resolve()) for name,path in tools.items()}
+    tools={name:canonical_tool(path) for name,path in tools.items()}
     if subprocess.check_output([tools['node'],'--version'],text=True).strip()!='v22.23.3':
         raise ValueError('installer Node version differs from source-selected22.23.3')
     relay=load_owner('windows/windows_signing.py','application_sdk_intake')
@@ -370,7 +376,7 @@ def application_inputs(required, version):
         'windows-sdk-signed-'+os.environ['PE_ARTIFACT_ATTEMPT'],os.environ['CANDIDATE_SHA'],
         int(os.environ['GITHUB_RUN_ID']),int(os.environ['PE_ARTIFACT_ATTEMPT']),sdk/'canonical')
     received['canonical']=canonical
-    subprocess.run([sys.executable,'windows/windows_signing.py','verify-language','--root',str(sdk),
+    subprocess.run([canonical_tool(sys.executable),'windows/windows_signing.py','verify-language','--root',str(sdk),
         '--canonical',str(sdk/'canonical/native'),'--policy','windows/certum_simplysign.json',
         '--signtool',os.environ['SIGNTOOL']],check=True)
     if 'lemonade' in owners:
@@ -379,7 +385,8 @@ def application_inputs(required, version):
         inputs.mkdir()
         selector=load_owner('sources/redist/sdk_smokes/prepare.py','application_host_tool_selection')
         selection=selector.msvc_toolchain()
-        all_tools=dict(tools,python=sys.executable,cmake=str(selection['cmake']),msbuild=str(selection['msbuild']))
+        all_tools=dict(tools,python=canonical_tool(sys.executable),
+            cmake=canonical_tool(selection['cmake']),msbuild=canonical_tool(selection['msbuild']))
         (inputs/'selected-toolchain.json').write_text(json.dumps({
             'installation_path':str(selection['installation_path']),'installation_version':selection['installation_version'],
             'generator':selection['generator'],'tools':{name:dict(pin(pathlib.Path(value)),path=value) for name,value in all_tools.items()}},sort_keys=True)+'\n')
@@ -476,6 +483,7 @@ def application_native_prepare(required,version):
     if not required:
         compiler=shutil.which('cl.exe')
         if not compiler:raise ValueError('selected Visual Studio developer environment is required')
+        compiler=canonical_tool(compiler)
         base=pathlib.Path('app-native');inputs=base/'inputs'
         closure_file(inputs,'selected-toolchain.json')
         (inputs/'app-native-tools.json').write_text(json.dumps({
@@ -488,6 +496,7 @@ def application_native_prepare(required,version):
     roles=('cl.exe','rc.exe','cvtres.exe') if ('comfyui' in owners and native_archive_selected(owners['comfyui'])) else ('cl.exe','rc.exe')
     compiler={name:shutil.which(name) for name in roles}
     if not all(compiler.values()):raise ValueError('selected Visual Studio developer environment is required')
+    compiler={name:canonical_tool(path) for name,path in compiler.items()}
     (inputs/'app-native-tools.json').write_text(json.dumps({
         'tools':{name:dict(pin(pathlib.Path(path)),path=str(pathlib.Path(path).resolve())) for name,path in compiler.items()},
         'runner_image':{name:os.environ.get(name) for name in ('ImageOS','ImageVersion','RUNNER_ARCH')}},sort_keys=True)+'\n')
@@ -538,7 +547,7 @@ def application_native_prepare(required,version):
                 '--input-receipt',str((base/'producer-inputs.json').resolve()),
                 '--source-root',str((inputs/'upstream/desktop').resolve()),'--git',selected['tools']['git']['path'],
                 '--out',str(out),'--version',version]
-        subprocess.run([sys.executable,str(pathlib.Path(owner.__file__).resolve()),*arguments],check=True)
+        subprocess.run([canonical_tool(sys.executable),str(pathlib.Path(owner.__file__).resolve()),*arguments],check=True)
     if helper.pinned_input_receipt(pins,'sources',inputs)!=received:
         raise ValueError('application preparation changed selected inputs')
     for out,original in completed_native:
@@ -572,7 +581,7 @@ def sign_bundle_actions(required,base,relay,*,catalog_maintenance=False):
     digest=pin(receipt)['sha256'];chain={'apps':[{'id':app} for app in sorted(required)]}
     owner.check_bundle_actions(chain,closure_file(out,owner.ACTIONS_NAME),receipt,digest,
         catalog_maintenance=catalog_maintenance)
-    subprocess.run([sys.executable,'windows/windows_signing.py','sign',
+    subprocess.run([canonical_tool(sys.executable),'windows/windows_signing.py','sign',
         '--policy','windows/certum_simplysign.json','--signtool',os.environ['SIGNTOOL'],
         '--root',str(out),'--receipt',str(out/'signatures.json'),'--file',owner.ACTIONS_NAME],check=True)
     policy_raw=pathlib.Path('windows/certum_simplysign.json').read_bytes()
@@ -667,7 +676,7 @@ def application_native_sign(required,version):
     for app,(root,names) in closed.items():
         native=app=='comfyui' and native_archive_selected(owners[app])
         receipt_name='desktop-signatures.json' if app=='comfyui' and not native else 'signatures.json'
-        subprocess.run([sys.executable,'windows/windows_signing.py','sign','--policy','windows/certum_simplysign.json',
+        subprocess.run([canonical_tool(sys.executable),'windows/windows_signing.py','sign','--policy','windows/certum_simplysign.json',
             '--signtool',os.environ['SIGNTOOL'],'--root',str(root),'--receipt',str(root/receipt_name),
             *[item for name in names for item in ('--file',name)]],check=True)
         if native:
@@ -795,10 +804,11 @@ def application_helpers_prepare(required,version):
     admitted=signed_desktop_arguments(out,base,relay,json.loads((base/'producer-inputs.json').read_bytes())['sources'])
     compiler={name:shutil.which(name) for name in ('cl.exe','rc.exe')}
     if not all(compiler.values()):raise ValueError('selected compiler environment is required for helpers')
+    compiler={name:canonical_tool(path) for name,path in compiler.items()}
     recorded=json.loads(closure_file(inputs,'app-native-tools.json').read_bytes())['tools']
     if any(any(pin(pathlib.Path(path))[key]!=recorded[name][key] for key in ('sha256','bytes'))
            for name,path in compiler.items()):raise ValueError('helper compiler differs from the admitted native toolchain')
-    subprocess.run([sys.executable,str(pathlib.Path(owner.__file__).resolve()),'--phase','prepare',
+    subprocess.run([canonical_tool(sys.executable),str(pathlib.Path(owner.__file__).resolve()),'--phase','prepare',
         '--desktop-binding',str((inputs/'desktop-host.json').resolve()),'--input-root',str(inputs.resolve()),
         '--input-receipt',str((base/'producer-inputs.json').resolve()),
         '--shared-app-builder',str(pathlib.Path('windows/apps').resolve()),'--out',str(out.resolve()),
@@ -834,7 +844,7 @@ def application_helpers_sign(required,version):
             raise ValueError('helper signer input changed after immutable API intake')
         if name in names and any(measured[key]!=receipt['outputs'][name][key] for key in ('sha256','bytes')):
             raise ValueError('helper signer output differs from actual prepared receipt')
-    subprocess.run([sys.executable,'windows/windows_signing.py','sign','--policy','windows/certum_simplysign.json',
+    subprocess.run([canonical_tool(sys.executable),'windows/windows_signing.py','sign','--policy','windows/certum_simplysign.json',
         '--signtool',os.environ['SIGNTOOL'],'--root',str(out),'--receipt',str(out/'signatures.json'),
         *[item for name in sorted(names) for item in ('--file',name)]],check=True)
 
@@ -1021,7 +1031,7 @@ def local_package_only(app, owner, raw, binding, closure, destination, wix, vers
         host_name='apps/opencode/'+owner.source_owned_host_policy()['name']
         desktop=copy(host_name,destination/'desktop.exe',intake[host_name])
         closure_file(desktop.parent,desktop.name,owner.UPSTREAM['desktop'])
-        run([sys.executable,'-B',owner.__file__,'--phase','package','--app-builder',owner.build_app.__file__,
+        run([canonical_tool(sys.executable),'-B',owner.__file__,'--phase','package','--app-builder',owner.build_app.__file__,
              '--out',native,'--version',version,'--wix',wix,'--desktop',desktop,*arguments])
         output=native/('opencode-'+version+'.msi')
     else:
@@ -1317,7 +1327,7 @@ def application_package(required,version):
                                 ('uninstaller','desktop-uninstaller.exe')):
                 proof=proofs[name]
                 arguments += ['--'+option,str((root/name).resolve()),'--'+option+'-sha256',proof['sha256'],'--'+option+'-bytes',str(proof['bytes'])]
-        subprocess.run([sys.executable,str(pathlib.Path(owner.__file__).resolve()),*arguments],check=True)
+        subprocess.run([canonical_tool(sys.executable),str(pathlib.Path(owner.__file__).resolve()),*arguments],check=True)
         if app=='lemonade':
             originals.update(lemonade_package_files(out,json.loads((target/'installer-receipt.json').read_bytes())))
         if app=='comfyui':
@@ -1515,7 +1525,7 @@ def application_sign_host(required,version):
     if not any(all(row['host'][key]==value[key] for key in ('sha256','bytes'))
                for value in (installer,current)):
         raise ValueError('raw Burn host differs from packaged unsigned host')
-    subprocess.run([sys.executable,'windows/windows_signing.py','sign','--policy','windows/certum_simplysign.json',
+    subprocess.run([canonical_tool(sys.executable),'windows/windows_signing.py','sign','--policy','windows/certum_simplysign.json',
         '--signtool',os.environ['SIGNTOOL'],'--root',str(directory),'--receipt',str(native/'host-signing.json'),
         '--file',installer['name']],check=True)
     policy=json.loads(pathlib.Path('windows/certum_simplysign.json').read_bytes())
@@ -1937,7 +1947,7 @@ def final_native_archive(root,binding,selected,version,relay):
 
 
 def application_bundle(required,version):
-    command=[sys.executable,'windows/apps/build_bundle.py',
+    command=[canonical_tool(sys.executable),'windows/apps/build_bundle.py',
              '--bal-ext',os.environ['WIX_BAL_EXT'],'--util-ext',os.environ['WIX_UTIL_EXT'],'--out','setup/bundle']
     catalog_comfy=False
     if required:

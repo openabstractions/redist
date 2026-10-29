@@ -320,8 +320,8 @@ def msvc_toolchain() -> dict:
     msbuild = path / "MSBuild/Current/Bin/MSBuild.exe"
     if not path.is_absolute() or not generator or not cmake.is_file() or not msbuild.is_file():
         raise RuntimeError("Visual Studio has no supported bundled CMake/MSBuild")
-    return {"installation_path": path, "installation_version": version,
-            "cmake": cmake, "generator": generator, "msbuild": msbuild}
+    return {"installation_path": path.resolve(strict=True), "installation_version": version,
+            "cmake": cmake.resolve(strict=True), "generator": generator, "msbuild": msbuild.resolve(strict=True)}
 
 
 def msvc_cmake() -> tuple[Path, str]:

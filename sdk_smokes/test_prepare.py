@@ -255,6 +255,35 @@ class SDKPrepare(unittest.TestCase):
                 with self.assertRaisesRegex(RuntimeError, 'CMake/MSBuild'):
                     prepare.msvc_toolchain()
 
+    @unittest.skipUnless(os.name == 'nt', 'Windows junction tool locator')
+    def test_msvc_owner_resolves_selected_instance_and_msbuild_current_junctions(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            program_files = root / 'program-files'
+            vswhere = program_files / 'Microsoft Visual Studio/Installer/vswhere.exe'
+            vswhere.parent.mkdir(parents=True)
+            vswhere.write_bytes(b'inert selector')
+            instance = root / 'vs-instance'
+            cmake = instance / 'Common7/IDE/CommonExtensions/Microsoft/CMake/CMake/bin/cmake.exe'
+            msbuild = instance / 'MSBuild/18/Bin/MSBuild.exe'
+            for tool in (cmake, msbuild):
+                tool.parent.mkdir(parents=True, exist_ok=True)
+                tool.write_bytes(b'inert tool')
+            alias = root / 'selected-instance'
+            current = instance / 'MSBuild/Current'
+            import contextlib
+            with contextlib.ExitStack() as cleanup:
+                for link, target in ((alias, instance), (current, msbuild.parents[1])):
+                    subprocess.run(['cmd.exe', '/d', '/c', 'mklink', '/J', str(link), str(target)],
+                                   check=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+                    cleanup.callback(link.rmdir)
+                    self.assertTrue(link.is_junction())
+                with patch.dict(os.environ, {'ProgramFiles(x86)': str(program_files)}), \
+                        patch.object(prepare.subprocess, 'check_output', side_effect=[str(alias), '18.9.0']):
+                    selected = prepare.msvc_toolchain()
+                self.assertEqual(selected, {'installation_path': instance, 'installation_version': '18.9.0',
+                    'cmake': cmake, 'msbuild': msbuild, 'generator': 'Visual Studio 18 2026'})
+
     def check(self, evidence, tools_version="v0.3.0"):
         with tempfile.TemporaryDirectory(prefix="oa-sdk-pins-") as folder:
             directory = Path(folder)
