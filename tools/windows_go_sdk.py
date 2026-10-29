@@ -144,7 +144,7 @@ def _archive_files(archive):
                 raise ValueError("SDK archive contains a link")
             if item.is_dir():
                 continue
-            relative = name.relative_to("go").as_posix()
+            relative = "/".join(name.parts[1:]) or "."
             if relative in files:
                 raise ValueError("SDK archive contains duplicate members")
             files[relative] = z.read(item)
@@ -272,13 +272,14 @@ def validate_sdk_receipt(receipt):
         raise ValueError("SDK receipt source identity differs from the pinned recipe")
     observed = set()
     for directory, folders, names in os.walk(sdk, followlinks=False):
+        relative_directory = Path(directory).relative_to(sdk)
         for entry in [*folders, *names]:
             path = Path(directory) / entry
             if path.is_symlink() or getattr(path.lstat(), "st_file_attributes", 0) & 0x400:
                 raise ValueError("SDK source/compiler path is linked")
         for entry in names:
             path = Path(directory) / entry
-            name = path.relative_to(sdk).as_posix(); observed.add(name)
+            name = (relative_directory / entry).as_posix(); observed.add(name)
             if name not in files or _hash(path.read_bytes()) != _hash(files[name]):
                 raise ValueError("SDK source/compiler bytes changed: " + name)
     if observed != set(files):

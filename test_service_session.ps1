@@ -72,8 +72,8 @@ function Write-Diagnostic([string]$Text) {
 }
 # One status probe: a bounded process that keeps its creation handle, so an
 # already-exited child still reports its exit code.
-function Invoke-StatusProcess([Diagnostics.ProcessStartInfo]$StartInfo) {
-    return Invoke-FixtureProcess $StartInfo 10
+function Invoke-StatusProcess([Diagnostics.ProcessStartInfo]$StartInfo, [string]$ObservationPath) {
+    return Invoke-FixtureProcess $StartInfo 10 -ObservationPath $ObservationPath
 }
 # Only fixed vocabulary reaches the artifact; captured CLI text may contain paths or secrets.
 function Format-StatusFailure([Nullable[int]]$ExitCode, [string]$Json, [string]$Diagnostics) {

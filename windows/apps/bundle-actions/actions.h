@@ -6,7 +6,26 @@ struct OA_BUNDLE_APP
 {
     LPCWSTR variable;
     LPCWSTR packages[4]; // integration, host, preflight, preparation
+    BOOL needsMcpGateway;
 };
+struct OA_BUNDLE_CORE_FEATURE { LPCWSTR id; BOOL defaultLocal; };
+
+// The source-owned unconditional Level1 roster supplies fresh defaults. Burn
+// supplies actual installed states; unknown observations never mean absent.
+inline HRESULT OaBundleCoreFeatureState(BOOTSTRAPPER_ACTION action,
+    BOOTSTRAPPER_PACKAGE_STATE core, BOOTSTRAPPER_REQUEST_STATE requestedCore,
+    BOOL selected, BOOL related, BOOL defaultLocal, BOOL required,
+    BOOTSTRAPPER_FEATURE_STATE detected, BOOTSTRAPPER_FEATURE_STATE* requested)
+{
+    if (!selected || (action != BOOTSTRAPPER_ACTION_INSTALL && action != BOOTSTRAPPER_ACTION_MODIFY) ||
+        requestedCore != BOOTSTRAPPER_REQUEST_STATE_PRESENT) return S_OK;
+    if (core != BOOTSTRAPPER_PACKAGE_STATE_ABSENT && core != BOOTSTRAPPER_PACKAGE_STATE_PRESENT) return E_INVALIDARG;
+    if (detected < BOOTSTRAPPER_FEATURE_STATE_ABSENT || detected > BOOTSTRAPPER_FEATURE_STATE_SOURCE) return E_INVALIDARG;
+    if (required) *requested = BOOTSTRAPPER_FEATURE_STATE_LOCAL;
+    else if (core == BOOTSTRAPPER_PACKAGE_STATE_PRESENT || related) *requested = detected;
+    else *requested = defaultLocal ? BOOTSTRAPPER_FEATURE_STATE_LOCAL : BOOTSTRAPPER_FEATURE_STATE_ABSENT;
+    return S_OK;
+}
 
 inline HRESULT OaBundleRequestedState(BOOTSTRAPPER_ACTION action,
     BOOTSTRAPPER_PACKAGE_STATE state, BOOTSTRAPPER_PACKAGE_CONDITION_RESULT selected,

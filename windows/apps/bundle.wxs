@@ -38,6 +38,9 @@
 -->
 <Wix xmlns="http://wixtoolset.org/schemas/v4/wxs"
      xmlns:bal="http://wixtoolset.org/schemas/v4/wxs/bal">
+<?ifndef CoreFeatureSelection?>
+<?define CoreFeatureSelection = "no" ?>
+<?endif?>
   <Bundle Name="OpenAbstractions Setup"
           Manufacturer="OpenAbstractions"
           Version="$(var.Version)"
@@ -55,7 +58,7 @@
     </BootstrapperApplication>
 
     <Chain>
-      <MsiPackage Id="OpenAbstractions" SourceFile="$(var.CoreMsi)" Vital="yes" ForcePerMachine="yes" />
+      <MsiPackage Id="OpenAbstractions" SourceFile="$(var.CoreMsi)" Vital="yes" ForcePerMachine="yes" EnableFeatureSelection="$(var.CoreFeatureSelection)" />
       <PackageGroupRef Id="ShowcaseApplications" />
     </Chain>
   </Bundle>

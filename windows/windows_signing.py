@@ -131,6 +131,7 @@ def diagnostic_main(argv):
     parser.add_argument('--source', required=True)
     parser.add_argument('--release-id', type=int)
     parser.add_argument('--asset-id', type=int)
+    parser.add_argument('--intake-attempt', help='exact original intake producer attempt from its bound job output; required for check/sign/verify')
     parser.add_argument('--policy', type=Path)
     parser.add_argument('--signtool')
     args = parser.parse_args(argv)
@@ -168,14 +169,17 @@ def diagnostic_main(argv):
             asset_id=args.asset_id, run_id=os.environ['GITHUB_RUN_ID'],
             run_attempt=os.environ['GITHUB_RUN_ATTEMPT']), sort_keys=True)+'\n', encoding='utf-8')
     else:
+        if not re.fullmatch('[1-9][0-9]*', args.intake_attempt or ''):
+            raise ValueError('diagnostic check/sign/verify requires the exact intake producer attempt (--intake-attempt)')
         original = args.root/'unsigned.exe'
         payload = diagnostic_input(original)
         intake = diagnostic_json((args.root/'intake.json').read_bytes())
         if (set(intake) != set(origin) | {'release_id','asset_id','run_id','run_attempt'}
                 or any(intake.get(key) != value for key,value in origin.items())
                 or any(type(intake.get(key)) is not int or intake[key] < 1 for key in ('release_id','asset_id'))
-                or any(intake.get(key) != os.environ.get(env) or not re.fullmatch('[1-9][0-9]*', str(intake.get(key)))
-                       for key,env in (('run_id','GITHUB_RUN_ID'),('run_attempt','GITHUB_RUN_ATTEMPT')))):
+                or intake.get('run_id') != os.environ.get('GITHUB_RUN_ID')
+                or not re.fullmatch('[1-9][0-9]*', str(intake.get('run_id')))
+                or intake.get('run_attempt') != args.intake_attempt):
             raise ValueError('diagnostic input provenance differs')
         target = args.root/DIAGNOSTIC_HOST['name']
         if args.phase == 'check':
@@ -2466,6 +2470,8 @@ def phase_main(argv):
                 verify(path, policy, args.signtool)
         return 0
     if args.operation == 'verify-msis':
+        if args.canonical is None:
+            raise ValueError('verify-msis requires the canonical signed IPC DLL (--canonical)')
         payloads, retained = {}, {}
         if (root / 'core').exists():
             targets = [member(root, 'core/abstraction-x64.msi'), member(root, 'core/abstraction-arm64.msi')]

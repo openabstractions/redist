@@ -101,6 +101,7 @@ jobs:
       # This isolated job has no signing secrets or mutation commands.
       contents: write
     outputs:
+      artifact-attempt: ${{ github.run_attempt }}
       artifact-id: ${{ steps.artifact.outputs.artifact-id }}
       artifact-digest: ${{ steps.artifact.outputs.artifact-digest }}
     steps:
@@ -135,7 +136,10 @@ jobs:
       actions: read
     env:
       OA_CERTUM_SIGNING_ONLY: '1'
+      INTAKE_ATTEMPT: ${{ needs.diagnostic-host-intake.outputs.artifact-attempt }}
     outputs:
+      artifact-attempt: ${{ github.run_attempt }}
+      intake-attempt: ${{ needs.diagnostic-host-intake.outputs.artifact-attempt }}
       artifact-id: ${{ steps.artifact.outputs.artifact-id }}
       artifact-digest: ${{ steps.artifact.outputs.artifact-digest }}
     steps:
@@ -150,13 +154,15 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           ARTIFACT_ID: ${{ needs.diagnostic-host-intake.outputs.artifact-id }}
           ARTIFACT_DIGEST: ${{ needs.diagnostic-host-intake.outputs.artifact-digest }}
+          ARTIFACT_ATTEMPT: ${{ needs.diagnostic-host-intake.outputs.artifact-attempt }}
         run: >-
           python3 windows/windows_signing.py consume --artifact-id "$ARTIFACT_ID"
-          --digest "$ARTIFACT_DIGEST" --name "diagnostic-comfy-self1829-unsigned-$GITHUB_RUN_ATTEMPT"
-          --source "$GITHUB_SHA" --run-id "$GITHUB_RUN_ID" --attempt "$GITHUB_RUN_ATTEMPT" --out diagnostic-host
+          --digest "$ARTIFACT_DIGEST" --name "diagnostic-comfy-self1829-unsigned-$ARTIFACT_ATTEMPT"
+          --source "$GITHUB_SHA" --run-id "$GITHUB_RUN_ID" --attempt "$ARTIFACT_ATTEMPT" --out diagnostic-host
       - name: revalidate exact unsigned host before credentials
         run: >-
           python3 windows/windows_signing.py diagnostic-host check --root diagnostic-host --source "$GITHUB_SHA"
+          --intake-attempt "$INTAKE_ATTEMPT"
       - name: exact pinned Microsoft signature tools
         run: python3 windows/windows_signing.py prepare-tools --root "$RUNNER_TEMP/signing-tools" --github-env "$GITHUB_ENV"
       - name: download pinned SimplySign Desktop installer
@@ -176,7 +182,7 @@ jobs:
       - name: sign only the admitted copy and compare every payload byte
         run: >-
           python3 windows/windows_signing.py diagnostic-host sign --root diagnostic-host
-          --source "$GITHUB_SHA" --policy windows/certum_simplysign.json --signtool "$SIGNTOOL"
+          --source "$GITHUB_SHA" --intake-attempt "$INTAKE_ATTEMPT" --policy windows/certum_simplysign.json --signtool "$SIGNTOOL"
       - name: disconnect owned signing session
         if: always()
         shell: pwsh
@@ -196,6 +202,8 @@ jobs:
     permissions:
       contents: read
       actions: read
+    env:
+      INTAKE_ATTEMPT: ${{ needs.diagnostic-host-sign.outputs.intake-attempt }}
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
         with:
@@ -208,16 +216,17 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           ARTIFACT_ID: ${{ needs.diagnostic-host-sign.outputs.artifact-id }}
           ARTIFACT_DIGEST: ${{ needs.diagnostic-host-sign.outputs.artifact-digest }}
+          ARTIFACT_ATTEMPT: ${{ needs.diagnostic-host-sign.outputs.artifact-attempt }}
         run: >-
           python3 windows/windows_signing.py consume --artifact-id "$ARTIFACT_ID"
-          --digest "$ARTIFACT_DIGEST" --name "diagnostic-comfy-self1829-signed-$GITHUB_RUN_ATTEMPT"
-          --source "$GITHUB_SHA" --run-id "$GITHUB_RUN_ID" --attempt "$GITHUB_RUN_ATTEMPT" --out diagnostic-host
+          --digest "$ARTIFACT_DIGEST" --name "diagnostic-comfy-self1829-signed-$ARTIFACT_ATTEMPT"
+          --source "$GITHUB_SHA" --run-id "$GITHUB_RUN_ID" --attempt "$ARTIFACT_ATTEMPT" --out diagnostic-host
       - name: exact pinned Microsoft signature tools
         run: python3 windows/windows_signing.py prepare-tools --root "$RUNNER_TEMP/signing-tools" --github-env "$GITHUB_ENV"
       - name: independent normal signature and unchanged payload resource verification
         run: >-
           python3 windows/windows_signing.py diagnostic-host verify --root diagnostic-host
-          --source "$GITHUB_SHA" --policy windows/certum_simplysign.json --signtool "$SIGNTOOL"
+          --source "$GITHUB_SHA" --intake-attempt "$INTAKE_ATTEMPT" --policy windows/certum_simplysign.json --signtool "$SIGNTOOL"
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
           name: diagnostic-comfy-self1829-verified-${{ github.run_attempt }}

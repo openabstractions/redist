@@ -5,7 +5,7 @@
   "release_admission": {
     "schema": 1,
     "version": "0.8.0",
-    "scope_sha256": "c392bdf87eb4f32729fc40a7bf8d02f59d3e5ca38b1affa7041c34773eab212c",
+    "scope_sha256": "a8d2bde08d386ab130654b020a2a673029f8887cc47f50ae220e0c3557ce5a76",
     "delivery_accepted": false,
     "outcomes": {
       "adopters": [
@@ -109,6 +109,6 @@
       ]
     },
     "selections": [],
-    "capsule_sha256": "68a3a489ccf93ea90f25983271cbbbb880909d4b1585418f70dd7c2e853a0ef3"
+    "capsule_sha256": "bdc49e4a9611d94cbf8cfdd338bee91b5ea7570fa42e41415a456886ff006b84"
   }
 }
