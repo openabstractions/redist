@@ -279,9 +279,13 @@ public static class OASignatureCms {
       X509Certificate2 tsa;
       if (token==null || !token.VerifySignatureForSignerInfo(signer, out tsa))
         throw new InvalidOperationException("RFC3161 token is not bound to this signer");
+      var signingTime=token.TokenInfo.Timestamp.UtcDateTime;
+      var leafValidAtTimestamp=signer.Certificate.NotBefore.ToUniversalTime()<=signingTime
+        && signingTime<=signer.Certificate.NotAfter.ToUniversalTime();
       return new [] {fileAlgorithm, token.TokenInfo.HashAlgorithmId.Value,
         Convert.ToHexString(SHA256.HashData(signer.Certificate.RawData)).ToLowerInvariant(),
-        Convert.ToHexString(SHA256.HashData(tsa.RawData)).ToLowerInvariant(), signer.DigestAlgorithm.Value};
+        Convert.ToHexString(SHA256.HashData(tsa.RawData)).ToLowerInvariant(), signer.DigestAlgorithm.Value,
+        leafValidAtTimestamp.ToString(), signingTime.ToString("O")};
     } finally { if(message!=IntPtr.Zero) CryptMsgClose(message); if(store!=IntPtr.Zero) CertCloseStore(store,0); }
   }
 }
@@ -324,14 +328,15 @@ $chain = Chain $leaf
 $oaStage = 'timestamp-chain'
 $tsa = Chain $timestamp
 $oaStage = 'cms-read'
-$cms = if ($leaf) { [OASignatureCms]::Read($env:OA_SIGNATURE_FILE) } else { @($null,$null,$null,$null,$null) }
+$cms = if ($leaf) { [OASignatureCms]::Read($env:OA_SIGNATURE_FILE) } else { @($null,$null,$null,$null,$null,$null,$null) }
 $oaStage = 'serialization'
 @{status=$signature.Status.ToString();sha1=$(if ($leaf) {$leaf.Thumbprint.ToLowerInvariant()} else {$null})
   sha256=(Digest $leaf);subject=$(if ($leaf) {$leaf.Subject} else {$null})
   issuer=$(if ($leaf) {$leaf.Issuer} else {$null});eku=@(Usage $leaf)
   chain_valid=$chain.valid;chain_status=$chain.status;chain=$chain.certificates;timestamp_sha256=(Digest $timestamp)
   timestamp_eku=@(Usage $timestamp);timestamp_chain_valid=$tsa.valid;timestamp_chain_status=$tsa.status
-  file_digest_oid=$cms[0];timestamp_digest_oid=$cms[1];cms_leaf_sha256=$cms[2];cms_timestamp_sha256=$cms[3];cms_digest_oid=$cms[4]} | ConvertTo-Json -Depth 5 -Compress
+  file_digest_oid=$cms[0];timestamp_digest_oid=$cms[1];cms_leaf_sha256=$cms[2];cms_timestamp_sha256=$cms[3];cms_digest_oid=$cms[4]
+  supplier_leaf_valid_at_timestamp=($leaf -and [bool]::Parse($cms[5]));timestamp_utc=$cms[6]} | ConvertTo-Json -Depth 5 -Compress
 } catch {
   [Console]::Error.WriteLine("OA signature inspection failed; stage=$oaStage.")
   exit 1
@@ -605,14 +610,28 @@ def verify(path, policy, signtool):
     return _verify_signature(path, expected, signtool, signature)
 
 
-def _verify_signature(path, expected, signtool, signature):
+def supplier_timestamp_rule(signature):
+    """Use the bound RFC3161 signing time for a pinned supplier's leaf expiry.
+
+    Authenticode and SignTool still establish signing-time trust. Every other
+    current-chain error remains a refusal, including revocation and unknown trust.
+    """
+    return (signature.get('supplier_leaf_valid_at_timestamp') is True
+            and signature.get('chain_valid') is False
+            and signature.get('chain_status') == ['NotTimeValid'])
+
+
+def _verify_signature(path, expected, signtool, signature, *, supplier_timestamp=False):
+    supplier_time = supplier_timestamp and supplier_timestamp_rule(signature)
     criteria = (
         ('status', lambda: signature.get('status') == 'Valid'),
         *(("leaf-" + key, lambda key=key: signature.get(key) == expected[key])
           for key in ('sha1', 'sha256', 'subject', 'issuer')),
         ('code-signing-eku', lambda: CODE_SIGNING in signature.get('eku', [])),
-        ('leaf-chain-valid', lambda: signature.get('chain_valid') is True),
-        ('leaf-chain-status', lambda: signature.get('chain_status') == []),
+        ('leaf-chain-valid', lambda: signature.get('chain_valid') is True or supplier_time),
+        ('leaf-chain-status', lambda: signature.get('chain_status') == [] or supplier_time),
+        *((('supplier-timestamp-leaf-time', lambda: signature.get('supplier_leaf_valid_at_timestamp') is True),)
+          if supplier_timestamp else ()),
         ('timestamp-chain-status', lambda: signature.get('timestamp_chain_status') == []),
         ('leaf-chain-roster', lambda: isinstance(signature.get('chain'), list) and len(signature['chain']) >= 2),
         ('leaf-chain-leaf', lambda: signature['chain'][0] == expected['sha256']),
@@ -643,7 +662,8 @@ def _verify_signature(path, expected, signtool, signature):
             'certificate': {key: signature[key] for key in ('sha1', 'sha256', 'subject', 'issuer')},
             'chain': signature['chain'], 'timestamp_certificate_sha256': signature['timestamp_sha256'],
             'file_digest': 'SHA256', 'timestamp_digest': 'SHA256', 'timestamp': 'RFC3161',
-            'verification': 'embedded Authenticode /pa /all /tw; expected leaf/EKU; online trusted chains',
+            'verification': ('embedded Authenticode /pa /all /tw; expected leaf/EKU; supplier signing-time validity; online timestamp chain'
+                             if supplier_time else 'embedded Authenticode /pa /all /tw; expected leaf/EKU; online trusted chains'),
             'tool_output_sha256': hashlib.sha256(output.encode()).hexdigest()}
 
 
@@ -652,6 +672,8 @@ def verify_upstream(path, pin, signtool):
 
     The source-owned pin and immutable producer intake are caller expectations;
     a signature receipt cannot select this role or grant its own authority.
+    The reviewed bytes include the supplier's publisher certificate. Its CMS
+    binding and trusted timestamp remain mandatory after that pin is established.
     """
     path = Path(path)
     data = path.read_bytes()
@@ -661,7 +683,7 @@ def verify_upstream(path, pin, signtool):
     observed = {key: signature.get(key) for key in ('sha1', 'sha256', 'subject', 'issuer')}
     expected = identity({'certificate': observed, 'file_digest': 'SHA256',
                          'timestamp': {'url': TIMESTAMP_URL, 'digest': 'SHA256'}})
-    proof = _verify_signature(path, expected, signtool, signature)
+    proof = _verify_signature(path, expected, signtool, signature, supplier_timestamp=True)
     if (proof['sha256'], proof['bytes']) != (pin['sha256'], pin['bytes']):
         raise ValueError('official host changed during native signature verification')
     return dict(proof, kind='upstream-signature', authority='exact supplier bytes and admitted producer input')

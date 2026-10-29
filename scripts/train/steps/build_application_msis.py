@@ -13,6 +13,20 @@ def canonical_tool(path):
     return str(pathlib.Path(path).resolve(strict=True))
 
 
+def package_tools():
+    selected={'git':shutil.which('git'), 'python':sys.executable, 'wix':shutil.which('wix')}
+    if not all(selected.values()):raise ValueError('current Git, Python and WiX are required for application packaging')
+    return {name:canonical_tool(path) for name,path in selected.items()}
+
+
+def package_wix_snapshot(wix):
+    owner_path=pathlib.Path('windows/wix_packages.py').resolve(strict=True)
+    owner_pin=pin(closure_file(owner_path.parent,owner_path.name))
+    shim=pathlib.Path(wix)
+    payload=load_owner(owner_path,'application_package_wix_payload_owner').installed_tool_payload(shim)
+    return dict(owner=owner_pin,shim=pin(closure_file(shim.parent,shim.name)),payload=payload)
+
+
 def release_completed_stage(parent,name):
     """Release the caller's two fixed disposable stages after their last reader."""
     if name not in ('backend-launch-build','app-control-stage'):
@@ -1028,7 +1042,7 @@ def lemonade_package_files(native, receipt):
     return {name:closure_file(native,name,pin) for name,pin in inputs.items()}
 
 
-def local_package_only(app, owner, raw, binding, closure, destination, wix, version, run, *, sources_root):
+def local_package_only(app, owner, raw, binding, closure, destination, wix, version, run, *, sources_root, wix_packages_owner=None):
     """Repack authenticated signed inner bytes into a fresh unsigned diagnostic MSI.
 
     The caller supplies the already joined API/source/SDK closure and the same
@@ -1037,9 +1051,13 @@ def local_package_only(app, owner, raw, binding, closure, destination, wix, vers
     raw=pathlib.Path(raw);destination=pathlib.Path(destination)
     if destination.exists():raise ValueError('local package destination must be fresh')
     original={name:closure_file(raw,name,row) for name,row in closure.items()}
-    selected=json.loads(closure_file(raw,'provenance/inputs/selected-toolchain.json',
-        closure['provenance/inputs/selected-toolchain.json']).read_bytes())
-    closure_file(pathlib.Path(wix).parent,pathlib.Path(wix).name,selected['tools']['wix'])
+    closure_file(raw,'provenance/inputs/selected-toolchain.json',
+        closure['provenance/inputs/selected-toolchain.json'])
+    wix_owner_path=pathlib.Path(wix_packages_owner or pathlib.Path(sources_root)/'redist/windows/wix_packages.py')
+    wix_owner_pin=pin(closure_file(wix_owner_path.parent,wix_owner_path.name))
+    wix_shim_pin=pin(closure_file(pathlib.Path(wix).parent,pathlib.Path(wix).name))
+    wix_owner=load_owner(wix_owner_path,'local_package_wix_payload_owner')
+    wix_before=wix_owner.installed_tool_payload(pathlib.Path(wix))
     destination.mkdir(parents=True)
     native=destination/'native';native.mkdir()
     final=json.loads(closure_file(raw,'apps/'+app+'/installer-receipt.json',
@@ -1088,6 +1106,9 @@ def local_package_only(app, owner, raw, binding, closure, destination, wix, vers
     else:
         raise ValueError('selected app has no MSI package role')
     for name,path in original.items():closure_file(raw,name,closure[name])
+    if (pin(wix_owner_path)!=wix_owner_pin or pin(pathlib.Path(wix))!=wix_shim_pin
+            or wix_owner.installed_tool_payload(pathlib.Path(wix))!=wix_before):
+        raise ValueError('package WiX owner or payload changed during local packaging')
     closure_file(output.parent,output.name)
     return output
 
@@ -1280,11 +1301,12 @@ def application_package(required,version):
     helper,owners,base,inputs=native_context(required,version,checkout=True)
     relay=load_owner('windows/windows_signing.py','application_package_proof_owner')
     policy_bytes=pathlib.Path('windows/certum_simplysign.json').read_bytes();policy=json.loads(policy_bytes)
-    selected=json.loads((inputs/'selected-toolchain.json').read_bytes())
-    tool_args=[item for name,row in selected['tools'].items() for item in ('--'+name,row['path'])]
+    tools=package_tools()
+    wix_before=package_wix_snapshot(tools['wix'])
+    tool_args=[item for name,path in tools.items() for item in ('--'+name,path)]
     common=['--input-receipt',str((base/'producer-inputs.json').resolve()),'--inputs-root',str(inputs.resolve()),
         '--sources-root',str(pathlib.Path('sources').resolve()),'--version',version,'--host-tools',str((inputs/'host-tools.json').resolve()),
-        '--npm-cache',str((inputs/'npm-cache').resolve()),'--wix-ui-package',str((inputs/'wix-ui.nupkg').resolve()),
+        '--wix-ui-package',str((inputs/'wix-ui.nupkg').resolve()),
         '--wix-ui-extension',str((inputs/'WixToolset.UI.wixext.dll').resolve()),*tool_args]
     producer=json.loads(closure_file(base,'producer-inputs.json').read_bytes())
     shared=shared_closure_files(inputs,producer)
@@ -1356,12 +1378,12 @@ def application_package(required,version):
             continue
         if app=='lemonade':
             target=out/'package'
-            arguments=['package',*common,'--native-root',str(out.resolve()),'--signatures',str((root/'signatures.json').resolve()),'--out',str(target.resolve())]
+            arguments=['package',*common,'--wix-packages-owner',str(pathlib.Path('windows/wix_packages.py').resolve()),'--native-root',str(out.resolve()),'--signatures',str((root/'signatures.json').resolve()),'--out',str(target.resolve())]
         elif app=='opencode':
             target=out
             arguments=['--phase','package','--app-builder',str(pathlib.Path('windows/apps/build_app.py').resolve()),
                 '--desktop',str((inputs/'opencode-desktop.exe').resolve()),'--out',str(out.resolve()),'--version',version,
-                '--wix',selected['tools']['wix']['path']]
+                '--wix',tools['wix']]
             for option,name in (('installer-host','installer_host.dll'),('preflight','desktop_preflight.exe')):
                 proof=proofs[name]
                 arguments += ['--'+option,str((root/name).resolve()),'--'+option+'-sha256',proof['sha256'],'--'+option+'-bytes',str(proof['bytes'])]
@@ -1371,7 +1393,7 @@ def application_package(required,version):
                 '--input-root',str(inputs.resolve()),'--shared-app-builder',str(pathlib.Path('windows/apps').resolve()),
                 '--out',str(out.resolve()),'--version',version,'--extension',str(pathlib.Path(owner.__file__).parent/'extension.json'),
                 '--include-root',str(pathlib.Path('sources').resolve()),'--input-receipt',str((base/'producer-inputs.json').resolve()),
-                '--wix',selected['tools']['wix']['path'],*signed_desktop_arguments(out,base,relay,producer['sources']),
+                '--wix',tools['wix'],*signed_desktop_arguments(out,base,relay,producer['sources']),
                 '--package-source',os.environ['CANDIDATE_SHA'],'--package-run',os.environ['GITHUB_RUN_ID'],
                 '--package-attempt',os.environ['GITHUB_RUN_ATTEMPT']]
             for option,name in (('action','comfyui-hostfolder.dll'),('preparation','comfyui-prepare-instance.exe'),
@@ -1404,7 +1426,7 @@ def application_package(required,version):
     if official_comfy(required):
         pins=selected_sources(required,version)[1]
         extension=extension_owner()
-        extension.package(*extension_arguments(pins,base),version,selected['tools']['wix']['path'],policy,os.environ['SIGNTOOL'])
+        extension.package(*extension_arguments(pins,base),version,tools['wix'],policy,os.environ['SIGNTOOL'])
         out=base/'native/comfyui';target=out/'package'
         row=json.loads(closure_file(target,'bundle-app.json').read_bytes())
         row['file']=str(closure_file(target,pathlib.Path(row['file']).name).resolve())
@@ -1412,6 +1434,8 @@ def application_package(required,version):
         provenance=pathlib.Path('setup/provenance/comfyui')
         shutil.copytree(out,provenance)
         shutil.copytree(base/'comfy-extension-inputs',provenance/'inputs')
+    if package_wix_snapshot(tools['wix'])!=wix_before:
+        raise ValueError('package WiX owner or payload changed during application packaging')
     packages=relay.bundle_owner().chain_packages
     chain['apps'].sort(key=lambda row:row['id'])
     retain_installer_chain(chain,'setup',packages=packages)

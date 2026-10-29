@@ -2374,8 +2374,8 @@ jobs:
           GH_REPO: ${{ github.repository }}
           PRODUCER_MODE: ${{ inputs.producer_mode }}
         run: |
-          gh api --paginate --slurp "repos/$GH_REPO/actions/runs/$GITHUB_RUN_ID/jobs?filter=all&per_page=100" --jq '{jobs: [.[].jobs[]]}' > sdk-jobs.json
-          gh api --paginate --slurp "repos/$GH_REPO/actions/runs/$GITHUB_RUN_ID/artifacts?per_page=100" --jq '{artifacts: [.[].artifacts[]]}' > sdk-artifacts.json
+          gh api --paginate --slurp "repos/$GH_REPO/actions/runs/$GITHUB_RUN_ID/jobs?filter=all&per_page=100" | python3 -c 'import json,sys; json.dump({"jobs": [row for page in json.load(sys.stdin) for row in page["jobs"]]}, sys.stdout)' > sdk-jobs.json
+          gh api --paginate --slurp "repos/$GH_REPO/actions/runs/$GITHUB_RUN_ID/artifacts?per_page=100" | python3 -c 'import json,sys; json.dump({"artifacts": [row for page in json.load(sys.stdin) for row in page["artifacts"]]}, sys.stdout)' > sdk-artifacts.json
           provenance_options=()
           node_options=()
           if [ "$PRODUCER_MODE" = train ]; then

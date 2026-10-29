@@ -33,8 +33,10 @@ import argparse
 import hashlib
 import io
 import json
+import os
 from pathlib import Path
 import shutil
+import stat
 import sys
 import urllib.request
 import xml.etree.ElementTree as ET
@@ -98,6 +100,65 @@ def pinned(data: bytes, size: int, sha256: str, what: str) -> bytes:
     if (len(data), digest) != (size, sha256):
         raise ValueError(f"{what} is not the pinned file ({len(data)} bytes, sha256 {digest})")
     return data
+
+
+def installed_tool_payload(path: Path) -> dict:
+    """Verify the installed WiX payload against its pinned NuGet package.
+
+    The .NET SDK supplies the native apphost shim. Its managed target and every
+    installed payload file must still be the exact source-selected WiX bytes.
+    """
+    def ordinary(file):
+        file = Path(file)
+        if not file.is_absolute():
+            raise ValueError("WiX tool path must be absolute")
+        for member in (file, *file.parents):
+            info = member.lstat()
+            if (member.is_symlink() or getattr(info, "st_file_attributes", 0) & 0x400
+                    or not (stat.S_ISREG(info.st_mode) if member == file else stat.S_ISDIR(info.st_mode))):
+                raise ValueError("linked or nonordinary WiX tool payload")
+        return file
+
+    selected = PACKAGES["wix"]
+    version = selected["file"].removeprefix("wix.").removesuffix(".nupkg")
+    path = ordinary(path)
+    root = path.parent / ".store/wix" / version / "wix" / version
+    package = ordinary(root / selected["file"])
+    data = pinned(package.read_bytes(), selected["bytes"], selected["sha256"], str(package))
+    prefix = "tools/net6.0/any/"
+    expected = {}
+    with zipfile.ZipFile(io.BytesIO(data)) as archive:
+        for row in archive.infolist():
+            if row.is_dir() or not row.filename.startswith(prefix):
+                continue
+            name = row.filename.removeprefix(prefix)
+            if (not name or "\\" in name or ":" in name or name.startswith("/")
+                    or any(part in ("", ".", "..") for part in name.split("/")) or name in expected):
+                raise ValueError("invalid or duplicate package WiX payload")
+            raw = archive.read(row)
+            expected[name] = {"sha256": hashlib.sha256(raw).hexdigest(), "bytes": len(raw)}
+    actual = {}
+    payload = root / prefix
+    for directory, folders, files in os.walk(payload, followlinks=False):
+        for folder in folders:
+            member = Path(directory) / folder
+            info = member.lstat()
+            if member.is_symlink() or getattr(info, "st_file_attributes", 0) & 0x400:
+                raise ValueError("linked package WiX payload directory")
+        for name in files:
+            member = ordinary(Path(directory) / name)
+            relative = member.relative_to(payload).as_posix()
+            if relative not in expected or member.stat().st_size != expected[relative]["bytes"]:
+                raise ValueError("package WiX installed payload differs from pinned NuGet")
+            raw = member.read_bytes()
+            actual[relative] = {"sha256": hashlib.sha256(raw).hexdigest(), "bytes": len(raw)}
+    if not expected or actual != expected:
+        raise ValueError("package WiX installed payload differs from pinned NuGet")
+    entry = str(Path(".store/wix") / version / "wix" / version / prefix / "wix.dll").replace("/", "\\")
+    if path.read_bytes().count(entry.encode() + b"\0") != 1:
+        raise ValueError("package WiX launcher differs from its managed entry")
+    return {"version": version, "package": {key: selected[key] for key in ("sha256", "bytes")},
+            "payload": expected}
 
 
 def _closed_members(archive: zipfile.ZipFile, *, count: int, total: int) -> dict:
