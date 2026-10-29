@@ -19,7 +19,20 @@
       "store:lmstudio",
       "store:comfyui",
       "store:fastflowlm",
-      "store:jan"
+      "store:jan",
+      "store:ollama-service",
+      "store:huggingface-default",
+      "store:jan-mlx",
+      "store:jan-external",
+      "store:lemonade-cache",
+      "store:lemonade-models",
+      "store:lemonade-extra",
+      "store:asus-aicreator",
+      "store:asus-llmserver",
+      "store:asus-whisperrecorder",
+      "store:stabilitymatrix",
+      "store:pinokio",
+      "store:swarmui"
     ],
     "activation": "on_demand",
     "role": "provider"

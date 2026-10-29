@@ -4,8 +4,10 @@ This command reads one successful candidate run and downloads its retained
 artifacts. It never builds a wheel or uploads to PyPI.
 """
 import argparse
+from datetime import datetime, timezone
 import hashlib
 import io
+import json
 from pathlib import Path
 import re
 import sys
@@ -28,6 +30,78 @@ PLATFORMS = {
     'darwin-arm64': 'macosx_11_0_arm64',
     'darwin-x64': 'macosx_11_0_x86_64',
 }
+
+
+def deployment_environment(repo, read=promote.api):
+    """Receive the existing redist pypi environment and its deployment rules."""
+    if repo != 'openabstractions/redist':
+        raise ValueError('PyPI publishing requires openabstractions/redist')
+    endpoint = f'repos/{repo}/environments/pypi'
+    environment = read(endpoint)
+    environment_id = environment['id']
+    if (environment['name'] != 'pypi' or type(environment_id) is not int
+            or environment_id < 1 or not isinstance(environment['protection_rules'], list)):
+        raise ValueError('GitHub did not return the exact pypi environment')
+    updated = datetime.fromisoformat(environment['updated_at'])
+    if updated.tzinfo is None:
+        raise ValueError('pypi environment has no valid update time')
+
+    rules = []
+    for rule in environment['protection_rules']:
+        kind, instance = rule['type'], rule['id']
+        if type(instance) is not int or instance < 1:
+            raise ValueError('invalid pypi environment protection rule ID')
+        if kind == 'required_reviewers':
+            reviewers = sorted((row['type'], row['reviewer']['id']) for row in rule['reviewers'])
+            if (not reviewers or any(kind not in ('User', 'Team') or type(identity) is not int
+                                     or identity < 1 for kind, identity in reviewers)
+                    or type(rule['prevent_self_review']) is not bool):
+                raise ValueError('invalid pypi environment reviewer policy')
+            rules.append((kind, instance, rule['prevent_self_review'], reviewers))
+        elif kind == 'wait_timer':
+            timer = rule['wait_timer']
+            if type(timer) is not int or not 0 <= timer <= 43200:
+                raise ValueError('invalid pypi environment wait timer')
+            rules.append((kind, instance, timer))
+        elif kind == 'branch_policy':
+            rules.append((kind, instance))
+        else:
+            raise ValueError('unrecognized pypi environment protection rule')
+
+    policy = environment['deployment_branch_policy']
+    protected = custom = False
+    branches = []
+    if policy is not None:
+        protected, custom = policy['protected_branches'], policy['custom_branch_policies']
+        if type(protected) is not bool or type(custom) is not bool or protected and custom:
+            raise ValueError('invalid pypi environment branch policy')
+        if custom:
+            rows = promote.pages(endpoint + '/deployment-branch-policies', 'branch_policies', fetch=read)
+            branches = [(row.get('type', ''), row['name'], row['id']) for row in rows]
+            if not branches or any(kind not in ('', 'branch', 'tag') or not isinstance(name, str)
+                                   or not name or type(instance) is not int or instance < 1
+                                   for kind, name, instance in branches):
+                raise ValueError('invalid pypi environment branch rules')
+
+    custom_rules = read(endpoint + '/deployment_protection_rules')
+    enabled = custom_rules['custom_deployment_protection_rules']
+    if (not isinstance(enabled, list) or type(custom_rules['total_count']) is not int
+            or len(enabled) != custom_rules['total_count']
+            or any(row['enabled'] is not True or type(row['app']['id']) is not int
+                   or row['app']['id'] < 1 or type(row['id']) is not int or row['id'] < 1
+                   for row in enabled)):
+        raise ValueError('invalid pypi environment custom protection rules')
+    # GitHub permits all branches when protected-branch mode has no protected
+    # branches. This endpoint reports the mode, so require a separate gate.
+    if not (branches or enabled or any(rule[0] == 'required_reviewers'
+            or rule[0] == 'wait_timer' and rule[2] > 0 for rule in rules)):
+        raise ValueError('pypi environment has no deployment protection')
+    canonical = dict(updated_at=updated.astimezone(timezone.utc).isoformat(),
+                     protection=sorted(rules), protected_branches=protected,
+                     custom_branches=sorted(branches),
+                     custom_protection=sorted((row['id'], row['app']['id']) for row in enabled))
+    raw = json.dumps(canonical, sort_keys=True, separators=(',', ':')).encode('utf-8')
+    return environment_id, hashlib.sha256(raw).hexdigest()
 
 
 def wheel_artifacts(artifacts, jobs, source, run_id, latest_attempt):
@@ -139,20 +213,35 @@ def stage(repo, run_id, attempt, source, version, output, inspect=promote.inspec
 
 
 def main(argv=None):
+    argv = sys.argv[1:] if argv is None else argv
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--repo', default='openabstractions/redist')
+    if argv and argv[0] == 'check-environment':
+        parser.add_argument('--environment-id', required=True, type=int)
+        parser.add_argument('--environment-sha256', required=True)
+        args = parser.parse_args(argv[1:])
+        if args.environment_id < 1 or not re.fullmatch(r'[0-9a-f]{64}', args.environment_sha256):
+            parser.error('expected the verified pypi environment ID and rule digest')
+        if deployment_environment(args.repo) != (args.environment_id, args.environment_sha256):
+            raise ValueError('pypi environment identity or rules changed since wheel verification')
+        return 0
     parser.add_argument('--run', type=int, required=True)
     parser.add_argument('--attempt', type=int, required=True)
     parser.add_argument('--source', required=True)
     parser.add_argument('--version', required=True)
     parser.add_argument('--output', type=Path, required=True)
+    parser.add_argument('--environment-output', type=Path)
     args = parser.parse_args(argv)
     if (not re.fullmatch(r'[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+', args.repo)
             or args.run < 1 or args.attempt < 1
             or not re.fullmatch(r'[0-9a-f]{40}', args.source)
             or not re.fullmatch(r'v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)', args.version)):
         parser.error('expected repository, positive run/attempt, full SHA and vMAJOR.MINOR.PATCH')
+    environment_id, environment_sha256 = deployment_environment(args.repo)
     names = stage(args.repo, args.run, args.attempt, args.source, args.version, args.output)
+    if args.environment_output is not None:
+        with args.environment_output.open('a', encoding='utf-8') as output:
+            output.write(f'environment_id={environment_id}\nenvironment_sha256={environment_sha256}\n')
     for name in names:
         print(f'verified {name} sha256:{hashlib.sha256((args.output / name).read_bytes()).hexdigest()}')
     return 0
@@ -161,7 +250,7 @@ def main(argv=None):
 if __name__ == '__main__':
     try:
         sys.exit(main())
-    except (ValueError, KeyError, OSError, UnicodeError, zipfile.BadZipFile,
+    except (ValueError, KeyError, TypeError, AttributeError, OSError, UnicodeError, zipfile.BadZipFile,
             py_wheels.Refused) as exc:
         print('REFUSED: ' + str(exc), file=sys.stderr)
         sys.exit(1)

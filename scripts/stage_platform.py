@@ -38,12 +38,71 @@ import tempfile
 import uuid
 
 if __package__:
-    from .file_boundary import remove_tree
+    from .file_boundary import ordinary_path, remove_tree
 else:
-    from file_boundary import remove_tree
+    from file_boundary import ordinary_path, remove_tree
 
-# Whole serve-package budget shared with the focused local gate.
-SERVE_TEST_TIMEOUT = "30m"
+# Serve's normal Go bound is shared with the focused local gate.
+SERVE_TEST_TIMEOUT = "60m"
+SERVE_RACE_TIMEOUT = "90m"
+# Allow time for compilation and process shutdown outside Go's test timer.
+SERVE_MODULE_COMMAND_TIMEOUT = 6000
+# The generated IDL corpus compiles fixtures in several languages per test.
+IDL_GENERATOR_TEST_TIMEOUT = "20m"
+# Windows normal took 515s in the root package; race exhausted the 10m default.
+MCP_GATEWAY_TEST_TIMEOUT = "20m"
+MCP_GATEWAY_RACE_TIMEOUT = "30m"
+MCP_GATEWAY_MODULE = "github.com/openabstractions/abstractions/mcp-gateway"
+OPENCODE_WINDOWS_NATIVE = "opencode-windows-native"
+OPENCODE_WINDOWS_NATIVE_PIN = "opencode windows native sha256"
+OPENCODE_WINDOWS_NATIVE_OWNERS = ("scripts/build_node_addon.py", "installer/runtime_imports.py")
+
+
+# The existing Node 24 x64 SDK contains about 2,700 files and 62 MB.
+OPENCODE_NATIVE_MAX_MEMBERS = 4096
+OPENCODE_NATIVE_MAX_FILE = 8 * 1024 * 1024
+OPENCODE_NATIVE_MAX_BYTES = 96 * 1024 * 1024
+
+
+def opencode_native_files(root):
+    root = ordinary_path(root, kind="directory")
+    files, pending = [], [root]
+    members = total = 0
+    while pending:
+        for path in pending.pop().iterdir():
+            members += 1
+            if members > OPENCODE_NATIVE_MAX_MEMBERS:
+                raise ValueError("frozen Windows OpenCode native input exceeds its member limit")
+            if path.is_dir():
+                pending.append(ordinary_path(path, kind="directory"))
+                continue
+            path = ordinary_path(path, kind="file")
+            size = path.stat().st_size
+            total += size
+            if size > OPENCODE_NATIVE_MAX_FILE or total > OPENCODE_NATIVE_MAX_BYTES:
+                raise ValueError("frozen Windows OpenCode native input exceeds its byte limit")
+            files.append((path.relative_to(root).as_posix(), path, size))
+    return sorted(files)
+
+
+def opencode_windows_native_digest(root):
+    digest = hashlib.sha256()
+    for name, path, size in opencode_native_files(root):
+        name = name.encode()
+        digest.update(len(name).to_bytes(4, "big") + name)
+        digest.update(size.to_bytes(8, "big"))
+        with path.open("rb") as source:
+            remaining = size
+            while remaining:
+                chunk = source.read(min(remaining, 64 * 1024))
+                if not chunk:
+                    raise ValueError("frozen Windows OpenCode native input changed size")
+                digest.update(chunk)
+                remaining -= len(chunk)
+            if source.read(1):
+                raise ValueError("frozen Windows OpenCode native input changed size")
+    return digest.hexdigest()
+
 
 PLATFORMS = ("windows", "linux", "macos")
 RUNNER_OS = {"windows": "Windows", "linux": "Linux", "macos": "macOS"}
@@ -97,26 +156,83 @@ def version_tuple(value):
     return parts + (0,) * (3 - len(parts))
 
 
+OPENCODE_CACHE_PIN = "opencode dependencies sha256"
+SERVE_MODULE = "github.com/openabstractions/abstractions/serve"
+
+
+def opencode_workflow_step(job, step):
+    return (job.get("repo"), job.get("workflow"), job.get("job"), step.get("name")) == (
+        "abstractions", "build.yml", "go", "build and test") and bool(
+            re.search(r"(?m)^\s*for module in serve\s", step.get("run", "")))
+
+
+def windows_serve_download_job(job):
+    return job.get("module") == SERVE_MODULE or any(
+        opencode_workflow_step(job, step) for step in job.get("steps", ()))
+
+
+def windows_download_volume():
+    import ctypes
+    from ctypes import wintypes
+
+    kernel = ctypes.WinDLL("kernel32.dll", use_last_error=True)
+    temp_path = getattr(kernel, "GetTempPath2W", None) or kernel.GetTempPathW
+    temp_path.argtypes = (wintypes.DWORD, wintypes.LPWSTR)
+    temp_path.restype = wintypes.DWORD
+    directory = ctypes.create_unicode_buffer(32768)
+    if not 0 < temp_path(len(directory), directory) < len(directory):
+        raise ctypes.WinError(ctypes.get_last_error())
+    space = kernel.GetDiskFreeSpaceExW
+    count = ctypes.c_ulonglong
+    space.argtypes = (wintypes.LPCWSTR, ctypes.POINTER(count), ctypes.POINTER(count), ctypes.POINTER(count))
+    space.restype = wintypes.BOOL
+    free, total = count(), count()
+    if not space(directory.value, ctypes.byref(free), ctypes.byref(total), None):
+        raise ctypes.WinError(ctypes.get_last_error())
+    return directory.value, free.value, total.value
+
+
+def windows_serve_download_space_issue(job):
+    if not windows_serve_download_job(job):
+        return None
+    try:
+        folder, free, total = windows_download_volume()
+    except OSError:
+        # Match Serve's behavior when the volume does not report free space.
+        return None
+    # Serve checkDownloadReserve uses min(total / 10, 20 GiB). The native
+    # private credential journey downloads one 31-byte object under Go TempDir.
+    reserve = min(total // 10, 20 << 30)
+    if free < reserve + 31:
+        return (f"Serve download fixture temp directory {folder}: {free} bytes available; "
+                f"31-byte download requires {reserve} bytes left free ({reserve + 31} bytes minimum).")
+    return None
+
+
+IDL_GENERATOR_MODULE = "github.com/openabstractions/abstractions/idl/gen"
+
+
 def probe_tools(requirements, env):
     """Record the actual selected executables and compare declared version constraints."""
     observed, failures = {}, list(requirements.get("errors", []))
     arguments = {"go": ["version"], "git": ["--version"], "bash": ["--version"],
-                 "node": ["--version"], "cmake": ["--version"]}
-    patterns = {"go": r"\bgo(\d+(?:\.\d+){1,2})\b", "git": r"\b(\d+(?:\.\d+){1,2})\b",
+                 "node": ["--version"], "npm": ["--version"], "cmake": ["--version"], "clippy": ["clippy", "--version"]}
+    patterns = {"npm": r"^(\d+(?:\.\d+){1,2})(?:\s|$)", "go": r"\bgo(\d+(?:\.\d+){1,2})\b", "git": r"\b(\d+(?:\.\d+){1,2})\b",
                 "bash": r"\bversion\s+(\d+(?:\.\d+){1,2})\b", "python3": r"\bPython\s+(\d+(?:\.\d+){1,2})\b",
                 "node": r"\bv(\d+(?:\.\d+){1,2})\b", "cmake": r"\bcmake version\s+(\d+(?:\.\d+){1,2})\b",
-                "cxx": r"\b(\d+(?:\.\d+){1,2})\b"}
+                "cxx": r"\b(\d+(?:\.\d+){1,2})\b",
+                **{name: rf"\b{name}\s+(\d+(?:\.\d+){{1,2}})\b" for name in ("rustc", "cargo", "clippy")}}
     for tool, constraint in sorted(requirements.items()):
         if tool == "errors":
             continue
-        choices = ["g++", "clang++"] if tool == "cxx" else [tool]
+        choices = ["g++", "clang++"] if tool == "cxx" else ["cargo" if tool == "clippy" else tool]
         selected = ("python3", sys.executable) if tool == "python3" else \
                    ("bash", bash()) if tool == "bash" and Path(bash()).is_file() else \
                    next(((name, shutil.which(name, path=env.get("PATH"))) for name in choices
                          if shutil.which(name, path=env.get("PATH"))), None)
         if selected is None:
             observed[tool] = {"status": "missing", "required": constraint}
-            failures.append(tool + " is not on PATH")
+            failures.append("clippy requires cargo on PATH" if tool == "clippy" else tool + " is not on PATH")
             continue
         name, path = selected
         try:
@@ -126,6 +242,13 @@ def probe_tools(requirements, env):
             command = ([bash(), "--noprofile", "--norc", "-c",
                         "command -v python3; python3 -c 'import sys; print(sys.executable)'; python3 --version"]
                        if tool == "python3" else [path, *arguments.get(tool, ["--version"])])
+            if tool == "npm":
+                from npm_packages import npm_bundled_modules
+                npm_cli = npm_bundled_modules(environment=env).parent / "bin/npm-cli.js"
+                node = shutil.which("node", path=env.get("PATH"))
+                if node is None:
+                    raise ValueError("npm requires node on PATH")
+                command = [node, str(npm_cli), "--version"]
             result = subprocess.run(command, env=env,
                                     stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=30)
             lines = result.stdout.decode(errors="replace").strip().splitlines() if result.stdout else []
@@ -134,7 +257,7 @@ def probe_tools(requirements, env):
             else:
                 shim, invoked = None, None
                 output = lines[0] if lines else ""
-        except (OSError, subprocess.SubprocessError) as error:
+        except (OSError, ValueError, subprocess.SubprocessError) as error:
             output, result, shim, invoked = str(error), None, None, None
         match = re.search(patterns[tool], output)
         version = match.group(1) if match else None
@@ -531,6 +654,10 @@ def github_context(plan, repo):
             'event': {'repository': {'name': repo, 'full_name': plan['org'] + '/' + repo}}}
 
 
+POSIX_TMP_ROOTS = {"macos": Path("/private/tmp"), "linux": Path("/var/tmp")}
+POSIX_TMP_MAX_BYTES = 40
+
+
 class Leg:
     def __init__(self, bundle, work, name, path_prefix="", go_build_cache=None, output_invocation=None):
         self.bundle, self.work, self.name = Path(bundle).resolve(), Path(work).resolve(), name
@@ -541,6 +668,7 @@ class Leg:
         self.counter = 0
         self.go_build_cache = go_build_cache
         self.go_cache = None
+        self.posix_tmp = None
         self.windows_sdk = None
         self.output_invocation = output_invocation or uuid.uuid4().hex
         if not re.fullmatch(r'[0-9a-f]{32}', self.output_invocation):
@@ -597,6 +725,8 @@ class Leg:
         for name in ("GOFLAGS", "GOPRIVATE", "GONOPROXY", "GONOSUMDB", "GOWORK", "GOPATH", "GOTOOLCHAIN",
                      "PYTHONPATH", "GIT_DIR", "GIT_WORK_TREE", "CI", "GITHUB_ACTIONS", "OA_LIVE_PANEL"):
             env.pop(name, None)
+        if self.posix_tmp is not None:
+            env["TMPDIR"] = str(self.posix_tmp)
         shims = self.work / "bin"
         paths = [str(shims)] + self.prefix + [env.get("PATH", "")]
         env["PATH"] = os.pathsep.join(p for p in paths if p)
@@ -617,6 +747,9 @@ class Leg:
             env["HOME"] = str(self.work / "home")
             env["XDG_CONFIG_HOME"] = str(self.work / "home" / ".config")
             env["XDG_CACHE_HOME"] = str(self.work / "home" / ".cache")
+            if self.name == "linux":
+                env["XDG_DATA_HOME"] = str(self.work / "home" / ".local" / "share")
+                env["XDG_STATE_HOME"] = str(self.work / "home" / ".local" / "state")
         else:
             sdk = windows_sdk_module()
             if self.windows_sdk is None:
@@ -720,6 +853,128 @@ class Leg:
                        "required": required, "observed": observed, "requirement_source": requirement_source})
         return checks
 
+    def stage_opencode_dependencies(self, job, workspace, env, steps, *, charter=None):
+        bundle = self.bundle / "opencode-dependencies"
+        adopter = (charter or workspace / job["repo"]) / "adopters/opencode"
+        helper = adopter / "test"
+        destination = (workspace if charter is not None else workspace.parent) / "opencode-receiving"
+        expected = self.plan["inputs"][OPENCODE_CACHE_PIN]
+        if not isinstance(expected, str) or not re.fullmatch(r"[0-9a-f]{64}", expected):
+            raise Unsupported("invalid frozen OpenCode input digest")
+        native = None
+        if self.name == "windows":
+            env = {key: value for key, value in env.items() if key.upper() not in
+                   {"ABSTRACTION_IPC_NODE", "NODE_OPTIONS", "NODE_PATH", "VSINSTALLDIR"}}
+            native = self.admit_opencode_windows_native(workspace, env)
+        program = """import sys
+from pathlib import Path
+import hashlib
+from file_boundary import ordinary_path
+bundle, adopter, destination = map(Path, sys.argv[2:5])
+sha = hashlib.sha256()
+root = ordinary_path(bundle, kind='directory')
+for path in sorted(root.rglob('*'), key=lambda p: p.relative_to(root).as_posix()):
+    if path.is_dir():
+        ordinary_path(path, kind='directory')
+        continue
+    path = ordinary_path(path, kind='file')
+    name, content = path.relative_to(root).as_posix().encode(), path.read_bytes()
+    sha.update(len(name).to_bytes(4, 'big') + name)
+    sha.update(len(content).to_bytes(8, 'big') + content)
+if sha.hexdigest() != sys.argv[5]:
+    raise ValueError('frozen OpenCode dependency bundle digest differs')
+sys.path.insert(0, sys.argv[1])
+from run_node_tests import LINKED, receive_dependency_cache
+if sys.argv[6] == 'roster':
+    for item in LINKED:
+        relative = Path(item)
+        if len(relative.parts) != 3 or relative.parts[0] != 'openabstractions-flat' or relative.parts[2] != 'javascript':
+            raise ValueError('invalid linked OpenCode source: ' + item)
+        print(relative.parts[1])
+else:
+    import os
+    receive_dependency_cache(bundle, adopter, destination, environment=os.environ)
+"""
+        # The trusted stage helpers live beside this runner in the frozen bundle.
+        invocation = [sys.executable, "-I", "-B", "-c",
+                      "import sys; sys.path.insert(0, sys.argv.pop(1));\n" + program,
+                      str(Path(__file__).resolve().parent), str(helper), str(bundle), str(adopter), str(destination), expected]
+        try:
+            roster = subprocess.run([*invocation, "roster"], cwd=workspace, env=env, check=True,
+                                    capture_output=True, text=True, timeout=60).stdout.splitlines()
+        except (OSError, subprocess.SubprocessError) as error:
+            raise Unsupported("frozen OpenCode input: " + (getattr(error, "stderr", None) or str(error))) from error
+        if job.get("opencode_siblings") is not None and roster != job["opencode_siblings"]:
+            raise Unsupported("OpenCode source roster differs from the frozen plan")
+        if not roster or len(roster) != len(set(roster)) or any(not re.fullmatch(r"abstraction-[a-z0-9-]+", name) for name in roster):
+            raise Unsupported("invalid OpenCode source roster")
+        for repo in roster:
+            target = workspace / repo
+            result = self.clone(repo, target, env)
+            steps.append(dict(result, name="checkout OpenCode dependency " + repo))
+            if result["exit"] != 0:
+                return None
+            if not (target / "javascript/package.json").is_file():
+                raise Unsupported("staged OpenCode JavaScript source missing: " + repo)
+        result = self.execute([*invocation, "install"], workspace, env, 300, "install frozen OpenCode dependencies")
+        steps.append(dict(result, name="install frozen OpenCode dependencies"))
+        if result["exit"] != 0:
+            return None
+        env = dict(env, OA_AI_SDK_PROVIDER_MODULES=str(destination / "node_modules"))
+        if native is not None:
+            return self.stage_opencode_windows_native(workspace, destination, env, steps, native)
+        return env
+
+    def admit_opencode_windows_native(self, workspace, env):
+        native = self.bundle / OPENCODE_WINDOWS_NATIVE
+        pin = self.plan["inputs"].get(OPENCODE_WINDOWS_NATIVE_PIN)
+        if not isinstance(pin, str) or not re.fullmatch(r"[0-9a-f]{64}", pin):
+            raise Unsupported("Windows Serve requires ABSTRACTION_STAGE_OPENCODE_WINDOWS_NODE_SDK to freeze the native build inputs")
+        try:
+            if opencode_windows_native_digest(native) != pin:
+                raise ValueError("frozen OpenCode Node SDK or native build owner differs")
+            for name in OPENCODE_WINDOWS_NATIVE_OWNERS:
+                ordinary_path(native / name, kind="file")
+            node = shutil.which("node", path=env.get("PATH", ""))
+            if not node:
+                raise ValueError("selected Node executable is unavailable")
+            observed = subprocess.run([node, "--version"], cwd=workspace, env=env, check=True,
+                                      capture_output=True, text=True, timeout=15).stdout.strip()
+            if not re.fullmatch(r"v[0-9]+\.[0-9]+\.[0-9]+", observed):
+                raise ValueError("selected Node executable did not return a release version")
+            sdk = native / "node-sdk" / observed[1:]
+            for name in ("include/node/node_api.h", "x64/node.lib"):
+                if not (sdk / name).is_file():
+                    raise ValueError("frozen OpenCode Node SDK lacks headers or node.lib for selected Node " + observed)
+                ordinary_path(sdk / name, kind="file")
+        except (OSError, ValueError, subprocess.SubprocessError) as error:
+            raise Unsupported(str(error)) from error
+        return native
+
+    def stage_opencode_windows_native(self, workspace, destination, env, steps, native):
+        # Reuse the native owner's private input layout in this disposable job.
+        root = destination / "native-build"
+        identity = root / "openabstractions-flat" / "abstraction-identity"
+        identity.mkdir(parents=True)
+        staged = workspace / "abstraction-identity"
+        for name in ("cpp", "fileid", "javascript"):
+            shutil.copytree(staged / name, identity / name)
+        for name in OPENCODE_WINDOWS_NATIVE_OWNERS:
+            path = root / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(native / name, path)
+        build_tmp = root / "tmp"
+        build_tmp.mkdir()
+        result = self.execute([sys.executable, "-B", str(root / OPENCODE_WINDOWS_NATIVE_OWNERS[0]),
+                               "--run", "--force", "--node-sdk", str(native / "node-sdk")],
+                              root, dict(env, TMP=str(build_tmp), TEMP=str(build_tmp)), 300,
+                              "build frozen OpenCode Windows IPC addon")
+        steps.append(dict(result, name="build frozen OpenCode Windows IPC addon"))
+        if result["exit"] != 0:
+            return None
+        addon = ordinary_path(identity / "javascript/native/oa_ipc_node.node", kind="file")
+        return dict(env, ABSTRACTION_IPC_NODE=str(addon))
+
     # -- module --
     def module(self, job, job_dir, env):
         steps = []
@@ -738,6 +993,14 @@ class Leg:
                 self.go_cache = native_go_cache(self.go_build_cache, env, self.name, "qualification",
                                                record=lambda value: self.note("Go compilation cache", json.dumps(value, indent=2) + "\n"))
             env = dict(env, GOCACHE=self.go_cache)
+        if job["module"] == IDL_GENERATOR_MODULE:
+            # The IDL tests launch Python directly on every platform.
+            env = dict(env, PYTHON=sys.executable)
+            env.pop("IDL_GEN_TESTS_WITHOUT_PYTHON", None)
+        if job["module"] == SERVE_MODULE and OPENCODE_CACHE_PIN in self.plan.get("inputs", {}):
+            env = self.stage_opencode_dependencies(job, workspace, env, steps)
+            if env is None:
+                return steps
         module_steps, packages = run_module_gate(directory, env, job.get("timeout", 3600), job["module"],
                                                   self.execute, self.note)
         job["race_packages"] = packages
@@ -870,6 +1133,11 @@ class Leg:
                     else:
                         raise Unsupported("action " + action)
                 else:
+                    if opencode_workflow_step(job, step) and OPENCODE_CACHE_PIN in self.plan.get("inputs", {}):
+                        step_env = self.stage_opencode_dependencies(job, workspace.parent, step_env, steps, charter=workspace)
+                        if step_env is None:
+                            status = "failure"
+                            continue
                     script = substitute(step["run"], context)
                     shell_name = step.get("shell") or job.get("shell") or "bash"
                     if shell_name != "bash":
@@ -902,6 +1170,21 @@ class Leg:
         return steps
 
     def run(self):
+        temp_root = POSIX_TMP_ROOTS.get(self.name)
+        if temp_root is None:
+            return self.run_jobs()
+        # Use the physical spelling and leave room for Unix socket fixtures.
+        # Linux FileID fixtures need persistent file identity, unlike tmpfs.
+        with tempfile.TemporaryDirectory(prefix="oa-", dir=temp_root.resolve(strict=True)) as directory:
+            if len(os.fsencode(directory)) > POSIX_TMP_MAX_BYTES:
+                raise Unsupported(f"{self.name} stage temporary path is too long for Unix socket fixtures")
+            self.posix_tmp = Path(directory)
+            try:
+                return self.run_jobs()
+            finally:
+                self.posix_tmp = None
+
+    def run_jobs(self):
         self.prepare()
         started = time.time()
         host = {"platform": host_platform.platform(), "machine": host_platform.machine(), "python": sys.version.split()[0]}
@@ -916,6 +1199,13 @@ class Leg:
                      "status": "pass" if all(c["exit"] == 0 for c in checks) else "fail"})
         preflight_passed = jobs[-1]["status"] == "pass"
         self.log(("ok    " if jobs[-1]["status"] == "pass" else "FAIL  ") + "preflight")
+        if preflight_passed and self.name == "windows":
+            for job in self.plan["jobs"]:
+                if self.name not in job["platforms"]:
+                    continue
+                issue = windows_serve_download_space_issue(job)
+                if issue is not None:
+                    self.log("WARN  " + job["id"] + ": " + issue)
         passed = {}
         for index, job in enumerate(self.plan["jobs"], 1):
             if self.name not in job["platforms"]:
@@ -929,6 +1219,11 @@ class Leg:
             needs = job.get("needs") or []
             if not preflight_passed:
                 record.update(status="skipped", steps=[], reason="preflight failed")
+            elif (self.name == "windows" and job.get("module") == SERVE_MODULE
+                  and (issue := windows_serve_download_space_issue(job)) is not None):
+                record.update(status="fail", reason="Serve download volume admission failed before execution",
+                              steps=[{"name": "Serve download volume", "exit": 1, "seconds": 0,
+                                      "log": self.note("Serve download volume " + job["id"], issue + "\n")}])
             elif job["kind"] == "workflow" and needs and not re.search(r"\balways\s*\(", str(job.get("if") or "")) \
                     and not all(passed.get((job["repo"], job["workflow"], n), True) for n in needs):
                 record.update(status="skipped", steps=[], reason="a needed job failed")
@@ -963,7 +1258,10 @@ class Leg:
         results = {"platform": self.name, "source": self.plan["source"], "host": host, "status": "fail" if failed else "pass",
                    "failed": failed, "jobs": jobs, "seconds": round(time.time() - started, 1)}
         self.write_results(results)
-        self.log(("PASS " if not failed else "FAIL ") + str(len(jobs) - len(failed)) + "/" + str(len(jobs)) + " jobs in " + str(results["seconds"]) + " s")
+        passing = sum(job["status"] == "pass" for job in jobs)
+        skipped = sum(job["status"] == "skipped" for job in jobs)
+        self.log(f'{results["status"].upper()} {passing} passed, {len(failed)} failed, '
+                 f'{skipped} skipped in {results["seconds"]} s')
         return 0 if not failed else 1
 
     def write_results(self, results):
@@ -1038,14 +1336,22 @@ def concurrent_packages(listing):
 def module_gate_commands(module=None):
     """Commands shared by staged qualification and local module checks."""
     test = ["go", "test", "-v", "-count=1", "./..."]
-    if module == "github.com/openabstractions/abstractions/serve":
+    if module == SERVE_MODULE:
         test[-1:-1] = ["-timeout=" + SERVE_TEST_TIMEOUT]
+    elif module == MCP_GATEWAY_MODULE:
+        test[-1:-1] = ["-timeout=" + MCP_GATEWAY_TEST_TIMEOUT]
+    elif module == IDL_GENERATOR_MODULE:
+        test[-1:-1] = ["-timeout=" + IDL_GENERATOR_TEST_TIMEOUT]
     return (["go", "build", "./..."], test,
             ["go", "list", "-f", "{{.ImportPath}}\t{{.Dir}}\t{{join .GoFiles \",\"}},{{join .CgoFiles \",\"}},{{join .TestGoFiles \",\"}},{{join .XTestGoFiles \",\"}}", "./..."])
 
 
 def module_race_command(module, packages):
-    timeout = ["-timeout=" + SERVE_TEST_TIMEOUT] if module == "github.com/openabstractions/abstractions/serve" else []
+    timeout = ["-timeout=" + SERVE_RACE_TIMEOUT] if module == SERVE_MODULE else []
+    if module == MCP_GATEWAY_MODULE:
+        timeout = ["-timeout=" + MCP_GATEWAY_RACE_TIMEOUT]
+    elif module == IDL_GENERATOR_MODULE:
+        timeout = ["-timeout=" + IDL_GENERATOR_TEST_TIMEOUT]
     return ["go", "test", "-race", "-v", "-count=1", *timeout, *packages]
 
 

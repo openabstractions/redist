@@ -13,12 +13,22 @@ The chain file names every package with its SHA-256 and size pin:
              "download_url": "https://..."}]}
 
 A relative file is relative to the chain file. Every package is checked
-against its pin before anything is built. The chain is the core first, then
+against its pin before anything is built, and the core must carry its
+LemonadeImage feature with lemonaded.exe, which Setup's picture plan
+installs; a core built without the lemonadeimage source is refused, and so
+is a core declaring a picture engine feature without every file payload.tsv
+gives it. The chain is the core first, then
 the applications in the chain file's order. Each application's checkbox selects
 its vital packages and rollback boundary. A failure preserves the completed
 core and remains visible. Packages stay outside the bundle's container and
 use download_url when absent beside the bundle. An official host keeps its
 separate uninstall ownership.
+
+BAFunctions plans no predecessor-bundle restore. Burn appends the related
+bundle's uninstall after the chain; each MSI owns rollback before its commit.
+The core's afterInstallFinalize upgrade removal keeps the predecessor on a
+precommit failure. A later application failure keeps the committed new core,
+with the vital application failure reported by Setup.
 
 The theme is the standard bootstrapper's HyperlinkTheme, read from the
 WixToolset.Bal.wixext 5.0.2 extension DLL given by --bal-ext, with the Options
@@ -34,11 +44,17 @@ the SHA-512 of the same bytes. bundle-receipt.json in --out records the
 bundle's and each package's SHA-256 and size. The bundle is UNSIGNED.
 
 Usage:
-  build_bundle.py --chain FILE --bal-ext DLL --out DIR [--wix wix]
-    [--actions-dll DLL --actions-receipt JSON --actions-receipt-sha256 HEX]
+  build_bundle.py --chain FILE --bal-ext DLL --util-ext DLL --upgrade-binary EXE
+    --out DIR [--wix wix] --actions-dll DLL --actions-receipt JSON --actions-receipt-sha256 HEX
+  build_bundle.py --installed-scope
 
-Application chains require all three admitted native inputs. Core-only chains
-use the standard bootstrapper without an extension.
+--installed-scope is the check before a bundle is handed to someone on this
+computer: the bundle installs its core per-machine, and Windows Installer
+cannot upgrade an OpenAbstractions installed per-user, so it reports one and
+exits 1.
+
+Every chain requires the admitted native inputs. Core-only chains use the same
+BAFunctions chain-token minter with an empty application map.
 
 Without arguments, prints this text.
 """
@@ -50,6 +66,8 @@ import hashlib
 import json
 from pathlib import Path
 import re
+import shutil
+import struct
 import subprocess
 import sys
 import tempfile
@@ -62,7 +80,7 @@ sys.path.insert(0, str(HERE.parent))
 sys.path.insert(0, str(HERE.parent.parent / 'scripts'))
 from build_app import APP_ID, MSI_VERSION, SHA256  # noqa: E402
 from wix_packages import PACKAGES, embedded_wixlib  # noqa: E402
-from file_boundary import EXTENDED_MARKERS, plain_path  # noqa: E402
+from file_boundary import EXTENDED_MARKERS, ordinary_path, plain_path, relative_beneath_existing  # noqa: E402
 
 # WixToolset.Bal.wixext 5.0.2, the extension the owner consented to
 # (2026-10-06): the NuGet package and the extension DLL inside it, as
@@ -74,6 +92,26 @@ BAL_NUPKG_BYTES = _BAL["bytes"]
 BAL_DLL_SHA256 = _BAL["dll_sha256"]
 BAL_DLL_BYTES = _BAL["dll_bytes"]
 STANDARD_THEME = "wix-ir/HyperlinkTheme.xml"
+# The success page's own controls (bundle-actions/actions.h): Finish, and
+# the ticked box that opens OpenAbstractions when Setup closes.
+# The Setup window's title-bar and taskbar icon: OA's icon, a BA payload
+# beside the theme (bundle.wxs). Its caption is the bundle's name, which
+# already ends in Setup; the standard "[WixBundleName] Setup" read
+# "OpenAbstractions Setup Setup" (preview-1031m).
+WINDOW_ICON = "openabstractions.ico"
+WINDOW_CAPTION = "[WixBundleName]"
+FINISH = "Finish"
+# The OpenCode preflight's one command line: --quiet when Setup shows no UI.
+PREFLIGHT_QUIET = ("WixBundleUILevel < 3", "--quiet")
+PREFLIGHT_PASSIVE = ("WixBundleUILevel = 3", "--passive")
+FINISH_BUTTON = "OaFinishButton"
+OPEN_CHECKBOX = "OaOpenCheckbox"
+OPEN_TEXT = "Open OpenAbstractions"
+# The box shows after an install (6), change (7) or repair (8), never after an
+# update replace, with no restart pending and Setup not elevated (the
+# extension sets OaSetupElevated; --finish refuses an elevated token).
+OPEN_CONDITION = ("(WixBundleAction = 6 OR WixBundleAction = 7 OR WixBundleAction = 8)"
+                  " AND NOT WixStdBARestartRequired AND NOT OaSetupElevated")
 
 WXS = "http://wixtoolset.org/schemas/v4/wxs"
 BAL = "http://wixtoolset.org/schemas/v4/wxs/bal"
@@ -92,6 +130,123 @@ ACTIONS_NAME = "oa_bundle_actions.dll"
 ACTIONS_ROOT = HERE / "bundle-actions"
 ACTIONS_SOURCES = ("actions.cpp", "actions.h", "wix5/BAFunctions.h", "wix5/IBootstrapperEngine.h",
                    "wix5/BootstrapperApplicationTypes.h", "wix5/BootstrapperEngineTypes.h", "wix5/LICENSE.TXT")
+
+
+def brand_sources() -> tuple[Path, Path]:
+    """OA's mark for Setup: the Panel's icon, for the Setup program and its
+    registration, and its 64-pixel image, for the theme's 64x64 logo.
+
+    The private source keeps both under monitor/icon; the published tree
+    carries them beside this file. A missing published file never triggers a
+    private-source lookup."""
+    owner = HERE
+    if owner.name == "apps" and owner.parent.name == "installer":
+        icons = owner.parent.parent / "monitor" / "icon"
+        selected = (icons / "panel.ico", icons / "mark-64.png")
+    elif owner.name == "apps" and owner.parent.name == "windows":
+        selected = (owner / "openabstractions.ico", owner / "openabstractions-64.png")
+    else:
+        raise ValueError("the bundle builder sits in no known source layout")
+    for path in selected:
+        if not path.is_file() or path.is_symlink() or path.is_junction():
+            raise ValueError(f"OA's Setup mark is missing: {path.name}")
+    return selected
+
+
+def icon_images(data: bytes) -> list[bytes]:
+    """The image bytes of an .ico file, in its directory order."""
+    reserved, kind, count = struct.unpack_from("<HHH", data, 0)
+    if reserved != 0 or kind != 1 or count == 0:
+        raise ValueError("not an icon file")
+    images = []
+    for index in range(count):
+        size, offset = struct.unpack_from("<II", data, 6 + 16 * index + 8)
+        images.append(data[offset:offset + size])
+    return images
+
+
+def program_icon_images(program: Path) -> list[bytes]:
+    """The images of a Windows program's first icon group, which Explorer and
+    Apps show for it."""
+    import ctypes
+    from ctypes import wintypes
+    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel.LoadLibraryExW.restype = wintypes.HMODULE
+    kernel.LoadLibraryExW.argtypes = [wintypes.LPCWSTR, wintypes.HANDLE, wintypes.DWORD]
+    kernel.FindResourceW.restype = wintypes.HRSRC
+    kernel.FindResourceW.argtypes = [wintypes.HMODULE, ctypes.c_void_p, ctypes.c_void_p]
+    kernel.LoadResource.restype = wintypes.HGLOBAL
+    kernel.LoadResource.argtypes = [wintypes.HMODULE, wintypes.HRSRC]
+    kernel.LockResource.restype = ctypes.c_void_p
+    kernel.LockResource.argtypes = [wintypes.HGLOBAL]
+    kernel.SizeofResource.restype = wintypes.DWORD
+    kernel.SizeofResource.argtypes = [wintypes.HMODULE, wintypes.HRSRC]
+    kernel.FreeLibrary.argtypes = [wintypes.HMODULE]
+    callback = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HMODULE, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p)
+    kernel.EnumResourceNamesW.argtypes = [wintypes.HMODULE, ctypes.c_void_p, callback, ctypes.c_void_p]
+    module = kernel.LoadLibraryExW(str(program), None, 0x00000002 | 0x00000020)  # as a data file and image resource
+    if not module:
+        raise ValueError(f"{program.name} cannot be read for its icon")
+    try:
+        def read(kind: int, name: int) -> bytes:
+            found = kernel.FindResourceW(module, ctypes.c_void_p(name), ctypes.c_void_p(kind))
+            if not found:
+                raise ValueError(f"{program.name} lacks resource {kind}/{name}")
+            size = kernel.SizeofResource(module, found)
+            return ctypes.string_at(kernel.LockResource(kernel.LoadResource(module, found)), size)
+        groups = []
+        kernel.EnumResourceNamesW(module, ctypes.c_void_p(14), callback(lambda m, k, name, p: groups.append(name) or False), None)
+        if not groups:
+            raise ValueError(f"{program.name} has no icon")
+        if groups[0] > 0xFFFF:
+            group = ctypes.wstring_at(groups[0])
+            found = kernel.FindResourceW(module, ctypes.c_wchar_p(group), ctypes.c_void_p(14))
+            directory = ctypes.string_at(kernel.LockResource(kernel.LoadResource(module, found)), kernel.SizeofResource(module, found))
+        else:
+            directory = read(14, groups[0])
+        count = struct.unpack_from("<HHH", directory, 0)[2]
+        return [read(3, struct.unpack_from("<H", directory, 6 + 14 * index + 12)[0]) for index in range(count)]
+    finally:
+        kernel.FreeLibrary(module)
+
+
+def brand_problems(bundle: Path, ba: Path) -> list[str]:
+    """Setup that would show WiX's stock icon or logo instead of OA's mark
+    (owner, 2026-10-31: "setup is missing icon"). Burn registers the bundle
+    with DisplayIcon at its cached program, so the program's icon is also the
+    registration's."""
+    icon, logo = brand_sources()
+    problems = []
+    if program_icon_images(bundle) != icon_images(icon.read_bytes()):
+        problems.append(f"{bundle.name} does not carry OA's icon ({icon.name})")
+    shown = ba / "logo.png"
+    if not shown.is_file() or shown.read_bytes() != logo.read_bytes():
+        problems.append(f"the Setup window's logo is not OA's mark ({logo.name})")
+    return problems + window_problems(ba, icon)
+
+
+def window_problems(ba: Path, icon: Path) -> list[str]:
+    """The Setup window's title bar and taskbar entry (owner, 2026-11-01:
+    preview-1031m showed WiX's icon there and read "OpenAbstractions Setup
+    Setup"). The theme's Window names OA's icon, a payload beside it, and its
+    caption reads the bundle's name once."""
+    try:
+        window = ET.parse(ba / "thm.xml").getroot().find(f"{{{THM}}}Window")
+        name = ET.parse(ba / "manifest.xml").getroot().find(f"{{{BURN}}}Registration/{{{BURN}}}Arp").get("DisplayName")
+        strings = {node.get("Id"): node.get("Value") for node in ET.parse(ba / "thm.wxl").getroot().iter()
+                   if node.tag.rsplit("}", 1)[-1] == "String"}
+    except (OSError, ET.ParseError, AttributeError):
+        return ["the Setup window's theme, strings or registration cannot be read"]
+    problems = []
+    shown = ba / (window.get("IconFile") or "") if window is not None and window.get("IconFile") else None
+    if shown is None or not shown.is_file() or shown.read_bytes() != icon.read_bytes():
+        problems.append(f"the Setup window's title bar does not show OA's icon ({icon.name})")
+    caption = re.sub(r"#\(loc\.(\w+)\)", lambda m: strings.get(m.group(1), m.group(0)), window.get("Caption", "") if window is not None else "")
+    caption = caption.replace("[WixBundleName]", name or "")
+    words = caption.split()
+    if caption != name or any(a == b for a, b in zip(words, words[1:])):
+        problems.append(f"the Setup window's title reads {caption!r}, not the bundle's name {name!r}")
+    return problems
 
 
 def sha256_and_size(path: Path) -> tuple[str, int]:
@@ -121,13 +276,39 @@ def package_id(app_id: str) -> str:
     return "App_" + app_id.replace("-", "_")
 
 
-def bundle_actions_inputs(app_ids: list[str]) -> dict:
+CATALOG_ONLY_APP = "opencode"
+
+
+def app_install_condition(app_id: str) -> str:
+    return "0" if app_id == CATALOG_ONLY_APP else variable(app_id) + " = 1"
+
+
+def preview_catalog_document(folder, version, *, built=False):
+    """The local-package owner adds its freshly built OpenCode MSI after admission."""
+    path = ordinary_path(Path(folder) / 'adopter_assets.json', kind='file')
+    with path.open('rb') as stream:
+        raw = stream.read((1 << 20) + 1)
+    value = json.loads(raw) if len(raw) <= 1 << 20 else None
+    if (not isinstance(value, dict) or value.get('schema') != 2 or value.get('release_tag') != 'v' + version
+            or not isinstance(value.get('apps'), list) or not isinstance(value.get('extensions', []), list)):
+        raise ValueError('preview Catalog needs its schema-2 package pins for this version')
+    extensions = value.get('extensions', [])
+    if any(not isinstance(row, dict) or 'id' not in row for row in extensions):
+        raise ValueError('preview Catalog extension descriptor differs')
+    opencode = [row for row in extensions if row['id'] == CATALOG_ONLY_APP]
+    if len(opencode) != int(built) or (built and (opencode[0].get('file') != 'opencode-' + version + '.msi'
+                                                 or opencode[0].get('version') != version)):
+        raise ValueError('preview Catalog OpenCode descriptor differs from its producer stage')
+    return value
+
+
+def bundle_actions_inputs(app_ids: list[str], *, catalog_maintenance: bool = False) -> dict:
     """Source-only native inputs; selected IDs precede final MSI/container hashes.
 
     Every potential role ID is from this same chain owner. The manifest receiver
     still requires exactly the actual roles; absent potential roles never execute.
     """
-    if (not isinstance(app_ids, list) or not 0 < len(app_ids) <= 16
+    if (type(catalog_maintenance) is not bool or not isinstance(app_ids, list) or not 0 <= len(app_ids) <= 16
             or any(not isinstance(app, str) or not APP_ID.fullmatch(app) for app in app_ids)
             or len({variable(app) for app in app_ids}) != len(app_ids)):
         raise ValueError("bundle actions require a closed ordered list of unique app IDs")
@@ -149,9 +330,15 @@ def bundle_actions_inputs(app_ids: list[str]) -> dict:
         raise ValueError('canonical core feature roster differs')
     header = "// Generated by build_bundle.bundle_actions_inputs; no package hashes.\n"
     header += "static const OA_BUNDLE_APP OA_BUNDLE_APPS[] = {\n"
+    if not rows:
+        header += '    {NULL, {NULL, NULL, NULL, NULL}, FALSE},\n'
     for row in rows:
         header += '    {L"' + row['variable'] + '", {' + ', '.join('L"' + name + '"' for name in row['packages']) + '}, ' + ('TRUE' if row['id'] == 'opencode' else 'FALSE') + '},\n'
-    header += "};\nstatic const SIZE_T OA_BUNDLE_APP_COUNT = sizeof(OA_BUNDLE_APPS) / sizeof(OA_BUNDLE_APPS[0]);\n"
+    header += "};\nstatic const SIZE_T OA_BUNDLE_APP_COUNT = " + str(len(rows)) + ";\n"
+    header += "static const BOOL OA_BUNDLE_OPENCODE_CATALOG_ONLY = " + (
+        "TRUE" if CATALOG_ONLY_APP in app_ids else "FALSE") + ";\n"
+    header += "static const BOOL OA_BUNDLE_CATALOG_MAINTENANCE = " + (
+        "TRUE" if catalog_maintenance else "FALSE") + ";\n"
     header += 'static const OA_BUNDLE_CORE_FEATURE OA_BUNDLE_CORE_FEATURES[] = {\n'
     for row in features:
         header += '    {L"' + row['id'] + '", ' + ('TRUE' if row['default'] else 'FALSE') + '},\n'
@@ -164,22 +351,24 @@ def bundle_actions_inputs(app_ids: list[str]) -> dict:
         digest, size = sha256_and_size(path)
         sources[name] = {"sha256": digest, "bytes": size}
     digest, size = sha256_and_size(core)
-    inputs = {"sources": sources, "map": rows, "core_features": {'sha256': digest, 'bytes': size, 'features': features},
+    inputs = {"sources": sources, "map": rows, "catalog_maintenance": catalog_maintenance,
+              "core_features": {'sha256': digest, 'bytes': size, 'features': features},
               "map_header_sha256": hashlib.sha256(header.encode()).hexdigest()}
     return {"schema": 1, "inputs": inputs, "header": header, "output": ACTIONS_NAME}
 
 
-def bundle_actions_compile(app_ids: list[str], out: Path, cl: str = "cl") -> list[str]:
+def bundle_actions_compile(app_ids: list[str], out: Path, cl: str = "cl", *, catalog_maintenance: bool = False) -> list[str]:
     """The existing native producer writes inputs.header to out/actions_map.h."""
-    bundle_actions_inputs(app_ids)
+    bundle_actions_inputs(app_ids, catalog_maintenance=catalog_maintenance)
     return [cl, "/nologo", "/LD", "/O2", "/W4", "/WX", "/DUNICODE", "/D_UNICODE",
             "/I" + str(out), "/I" + str(ACTIONS_ROOT / 'wix5'),
             "/Fo" + str(out / 'actions.obj'), str(ACTIONS_ROOT / 'actions.cpp'),
-            "/link", "Shell32.lib", "Msi.lib", "/OUT:" + str(out / ACTIONS_NAME),
+            "/link", "Shell32.lib", "User32.lib", "Comctl32.lib", "Advapi32.lib", "Msi.lib", "Ole32.lib", "/OUT:" + str(out / ACTIONS_NAME),
             "/IMPLIB:" + str(out / 'oa_bundle_actions.lib')]
 
 
-def check_bundle_actions(chain: dict, dll: Path, receipt_path: Path, receipt_sha256: str) -> dict:
+def check_bundle_actions(chain: dict, dll: Path, receipt_path: Path, receipt_sha256: str, *,
+                         catalog_maintenance: bool = False) -> dict:
     """Compare native/map bytes from independently admitted signed-native intake.
 
     This is integrity/source consistency; the existing signing owner verifies
@@ -195,7 +384,7 @@ def check_bundle_actions(chain: dict, dll: Path, receipt_path: Path, receipt_sha
     if len(raw) > 1 << 20 or hashlib.sha256(raw).hexdigest() != receipt_sha256:
         raise ValueError("bundle action receipt differs from admitted bytes")
     receipt = json.loads(raw)
-    expected = bundle_actions_inputs([app['id'] for app in chain['apps']])
+    expected = bundle_actions_inputs([app['id'] for app in chain['apps']], catalog_maintenance=catalog_maintenance)
     if (not isinstance(receipt, dict) or set(receipt) != {'schema', 'inputs', 'native'}
             or receipt['schema'] != 1 or receipt['inputs'] != expected['inputs']
             or not isinstance(receipt['native'], dict) or set(receipt['native']) != {'name', 'sha256', 'bytes'}
@@ -210,11 +399,14 @@ def check_bundle_actions(chain: dict, dll: Path, receipt_path: Path, receipt_sha
 
 def chain_packages(chain: dict):
     """The existing flat chain, including an app's optional official host."""
+    for app in chain["apps"]:
+        if "preflight" in app.get("host", {}):
+            yield "Preflight_" + app["id"].replace("-", "_"), "ExePackage", app["host"]["preflight"], app
+    if 'upgrade' in chain:
+        yield "BeginCoreUpgrade", "ExePackage", chain['upgrade'], None
     yield CORE_ID, "MsiPackage", chain["core"], None
     for app in chain["apps"]:
         if "host" in app:
-            if "preflight" in app["host"]:
-                yield "Preflight_" + app["id"].replace("-", "_"), "ExePackage", app["host"]["preflight"], app
             yield "Host_" + app["id"].replace("-", "_"), "ExePackage", app["host"], app
             if "preparation" in app["host"]:
                 yield "Preparation_" + app["id"].replace("-", "_"), "ExePackage", app["host"]["preparation"], app
@@ -331,6 +523,12 @@ def chain_context(chain: dict) -> dict:
     return {'sha256': hashlib.sha256(encoded).hexdigest(), 'chain': value}
 
 
+def burn_chain(distribution: dict) -> dict:
+    """Project the current Setup packages from the validated distribution roster."""
+    return dict(distribution, apps=[app for app in distribution['apps']
+                                    if app['id'] != CATALOG_ONLY_APP])
+
+
 def read_chain_context(context: dict, root: Path) -> dict:
     if not isinstance(context, dict) or set(context) != {'sha256', 'chain'}:
         raise ValueError('the bundle has no bound chain context')
@@ -357,6 +555,95 @@ def check_pins(chain: dict) -> None:
                              f"({size} bytes, sha256 {digest})")
 
 
+PICTURE_FEATURE = "LemonadeImage"
+# payload.tsv's picture engine features: Setup's picture plan adds one of them
+# to the core and runs its provider from the files that feature installs.
+ENGINE_FEATURES = ("lemonadeimage", "pytorchimage")
+
+
+def engine_feature_files() -> dict[str, list[str]]:
+    """Each picture engine feature's WiX id and the file names payload.tsv
+    places with it, the provider program first."""
+    from feature_invariants import FEATURE_NAMES
+    from validate import rows
+    files: dict[str, list[str]] = {}
+    for feature, path, *_ in rows("payload.tsv"):
+        if feature in ENGINE_FEATURES:
+            files.setdefault(FEATURE_NAMES[feature], []).append(Path(path).name)
+    return files
+
+
+def core_upgrade_binary(wix: str, core: Path) -> bytes:
+    """Read the incoming supervisor from the core's own Binary table."""
+    with tempfile.TemporaryDirectory(prefix='oa-bundle-upgrade-') as temporary:
+        root = Path(temporary)
+        source, files = root/'core.wxs', root/'files'
+        result = subprocess.run([wix, 'msi', 'decompile', str(core), '-x', str(files), '-o', str(source)], capture_output=True, text=True)
+        if result.returncode:
+            raise ValueError('cannot read core upgrade supervisor')
+        rows = [row for row in ET.parse(source).iter(f'{{{WXS}}}Binary') if row.get('Id') == 'UpgradeSupervisorCode']
+        if len(rows) != 1 or not rows[0].get('SourceFile'):
+            raise ValueError('core has no exact UpgradeSupervisorCode')
+        carried = Path(rows[0].get('SourceFile'))
+        carried = root/carried if not carried.is_absolute() else carried
+        plain_path(carried)
+        relative_beneath_existing(carried, root)
+        return carried.read_bytes()
+
+
+def check_upgrade_binary(wix: str, core: Path, binary: Path) -> dict:
+    """Burn executes the exact Binary-table supervisor carried by this MSI."""
+    plain_path(binary)
+    digest, size = sha256_and_size(binary)
+    if not size:
+        raise ValueError('upgrade supervisor is empty')
+    carried = core_upgrade_binary(wix, core)
+    if (hashlib.sha256(carried).hexdigest(), len(carried)) != (digest, size):
+        raise ValueError('Burn upgrade supervisor differs from core Binary table')
+    return {'file': str(binary), 'sha256': digest, 'bytes': size}
+
+
+def check_core_picture_feature(wix: str, core: Path) -> None:
+    """The core carries its LemonadeImage feature with lemonaded.exe in it,
+    and every picture engine feature it declares carries its whole payload.
+
+    Setup's picture plan installs one of these features (monitor/internal/
+    setup feature_windows.go); a core built without the lemonadeimage source
+    gates it out silently, and the bundle then offers no pictures. A declared
+    PyTorchImage without its input ZIP would offer an engine Setup cannot
+    prepare. Read from the core MSI itself by `wix msi decompile`, never from
+    the chain's metadata."""
+    with tempfile.TemporaryDirectory(prefix="oa-bundle-core-") as temporary:
+        out = Path(temporary) / "core.wxs"
+        result = subprocess.run([wix, "msi", "decompile", str(core), "-o", str(out)], capture_output=True, text=True)
+        if result.returncode:
+            raise ValueError(f"the core package could not be read: {(result.stderr or result.stdout).strip()}")
+        root = ET.parse(out).getroot()
+    components = {}
+    for component in root.iter(f"{{{WXS}}}Component"):
+        for item in component.iter(f"{{{WXS}}}File"):
+            # The File table name exactly as this repository's core authors it.
+            name = item.get("Name") or Path(item.get("Source", "")).name
+            components.setdefault(component.get("Id"), set()).add(name)
+    declared = {}
+    for feature in root.iter(f"{{{WXS}}}Feature"):
+        declared.setdefault(feature.get("Id"), []).append(feature)
+    if len(declared.get(PICTURE_FEATURE, [])) != 1:
+        raise ValueError(f"the core has no {PICTURE_FEATURE} feature; build it with the lemonadeimage source")
+    for feature_id, names in engine_feature_files().items():
+        found = declared.get(feature_id, [])
+        if not found:
+            continue
+        if len(found) != 1:
+            raise ValueError(f"the core declares {feature_id} more than once")
+        referenced = {ref.get("Id") for ref in found[0].iter(f"{{{WXS}}}ComponentRef")}
+        referenced |= {c.get("Id") for c in found[0].iter(f"{{{WXS}}}Component")}
+        carried = set().union(*(components.get(identifier, set()) for identifier in referenced))
+        for name in names:
+            if name not in carried:
+                raise ValueError(f"the core's {feature_id} feature carries no {name}")
+
+
 def apps_fragment(apps: list[dict]) -> str:
     """apps.wxs: the ShowcaseApplications package group, one optional
     host EXE then integration MSI and one checkbox per application, in order."""
@@ -372,20 +659,28 @@ def apps_fragment(apps: list[dict]) -> str:
     wix = ET.Element(f"{{{WXS}}}Wix")
     fragment = ET.SubElement(wix, f"{{{WXS}}}Fragment")
     for app in apps:
+        if app["id"] == CATALOG_ONLY_APP:
+            continue
         ET.SubElement(fragment, f"{{{WXS}}}Variable", {
             "Name": variable(app["id"]), "Type": "numeric", "Value": "0", f"{{{BAL}}}Overridable": "yes"})
     group = ET.SubElement(fragment, f"{{{WXS}}}PackageGroup", {"Id": PACKAGE_GROUP})
+    checks = ET.SubElement(fragment, f"{{{WXS}}}PackageGroup", {"Id": "SelectedApplicationPreflights"})
     for app in apps:
+        condition = app_install_condition(app["id"])
         ET.SubElement(group, f"{{{WXS}}}RollbackBoundary", {"Id": "AppBoundary_" + app["id"].replace("-", "_"), "Vital": "yes"})
         if "host" in app:
             host = app["host"]
             if 'preflight' in host:
-                ET.SubElement(group,f"{{{WXS}}}ExePackage",{
+                preflight = ET.SubElement(checks,f"{{{WXS}}}ExePackage",{
                     'Id':'Preflight_'+app['id'].replace('-','_'),'SourceFile':source_file(host['preflight']['file']),
-                    'Vital':'yes','Compressed':'yes','InstallCondition':variable(app['id'])+' = 1',
+                    'Vital':'yes','Compressed':'yes','InstallCondition':condition,
                     'PerMachine':'no','Permanent':'yes','DetectCondition':'0'})
+                # Without UI the preflight refuses with its exit code alone; a
+                # box nobody can answer held a quiet install for 21 minutes.
+                ET.SubElement(preflight, f"{{{WXS}}}CommandLine", {'Condition': PREFLIGHT_QUIET[0], 'InstallArgument': PREFLIGHT_QUIET[1]})
+                ET.SubElement(preflight, f"{{{WXS}}}CommandLine", {'Condition': PREFLIGHT_PASSIVE[0], 'InstallArgument': PREFLIGHT_PASSIVE[1]})
             attributes = {"Id": "Host_" + app["id"].replace("-", "_"), "SourceFile": source_file(host["file"]), "Vital": "yes",
-                          "Compressed": "no", "InstallCondition": variable(app["id"]) + " = 1", "PerMachine": "no",
+                          "Compressed": "no", "InstallCondition": condition, "PerMachine": "no",
                           "Permanent": "yes", "InstallArguments": "/S /currentuser"}
             if host.get("download_url"):
                 attributes["DownloadUrl"] = host["download_url"]
@@ -394,7 +689,7 @@ def apps_fragment(apps: list[dict]) -> str:
             if 'preparation' in host:
                 preparation = ET.SubElement(group, f"{{{WXS}}}ExePackage", {
                     'Id': 'Preparation_' + app['id'].replace('-', '_'), 'SourceFile': source_file(host['preparation']['file']),
-                    'Vital': 'yes', 'Compressed': 'yes', 'InstallCondition': variable(app['id']) + ' = 1',
+                    'Vital': 'yes', 'Compressed': 'yes', 'InstallCondition': condition,
                     'PerMachine': 'no', 'Permanent': 'yes', 'DetectCondition': '0'})
                 ET.SubElement(preparation, f"{{{WXS}}}CommandLine", {'Condition': 'WixBundleUILevel = 4', 'InstallArgument': '--guided'})
                 ET.SubElement(preparation, f"{{{WXS}}}CommandLine", {'Condition': 'WixBundleUILevel <> 4', 'InstallArgument': '--verify-only'})
@@ -403,7 +698,9 @@ def apps_fragment(apps: list[dict]) -> str:
         if 'embedded_integration' in app:
             continue
         attributes = {"Id": package_id(app["id"]), "SourceFile": source_file(app["file"]), "Vital": "yes",
-                      "Compressed": "no", "InstallCondition": variable(app["id"]) + " = 1"}
+                      "Compressed": "no", "InstallCondition": condition}
+        if app["id"] == CATALOG_ONLY_APP:
+            attributes["Permanent"] = "yes"
         if app.get("download_url"):
             attributes["DownloadUrl"] = app["download_url"]
         ET.SubElement(group, f"{{{WXS}}}MsiPackage", attributes)
@@ -419,7 +716,7 @@ def standard_theme(dll_path: Path) -> str:
     return embedded_wixlib(data).read(STANDARD_THEME).decode("utf-8-sig")
 
 
-def theme(standard: str, apps: list[dict]) -> str:
+def theme(standard: str, apps: list[dict], *, catalog_maintenance: bool = False) -> str:
     """Use the existing Options and Repair planning controls for add/repair.
 
     The BAFunctions payload preserves unselected packages and admits selected
@@ -427,6 +724,11 @@ def theme(standard: str, apps: list[dict]) -> str:
     """
     ET.register_namespace("", THM)
     root = ET.fromstring(standard, parser=ET.XMLParser(target=ET.TreeBuilder(insert_comments=True)))
+    window = root.find(f"{{{THM}}}Window")
+    if window is None or window.get("Caption") != "#(loc.Caption)":
+        raise ValueError("the standard theme has no Window with the standard caption")
+    window.set("Caption", WINDOW_CAPTION)
+    window.set("IconFile", WINDOW_ICON)
     options = [page for page in root.iter(f"{{{THM}}}Page") if page.get("Name") == "Options"]
     if len(options) != 1:
         raise ValueError("the standard theme has no single Options page")
@@ -439,10 +741,11 @@ def theme(standard: str, apps: list[dict]) -> str:
     for control in folder:
         page.remove(control)
     controls = []
+    apps = [app for app in apps if app["id"] != CATALOG_ONLY_APP]
     if apps:
         label = ET.Element(f"{{{THM}}}Label", {"X": "11", "Y": "121", "Width": "-11", "Height": "17",
                                                "FontId": "3", "DisablePrefix": "yes"})
-        label.text = "Choose apps to install or repair. Unchecked installed apps are kept."
+        label.text = "Choose apps to install or repair. Setup keeps installed apps."
         controls.append(label)
     for index, app in enumerate(apps):
         box = ET.Element(f"{{{THM}}}Checkbox", {"Name": variable(app["id"]), "X": "11", "Y": str(143 + 22 * index),
@@ -465,6 +768,54 @@ def theme(standard: str, apps: list[dict]) -> str:
             'TabStop':'yes','FontId':'0'})
         ET.SubElement(choose, f"{{{THM}}}Text").text = 'Choose applications'
         ET.SubElement(choose, f"{{{THM}}}ChangePageAction", {'Page':'Options'})
+        # The Options page is shared by a first install and maintenance. Its
+        # OK and Cancel returned to the Install page in both, so maintenance
+        # showed the licence, Options and Install controls; the finish page
+        # then appeared over them (preview-1031f, 2026-10-31). thmutil runs
+        # the first action whose condition holds, so an installed bundle
+        # returns to Modify and a first install to Install.
+        for button in page.iter(f"{{{THM}}}Button"):
+            actions = list(button.findall(f"{{{THM}}}ChangePageAction"))
+            if len(actions) != 1 or actions[0].get('Page') != 'Install' or actions[0].get('Condition'):
+                continue
+            back = ET.Element(f"{{{THM}}}ChangePageAction", {'Page': 'Modify', 'Condition': 'WixBundleInstalled'})
+            if actions[0].get('Cancel'):
+                back.set('Cancel', actions[0].get('Cancel'))
+            back.tail = actions[0].tail
+            button.insert(list(button).index(actions[0]), back)
+    # The success page (owner, 2026-10-31): Finish, plus a ticked "Open
+    # OpenAbstractions" box after an install, change or repair. Finish closes
+    # Setup; with the box ticked the bundle actions extension, which owns both
+    # controls, first starts the Panel's Finish mode in the person's own
+    # session: the setup question when there is setup to do, otherwise the
+    # Panel. The verified Catalog may require the custom Finish when there
+    # are no chained app packages. Other core-only bundles keep the standard
+    # Finish control and load the extension for its chain-token minter.
+    success = [p for p in root.iter(f"{{{THM}}}Page") if p.get("Name") == "Success"]
+    if len(success) != 1:
+        raise ValueError("the standard theme has no single Success page")
+    page = success[0]
+    launch = [c for c in page if c.get("Name") == "LaunchButton"]
+    close = [c for c in page if c.get("Name") == "SuccessCloseButton"]
+    if len(launch) != 1 or len(close) != 1:
+        raise ValueError("the standard Success page has no single launch and close button")
+    tail = launch[0].tail
+    page.remove(launch[0])
+    if not apps and not catalog_maintenance:
+        text = close[0].find(f"{{{THM}}}Text")
+        (text if text is not None else close[0]).text = FINISH
+    else:
+        at = list(page).index(close[0])
+        page.remove(close[0])
+        box = ET.Element(f"{{{THM}}}Checkbox", {"Name": OPEN_CHECKBOX, "X": "11", "Y": "121", "Width": "-11", "Height": "17",
+                                                "TabStop": "yes", "FontId": "3",
+                                                "VisibleCondition": OPEN_CONDITION})
+        box.text = OPEN_TEXT
+        finish = ET.Element(f"{{{THM}}}Button", {"Name": FINISH_BUTTON, "X": "-11", "Y": "-11", "Width": "75", "Height": "23",
+                                                "TabStop": "yes", "FontId": "0"})
+        finish.text = FINISH
+        box.tail = finish.tail = tail
+        page[at:at] = [box, finish]
     # The parser keeps no comment outside the root element; the standard
     # theme's copyright and license notice is carried over as written.
     notices = "".join(m.group(0) + "\n" for m in re.finditer(r"<!--.*?-->", standard[:standard.find("<Theme")], re.S))
@@ -489,6 +840,7 @@ def manifest_chain(manifest: str) -> list[dict]:
                       "sha512": bytes.fromhex(payload.get("Hash")).hex(), "vital": package.get("Vital"),
                       "condition": package.get("InstallCondition"),
                       "per_machine": package.get("PerMachine"),
+                      "cache": package.get("Cache"),
                       "permanent": package.get("Permanent"),
                       "boundary_forward": package.get("RollbackBoundaryForward"),
                       "arguments": package.get("InstallArguments", ""),
@@ -503,8 +855,85 @@ def manifest_chain(manifest: str) -> list[dict]:
                       "arp_win64": package.get("ArpWin64", "no"),
                       "allusers": [(p.get("Value"), p.get("Condition"))
                                    for p in package.findall("b:MsiProperty[@Id='ALLUSERS']", ns)],
+                      "upgrade_chain": [(p.get("Value"), p.get("Condition"))
+                                   for p in package.findall("b:MsiProperty[@Id='OAUPGRADECHAIN']", ns)],
                       "features": [p.get('Id') for p in package.findall('b:MsiFeature', ns)]})
     return chain
+
+
+def elevation_problems(manifest: str) -> list[str]:
+    """Authoring that would let Burn do per-machine work without elevating, or
+    let a bundle upgrade remove a per-machine package (upgrade_problems).
+
+    The bundle asks for administrator rights whenever it needs them and never
+    fails with access denied (owner, 2026-10-31). Burn elevates for a
+    per-machine package it executes. A per-user bundle registers itself
+    per-user and skips cross-scope dependency registration, so the remaining
+    per-machine work is caching: "keep" caches a per-machine package that is
+    already present and planned to do nothing, and "force" caches it whatever
+    the plan, both into the per-machine package cache with no elevation
+    (preview-1031d). "remove" caches a package only while it executes, inside
+    the elevated step. A per-machine bundle elevates for everything."""
+    root = ET.fromstring(manifest)
+    registration = root.find(f"{{{BURN}}}Registration")
+    if registration is not None and registration.get("PerMachine") == "yes":
+        return []
+    problems = []
+    for package in root.find(f"{{{BURN}}}Chain"):
+        if package.get("PerMachine") == "yes" and package.get("Cache") != "remove":
+            problems.append(f"per-machine package {package.get('Id')} has Cache={package.get('Cache')}: a per-user run could "
+                            "cache it into the per-machine package cache without elevating; it must be Cache=remove")
+    return problems + upgrade_problems(root)
+
+
+def upgrade_problems(root: ET.Element) -> list[str]:
+    """Authoring that would let a bundle upgrade remove a per-machine package.
+
+    A per-user bundle registers no dependency on a per-machine package (Burn
+    logs "Skipping cross-scope dependency registration"). When an upgrade then
+    removes the earlier bundle, that bundle's uninstall finds no other
+    dependent and uninstalls the package (preview-1031f lost its core). A
+    permanent package is never uninstalled by a bundle; it must also stay
+    visible (no ARPSYSTEMCOMPONENT) so the person can remove it from Apps."""
+    registration = root.find(f"{{{BURN}}}Registration")
+    if registration is not None and registration.get("PerMachine") == "yes":
+        return []
+    problems = []
+    for package in root.find(f"{{{BURN}}}Chain"):
+        if package.get("PerMachine") != "yes":
+            continue
+        # This condition-only command has no installed product to remove. Its
+        # uninstall command is the existing rollback activation, not removal.
+        if (package.tag == f'{{{BURN}}}ExePackage' and package.get('Id') == 'BeginCoreUpgrade'
+                and package.get('DetectionType') == 'condition' and package.get('DetectCondition') == 'false'
+                and package.get('InstallCondition') == 'OACorePrior = 5 AND WixBundleAction = 6'
+                and package.get('InstallArguments') == 'service begin-upgrade --machine --installed --chain [OAUpgradeChain]'
+                and package.get('UninstallArguments') == 'service start --machine'
+                and package.get('Vital') == 'no' and package.get('Cache') == 'remove'):
+            continue
+        if package.get("Permanent") != "yes":
+            problems.append(f"per-machine package {package.get('Id')} is not Permanent: a per-user bundle holds no dependency "
+                            "on it, so an upgrade that removes an earlier bundle would uninstall it")
+        if any(item.get("Id") == "ARPSYSTEMCOMPONENT" and item.get("Value") == "1"
+               for item in package.findall(f"{{{BURN}}}MsiProperty")):
+            problems.append(f"permanent per-machine package {package.get('Id')} is hidden from Apps; it must stay visible "
+                            "so the person can remove it")
+    return problems
+
+
+def apps_entry_problems(manifest: str) -> list[str]:
+    """Authoring that would give the person a second Apps entry.
+
+    The person sees one entry, the core "OpenAbstractions" (owner,
+    2026-10-31). Burn hides a bundle's own entry, writing SystemComponent,
+    only when its Arp registration disables both modify and remove; the
+    bundle stays registered for related-bundle upgrades and its cache."""
+    registration = ET.fromstring(manifest).find(f"{{{BURN}}}Registration")
+    arp = registration.find(f"{{{BURN}}}Arp") if registration is not None else None
+    if arp is None or arp.get("DisableModify") != "yes" or arp.get("DisableRemove") != "yes":
+        return ["the bundle would have its own Apps entry beside the core; its registration must set "
+                "DisableModify=yes and DisableRemove=yes"]
+    return []
 
 
 def check_manifest(manifest: str, chain: dict) -> list[dict]:
@@ -515,9 +944,14 @@ def check_manifest(manifest: str, chain: dict) -> list[dict]:
     active_boundary = None
     if [p["id"] for p in built] != [i for i, _, _, _ in expected]:
         raise ValueError(f"the bundle's chain is {[p['id'] for p in built]}, not {[i for i, _, _, _ in expected]}")
-    if built[0]["per_machine"] != "yes" or built[0]["allusers"] != [("1", None)]:
+    core = next(package for package in built if package['id'] == CORE_ID)
+    if core["per_machine"] != "yes" or core["allusers"] != [("1", None)]:
         raise ValueError("the core must be per-machine with unconditional ALLUSERS=1")
-    features = built[0]['features']
+    if 'upgrade' in chain and core['upgrade_chain'] != [('[OAUpgradeChain]', None)]:
+        raise ValueError('the core MSI must receive the per-run upgrade chain token')
+    for problem in elevation_problems(manifest) + apps_entry_problems(manifest):
+        raise ValueError(problem)
+    features = core['features']
     if any(app['id'] == 'opencode' for app in chain['apps']):
         allowed = {row['id'] for row in bundle_actions_inputs(['opencode'])['inputs']['core_features']['features']}
         if not features or len(features) != len(set(features)) or 'McpGateway' not in features or not set(features) <= allowed:
@@ -526,13 +960,24 @@ def check_manifest(manifest: str, chain: dict) -> list[dict]:
         raise ValueError('unrelated/core-only bundle must preserve ordinary core feature selection')
     for found, (identifier, kind, package, app) in zip(built, expected):
         active_boundary = found["boundary_forward"] or active_boundary
+        if identifier == 'BeginCoreUpgrade':
+            if (found['type'] != 'ExePackage' or found['vital'] != 'no' or found['per_machine'] != 'yes'
+                    or found['cache'] != 'remove' or found['condition'] != 'OACorePrior = 5 AND WixBundleAction = 6'
+                    or found['arguments'] != 'service begin-upgrade --machine --installed --chain [OAUpgradeChain]'
+                    or found['uninstall_arguments'] != 'service start --machine' or found['detection'] != 'condition'
+                    or found['detect_condition'] != 'false' or found['permanent'] != 'no' or found['packaging'] != 'embedded'
+                    or found['bytes'] != package['bytes'] or found['sha512'] != package['sha512']):
+                raise ValueError('early upgrade package changed its scope, planning, command or pinned bytes')
+            continue
         if found["type"] != kind or found["vital"] != "yes":
             raise ValueError("a selected package must keep its type and report failure")
-        if app is not None and (found["per_machine"] != "no" or found["allusers"] or found["condition"] != variable(app["id"]) + " = 1"):
-            raise ValueError("application packages must be per-user under their one checkbox")
+        if app is not None and (found["per_machine"] != "no" or found["allusers"] or found["condition"] != app_install_condition(app["id"])):
+            raise ValueError("application packages must keep their per-user install condition")
+        if app is not None and app["id"] == CATALOG_ONLY_APP and found["permanent"] != "yes":
+            raise ValueError("Catalog-owned OpenCode packages must be permanent")
         if kind == "ExePackage" and found["permanent"] != "yes":
             raise ValueError("the official Desktop keeps its own removal ownership")
-        if app is not None:
+        if app is not None and not identifier.startswith('Preflight_'):
             boundary = "AppBoundary_" + app["id"].replace("-", "_")
             if active_boundary != boundary or boundary not in boundaries or boundaries[boundary].get("Vital") != "yes" or boundaries[boundary].get("Transaction") != "no":
                 raise ValueError("a selected application's vital boundary must preserve the completed core")
@@ -541,8 +986,9 @@ def check_manifest(manifest: str, chain: dict) -> list[dict]:
                 or found['command_lines'] != [('WixBundleUILevel = 4', '--guided', '', ''), ('WixBundleUILevel <> 4', '--verify-only', '', '')]
                 or found['exit_codes'] != [('0', '1'), ('*', '2')]):
             raise ValueError('the fixed preparation must keep its disjoint UI modes, embedded payload and zero-only success')
-        if kind == "ExePackage" and 'arp_id' not in package and (found['arguments']!='' or found['detection']!='condition' or found['detect_condition']!='0'):
-            raise ValueError('the fixed read-only preflight must run before its host without arguments')
+        if kind == "ExePackage" and 'arp_id' not in package and not preparation and (found['arguments']!='' or found['detection']!='condition'
+                or found['detect_condition']!='0' or found['command_lines'] != [(PREFLIGHT_QUIET[0], PREFLIGHT_QUIET[1], '', ''), (PREFLIGHT_PASSIVE[0], PREFLIGHT_PASSIVE[1], '', '')]):
+            raise ValueError('the fixed read-only preflight must run before its host without arguments, --quiet only without UI')
         if kind == "ExePackage" and 'arp_id' in package and (found["arguments"] != "/S /currentuser" or found["detection"] != "arp"
                 or found["arp_id"] != package["arp_id"] or found["arp_version"] != package["arp_version"]
                 or found["arp_win64"] != ("yes" if package["arp_win64"] else "no")):
@@ -561,18 +1007,86 @@ def wix_burn_manifest(wix: str, bundle: Path) -> str:
         return (Path(temp) / "manifest.xml").read_text(encoding="utf-8-sig")
 
 
+def bundle_readback(wix: str, bundle: Path) -> tuple[str, list[str]]:
+    """A built bundle's manifest and brand_problems, through one `wix burn extract`."""
+    with tempfile.TemporaryDirectory() as temp:
+        if subprocess.run([wix, "burn", "extract", str(bundle), "-oba", temp]).returncode:
+            raise ValueError("wix burn extract failed")
+        return (Path(temp) / "manifest.xml").read_text(encoding="utf-8-sig"), brand_problems(bundle, Path(temp))
+
+
+def core_upgrade_code() -> str:
+    """The core package's UpgradeCode, from the canonical core source."""
+    package = ET.parse(HERE.parent / "abstraction.wxs").getroot().find(f"{{{WXS}}}Package")
+    code = package.get("UpgradeCode") if package is not None else None
+    if not code or not re.fullmatch(r"[0-9A-Fa-f]{8}(-[0-9A-Fa-f]{4}){3}-[0-9A-Fa-f]{12}", code):
+        raise ValueError("the canonical core source names no UpgradeCode")
+    return "{" + code.upper() + "}"
+
+
+def installed_related_products(upgrade_code: str) -> list[dict]:
+    """Every product Windows Installer lists for upgrade_code on this account,
+    with its install context: AssignmentType 0 per-user, 1 per-machine."""
+    import ctypes
+    msi = ctypes.WinDLL("msi")
+    products = []
+    for index in range(256):
+        buffer = ctypes.create_unicode_buffer(39)
+        status = msi.MsiEnumRelatedProductsW(upgrade_code, 0, index, buffer)
+        if status == 259:  # ERROR_NO_MORE_ITEMS
+            return products
+        if status:
+            raise OSError(f"Windows Installer could not list products for {upgrade_code}: error {status}")
+        def info(name):
+            size = ctypes.c_uint(1024)
+            value = ctypes.create_unicode_buffer(size.value)
+            return value.value if msi.MsiGetProductInfoW(buffer.value, name, value, ctypes.byref(size)) == 0 else ""
+        products.append({"product": buffer.value, "assignment": info("AssignmentType"),
+                         "version": info("VersionString"), "location": info("InstallLocation")})
+    raise OSError("too many related products")
+
+
+def installed_scope_conflicts(related: list[dict]) -> list[str]:
+    """The bundle installs its core per-machine (ForcePerMachine). Windows
+    Installer upgrades a product only within its own install context, so a
+    per-user OpenAbstractions stays installed beside the new per-machine core
+    (preview-1031c, 2026-10-31). One sentence per such product."""
+    return [f"OpenAbstractions {row['version'] or '?'} is installed per-user ({row['product']}"
+            + (f", {row['location']}" if row['location'] else "")
+            + "); this bundle installs the core per-machine and cannot upgrade it. Uninstall it first."
+            for row in related if row.get("assignment") != "1"]
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="build_bundle.py", description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--installed-scope", action="store_true",
+                        help="before handing a bundle to someone on this computer: report an installed "
+                             "OpenAbstractions the per-machine core cannot upgrade, and exit 1 if there is one")
     parser.add_argument("--chain", type=Path)
     parser.add_argument("--bal-ext", type=Path)
+    parser.add_argument("--util-ext", type=Path, help="Pinned WiX 5.0.2 Util extension for native core product search")
+    parser.add_argument("--upgrade-binary", type=Path, help="Exact UpgradeSupervisorCode binary from the core MSI")
     parser.add_argument("--out", type=Path)
     parser.add_argument("--wix", default="wix")
     parser.add_argument("--actions-dll", type=Path, help="Final OA-signed BAFunctions DLL from admitted native intake")
     parser.add_argument("--actions-receipt", type=Path, help="Existing native producer's source/map/final-DLL facts")
     parser.add_argument("--actions-receipt-sha256", help="Independent admitted native receipt pin")
+    parser.add_argument("--catalog-maintenance", action="store_true",
+                        help="The verified distribution includes a Catalog desktop integration update")
     args = parser.parse_args(argv)
-    if all(value is None for value in (args.chain, args.bal_ext, args.out,
+    if args.installed_scope:
+        try:
+            conflicts = installed_scope_conflicts(installed_related_products(core_upgrade_code()))
+        except (OSError, ValueError, ET.ParseError) as error:
+            print("FAIL ", error)
+            return 1
+        for line in conflicts:
+            print("FAIL ", line)
+        if not conflicts:
+            print("ok    no installed OpenAbstractions in another install context")
+        return 1 if conflicts else 0
+    if all(value is None for value in (args.chain, args.bal_ext, args.util_ext, args.upgrade_binary, args.out,
                                       args.actions_dll, args.actions_receipt, args.actions_receipt_sha256)):
         parser.print_help()
         return 0
@@ -583,28 +1097,44 @@ def main(argv: list[str] | None = None) -> int:
         chain = read_chain(args.chain.resolve())
         check_pins(chain)
         context = chain_context(chain)
+        check_core_picture_feature(args.wix, Path(chain["core"]["file"]))
         action_args = (args.actions_dll, args.actions_receipt, args.actions_receipt_sha256)
-        if chain['apps']:
-            if not all(action_args):
-                raise ValueError('optional apps require the admitted signed bundle actions DLL and receipt')
-            actions = check_bundle_actions(chain, *action_args)
-        elif any(action_args):
-            raise ValueError('a core-only bundle has no optional-app native action payload')
-        else:
-            actions = None
+        if not all(action_args):
+            raise ValueError('every bundle requires the admitted signed bundle actions DLL and receipt')
+        actions = check_bundle_actions(chain, *action_args, catalog_maintenance=args.catalog_maintenance)
+        if args.util_ext is None or args.upgrade_binary is None:
+            raise ValueError('every bundle requires --util-ext and --upgrade-binary')
+        util = PACKAGES['WixToolset.Util.wixext']
+        if sha256_and_size(args.util_ext) != (util['dll_sha256'], util['dll_bytes']):
+            raise ValueError('Util extension differs from pinned WiX 5.0.2')
+        chain['upgrade'] = check_upgrade_binary(args.wix, Path(chain['core']['file']), args.upgrade_binary.resolve())
+        names = [Path(package['file']).name for _,_,package,_ in chain_packages(chain)]
+        if len(names) != len(set(names)):
+            raise ValueError('upgrade supervisor collides with a flat bundle package name')
         for _, _, package, _ in chain_packages(chain):
             package["sha512"] = sha512(Path(package["file"]))
         out.mkdir(parents=True, exist_ok=True)
+        upgrade = Path(chain['upgrade']['file'])
+        carried_upgrade = out/upgrade.name
+        if upgrade != carried_upgrade:
+            shutil.copyfile(upgrade, carried_upgrade)
+        if sha256_and_size(carried_upgrade) != (chain['upgrade']['sha256'], chain['upgrade']['bytes']):
+            raise ValueError('upgrade supervisor changed while copying into flat bundle')
+        chain['upgrade']['file'] = str(carried_upgrade)
         (out / "apps.wxs").write_text(apps_fragment(chain["apps"]), encoding="utf-8", newline="\n")
-        (out / "bundle.thm").write_text(theme(standard_theme(args.bal_ext), chain["apps"]),
+        icon, logo = brand_sources()
+        (out / "bundle.thm").write_text(theme(standard_theme(args.bal_ext), chain["apps"],
+                                             catalog_maintenance=args.catalog_maintenance),
                                         encoding="utf-8", newline="\n")
     except (OSError, ValueError, KeyError, zipfile.BadZipFile, json.JSONDecodeError, ET.ParseError) as error:
         print("FAIL ", error)
         return 1
     bundle = out / f"OpenAbstractions-Setup-{chain['version']}.exe"
-    command = [args.wix, "build", "-arch", "x64", "-ext", str(args.bal_ext.resolve()),
+    command = [args.wix, "build", "-arch", "x64", "-ext", str(args.bal_ext.resolve()), "-ext", str(args.util_ext.resolve()),
                "-d", f"Version={chain['version']}", "-d", f"CoreMsi={chain['core']['file']}",
+               "-d", f"UpgradeBinary={chain['upgrade']['file']}",
                "-d", f"ThemeFile={out / 'bundle.thm'}",
+               "-d", f"BundleIcon={icon}", "-d", f"BundleLogo={logo}",
                "-d", f"SuppressOptionsUI={'no' if chain['apps'] else 'yes'}",
                "-d", f"CoreFeatureSelection={'yes' if any(app['id'] == 'opencode' for app in chain['apps']) else 'no'}",
                *(["-d", f"BundleActions={args.actions_dll.resolve()}"] if actions else []),
@@ -613,8 +1143,11 @@ def main(argv: list[str] | None = None) -> int:
     if subprocess.run(command, cwd=out).returncode:
         return 1
     try:
-        built = check_manifest(wix_burn_manifest(args.wix, bundle), chain)
-        if actions and check_bundle_actions(chain, *action_args) != actions:
+        manifest, brand = bundle_readback(args.wix, bundle)
+        built = check_manifest(manifest, chain)
+        for problem in brand:
+            raise ValueError(problem)
+        if actions and check_bundle_actions(chain, *action_args, catalog_maintenance=args.catalog_maintenance) != actions:
             raise ValueError('bundle actions changed during bundle build')
     except (OSError, ValueError, KeyError, TypeError, ET.ParseError) as error:
         print("FAIL ", error)

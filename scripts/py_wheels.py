@@ -37,9 +37,11 @@ import sys
 import zipfile
 from pathlib import Path
 try:
+    from .file_boundary import extended_path
     from .windows_native import NativeDependencyError, validate_portable_windows_dll
     from .npm_packages import FACADE_NATIVE
 except ImportError:  # direct script invocation from scripts/
+    from file_boundary import extended_path
     from windows_native import NativeDependencyError, validate_portable_windows_dll
     from npm_packages import FACADE_NATIVE
 
@@ -309,7 +311,8 @@ def assemble(version, platform_tag, library, package, license_file, output, *, d
         raise Refused(f"--license must name an existing file: {license_file}")
     description, requires_python = read_metadata(package, distribution)
 
-    stage = output.parent / f".py_wheels-stage-{wheel_basename}-{platform_tag}"
+    # The package's staging members can be deeper than the final wheel path.
+    stage = extended_path(output.parent / f".py_wheels-stage-{wheel_basename}-{platform_tag}")
     if stage.exists():
         shutil.rmtree(stage)
     stage.mkdir(parents=True)

@@ -5,7 +5,7 @@
   "release_admission": {
     "schema": 1,
     "version": "0.8.0",
-    "scope_sha256": "a8d2bde08d386ab130654b020a2a673029f8887cc47f50ae220e0c3557ce5a76",
+    "scope_sha256": "9b8e267fd9fbe69efb5af4ce518b56254d7e400d222d6742b6f8442804b7110f",
     "delivery_accepted": false,
     "outcomes": {
       "adopters": [
@@ -52,7 +52,7 @@
           "state": "pending"
         },
         {
-          "id": "F18",
+          "id": "F18-J1",
           "target": "windows-x64",
           "state": "pending"
         },
@@ -109,6 +109,6 @@
       ]
     },
     "selections": [],
-    "capsule_sha256": "bdc49e4a9611d94cbf8cfdd338bee91b5ea7570fa42e41415a456886ff006b84"
+    "capsule_sha256": "ddc6f47049abaccce001e227c3ff3a387fa725a0063aafac3b193f4a69ddd9fa"
   }
 }

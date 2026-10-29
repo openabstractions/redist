@@ -118,9 +118,12 @@ Linux, a **LaunchAgent** on macOS. The runtime runs with the installing user's
 permissions. Windows additionally offers a machine-wide installation that
 registers per-user service instances.
 
-`install.sh` enables `abstraction-runtime.service` through the systemd user
-manager on Linux. The runtime executes `openabstractions serve runtime` and
-restarts on failure. Installation polls the installed read-only `status`
+`install.sh` starts `abstraction-runtime.service` through the systemd user
+manager on Linux and does not enable it. The runtime executes `openabstractions
+serve runtime` and restarts on failure. The runtime's Applications-driven
+reconciler enables the unit at login while a confirmed app is registered and
+disables it when the last one is removed; with no app the installation adds no
+login item. Installation polls the installed read-only `status`
 command within 15 seconds and reports failure if any default runtime contract
 is unavailable. The runtime owns durable jobs, logging and configuration;
 `openabstractions start` starts it on demand and is idempotent with a running
@@ -136,7 +139,10 @@ registration. Absence is reported, never passed.
 On macOS, the runtime's LaunchAgent identifier is
 `com.openabstractions.runtime`, at
 `~/Library/LaunchAgents/com.openabstractions.runtime.plist`. It runs
-`openabstractions serve runtime` with `RunAtLoad` and `KeepAlive`. The package
+`openabstractions serve runtime --xpc` on demand through its MachServices,
+with no `RunAtLoad` and no `KeepAlive`. The runtime's Applications-driven
+reconciler writes the separate login trigger
+`com.openabstractions.runtime-login` while a confirmed app is registered. The package
 scripts run as the installing user for a home-domain install. The payload
 carries the plist as a template in the share directory. `scripts/postinstall`
 substitutes the absolute path of the program into a temporary file beside the

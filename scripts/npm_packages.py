@@ -39,7 +39,7 @@ import sys
 import tarfile
 import tempfile
 from windows_native import NativeDependencyError, validate_portable_windows_dll
-from file_boundary import extended_path
+from file_boundary import extended_path, owned_temporary_tree
 
 ROOT = Path(__file__).resolve().parent.parent
 ADDON_FILE = "oa_ipc_node.node"
@@ -110,8 +110,22 @@ def platform_libraries(ipc):
 
 
 def host_platform():
-    """This host's platform identity, in the connectors' os-cpu spelling."""
-    system = {"win32": "win32", "linux": "linux", "darwin": "darwin"}.get(sys.platform)
+    """The receiving platform, using Node's architecture on Darwin."""
+    if sys.platform == "darwin":
+        environment = {key: value for key, value in os.environ.items()
+                       if key.upper() not in ("NODE_OPTIONS", "NODE_PATH")}
+        try:
+            node = subprocess.run(
+                ["node", "-p", 'process.platform + "-" + process.arch'],
+                env=environment, capture_output=True, text=True, check=True, timeout=15,
+            )
+        except (OSError, subprocess.SubprocessError) as error:
+            raise Refused("could not determine the Darwin Node platform") from error
+        identity = node.stdout.strip()
+        if not re.fullmatch(r"darwin-[a-z0-9]+", identity):
+            raise Refused("Node did not report a Darwin platform")
+        return identity
+    system = {"win32": "win32", "linux": "linux"}.get(sys.platform)
     machine = {"amd64": "x64", "x86_64": "x64", "arm64": "arm64", "aarch64": "arm64"}
     import platform as host
     return f"{system}-{machine.get(host.machine().lower(), host.machine().lower())}"
@@ -435,7 +449,7 @@ def test_opencode_package(directory, environment=None):
 if(typeof tool!=='function'||typeof tool.schema?.object!=='function') process.exit(1);
 const {default:{server:plugin}}=await import('@openabstractions/opencode/server');
 const hooks=await plugin({client:{app:{log:async()=>{}}}}, {tools:{selection_policy:true}});
-if(typeof hooks.config!=='function'||typeof hooks.tool.openabstractions_selection_policy.execute!=='function') process.exit(2);"""],
+if(typeof hooks.config!=='function'||typeof hooks.tool.oa_selection_manage.execute!=='function') process.exit(2);"""],
         cwd=directory, capture_output=True, text=True, env=environment,
     )
     if smoke.returncode != 0:
@@ -471,10 +485,26 @@ def cache_files(cache):
     return result
 
 
+def npm_bundled_modules(*, environment):
+    """Find the selected npm's bundled modules through its installed CLI."""
+    selected = shutil.which('npm', path=environment.get('PATH', os.defpath))
+    if not selected:
+        raise ValueError('npm is not on the selected PATH')
+    launcher = Path(selected).resolve(strict=True)
+    cli = (launcher.parent / 'node_modules/npm/bin/npm-cli.js'
+           if launcher.name.casefold() == 'npm.cmd' else launcher)
+    if (cli.name != 'npm-cli.js' or cli.parent.name != 'bin'
+            or cli.parent.parent.name != 'npm' or not cli.is_file()):
+        raise ValueError('selected npm has no supported bundled CLI: ' + str(launcher))
+    modules = cli.parent.parent / 'node_modules'
+    if not modules.is_dir():
+        raise ValueError('selected npm has no bundled modules: ' + str(launcher))
+    return modules
+
+
 def npm_content_cache(cache, *, environment):
     """Use npm's own configured-cache to pacote-cache projection."""
-    npm = Path(shutil.which('npm') or '')
-    definitions = npm.parent / 'node_modules/npm/node_modules/@npmcli/config/lib/definitions'
+    definitions = npm_bundled_modules(environment=environment) / '@npmcli/config/lib/definitions'
     result = subprocess.run(['node', '-e',
         "console.log(require(process.argv[1]).flatten({cache:process.argv[2]}).cache)",
         str(definitions), str(cache)], env=environment, check=True, capture_output=True, text=True)
@@ -483,8 +513,7 @@ def npm_content_cache(cache, *, environment):
 
 def verify_cached_archives(cache, packages, *, environment):
     """npm's own content-addressed cache reader verifies each locked integrity."""
-    npm = Path(shutil.which('npm') or '')
-    cacache = npm.parent / 'node_modules/npm/node_modules/cacache'
+    cacache = npm_bundled_modules(environment=environment) / 'cacache'
     if not cacache.is_dir():
         raise ValueError('npm content-cache verifier is absent')
     script = """const fs=require('fs');const c=require(process.argv[1]);
@@ -573,27 +602,13 @@ def resolve_packed_dependencies(packed, target, environment, packages):
 def test_packed_packages(packed, identity, dependency_cache=None):
     """Install this exact archive set offline, then import its declared APIs."""
     pins = {str(path): digest(path) for _, path, _ in packed}
-    names = []
-    for expected, path, _ in packed:
-        with tarfile.open(path, 'r:gz') as archive:
-            data = json.load(archive.extractfile('package/package.json'))
-        if data['name'] != expected:
-            raise Refused('packed import input name differs')
-        if expected in ('@openabstractions/ipc-' + identity, FACADE_NATIVE['prefix'] + identity):
-            continue  # Binary payload package: its source-owned IPC loader resolves it.
-        exports = data.get('exports')
-        if exports is not None and not isinstance(exports, (str, dict)):
-            raise Refused(expected + ': invalid public exports')
-        if isinstance(exports, dict) and any(key.startswith('.') for key in exports) and '.' not in exports:
-            raise Refused(expected + ': no declared public root import')
-        names.append(expected)
-    if len(names) != len(set(names)):
-        raise Refused('duplicate packed import package')
+    ipc_payload = '@openabstractions/ipc-' + identity
+    facade_payload = FACADE_NATIVE['prefix'] + identity
     environment = {key: value for key, value in os.environ.items()
                    if key.upper() not in ('NODE_PATH', 'NODE_OPTIONS', 'ABSTRACTION_IPC_NODE',
                        'ABSTRACTION_IPC_LIBRARY', 'ABSTRACTION_IPC_PREFIX', 'BUN_BE_BUN')
                    and not key.upper().startswith('NPM_CONFIG_')}
-    with tempfile.TemporaryDirectory(prefix='oa-npm-import-') as temporary:
+    with owned_temporary_tree(prefix='oa-npm-import-', parent=Path(tempfile.gettempdir())) as temporary:
         target = Path(temporary).resolve()
         # Node resolves transitive dependencies through every ancestor.  Refuse
         # ambient module directories before allowing any package child to run.
@@ -601,6 +616,32 @@ def test_packed_packages(packed, identity, dependency_cache=None):
             modules = parent / 'node_modules'
             if modules.exists() or modules.is_symlink():
                 raise Refused('ambient ancestor node_modules: ' + str(modules))
+        archives = target / 'archives'
+        archives.mkdir()
+        receiving = []
+        names = []
+        for expected, path, carried in packed:
+            copy = archives / path.name
+            if copy.exists():
+                raise Refused('duplicate packed import filename: ' + path.name)
+            shutil.copyfile(path, copy)
+            if digest(copy) != pins[str(path)]:
+                raise Refused('packed import copy differs from pinned archive: ' + path.name)
+            receiving.append((expected, copy, carried))
+            with tarfile.open(copy, 'r:gz') as archive:
+                data = json.load(archive.extractfile('package/package.json'))
+            if data['name'] != expected:
+                raise Refused('packed import input name differs')
+            if expected in (ipc_payload, facade_payload):
+                continue  # Binary payload package: its source-owned IPC loader resolves it.
+            exports = data.get('exports')
+            if exports is not None and not isinstance(exports, (str, dict)):
+                raise Refused(expected + ': invalid public exports')
+            if isinstance(exports, dict) and any(key.startswith('.') for key in exports) and '.' not in exports:
+                raise Refused(expected + ': no declared public root import')
+            names.append(expected)
+        if len(names) != len(set(names)):
+            raise Refused('duplicate packed import package')
         # The offline receiving child needs only the explicit archive set,
         # never a person's npm configuration, credential helpers or cache.
         for name in ('user.npmrc', 'global.npmrc'):
@@ -611,7 +652,7 @@ def test_packed_packages(packed, identity, dependency_cache=None):
             npm_config_globalconfig=str(target / 'global.npmrc'),
             npm_config_cache=str(target / 'npm-cache'), npm_config_update_notifier='false')
         if dependency_cache is not None:
-            opencode = [path for name, path, _ in packed if name == '@openabstractions/opencode']
+            opencode = [path for name, path, _ in receiving if name == '@openabstractions/opencode']
             if len(opencode) != 1:
                 raise Refused('dependency cache requires the packed OpenCode lock')
             with tarfile.open(opencode[0], 'r:gz') as archive:
@@ -622,12 +663,12 @@ def test_packed_packages(packed, identity, dependency_cache=None):
                     Path(dependency_cache), target / 'npm-cache', packages, environment=environment)
             except (OSError, ValueError, KeyError) as error:
                 raise Refused('dependency cache admission failed: ' + str(error)) from error
-            own_versions = resolve_packed_dependencies(packed, target, environment, packages)
+            own_versions = resolve_packed_dependencies(receiving, target, environment, packages)
             admitted_root = {name:(target / name).read_bytes() for name in ('package.json','package-lock.json')}
         install_args = (['npm', 'install', '--offline', '--ignore-scripts', '--no-save', '--no-audit', '--no-fund', '--prefix', str(target)]
                         if dependency_cache is not None else
                         ['npm', 'install', '--offline', '--ignore-scripts', '--no-audit', '--no-fund',
-                         '--no-package-lock', '--prefix', str(target), *pins])
+                         '--no-package-lock', '--prefix', str(target), *(str(path) for _, path, _ in receiving)])
         install = subprocess.run(install_args, cwd=target, env=environment,
             capture_output=True, text=True, shell=os.name == 'nt')
         if install.returncode:
@@ -644,6 +685,9 @@ import {fileURLToPath} from 'node:url';
 import {realpathSync} from 'node:fs';
 import {sep} from 'node:path';
 const names=JSON.parse(process.argv[1]);
+if(process.platform+'-'+process.arch!==process.argv[2]) {
+ throw Error('packed receiving Node platform differs');
+}
 const boundary=realpathSync(process.cwd())+sep+'node_modules'+sep;
 const require=createRequire(import.meta.url);
 const nativeName='@openabstractions/facade-native-'+process.argv[2];
@@ -671,7 +715,7 @@ if(nativePath) {
   context.close();
  } finally { app.close(); app.dispose(); }
 }'''
-        has_facade_native = any(name == FACADE_NATIVE['prefix'] + identity for name, _, _ in packed)
+        has_facade_native = any(name == facade_payload for name, _, _ in packed)
         checked = subprocess.run(['node', '--no-global-search-paths', '--input-type=module', '-e', script,
                                   json.dumps(names), identity, '1' if has_facade_native else '0'],
             cwd=target, env=environment, capture_output=True, text=True)
@@ -724,9 +768,22 @@ catch(error) { if(!error.message.startsWith('AppModel native component unavailab
                 native_manifest.write_bytes(original_native)
                 old_abi.unlink()
         if '@openabstractions/opencode' in names:
-            test_opencode_package(target, environment)
+            # The mandatory smoke receives the actual installed archive and
+            # frozen closure, with no ambient source dependency prerequisite.
+            test_opencode_package(target, environment=environment)
+        if any(digest(copy) != pins[str(path)] for (_, copy, _), (_, path, _) in zip(receiving, packed)):
+            raise Refused('packed import copies changed')
     if pins != {str(path): digest(path) for _, path, _ in packed}:
         raise Refused('packed import inputs changed')
+    checks = dict.fromkeys(names, 'public-import')
+    if '@openabstractions/ipc' in names:
+        checks[ipc_payload] = 'ipc-addon-resolved'
+    if has_facade_native:
+        checks[facade_payload] = 'appmodel-abi2-load'
+    for name, path, _ in packed:
+        if name in checks:
+            print(f'PASS {path.name} sha256={pins[str(path)]} node_platform={identity} '
+                  f'npm_package={name} npm_check={checks[name]}')
 
 
 def verify(name, tarball, required):
@@ -818,6 +875,7 @@ def run(args):
     if identity not in table:
         raise Refused(f"{identity} has no qualified platform package; "
                       "the connectors name " + ", ".join(sorted(table)))
+    receiving_platform = host_platform() if args.platform else identity
     facade_inputs = (getattr(args, "facade_library", None), getattr(args, "facade_addon", None))
     if any(facade_inputs) and not all(facade_inputs):
         raise Refused("facade native packaging requires both --facade-library and --facade-addon")
@@ -834,7 +892,6 @@ def run(args):
             if not path.is_file() or path.name != filename:
                 raise Refused("facade native packaging requires the built " + filename)
             facade_pins[path] = (path.stat().st_size, digest(path))
-    test_opencode_package(sources["opencode"])
     library, addon = Path(args.library).resolve(), Path(args.addon).resolve()
     for label, path in (("--library", library), ("--addon", addon)):
         if not path.is_file():
@@ -853,7 +910,7 @@ def run(args):
     output.mkdir(parents=True, exist_ok=True)
 
     packed = []
-    with tempfile.TemporaryDirectory(prefix="oa-npm-") as temporary:
+    with owned_temporary_tree(prefix='oa-npm-', parent=Path(tempfile.gettempdir())) as temporary:
         stage = Path(temporary)
         homepage = read_package(sources["ipc"])["homepage"]
         staged = [assemble_platform(stage, identity, table[identity], library, addon,
@@ -881,7 +938,7 @@ def run(args):
     actual = [name for name, _, _ in packed]
     if len(actual) != len(set(actual)) or set(actual) != expected:
         raise Refused("packed package roster differs from the pinned source packages and selected IPC platform")
-    if identity == host_platform():
+    if identity == receiving_platform:
         test_packed_packages(packed, identity, getattr(args, 'dependency_cache', None))
     else:
         print('packed import not run for incompatible host platform: ' + identity)

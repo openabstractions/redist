@@ -47,13 +47,25 @@ def same_existing_file(left: os.PathLike[str] | str,
     return os.path.samefile(extended_path(left), extended_path(right))
 
 
+class OutsideRoot(ValueError):
+    """An observed directory walk did not reach the admitted root identity."""
+
+
 def relative_beneath_existing(path: os.PathLike[str] | str,
-                              root: os.PathLike[str] | str) -> Path:
+                              root: os.PathLike[str] | str, *, ordinary_file=False) -> Path:
     """Return an existing name's suffix beneath an existing directory identity.
 
-    Callers own link/type admission. Errors remain errors. This snapshot walks
+    With ordinary_file, admit a file and directory without links or reparse
+    points. Otherwise callers own link/type admission. This snapshot walks
     directory names; a multiply named file does not imply a unique parent.
+    A ".." part is refused: the walk follows names, and a parent step in a
+    name would let a path outside the root pass through the root's own name.
     """
+    if any(part == ".." for part in Path(path).parts + Path(root).parts):
+        raise ValueError("containment refuses a parent (..) part")
+    if ordinary_file:
+        ordinary_path(path, kind="file")
+        ordinary_path(root, kind="directory")
     name, boundary = extended_path(path), extended_path(root)
     info = boundary.stat()
     if not stat.S_ISDIR(info.st_mode):
@@ -66,9 +78,82 @@ def relative_beneath_existing(path: os.PathLike[str] | str,
             return Path(*reversed(suffix))
         parent = at.parent
         if parent == at:
-            raise ValueError("existing path outside admitted root")
+            raise OutsideRoot("existing path outside admitted root")
         suffix.append(at.name)
         at = parent
+
+
+def ordinary_path(path, *, kind=None, allow_missing=False):
+    """Admit a name and all ancestors without links or reparse points.
+
+    Missing suffixes are allowed only explicitly, beneath an existing directory.
+    This is a snapshot admission; it does not provide write-race exclusion.
+    """
+    name = extended_path(path)
+    missing = False
+    leaf = None
+    for part in (name, *name.parents):
+        try:
+            info = part.lstat()
+        except FileNotFoundError:
+            if not allow_missing:
+                raise
+            missing = True
+            continue
+        if stat.S_ISLNK(info.st_mode) or getattr(info, 'st_file_attributes', 0) & getattr(stat, 'FILE_ATTRIBUTE_REPARSE_POINT', 0):
+            raise ValueError('path is linked or contains a reparse point')
+        if leaf is None:
+            leaf = info
+            if missing and not stat.S_ISDIR(info.st_mode):
+                raise ValueError('missing suffix requires an existing directory')
+            if not missing and kind == 'file' and not stat.S_ISREG(info.st_mode):
+                raise ValueError('path must be an ordinary file')
+            if not missing and kind == 'directory' and not stat.S_ISDIR(info.st_mode):
+                raise ValueError('path must be an ordinary directory')
+        elif not stat.S_ISDIR(info.st_mode):
+            raise ValueError('path ancestor must be a directory')
+    if leaf is None:
+        raise FileNotFoundError('path has no existing ancestor')
+    return plain_path(name)
+
+
+def relative_beneath_missing(path, root):
+    """Admit a possibly missing suffix beneath an existing ordinary root.
+
+    The existing-path owner validates parent syntax and asks filesystem identity.
+    Only FileNotFoundError permits walking back to the nearest existing ancestor.
+    """
+    ordinary_path(root, kind='directory')
+    try:
+        result = relative_beneath_existing(path, root)
+    except FileNotFoundError:
+        pass
+    else:
+        ordinary_path(path)
+        return result
+    name = extended_path(path)
+    ordinary_path(name, allow_missing=True)
+    suffix = []
+    while True:
+        try:
+            name.lstat()
+            break
+        except FileNotFoundError:
+            suffix.append(name.name)
+            name = name.parent
+    return relative_beneath_existing(name, root).joinpath(*reversed(suffix))
+
+
+def missing_child(root, relative):
+    """Return a nonempty relative child after ordinary-root identity admission."""
+    member = Path(relative)
+    if member.anchor or not member.parts:
+        raise ValueError('child must be a nonempty relative name')
+    target = Path(root) / member
+    suffix = relative_beneath_missing(target, root)
+    if not suffix.parts:
+        raise ValueError('child must be a nonempty relative name')
+    return target
 
 
 def extended_path(path: os.PathLike[str] | str) -> Path:
@@ -132,10 +217,7 @@ if _python_role is None:
 
 def _verify_python_role(role):
     path, stream, expected, checksum = role
-    for part in (path, *path.parents):
-        info = part.lstat()
-        if stat.S_ISLNK(info.st_mode) or getattr(info, 'st_file_attributes', 0) & stat.FILE_ATTRIBUTE_REPARSE_POINT:
-            raise ValueError('selected Python path is linked')
+    ordinary_path(path)
     before = os.fstat(stream.fileno())
     current = path.stat()
     if (not stat.S_ISREG(current.st_mode) or current.st_nlink != 1

@@ -11,7 +11,7 @@
 >         checkout it is handed. A --bin build may take a separately qualified
 >         prebuilt executable regardless of this ref. The 0.4 release gate
 >         requires exact source commits for localstores, modelhost,
->         lemonadeimage, thenoiseimage, pytorchimage and pytorchengine before
+>         lemonadeimage, pytorchimage and pytorchengine before
 >         publishing its final package candidate.
 >
 > UNRESOLVED is a source with no verified published commit. A payload row naming
@@ -55,7 +55,8 @@
 >
 > pytorchimage and pytorchengine both name the same prepared
 > abstraction-provider-pytorch source commit. The first builds pytorchd; the
-> second is a prepared local-input directory, whose existing enginefiles
+> second is the prepared input directory of the separate PyTorch component
+> (installer/pytorch_engine.py), never a core MSI payload, whose enginefiles
 > manifest comes from that same-source pytorchd setup inputs command. Its
 > CPython, lock-selected wheels and Hummingbird byte pins and license notices
 > remain owned by the provider. This source reference does not qualify those
@@ -79,13 +80,12 @@ installer	-						-
 panel		openabstractions/abstractions			fc273d2f6bffc54623081a0b28e5c2701ccc4651
 UNRESOLVED	-						-
 charter	openabstractions/abstractions	3ef816c8bbd62a9e1da21c8e51ce69f99b70af41
-localstores	openabstractions/abstraction-storage-over-local-stores	2e45aaa1e4bb17b7eb4d5eab8d569908ddbff4f2
-modelhost	openabstractions/abstraction-provider-modelhost	872d1103b3f3d1ecc9a98fdd4f72cc8704f7ae41
-modelpack	openabstractions/abstraction-provider-kit	-
+localstores	openabstractions/abstraction-storage-over-local-stores	6f4473dcfbe837f45dd0ccbb0ed1b2bc28be13ed
+modelhost	openabstractions/abstraction-provider-modelhost	9086e4702f2a525ec4272821f465f42dca5f1b81
+modelpack	openabstractions/abstraction-provider-kit	d85198fe99dadc8786b49454ab188647ed10ae4d
 modelhostengine	ggml-org/llama.cpp	9e0e220594af405a62835dc3a27495729fd8506b
-lemonadeimage	openabstractions/abstraction-provider-lemonade	32aae329a1a672c4fdd79fc3d3e3eceba9d17ba6
-thenoiseimage	openabstractions/abstraction-provider-thenoise	cdc96f4d94025774662a15098ee971282bb11234
-pytorchimage	openabstractions/abstraction-provider-pytorch	493be78d9666265112320c48ad7b3e62abb40b8d
-pytorchengine	openabstractions/abstraction-provider-pytorch	493be78d9666265112320c48ad7b3e62abb40b8d
-ipclibrary	openabstractions/abstraction-identity	1267f150df094a372b29080fe110fe82c955c295
-appmodellibrary	openabstractions/abstraction-facade	-
+lemonadeimage	openabstractions/abstraction-provider-lemonade	4f8afc1b6a8a404b83f2fa1cfd12efcacc77f524
+pytorchimage	openabstractions/abstraction-provider-pytorch	4b424486c19b53b112feae7cc892f51038235309
+pytorchengine	openabstractions/abstraction-provider-pytorch	4b424486c19b53b112feae7cc892f51038235309
+ipclibrary	openabstractions/abstraction-identity	9570f30244a6f984a0523e5ec595b0a963daf2db
+appmodellibrary	openabstractions/abstraction-facade	5c2de82c6a2328190428a241d6d93bc186d8a233

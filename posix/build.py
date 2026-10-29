@@ -494,7 +494,7 @@ def main():
                          "versions rather than out of checkouts; on macOS programs "
                          "must already be universal, because lipo is what joins "
                          "two thin builds and this route does not run it")
-    ap.add_argument("--native-source-root", type=Path, help="explicit four-repository C++ source assembly for a source-built macOS launcher")
+    ap.add_argument("--native-source-root", type=Path, help="explicit pinned C++ source assembly for a source-built macOS launcher")
     ap.add_argument("--native-source-roster", type=Path, help="existing selected pypi.tsv for the native source assembly")
     ap.add_argument("--native-provenance", type=Path, help="existing selected module-provenance.json for the native source assembly")
     ap.add_argument("--license", type=Path, default=nearest_license(),

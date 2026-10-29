@@ -8,15 +8,17 @@
 >		MIT and BoringSSL notices. It is on by default; openabstractions models host writes
 >		its declaration later, so this package ships none. Windows ARM64 has
 >		no reviewed local engine pin and does not carry the x64 archive.
->		lemonadeimage installs the native Lemonade image provider and its
+>		lemonadeimage is on by default and installs the native Lemonade image provider and its
 >		declaration only in x64 builds. The Panel separately selects and
 >		downloads the reviewed engine and model after the user approves them.
->		pytorchimage is optional and x64-only. Its provider, prepared runtime
->		input ZIP and same-source owner manifest are required together. The ZIP
->		retains selected CPython, wheel and Hummingbird license notices. Setup
->		prepares the component after separate model approval and writes the
->		provider declaration. Installation carries no model bytes.
->		mcpgateway installs the stdio MCP server and is off by default.
+>		pytorchimage is on by default, x64-only and installs pytorchd alone.
+>		Its runtime input ZIP (installer/pytorch_engine.py) is a separate
+>		release component Setup downloads through the job service when its
+>		picture plan selects the engine; the ZIP retains the CPython, wheel
+>		and Hummingbird license notices. Setup prepares the component after
+>		separate model approval and writes the provider declaration.
+>		Installation carries no model bytes and no runtime inputs.
+>		mcpgateway installs the stdio MCP server and is on by default.
 >		nas-download is a feature name held in abstraction.wxs with
 >		nothing behind it: the NAS delegator is a tier inside
 >		abstraction-download and no program of its own, so there is no
@@ -54,7 +56,7 @@
 >
 > The Panel embeds monitor/panel.manifest as a Windows resource instead of
 > shipping it as a side-by-side file: monitor/panel.rc names it RT_MANIFEST id
-> 1, and monitor/rsrc_windows_amd64.syso / rsrc_windows_arm64.syso (committed,
+> 1, and monitor/internal/panelres/rsrc_windows_amd64.syso / rsrc_windows_arm64.syso (committed,
 > built by `go run ./monitor/icon/gen -syso`) carry the compiled result into
 > every `go build` of this package, --bin and --src alike, with no payload row
 > of its own to drop. The manifest's Common-Controls dependency still names
@@ -79,6 +81,7 @@
 
 feature		path						kind		source		from						sign	subsystem
 tools		tools/Abstraction Panel.exe			gobuild		panel		monitor						yes	windows
+tools		tools/OpenAbstractions Presenter.exe		gobuild		panel		monitor						yes	windows
 tools	tools/abstraction_facade_appmodel.dll	copy	appmodellibrary	abstraction_facade_appmodel.dll	yes	-
 tools		examples/README.txt					authored	installer	examples/README.txt				no	-
 tools		examples/what-this-machine-does/run.cmd		authored	installer	examples/what-this-machine-does/run.cmd		no	-
@@ -98,10 +101,7 @@ modelhost	tools/engines/llama-b10825-oa-win-vulkan-x64.receipt.json	copy	modelho
 modelhost	tools/engines/llama.cpp-MIT.txt	authored	installer	engines/llama.cpp-MIT.txt	no	-
 modelhost	tools/engines/BoringSSL-LICENSE.txt	authored	installer	engines/BoringSSL-LICENSE.txt	no	-
 lemonadeimage	tools/lemonaded.exe	gobuild	lemonadeimage	go/cmd/lemonaded	yes	console
-thenoiseimage	tools/thenoise-provider.exe	gobuild	thenoiseimage	go/cmd/thenoise-provider	yes	console
 pytorchimage	tools/pytorchd.exe	gobuild	pytorchimage	go/cmd/pytorchd	yes	console
-pytorchimage	engines/pytorch/pytorch-2.11.0-rocm7.13.0-cpython3.12.10-gfx1151-inputs.zip	copy	pytorchengine	pytorch-2.11.0-rocm7.13.0-cpython3.12.10-gfx1151-inputs.zip	no	-
-pytorchimage	engines/pytorch/pytorch-2.11.0-rocm7.13.0-cpython3.12.10-gfx1151-inputs.manifest.json	copy	pytorchengine	pytorch-2.11.0-rocm7.13.0-cpython3.12.10-gfx1151-inputs.manifest.json	no	-
 lemonadeimage	tools/declarations/lemonade-image.json	authored	installer	declarations/lemonade-image.json	no	-
 mcpgateway	tools/openabstractions-mcp.exe	gobuild	charter	mcp-gateway	yes	console
 service	tools/abstraction_ipc.dll	copy	ipclibrary	abstraction_ipc.dll	yes	-

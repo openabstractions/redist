@@ -5,6 +5,9 @@ import tempfile
 import unittest
 import copy
 import os
+import shutil
+import subprocess
+import sys
 from unittest.mock import patch
 
 import prepare
@@ -40,6 +43,105 @@ def fixture():
 
 
 class SDKPrepare(unittest.TestCase):
+    def test_private_frontend_corpus_skips_in_published_layout_before_process(self):
+        with tempfile.TemporaryDirectory(prefix='oa-sdk-public-') as temporary:
+            root=Path(temporary)
+            for present in ('neither', 'source', 'corpus'):
+                with self.subTest(present=present):
+                    source=root/'openabstractions-flat/adopter-comfyui/web/oa_downloads.js'
+                    corpus=root/'adopters/comfyui/oa_downloads.test.mjs'
+                    for path in (source,corpus):path.unlink(missing_ok=True)
+                    if present!='neither':
+                        path=source if present=='source' else corpus
+                        path.parent.mkdir(parents=True,exist_ok=True);path.write_bytes(b'inert')
+                    with patch.object(prepare,'HERE',root/'redist/sdk_smokes'), \
+                         patch.object(subprocess,'run',side_effect=AssertionError('no process for absent private inputs')):
+                        with self.assertRaises(unittest.SkipTest):
+                            self.test_frontend_gating_corpus_executes_selected_payload_bytes_and_refuses_wrong_hash()
+
+    def test_frontend_gating_corpus_executes_selected_payload_bytes_and_refuses_wrong_hash(self):
+        import hashlib
+        root=prepare.HERE.parents[1]
+        source=root/'openabstractions-flat/adopter-comfyui/web/oa_downloads.js'
+        corpus=root/'adopters/comfyui/oa_downloads.test.mjs'
+        if not source.is_file() or not corpus.is_file():
+            self.skipTest('ComfyUI frontend corpus is private input; private gate runs this check')
+        node=shutil.which('node.exe') or shutil.which('node')
+        self.assertTrue(node and Path(node).is_absolute())
+        pattern="^(unsaved canvas changes go through ComfyUI's own confirmation|a frontend without a workflow store counts as unsaved: confirm, or keep the canvas|graph digest mismatch refuses the load without changing the canvas|a second click while the workflow loads reads and loads it once)$"
+        with tempfile.TemporaryDirectory(prefix='oa-j1-frontend-') as temporary:
+            frontend=Path(temporary)/'installed-frontend.js'
+            frontend.write_bytes(source.read_bytes())
+            env={key:value for key,value in os.environ.items() if key not in ('NODE_OPTIONS','ABSTRACTION_RUNTIME_ENDPOINT','ABSTRACTION_IPC_NODE')}
+            env.update(OA_COMFYUI_FRONTEND_UNDER_TEST=str(frontend),
+                OA_COMFYUI_FRONTEND_SHA256=hashlib.sha256(frontend.read_bytes()).hexdigest())
+            argv=[node,'--test','--test-reporter=tap','--test-name-pattern='+pattern,str(corpus)]
+            result=subprocess.run(argv,env=env,cwd=root,capture_output=True,text=True,timeout=30)
+            self.assertEqual(result.returncode,0,result.stdout+result.stderr)
+            self.assertIn('# pass 4',result.stdout)
+            env['OA_COMFYUI_FRONTEND_SHA256']='0'*64
+            refused=subprocess.run(argv,env=env,cwd=root,capture_output=True,text=True,timeout=30)
+            self.assertNotEqual(refused.returncode,0)
+
+    def test_native_application_collector_uses_actual_generated_package_closure(self):
+        root = prepare.HERE.parents[1]
+        with patch.object(sys, 'path', [str(root/'scripts'), *sys.path]):
+            from scripts import npm_packages
+        # Source-owner aliases differ from npm names (download is the
+        # @openabstractions/download-request package). Resolve actual names.
+        packages = {alias: npm_packages.read_package(root/location)
+                    for alias, location in npm_packages.SOURCES.items()}
+        npm_packages.validate_package_closure(packages,
+            npm_packages.generated_package_names(root/npm_packages.SOURCES['ipc']))
+        by_name = {data['name']: root/npm_packages.SOURCES[alias] for alias,data in packages.items()}
+        metadata = {data['name']: data for data in packages.values()}
+        closure = prepare.javascript_archive_closure(by_name, metadata, ['@openabstractions/facade'])
+        self.assertIn(by_name['@openabstractions/download-request'], closure)
+        self.assertIn(by_name['@openabstractions/rights'], closure)
+        with self.assertRaisesRegex(RuntimeError, 'download-request'):
+            prepare.javascript_archive_closure({key:value for key,value in by_name.items()
+                if key != '@openabstractions/download-request'}, metadata, ['@openabstractions/facade'])
+        node = shutil.which('node.exe') or shutil.which('node')
+        self.assertTrue(node and Path(node).is_absolute())
+        with tempfile.TemporaryDirectory(prefix='oa-j1-generated-js-') as temporary:
+            stage = Path(temporary)
+            for alias, location in npm_packages.SOURCES.items():
+                target = stage/'node_modules'/packages[alias]['name']
+                shutil.copytree(root/location, target,
+                    ignore=shutil.ignore_patterns('node_modules', '.forks'))
+            for name in ('j1_application_probe.mjs', 'j1_application_probe.test.mjs'):
+                shutil.copy2(prepare.HERE/name, stage/name)
+            result = subprocess.run([node, '--test', str(stage/'j1_application_probe.test.mjs')],
+                cwd=stage, capture_output=True, text=True, timeout=30,
+                env={key:value for key,value in os.environ.items() if key not in ('NODE_OPTIONS','ABSTRACTION_RUNTIME_ENDPOINT','ABSTRACTION_IPC_NODE')})
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_cpp_install_builds_current_and_older_package_closures(self):
+        for available in ({'abstraction_ipc'}, {'abstraction_ipc', 'abstraction_fileid'}):
+            with self.subTest(targets=available), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                out = root / 'out';out.mkdir()
+                temporary = root / 'temporary';temporary.mkdir()
+                built = set()
+                commands = []
+                def checked(*args):
+                    args = list(map(str, args));commands.append(args)
+                    if '--build' in args and args[args.index('--build') + 1].endswith('build-abstraction-identity'):
+                        selected = set(args[args.index('--target') + 1:]) if '--target' in args else available
+                        self.assertLessEqual(selected, available)
+                        built.update(selected)
+                    if '--install' in args and args[args.index('--install') + 1].endswith('build-abstraction-identity'):
+                        self.assertEqual(built, available, 'whole package install requires every installed archive')
+                    if '--build' in args and args[args.index('--build') + 1].endswith('build-sdk-cpp'):
+                        build = temporary / 'build-sdk-cpp';build.mkdir()
+                        (build / 'cpp_probe.exe').write_bytes(b'inert probe output')
+                with patch.object(prepare, 'msvc_cmake', return_value=('cmake', 'selected-generator')), patch.object(prepare, 'checked', side_effect=checked):
+                    prefix = prepare.prepare_cpp(out, root / 'sources', temporary)
+                self.assertEqual(prefix, temporary / 'cpp-prefix')
+                identity_configure = next(command for command in commands if '-S' in command and 'abstraction-identity' in command[command.index('-S') + 1])
+                self.assertIn('-DABSTRACTION_IPC_BUILD_TESTS=OFF', identity_configure)
+                self.assertTrue((out / 'cpp_probe.exe').is_file())
+
     def test_projection_scanner_distinguishes_generated_go_files_from_missing_inputs(self):
         import ast
         scanner = Path(__file__).resolve().parents[2] / 'scripts' / 'oa.py'
@@ -115,8 +217,9 @@ class SDKPrepare(unittest.TestCase):
             self.assertIn(f" {FACADE} v0.6.1\n", go_mod)
             self.assertIn(f" {CORE} v0.3.0\n", go_mod)
             self.assertEqual((root / "go/main.go").read_bytes(), (prepare.HERE / "go_probe.go").read_bytes())
-            self.assertEqual(checked.call_args_list[-1].args[:4],
-                             ("go", "build", "-o", root / "out/go_probe.exe"))
+            self.assertEqual((root / "go/sandbox_identity/main.go").read_bytes(), (prepare.HERE / "sandbox_identity/main.go").read_bytes())
+            self.assertEqual(checked.call_args_list[-1].args[:5],
+                             ("go", "build", "-tags=oa_source_probe", "-o", root / "out/sandbox_identity_probe.exe"))
             self.assertEqual(checked.call_args_list[-1].kwargs["env"]["GOWORK"], "off")
         selected = copy.deepcopy(selected)
         selected["abstraction-identity"]["version"] = "v0.4.0"

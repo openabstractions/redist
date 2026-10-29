@@ -1,0 +1,32 @@
+{
+  "schema": 1,
+  "release_tag": "v0.8.0",
+  "archive": {
+    "name": "vc-runtime-14.51.36231-win-x64.zip",
+    "url": "https://github.com/openabstractions/redist/releases/download/v0.8.0/vc-runtime-14.51.36231-win-x64.zip",
+    "size_bytes": 872702,
+    "sha256": "b249488d379d1cbac2570080341deec526f1e486ba7a0dbb142cd219e50d87c1"
+  },
+  "runtime": {
+    "name": "Microsoft Visual C++ 2015-2026 Redistributable (x64)",
+    "version": "14.51.36231",
+    "folder": "Microsoft.VC145.CRT",
+    "files": [
+      {
+        "path": "msvcp140.dll",
+        "size_bytes": 643512,
+        "sha256": "7c26614e1d733892c2deac7e245ce115504b1d80592dd0a01b08e3e5a55f89ca"
+      },
+      {
+        "path": "vcruntime140.dll",
+        "size_bytes": 178616,
+        "sha256": "d1f4225df2cd877dbf130d5668a021dce3f94118455ff5ec952061c30afc9ce7"
+      },
+      {
+        "path": "vcruntime140_1.dll",
+        "size_bytes": 50112,
+        "sha256": "a7146c08f89fe5b04541ab507cdb59ff7b44534d4ba3c668a426c6450a03434e"
+      }
+    ]
+  }
+}

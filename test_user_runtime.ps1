@@ -1,5 +1,5 @@
 ﻿param(
-    [ValidateSet('ValidateOnly','Verify','User','FailingCandidate','CheckLogs','LocalAccount')][string]$Mode = 'ValidateOnly',
+    [ValidateSet('ValidateOnly','Verify','User','FailingCandidate','CheckLogs','LocalAccount','ComfyCancelReadback')][string]$Mode = 'ValidateOnly',
     [switch]$Help,
     [string]$MsiPath,
     [string]$ExpectedSid,
@@ -9,6 +9,7 @@
     [switch]$FailUpgrade,
     [switch]$FailSameVersion,
     [switch]$NewProductCode,
+    [string]$AppFailureBinary,
     [string]$Output,
     [string]$PythonPath,
     [string]$NodePath,
@@ -25,7 +26,9 @@
     [string]$ResultDirectory = (Join-Path (Get-Location) 'user-runtime-diagnostics'),
     # CheckLogs: verbose MSI logs a finished run collected, separated by '|'.
     [string]$UpgradeLogs,
-    [string]$RemovalLogs
+    [string]$RemovalLogs,
+    [string]$NativeCoreRequestSHA256,
+    [ValidateRange(15,300)][int]$CancellationSeconds = 180
 )
 $ErrorActionPreference = 'Stop'
 if ($Help) {
@@ -37,7 +40,13 @@ Per-user Windows installer qualification.
 Modes
   ValidateOnly      parse the fixture and change nothing (default)
   CheckLogs         check collected MSI logs: -UpgradeLogs a|b -RemovalLogs c|d
+  ComfyCancelReadback  start with RC ComfyUI closed. Open it at the collector's prompt,
+                    then queue and cancel one video from Jobs as prompted.
+                    Requires -NativeCoreRequest PATH -NativeCoreRequestSHA256 HEX
+                    -ResultDirectory FRESH_ABSOLUTE_DIR [-CancellationSeconds 180].
   FailingCandidate  write a copy of -MsiPath that fails after its files: -Output PATH [-NewProductCode]
+                    -AppFailureBinary OpenCodeInstallerHost injects a deferred missing DLL entry
+                    into an app MSI for the disposable bundle failure regression.
   Verify            hosted runner only: create a disposable standard account and run User in it
   User              the per-user cases inside that account (started by Verify or LocalAccount)
   LocalAccount      the User cases on the invoking account, for a local qualification. It refuses
@@ -73,7 +82,7 @@ if ($Mode -eq 'ValidateOnly') {
 # invoking account itself and starts User with the account's SID as its marker.
 $localAccountChild = $Mode -eq 'User' -and $env:OA_FIXTURE_LOCAL_ACCOUNT -and
     $env:OA_FIXTURE_LOCAL_ACCOUNT -eq [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
-if ($Mode -notin @('CheckLogs','LocalAccount') -and -not $localAccountChild -and ($env:GITHUB_ACTIONS -ne 'true' -or $env:RUNNER_ENVIRONMENT -ne 'github-hosted')) {
+if ($Mode -notin @('CheckLogs','LocalAccount','ComfyCancelReadback') -and -not $localAccountChild -and ($env:GITHUB_ACTIONS -ne 'true' -or $env:RUNNER_ENVIRONMENT -ne 'github-hosted')) {
     throw 'This mutating fixture requires a disposable GitHub-hosted runner.'
 }
 function Get-ProfileFolder([Environment+SpecialFolder]$Folder, [scriptblock]$Resolve = {
@@ -457,6 +466,16 @@ function Assert-InstalledJ1Runtime([string]$Central,[string]$Tools,[string]$Pyth
         $report.before=Get-InstalledRuntimeIntervalRows $held
         $journal|ConvertTo-Json -Depth 40|Set-Content -LiteralPath $Evidence -Encoding UTF8
         Assert-NativeCore $Central $Tools $PythonPath $RequestPath
+        $updated=Get-Content -LiteralPath $Evidence -Raw|ConvertFrom-Json
+        if($updated.native_request.sha256 -cne $journal.native_request.sha256 -or $updated.native_request.path -cne $journal.native_request.path -or
+            $updated.native_request.bytes -ne $journal.native_request.bytes -or $updated.source_sha -cne $journal.source_sha -or
+            $updated.tool_source -cne $journal.tool_source -or $updated.runtime_sha256 -cne $journal.runtime_sha256 -or
+            ($updated.fixture_owner|ConvertTo-Json -Depth 8 -Compress) -cne ($journal.fixture_owner|ConvertTo-Json -Depth 8 -Compress) -or
+            $updated.runtime_interval.state -cne 'running' -or $updated.runtime_interval.started_at -cne $report.started_at -or
+            ($updated.runtime_interval.before|ConvertTo-Json -Depth 12 -Compress) -cne ($report.before|ConvertTo-Json -Depth 12 -Compress)){
+            throw 'J1 original runtime interval changed while the native lifecycle collected observations'
+        }
+        $journal=$updated;$journal.runtime_interval=$report
         Assert-InstalledSoakProcesses $held $Sid
         $report.after=Get-InstalledRuntimeIntervalRows $held
         $report.state='stable'
@@ -813,7 +832,7 @@ function Get-MsiSequence($Database, [string]$Condition) {
 # the predecessor is never touched. The copy gets its own package code; the
 # source package is unchanged. -NewProductCode also gives the copy its own
 # ProductCode, so the candidate itself can be its same-version predecessor.
-function New-FailingCandidate([string]$Source, [string]$Target, [switch]$NewProductCode) {
+function New-FailingCandidate([string]$Source, [string]$Target, [switch]$NewProductCode, [string]$AppFailureBinary) {
     if (Test-Path -LiteralPath $Target) { throw "Forced-failure candidate already exists: $Target" }
     Copy-Item -LiteralPath $Source -Destination $Target
     $installer = New-Object -ComObject WindowsInstaller.Installer
@@ -823,13 +842,25 @@ function New-FailingCandidate([string]$Source, [string]$Target, [switch]$NewProd
         $files = Get-MsiSequence $database "``Action``='InstallFiles'"
         $finalize = Get-MsiSequence $database "``Action``='InstallFinalize'"
         if ($null -eq $removal -or $null -eq $files -or $null -eq $finalize -or
-            -not ($files.Sequence + 1 -lt $finalize.Sequence -and $finalize.Sequence -lt $removal.Sequence)) {
+            -not ($files.Sequence + 1 -lt $finalize.Sequence) -or
+            (-not $AppFailureBinary -and $finalize.Sequence -ge $removal.Sequence)) {
             throw 'Candidate sequence does not place InstallFiles, then InstallFinalize, then RemoveExistingProducts'
         }
         $at = $files.Sequence + 1
         while ($at -lt $finalize.Sequence -and $null -ne (Get-MsiSequence $database "``Sequence``=$at")) { $at++ }
         if ($at -ge $finalize.Sequence) { throw "Candidate has no free sequence between InstallFiles ($($files.Sequence)) and InstallFinalize ($($finalize.Sequence))" }
-        Invoke-MsiSql $database "INSERT INTO ``CustomAction`` (``Action``, ``Type``, ``Source``, ``Target``) VALUES ('ForcedUpgradeFailure', 1026, 'UpgradeSupervisorCode', 'service forced-qualification-failure')"
+        if ($AppFailureBinary) {
+            if ($AppFailureBinary -cnotmatch '^[A-Za-z][A-Za-z0-9_]*$') { throw 'Invalid app failure Binary identifier' }
+            # A deferred DLL entry that the fixture deliberately does not export
+            # fails inside MSI's execution script after InstallFiles. MSI owns
+            # restoring the predecessor app and its transaction state.
+            $view = $database.OpenView("SELECT ``Name`` FROM ``Binary`` WHERE ``Name``='$AppFailureBinary'")
+            try { $view.Execute(); if ($null -eq $view.Fetch()) { throw 'App failure Binary is absent' } }
+            finally { [void][Runtime.InteropServices.Marshal]::FinalReleaseComObject($view) }
+            Invoke-MsiSql $database "INSERT INTO ``CustomAction`` (``Action``, ``Type``, ``Source``, ``Target``) VALUES ('ForcedUpgradeFailure', 1025, '$AppFailureBinary', 'OaDeliberatelyMissingFailureFixtureEntry')"
+        } else {
+            Invoke-MsiSql $database "INSERT INTO ``CustomAction`` (``Action``, ``Type``, ``Source``, ``Target``) VALUES ('ForcedUpgradeFailure', 1026, 'UpgradeSupervisorCode', 'service forced-qualification-failure')"
+        }
         Invoke-MsiSql $database "INSERT INTO ``InstallExecuteSequence`` (``Action``, ``Condition``, ``Sequence``) VALUES ('ForcedUpgradeFailure', 'NOT REMOVE', $at)"
         if ($NewProductCode) {
             $product = '{' + [Guid]::NewGuid().ToString().ToUpperInvariant() + '}'
@@ -986,8 +1017,8 @@ function Assert-InstalledPanelWebView2([string]$Tools, [string]$EvidencePath = '
 function Assert-InstalledPanelShortcuts([string]$Tools, [string]$Package) {
     $target = [IO.Path]::GetFullPath((Join-Path $Tools 'Abstraction Panel.exe'))
     $shell = New-Object -ComObject WScript.Shell
-    # The exact candidate package declares entry names and routes. Keep the
-    # legacy --page setup route testable while product naming evolves.
+    # The exact candidate package declares entry names and routes. Its menu
+    # directory locates the shortcuts but does not identify Panel UI content.
     $installer = New-Object -ComObject WindowsInstaller.Installer
     $database = $installer.OpenDatabase($Package, 0)
     $directoryView = $database.OpenView('SELECT `DefaultDir` FROM `Directory` WHERE `Directory`=''AbstractionMenuFolder''')
@@ -1103,40 +1134,48 @@ function Assert-InstalledNativePresenter([string]$Panel, [int]$Seconds = 10) {
     } while ([DateTime]::UtcNow -lt $deadline)
     throw 'Installed background native presenter missing or exited before the action window; preserve installation evidence'
 }
-function Assert-SelectedAppFile($Binding, [switch]$AllowEmpty) {
-    $path = if ($Binding.file) { $Binding.file } else { $Binding.path }
-    if (-not [IO.Path]::IsPathRooted($path) -or $Binding.sha256 -cnotmatch '^[0-9a-f]{64}$' -or
-        ($Binding.bytes -isnot [int] -and $Binding.bytes -isnot [long]) -or $Binding.bytes -lt 0 -or
-        ($Binding.bytes -eq 0 -and -not $AllowEmpty)) {
-        throw 'Selected application file needs an absolute path and exact bytes'
-    }
-    $item = Get-Item -LiteralPath $path -ErrorAction Stop
-    if ($item.PSIsContainer -or ($item.Attributes -band [IO.FileAttributes]::ReparsePoint)) { throw 'Selected application file is not plain' }
-    $parent = $item.Directory
-    while ($parent) {
-        if ($parent.Attributes -band [IO.FileAttributes]::ReparsePoint) { throw 'Selected application ancestor is redirected' }
-        $parent = $parent.Parent
-    }
-    if ($item.Length -ne $Binding.bytes -or (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash.ToLowerInvariant() -cne $Binding.sha256) {
-        throw 'Selected application bytes changed'
-    }
-    return $item.FullName
-}
 function Get-SelectedAppPlan($Native) {
     if (-not $Native.core.adopter_journey) { return @() }
+    $nativeApps=@($Native.selected_app_chain.apps|Where-Object{$_.variant -ceq 'oa-comfyui-native'})
+    $journey=$Native.core.adopter_journey
+    if($Native.adopter_case -ceq 'j1' -or $nativeApps.Count){
+        if($Native.adopter_case -cne 'j1' -or $nativeApps.Count -ne 1 -or
+            $Native.kind -cne 'local_msi' -or $Native.acceptance.profile -cne 'automated' -or $Native.core.ordinary -or
+            $Native.source_sha -cnotmatch '^[0-9a-f]{40}$' -or $Native.core.source_sha -cne $Native.source_sha -or
+            $journey.source_sha -cne $Native.source_sha -or $journey.version -cne $Native.version -or
+            $Native.core.helper.sha256 -cnotmatch '^[0-9a-f]{64}$' -or $journey.probe_source_sha256 -cne $Native.core.helper.sha256){
+            throw 'Authenticated automated native J1 component request required'
+        }
+        # The dispatcher selects the native collectors. Comparisons remain a
+        # final receiving requirement after this component has run.
+        $null=Assert-J1NativeInputs $Native
+    }
     $script:SelectedFileIdentityProbe=Get-SelectedIdentityProbe $Native
     $chain = $Native.selected_app_chain
     $readback = $Native.selected_app_readback
     if (-not $chain -or $chain.version -cne $Native.version -or -not $readback) {
         throw 'Automated adopter execution needs the authenticated selected application chain and compiled readback'
     }
-    $required = @($Native.core.adopter_journey.scope.adopters | Where-Object { 'windows-x64' -in $_.targets } | ForEach-Object { $_.id } | Sort-Object)
+    $required = @($journey.scope.adopters | Where-Object { 'windows-x64' -in $_.targets } | ForEach-Object { $_.id } | Sort-Object)
     if ($Native.adopter_case -ceq 'opencode') { $required = @($required | Where-Object { $_ -ceq 'opencode' }) }
     $ids = @($chain.apps | ForEach-Object { $_.id } | Sort-Object)
     if (-not $required.Count -or ($required -join ',') -cne ($ids -join ',') -or @($ids | Select-Object -Unique).Count -ne $ids.Count -or
         (@($readback.PSObject.Properties.Name | Sort-Object) -join ',') -cne ($ids -join ',')) { throw 'Selected application chain differs from accepted adopter membership' }
     $plans = @()
     foreach ($app in $chain.apps) {
+        if($app.variant -ceq 'oa-comfyui-native') {
+            $compiled=$readback.PSObject.Properties[$app.id].Value
+            if($app.id -cne 'comfyui' -or $compiled.variant -cne $app.variant -or $compiled.scope -cne 'perUser' -or
+                -not @($compiled.native_files).Count -or $compiled.native.binary.sha256 -cne $app.delivery.binary.sha256 -or
+                $compiled.native.binary.bytes -ne $app.delivery.binary.bytes -or
+                $compiled.native.identity.version -cnotmatch '^[A-Za-z0-9._-]{1,64}$' -or $compiled.native.identity.version -cin @('.','..')){
+                throw 'Authenticated native Comfy archive/payload projection required'
+            }
+            $root=Join-Path (Get-ProfileFolder LocalApplicationData) ('OA\a\cu\'+$compiled.native.identity.version)
+            if(Test-Path -LiteralPath $root){throw 'Preexisting native Comfy installation is protected'}
+            $plans+=@{app=$app;compiled=$compiled;native=$true;root=$root;files=$compiled.native_files}
+            continue
+        }
         $package = Assert-SelectedAppFile $app
         if ([IO.Path]::GetExtension($package) -ine '.msi') { throw 'Selected application integration is not an MSI' }
         $compiled = $readback.PSObject.Properties[$app.id].Value
@@ -1179,6 +1218,7 @@ function Get-SelectedAppPlan($Native) {
 function Assert-SelectedAppProductsAbsent($Plans) {
     $installer=New-Object -ComObject WindowsInstaller.Installer
     foreach($plan in $Plans){
+        if($plan.native){if(Test-Path -LiteralPath $plan.root){throw 'Preexisting native Comfy installation is protected'};continue}
         if(@($installer.ProductsEx($plan.compiled.product_code,'',7)).Count){throw 'Preexisting application integration is protected'}
         foreach($code in @($plan.related_upgrade_codes)){
             # RelatedProducts includes installed/advertised current-user and
@@ -1215,6 +1255,39 @@ function Get-SelectedAppComponents([string]$Package, $Expected) {
         }
         @{id=$file.id;component=$component.guid;key_name=$found[$component.key].name;name=$measured.name;sha256=$file.sha256;bytes=$file.bytes;declared_path=$file.path}
     }
+}
+function Get-RetentionAppComponents([string]$Package, $Files) {
+    $installer = New-Object -ComObject WindowsInstaller.Installer
+    $database = $installer.OpenDatabase($Package,0)
+    foreach ($file in $Files) {
+        $row=Get-RetentionMsiRow $installer $database 'SELECT `File`, `Component_`, `FileName` FROM `File` WHERE `File` = ?' $file.id 3
+        $component=Get-RetentionMsiRow $installer $database 'SELECT `Component`, `ComponentId`, `KeyPath`, `Attributes` FROM `Component` WHERE `Component` = ?' $row[1] 4
+        if ($row[0] -cne $file.id -or $component[0] -cne $row[1] -or
+            $component[1] -notmatch '^\{[0-9A-Fa-f-]{36}\}$' -or ([int]$component[3] -band 4)) {
+            throw 'Selected MSI component has no unambiguous file key path'
+        }
+        $key=Get-RetentionMsiRow $installer $database 'SELECT `File`, `Component_`, `FileName` FROM `File` WHERE `File` = ?' $component[2] 3
+        $name=($row[2] -split '\|')[-1]
+        $keyName=($key[2] -split '\|')[-1]
+        if ($key[0] -cne $component[2] -or $key[1] -cne $row[1] -or
+            $name -match '[/\\:]' -or $keyName -match '[/\\:]' -or
+            $name -in @('','..','.') -or $keyName -in @('','..','.')) {
+            throw 'Selected MSI component has no unambiguous file key path'
+        }
+        @{id=$file.id;component=$component[1];key_name=$keyName;name=$name;sha256=$file.sha256;bytes=$file.bytes;declared_path=$file.path}
+    }
+}
+function Get-RetentionMsiRow($Installer,$Database,[string]$Query,[string]$Key,[int]$Columns) {
+    if ([string]::IsNullOrEmpty($Key)) {throw 'Selected MSI row key is empty'}
+    $record=$Installer.CreateRecord(1)
+    $record.StringData(1)=$Key
+    $view=$Database.OpenView($Query)
+    try {
+        $null=$view.Execute($record)
+        $row=$view.Fetch()
+        if (-not $row -or $view.Fetch()) {throw 'Selected MSI row is missing or ambiguous'}
+        for($i=1;$i -le $Columns;$i++){$row.StringData($i)}
+    } finally {$null=$view.Close()}
 }
 function Get-SelectedAppInstalledFiles($Plan) {
     $installer = New-Object -ComObject WindowsInstaller.Installer
@@ -1363,82 +1436,458 @@ function Get-NewSelectedHost($Plan,$BeforeRoots,[DateTime]$Started,[string]$Supp
     if(($pin.sha256 -and $pin.sha256 -cne $program[0].sha256) -or ($pin.bytes -and $pin.bytes -ne $program[0].bytes)){throw 'Installed host differs from declared source executable pin'}
     return @{root=$root;display_icon=$rows[0].icon;files=$files;executable=$program[0];remover=$remover[0];signer_thumbprint=$SupplierThumbprint;signatures=$signatures;registry=$rows;root_identity=(Get-SelectedFileIdentity $root);observed_at=[DateTime]::UtcNow.ToString('o')}
 }
-function Get-SelectedIdentityProbe($Native) {
-    $sdk=$Native.sdk_smokes
-    if(-not $sdk -or -not [IO.Path]::IsPathRooted($sdk.directory) -or -not $sdk.manifest -or -not $sdk.sources){throw 'Authenticated current SDK manifest and selected source graph required before mutation'}
-    $manifestPath=Assert-SelectedAppFile $sdk.manifest
-    if($manifestPath -ine (Join-Path ([IO.Path]::GetFullPath($sdk.directory)) 'manifest.json')){throw 'SDK manifest differs from the selected preparation root'}
-    $manifest=Get-Content -LiteralPath $manifestPath -Raw|ConvertFrom-Json
-    if($manifest.schema -ne 1 -or -not $manifest.files -or -not $manifest.sources -or
-        (@($manifest.sources.PSObject.Properties.Name|Sort-Object)-join ',') -cne (@($sdk.sources.PSObject.Properties.Name|Sort-Object)-join ',') -or
-        -not $sdk.sources.PSObject.Properties['abstraction-identity']){throw 'SDK selected identity graph missing or changed'}
-    foreach($name in $sdk.sources.PSObject.Properties.Name){
-        $actual=$manifest.sources.PSObject.Properties[$name].Value;$expected=$sdk.sources.PSObject.Properties[$name].Value
-        if((@($actual.PSObject.Properties.Name|Sort-Object)-join ',') -cne 'commit,module,version' -or
-            $actual.module -cne $expected.module -or $actual.version -cne $expected.version -or $actual.commit -cne $expected.commit -or
-            $expected.commit -cnotmatch '^[0-9a-f]{40}$'){throw 'SDK manifest differs from independently selected source graph'}
-    }
-    $pin=$manifest.files.PSObject.Properties['go_probe.exe']
-    if(-not $pin -or $pin.Value -cnotmatch '^[0-9a-f]{64}$'){throw 'Selected SDK has no canonical identity probe pin'}
-    $path=Join-Path ([IO.Path]::GetFullPath($sdk.directory)) 'go_probe.exe'
-    $helper=@{path=$path;sha256=$pin.Value;bytes=(Get-Item -LiteralPath $path -ErrorAction Stop).Length}
-    $null=Assert-SelectedAppFile $helper
-    return @{helper=$helper;manifest=$sdk.manifest;sources=$sdk.sources}
-}
-function Assert-J1SelectionInputs($Native) {
-    if(-not $Native.core.adopter_journey){return}
-    $spec=$Native.j1_selection
-    if(-not $spec -or $spec.schema -ne 1 -or $spec.source_sha -cne $Native.core.source_sha -or
-        (@($spec.PSObject.Properties.Name|Sort-Object)-join ',') -cne 'node,schema,sdk,source_sha') {throw 'J1 explicit current SDK and pinned Node test tool required before installation'}
-    $null=Assert-SelectedAppFile $spec.node
-    $sdk=$spec.sdk
-    $null=Get-SelectedIdentityProbe ([pscustomobject]@{sdk_smokes=$sdk})
-    $manifest=Get-Content -LiteralPath $sdk.manifest.path -Raw|ConvertFrom-Json
-    $root=[IO.Path]::GetFullPath($sdk.directory).TrimEnd('\')
-    $pending=[Collections.Generic.Stack[string]]::new();$pending.Push($root)
-    $seen=@{};$total=0L
-    while($pending.Count){
-        foreach($item in @(Get-ChildItem -LiteralPath $pending.Pop() -Force)){
-            if($item.Attributes -band [IO.FileAttributes]::ReparsePoint){throw 'J1 SDK redirected member'}
-            if($item.PSIsContainer){$pending.Push($item.FullName);continue}
-            if($item.FullName -ieq $sdk.manifest.path){continue}
-            $name=$item.FullName.Substring($root.Length+1).Replace('\','/')
-            $total+=$item.Length
-            $pin=$manifest.files.PSObject.Properties[$name]
-            if($total -gt 536870912 -or $seen.Count -ge 40000 -or -not $pin -or $pin.Value -cnotmatch '^[0-9a-f]{64}$'){throw 'J1 SDK closure missing or exceeds bound'}
-            $null=Assert-SelectedAppFile @{path=$item.FullName;sha256=$pin.Value;bytes=$item.Length} -AllowEmpty
-            $seen[$name]=$true
-        }
-    }
-    if($seen.Count -ne @($manifest.files.PSObject.Properties).Count -or -not $seen.ContainsKey('j1_selection_probe.mjs')){throw 'J1 SDK closure differs'}
-    return $spec
-}
-function Invoke-J1SelectionCollection($Native,$Program,$Runtime,[string]$Account,[string]$Directory) {
+function Invoke-J1ApplicationCollection($Native,$Runtime,[string]$Account,[string]$Directory,[string]$Operation) {
+    if($Operation -cnotin @('observe','activate','graph')){throw 'Unknown fixed J1 application observation'}
+    Assert-FixtureMutationSafe
     $spec=Assert-J1SelectionInputs $Native
-    $request=Join-Path $Directory 'j1-selection-request.json';$result=Join-Path $Directory 'j1-selection-result.json';$process=Join-Path $Directory 'j1-selection-process.json'
-    foreach($path in @($request,$result,$process)){if(Test-Path -LiteralPath $path){throw 'J1 selection observation already exists'}}
-    [IO.File]::WriteAllText($request,(@{schema=1;account=$Account;program=$Program;runtime=$Runtime}|ConvertTo-Json -Depth 8),[Text.UTF8Encoding]::new($false))
-    $probe=Join-Path $spec.sdk.directory 'j1_selection_probe.mjs'
+    $manifest=Get-Content -LiteralPath $spec.sdk.manifest.path -Raw|ConvertFrom-Json
+    $probe=Join-Path $spec.sdk.directory 'j1_application_probe.mjs'
+    if(-not $manifest.files.PSObject.Properties['j1_application_probe.mjs'] -or
+        (Get-FileHash -LiteralPath $probe -Algorithm SHA256).Hash.ToLowerInvariant() -cne $manifest.files.'j1_application_probe.mjs'){
+        throw 'Current SDK has no authenticated J1 application collector'
+    }
+    $prefix=Join-Path $Directory ('j1-application-'+$Operation)
+    $request=$prefix+'-request.json';$result=$prefix+'-result.json';$process=$prefix+'-process.json'
+    foreach($path in @($request,$result,$process)){if(Test-Path -LiteralPath $path){throw 'J1 application observation already exists'}}
+    [IO.File]::WriteAllText($request,(@{schema=1;account=$Account;runtime=$Runtime;operation=$Operation}|ConvertTo-Json -Depth 8),[Text.UTF8Encoding]::new($false))
     $info=[Diagnostics.ProcessStartInfo]::new();$info.FileName=$spec.node.path
     $info.Arguments='"'+$probe+'" "'+$request+'" "'+$result+'"';$info.WorkingDirectory=$Directory
-    # Explicit test-tool environment, with no endpoint/addon override or Node preload.
     $keep=@{};foreach($key in @('SystemRoot','WINDIR','COMSPEC','PATHEXT','PROCESSOR_ARCHITECTURE','TEMP','TMP','USERPROFILE','LOCALAPPDATA','APPDATA')){if($info.EnvironmentVariables[$key]){$keep[$key]=$info.EnvironmentVariables[$key]}}
     $info.EnvironmentVariables.Clear();foreach($key in $keep.Keys){$info.EnvironmentVariables[$key]=$keep[$key]}
-    $held=Invoke-FixtureProcess $info 45 -ObservationPath $process
-    if($held.ExitCode -ne 0){throw 'J1 current SDK selection collector failed; inspect retained process observation'}
+    $held=Invoke-FixtureProcess $info 60 -ObservationPath $process
+    if($held.ExitCode -ne 0){throw 'J1 native application collector failed; retain its original process observation'}
     $null=Assert-J1SelectionInputs $Native
-    return @{request=@{path=$request;sha256=(Get-FileHash -LiteralPath $request -Algorithm SHA256).Hash.ToLowerInvariant();bytes=(Get-Item -LiteralPath $request).Length}
-        result=@{path=$result;sha256=(Get-FileHash -LiteralPath $result -Algorithm SHA256).Hash.ToLowerInvariant();bytes=(Get-Item -LiteralPath $result).Length}
-        process=@{path=$process;sha256=(Get-FileHash -LiteralPath $process -Algorithm SHA256).Hash.ToLowerInvariant();bytes=(Get-Item -LiteralPath $process).Length}}
+    $pins=@{}
+    foreach($role in @('request','result','process')){
+        $path=$prefix+'-'+$role+'.json'
+        $pins[$role]=@{path=$path;sha256=(Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash.ToLowerInvariant();bytes=(Get-Item -LiteralPath $path).Length}
+    }
+    return $pins
 }
-function Get-SelectedFileIdentity([string]$Path) {
+function Get-J1NativePayloadObservation($Native,[string]$Directory) {
+    Assert-FixtureMutationSafe
+    $compiled=$Native.selected_app_readback.comfyui
+    if($compiled.variant -cne 'oa-comfyui-native' -or -not @($compiled.native_files).Count -or
+        $compiled.native.identity.version -cnotmatch '^[A-Za-z0-9._-]{1,64}$' -or $compiled.native.identity.version -cin @('.','..')){
+        throw 'Authenticated native Comfy payload projection required'
+    }
+    $root=Join-Path (Get-ProfileFolder LocalApplicationData) ('OA\a\cu\'+$compiled.native.identity.version)
+    $spec=Assert-J1SelectionInputs $Native
+    $probe=Get-SelectedIdentityProbe ([pscustomobject]@{sdk_smokes=$spec.sdk})
+    $request=Join-Path $Directory 'j1-native-payload-request.json';$result=Join-Path $Directory 'j1-native-payload-result.json';$process=Join-Path $Directory 'j1-native-payload-process.json'
+    foreach($path in @($request,$result,$process)){if(Test-Path -LiteralPath $path){throw 'Native Comfy payload observation already exists'}}
+    [IO.File]::WriteAllText($request,(@{schema=1;root=$root;files=$compiled.native_files}|ConvertTo-Json -Depth 8),[Text.UTF8Encoding]::new($false))
+    $info=[Diagnostics.ProcessStartInfo]::new();$info.FileName=$probe.helper.path
+    $info.Arguments='--payload-observation "'+$request+'" "'+$result+'"';$info.WorkingDirectory=$Directory
+    $held=Invoke-FixtureProcess $info 150 -ObservationPath $process
+    if($held.ExitCode -ne 0){throw 'Native Comfy payload observer refused; retain its original OS process record'}
+    $null=Assert-J1SelectionInputs $Native
+    $pins=@{}
+    foreach($role in @('request','result','process')){
+        $path=Join-Path $Directory ('j1-native-payload-'+$role+'.json')
+        $pins[$role]=@{path=$path;sha256=(Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash.ToLowerInvariant();bytes=(Get-Item -LiteralPath $path).Length}
+    }
+    return $pins
+}
+function Invoke-J1NativePhase($Session,[string]$Directory,[string]$Phase) {
+    if($Phase -cnotin @('setup','recovery','remove')){throw 'Unknown native Comfy lifecycle phase'}
+    Assert-FixtureMutationSafe
+    $native=Get-Content -LiteralPath $Session.native_request.path -Raw|ConvertFrom-Json
+    $null=Assert-J1NativeInputs $native
+    $root=Join-Path $Directory ('comfy-'+$Phase)
+    if(Test-Path -LiteralPath $root){throw 'Native Comfy lifecycle phase already exists; retain original evidence'}
+    New-Item -ItemType Directory -Path $root|Out-Null
+    $request=Join-Path $root 'core-request.json'
+    $phaseSession=$Session.Clone();$phaseSession.evidence_directory=$root;$phaseSession.native_comfy_phase=$Phase
+    $phaseSession|ConvertTo-Json -Depth 40|Set-Content -LiteralPath $request -Encoding UTF8
+    $null=Assert-SelectedAppFile $Session.core.python;$null=Assert-SelectedAppFile $Session.core.helper
+    Invoke-Bounded $Session.core.python.path @('-B',('"'+$Session.core.helper.path+'"'),'--adopter-journey-request',('"'+$request+'"')) 390 -ObservationPath (Join-Path $root 'adopter-process.json')
+    $result=Join-Path $root 'adopter-journey-result.json'
+    $value=Get-Content -LiteralPath $result -Raw|ConvertFrom-Json
+    if($value.result -cne 'partial' -or -not $value.owned_children_exited -or $value.native_comfy_lifecycle.phase -cne $Phase -or
+        $value.native_request.sha256 -cne $Session.native_request.sha256 -or $value.core.helper.sha256 -cne $Session.core.helper.sha256){
+        throw 'Native Comfy lifecycle source/process result differs'
+    }
+    foreach($child in @($value.commands|Where-Object{$_.pid})){
+        if(-not $child.exited -or (Get-CimInstance Win32_Process -Filter ('ProcessId='+$child.pid))){throw 'Native Comfy phase child closure unknown'}
+    }
+    return @{path=$result;sha256=(Get-FileHash -LiteralPath $result -Algorithm SHA256).Hash.ToLowerInvariant();bytes=(Get-Item -LiteralPath $result).Length}
+}
+function Assert-J1NativeInputs($Native) {
+    $spec=Assert-J1SelectionInputs $Native
+    $manifest=Get-Content -LiteralPath $spec.sdk.manifest.path -Raw|ConvertFrom-Json
+    foreach($name in @('j1_application_probe.mjs','j1_comfy_frontend.test.mjs','go_probe.go')){
+        $pin=$manifest.files.PSObject.Properties[$name]
+        $path=Join-Path $spec.sdk.directory $name
+        if(-not $pin -or $pin.Value -cnotmatch '^[0-9a-f]{64}$' -or
+            (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash.ToLowerInvariant() -cne $pin.Value){
+            throw ('Current authenticated native J1 SDK collector missing or changed: '+$name)
+        }
+    }
+    return $spec
+}
+function Get-J1ComfyProcessPins($Native,[switch]$Walkthrough) {
+    $compiled=$Native.selected_app_readback.comfyui
+    $root=Join-Path (Get-ProfileFolder LocalApplicationData) ('OA\a\cu\'+$compiled.native.identity.version)
+    $roles=@{application=$compiled.native.identity.programs.application;backend='oa-backend/standalone-env/python.exe'}
+    foreach($role in @('application','backend')){
+        if($Walkthrough -and ($roles[$role] -cnotmatch '^[A-Za-z0-9._/-]+\.exe$' -or
+            @($roles[$role] -split '/'|Where-Object{$_ -cin @('','.','..')}).Count)){throw 'Native Comfy process role path is invalid'}
+        $pin=@($compiled.native_files|Where-Object{$_.id -ceq $roles[$role]})
+        if($pin.Count -ne 1){throw 'Native Comfy process role missing from original payload'}
+        @{role=$role;path=(Join-Path $root $roles[$role]);sha256=$pin[0].sha256;bytes=$pin[0].bytes}
+    }
+}
+function Assert-J1ComfyFreshBirth([DateTime]$Birth,[DateTime]$PinnedAfter) {
+    if($Birth.ToUniversalTime() -le $PinnedAfter.ToUniversalTime()){
+        throw 'Native Comfy occurrence predates the held RC files. Close it before starting the walkthrough.'
+    }
+}
+function Get-J1NativeProcesses($Native,[DateTime]$Started,[switch]$Walkthrough,$Pins) {
+    if($Walkthrough){
+        if($Mode -cne 'ComfyCancelReadback'){throw 'Owner Comfy observation requires the read-only walkthrough mode'}
+        $session=[Diagnostics.Process]::GetCurrentProcess().SessionId
+    }else{
+        Assert-FixtureMutationSafe
+        $session=$script:fixtureOwner.session
+    }
+    $sid=[Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+    if(-not $Walkthrough -and $sid -cne $script:fixtureOwner.sid){throw 'Native Comfy process owner differs from disposable account'}
+    if(-not $Pins){$Pins=@(Get-J1ComfyProcessPins $Native -Walkthrough:$Walkthrough)}
+    $held=@()
+    try {
+        foreach($pin in $Pins){
+            $path=$pin.path
+            $rows=@(Get-CimInstance Win32_Process -Filter "Name='launch-helper.exe' OR Name='python.exe'" -ErrorAction Stop|Where-Object{$_.ExecutablePath -ieq $path})
+            if($Walkthrough -and -not $rows.Count){foreach($entry in $held){$entry.handle.Dispose()};return}
+            if($rows.Count -ne 1){throw 'Native Comfy process missing or ambiguous; no absence is inferred'}
+            $row=$rows[0]
+            if($Walkthrough){Assert-J1ComfyFreshBirth $row.CreationDate $Started}
+            if((Get-ProcessOwnerSid $row) -cne $sid -or $row.CreationDate.ToUniversalTime() -lt $Started.ToUniversalTime() -or
+                [int]$row.SessionId -ne $session){throw 'Native Comfy process is not the selected account and session occurrence'}
+            $null=Assert-SelectedAppFile $pin
+            $process=Get-Process -Id $row.ProcessId -ErrorAction Stop
+            try {
+                $null=$process.Handle
+                $current=@(Get-CimInstance Win32_Process -Filter ('ProcessId='+$row.ProcessId) -ErrorAction Stop)
+                if($process.HasExited -or $current.Count -ne 1 -or $current[0].CreationDate -ne $row.CreationDate -or
+                    $current[0].ExecutablePath -ine $path -or (Get-ProcessOwnerSid $current[0]) -cne $sid){throw 'Native Comfy process changed while holding its occurrence'}
+                if($Walkthrough){Assert-J1ComfyFreshBirth $process.StartTime $Started}
+                $identity=if(-not $Walkthrough){Get-SelectedFileIdentity $path}
+                $held+=@{role=$pin.role;pid=[int]$row.ProcessId;parent=[int]$row.ParentProcessId;birth=$row.CreationDate.ToUniversalTime().ToString('o');
+                    handle_birth=$process.StartTime.ToUniversalTime().ToString('o');session=[int]$row.SessionId;sid=$sid;path=$path;
+                    command=[string]$row.CommandLine;sha256=$pin.sha256;bytes=$pin.bytes;identity=$identity;handle=$process}
+            }catch{$process.Dispose();throw}
+        }
+        if($held[1].parent -ne $held[0].pid){throw 'Native Comfy backend is not the exact held application child'}
+        return ,$held
+    }catch{foreach($entry in $held){$entry.handle.Dispose()};throw}
+}
+function Close-J1NativeProcesses($Held) {
+    Assert-FixtureMutationSafe
+    $gui=@($Held|Where-Object{$_.role -ceq 'application'})
+    if($gui.Count -ne 1){throw 'One held native Comfy window occurrence required'}
+    foreach($entry in $Held){
+        if($entry.handle.StartTime.ToUniversalTime().ToString('o') -cne $entry.handle_birth -or
+            (Get-SelectedFileIdentity $entry.path) -cne $entry.identity -or
+            (Get-FileHash -LiteralPath $entry.path -Algorithm SHA256).Hash.ToLowerInvariant() -cne $entry.sha256){throw 'Native Comfy occurrence/image changed before its ordinary Close action'}
+    }
+    if(-not $gui[0].handle.HasExited -and -not $gui[0].handle.CloseMainWindow()){throw 'Native Comfy did not accept its own window Close action'}
+    foreach($entry in $Held){if(-not $entry.handle.WaitForExit(30000)){throw 'Native Comfy occurrence did not close; retain installation without forced termination'}}
+}
+function Assert-J1ComfyListener($Held,[switch]$Starting) {
+    $backend=@($Held|Where-Object{$_.role -ceq 'backend'})
+    if($backend.Count -ne 1){throw 'One held native Comfy backend required'}
+    $errors=if($Starting){'SilentlyContinue'}else{'Stop'}
+    $rows=@(Get-NetTCPConnection -State Listen -LocalPort 8188 -ErrorAction $errors)
+    if($Starting -and -not $rows.Count){return}
+    if($rows.Count -ne 1 -or $rows[0].LocalAddress -cne '127.0.0.1' -or
+        $rows[0].OwningProcess -ne $backend[0].pid){throw 'Native Comfy loopback listener differs from held backend'}
+    foreach($entry in $Held){
+        $entry.handle.Refresh()
+        if($entry.handle.HasExited -or $entry.handle.StartTime.ToUniversalTime().ToString('o') -cne $entry.handle_birth){throw 'Native Comfy occurrence exited during listener observation'}
+    }
+    return @{address=[string]$rows[0].LocalAddress;port=[int]$rows[0].LocalPort;pid=[int]$rows[0].OwningProcess}
+}
+function Get-J1NativeInstanceObservation($Held,[string]$Directory) {
+    Assert-FixtureMutationSafe
+    if($Mode -cne 'User' -or -not $script:fixtureOwner.nonadmin -or $script:fixtureOwner.sid -cne $ExpectedSid){
+        throw 'Native Comfy models-root observation requires the disposable fixture owner'
+    }
+    $listener=Assert-J1ComfyListener $Held
+    $backend=@($Held|Where-Object{$_.role -ceq 'backend'})[0]
+    $models=Join-Path $script:fixtureOwner.local_app_data 'OpenAbstractions\ComfyUI\models'
+    $before=Get-SelectedFileIdentity $models -Directory
+    $current=@(Get-CimInstance Win32_Process -Filter ('ProcessId='+$backend.pid) -ErrorAction Stop)
+    if($current.Count -ne 1 -or
+        $current[0].CreationDate.ToUniversalTime().ToString('o') -cne $backend.birth -or
+        $current[0].ExecutablePath -cne $backend.path -or $current[0].CommandLine -cne $backend.command){
+        throw 'Native Comfy backend changed during models-root observation'
+    }
+    $after=Get-SelectedFileIdentity $models -Directory
+    $null=Assert-J1ComfyListener $Held
+    if($before -cne $after){throw 'Native Comfy models-root file identity changed'}
+    $modelsRoot=@{path=$models;kind='directory';identity_before=$before;identity_after=$after}
+    $processes=@(foreach($entry in $Held){
+        @{role=$entry.role;pid=$entry.pid;parent=$entry.parent;birth=$entry.birth;handle_birth=$entry.handle_birth;
+          session=$entry.session;sid=$entry.sid;path=$entry.path;command=$entry.command;sha256=$entry.sha256;identity=$entry.identity}
+    })
+    $pictures=Get-ProfileFolder MyPictures
+    $path=Join-Path $Directory 'j1-comfy-instance.json'
+    if(Test-Path -LiteralPath $path){throw 'Native Comfy instance observation already exists'}
+    [IO.File]::WriteAllText($path,(@{schema=1;processes=$processes;listener=$listener;pictures=$pictures;
+        models_root=$modelsRoot;observed_at=[DateTime]::UtcNow.ToString('o')}|ConvertTo-Json -Depth 12),[Text.UTF8Encoding]::new($false))
+    return @{path=$path;sha256=(Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash.ToLowerInvariant();bytes=(Get-Item -LiteralPath $path).Length}
+}
+function Get-J1ComfyFrontendPin($Native) {
+    $compiled=$Native.selected_app_readback.comfyui
+    $relative='oa-backend/ComfyUI/custom_nodes/abstraction_downloads/web/oa_downloads.js'
+    $expected=@($compiled.native_files|Where-Object{$_.id -ceq $relative})
+    if($compiled.variant -cne 'oa-comfyui-native' -or $expected.Count -ne 1 -or
+        $compiled.native.identity.version -cnotmatch '^[A-Za-z0-9._-]{1,64}$' -or $compiled.native.identity.version -cin @('.','..')){throw 'Original native Comfy frontend member required'}
+    $root=Join-Path (Get-ProfileFolder LocalApplicationData) ('OA\a\cu\'+$compiled.native.identity.version)
+    return @{path=(Join-Path $root $relative);sha256=$expected[0].sha256;bytes=$expected[0].bytes}
+}
+function Invoke-J1FrontendCollection($Native,[string]$Directory) {
+    Assert-FixtureMutationSafe
+    $frontend=Get-J1ComfyFrontendPin $Native
+    $null=Assert-SelectedAppFile $frontend
+    $identity=Get-SelectedFileIdentity $frontend.path
+    $spec=Assert-J1SelectionInputs $Native
+    $manifest=Get-Content -LiteralPath $spec.sdk.manifest.path -Raw|ConvertFrom-Json
+    $corpus=Join-Path $spec.sdk.directory 'j1_comfy_frontend.test.mjs'
+    if(-not $manifest.files.PSObject.Properties['j1_comfy_frontend.test.mjs'] -or
+        (Get-FileHash -LiteralPath $corpus -Algorithm SHA256).Hash.ToLowerInvariant() -cne $manifest.files.'j1_comfy_frontend.test.mjs'){throw 'Authenticated current Comfy frontend corpus required'}
+    $cases=@("unsaved canvas changes go through ComfyUI's own confirmation",
+        'a frontend without a workflow store counts as unsaved: confirm, or keep the canvas',
+        'graph digest mismatch refuses the load without changing the canvas',
+        'a second click while the workflow loads reads and loads it once')
+    $pattern='^('+($cases -join '|')+')$'
+    $request=Join-Path $Directory 'j1-comfy-frontend-request.json';$result=Join-Path $Directory 'j1-comfy-frontend.tap';$process=Join-Path $Directory 'j1-comfy-frontend-process.json'
+    foreach($path in @($request,$result,$process)){if(Test-Path -LiteralPath $path){throw 'Comfy frontend observation already exists'}}
+    $corpusPin=@{path=$corpus;sha256=(Get-FileHash -LiteralPath $corpus -Algorithm SHA256).Hash.ToLowerInvariant();bytes=(Get-Item -LiteralPath $corpus).Length}
+    [IO.File]::WriteAllText($request,(@{schema=1;source_sha=$Native.core.source_sha;frontend=$frontend;identity=$identity;corpus=$corpusPin;cases=$cases}|ConvertTo-Json -Depth 8),[Text.UTF8Encoding]::new($false))
+    $info=[Diagnostics.ProcessStartInfo]::new();$info.FileName=$spec.node.path
+    $info.Arguments='--test --test-reporter=tap "--test-name-pattern='+$pattern+'" "'+$corpus+'"';$info.WorkingDirectory=$Directory
+    $keep=@{};foreach($key in @('SystemRoot','WINDIR','COMSPEC','PATHEXT','PROCESSOR_ARCHITECTURE','TEMP','TMP','USERPROFILE','LOCALAPPDATA','APPDATA')){if($info.EnvironmentVariables[$key]){$keep[$key]=$info.EnvironmentVariables[$key]}}
+    $info.EnvironmentVariables.Clear();foreach($key in $keep.Keys){$info.EnvironmentVariables[$key]=$keep[$key]}
+    $info.EnvironmentVariables['OA_COMFYUI_FRONTEND_UNDER_TEST']=$frontend.path
+    $info.EnvironmentVariables['OA_COMFYUI_FRONTEND_SHA256']=$frontend.sha256
+    $held=Invoke-FixtureProcess $info 45 -ObservationPath $process
+    [IO.File]::WriteAllText($result,$held.Output,[Text.UTF8Encoding]::new($false))
+    if($held.ExitCode -ne 0 -or $held.Diagnostics -or $held.Output -notmatch '(?m)^# pass 4\r?$' -or $held.Output -notmatch '(?m)^# fail 0\r?$'){
+        throw 'Installed-byte Comfy frontend gating corpus did not complete all four cases'
+    }
+    $null=Assert-J1SelectionInputs $Native;$null=Assert-SelectedAppFile $frontend
+    if((Get-SelectedFileIdentity $frontend.path) -cne $identity){throw 'Installed Comfy frontend identity changed during corpus'}
+    $pins=@{}
+    foreach($role in @('request','process','result')){
+        $path=if($role -ceq 'result'){$result}else{Join-Path $Directory ('j1-comfy-frontend-'+$role+'.json')}
+        $pins[$role]=@{path=$path;sha256=(Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash.ToLowerInvariant();bytes=(Get-Item -LiteralPath $path).Length}
+    }
+    return $pins
+}
+function ConvertFrom-J1ComfyJobs($Body) {
+    if($Body.complete -isnot [bool] -or -not $Body.complete -or $Body.outcome -cne 'page' -or
+        $Body.operations -isnot [array] -or $Body.operations.Count -gt 1024){throw 'Complete Comfy Jobs inventory required'}
+    $rows=[Collections.Generic.Dictionary[string,object]]::new([StringComparer]::Ordinal)
+    $keys=[Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+    foreach($snapshot in $Body.operations){
+        $receipt=$snapshot.receipt;$identity=$receipt.identity
+        $attempt=if($null -eq $identity.attempt){0}else{$identity.attempt}
+        foreach($text in @($identity.key,$identity.history_epoch,$receipt.logical_owner,$receipt.operation_id)){
+            if($text -isnot [string] -or [string]::IsNullOrWhiteSpace($text) -or $text.Length -gt 1024){throw 'Comfy Jobs identity is incomplete'}
+        }
+        if(($attempt -isnot [int] -and $attempt -isnot [long]) -or $attempt -lt 0 -or
+            $snapshot.state -cnotin @('pending','running','transferred','complete','failed','cancelled')){throw 'Comfy Jobs attempt or state is invalid'}
+        $key=ConvertTo-Json -Compress -InputObject @($identity.key,$identity.history_epoch,[long]$attempt,$receipt.logical_owner)
+        if(-not $keys.Add($key) -or $rows.ContainsKey($receipt.operation_id)){throw 'Comfy Jobs inventory repeats an identity'}
+        $rows.Add($receipt.operation_id,[ordered]@{key=$identity.key;history_epoch=$identity.history_epoch;attempt=[long]$attempt;
+            logical_owner=$receipt.logical_owner;operation_id=$receipt.operation_id;state=$snapshot.state;label=[string]$snapshot.label})
+    }
+    return ,$rows
+}
+function Get-J1ComfyCancelRow($Before,$Current,$Selected) {
+    foreach($id in $Before.Keys){
+        if(-not $Current.ContainsKey($id)){throw 'An original Comfy Jobs row disappeared'}
+        foreach($name in @('key','history_epoch','attempt','logical_owner')){
+            if($Current[$id][$name] -cne $Before[$id][$name]){throw 'An original Comfy Jobs identity changed'}
+        }
+    }
+    $new=@($Current.Keys|Where-Object{-not $Before.ContainsKey($_)})
+    if($new.Count -gt 1 -or ($Selected -and $new.Count -ne 1)){throw 'Expected exactly one new Comfy Jobs row'}
+    if(-not $new.Count){return}
+    $row=$Current[$new[0]]
+    if($row.key -cnotmatch '^comfyui-video-[0-9a-f]{32}$' -or $row.attempt -ne 0 -or $row.label -cne 'ComfyUI video'){
+        throw 'The new Comfy Jobs row is not an original video request'
+    }
+    if($Selected){
+        foreach($name in @('key','history_epoch','attempt','logical_owner','operation_id')){
+            if($row[$name] -cne $Selected[$name]){throw 'The selected video Jobs identity changed'}
+        }
+    }
+    return $row
+}
+function Read-J1ComfyJobs($Client,$Held,[int]$Milliseconds) {
+    $null=Assert-J1ComfyListener $Held
+    $cancel=[Threading.CancellationTokenSource]::new($Milliseconds)
+    $response=$null
+    try{
+        $response=$Client.GetAsync('http://127.0.0.1:8188/abstraction/jobs',
+            [Net.Http.HttpCompletionOption]::ResponseContentRead,$cancel.Token).GetAwaiter().GetResult()
+        if([int]$response.StatusCode -ne 200){throw 'Comfy Jobs GET did not return a complete response'}
+        $body=$response.Content.ReadAsByteArrayAsync().GetAwaiter().GetResult()
+        $null=Assert-J1ComfyListener $Held
+        $value=([Text.UTF8Encoding]::new($false,$true)).GetString($body)|ConvertFrom-Json
+        return ,(ConvertFrom-J1ComfyJobs $value)
+    }finally{
+        if($response){$response.Dispose()}
+        $cancel.Dispose()
+    }
+}
+function Watch-J1ComfyCancel($Before,$Record,[scriptblock]$Read,[int]$Seconds) {
+    $clock=[Diagnostics.Stopwatch]::StartNew();$selected=$null
+    while($clock.Elapsed.TotalSeconds -lt $Seconds){
+        $remaining=[int][Math]::Max(1,$Seconds*1000-$clock.ElapsedMilliseconds)
+        $current=& $Read ([Math]::Min(12000,$remaining))
+        $Record.after=@($current.Values|Sort-Object operation_id -CaseSensitive)
+        $Record.after_at=[DateTime]::UtcNow.ToString('o')
+        if($clock.Elapsed.TotalSeconds -ge $Seconds){break}
+        $row=Get-J1ComfyCancelRow $Before $current $selected
+        if($row){
+            if(-not $selected){$selected=$row}
+            if($row.state -ceq 'running' -and -not $Record.running){
+                $Record.running=$row;$Record.running_at=$Record.after_at
+                Write-Host 'Running observed. Click Cancel for this video in the Jobs sidebar now.'
+            }elseif($row.state -ceq 'cancelled'){
+                if(-not $Record.running){throw 'Cancellation was visible before a matching running job was observed'}
+                $Record.result='cancelled';$Record.reason=$null;return
+            }elseif($row.state -cin @('transferred','complete','failed')){
+                throw ('The selected video reached '+$row.state+' instead of cancellation')
+            }
+        }
+        Start-Sleep -Milliseconds ([Math]::Min(600,[Math]::Max(0,$Seconds*1000-$clock.ElapsedMilliseconds)))
+    }
+    $Record.reason='Timed out before the same running video reached cancelled'
+}
+function Invoke-J1ComfyCancelReadback([string]$Request,[string]$Hash,[string]$Directory,[int]$Seconds) {
+    $principal=[Security.Principal.WindowsPrincipal]::new([Security.Principal.WindowsIdentity]::GetCurrent())
+    if($principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)){throw 'Run the Comfy walkthrough unelevated in the account showing Jobs'}
+    if($Hash -cnotmatch '^[0-9a-f]{64}$'){throw 'An exact RC request SHA256 is required'}
+    foreach($path in @($Request,$Directory)){
+        if($path -notmatch '^[A-Za-z]:[\\/]' -or [IO.DriveInfo]::new($path.Substring(0,3)).DriveType -ne [IO.DriveType]::Fixed){
+            throw 'The RC request and evidence directory must be on a fixed local drive'
+        }
+    }
+    if(Test-Path -LiteralPath $Directory){throw 'A fresh evidence directory is required'}
+    $size=(Get-Item -LiteralPath $Request -ErrorAction Stop).Length
+    if($size -gt 4194304){throw 'RC native request exceeds the collector limit'}
+    $requestPin=@{path=$Request;sha256=$Hash;bytes=$size}
+    $null=Assert-SelectedAppFile $requestPin
+    $requestFile=[IO.File]::Open($Request,[IO.FileMode]::Open,[IO.FileAccess]::Read,[IO.FileShare]::Read)
+    try{
+        $null=Assert-SelectedAppFile $requestPin
+        $native=Get-Content -LiteralPath $Request -Raw|ConvertFrom-Json
+    }finally{$requestFile.Dispose()}
+    if($native.core.source_sha -cnotmatch '^[0-9a-f]{40}$'){throw 'Exact RC product source required'}
+    $frontend=Get-J1ComfyFrontendPin $native
+    $parent=Get-Item -LiteralPath (Split-Path -Parent $Directory) -ErrorAction Stop
+    if(-not $parent.PSIsContainer){throw 'Evidence directory parent must be an existing directory'}
+    while($parent){
+        if($parent.Attributes -band [IO.FileAttributes]::ReparsePoint){throw 'Evidence directory ancestor is redirected'}
+        $parent=$parent.Parent
+    }
+    $null=New-Item -ItemType Directory -Path $Directory -ErrorAction Stop
+    $output=Join-Path $Directory 'comfy-video-cancel.json'
+    $record=[ordered]@{schema=1;result='unproven';source_sha=$native.core.source_sha;request_sha256=$Hash;frontend=$frontend;pinned_after=$null;
+        listener=$null;processes=@();before=$null;before_at=$null;running=$null;running_at=$null;after=$null;after_at=$null;
+        reason='walkthrough incomplete'}
+    $held=@();$files=@();$client=$null
+    try{
+        $processPins=@(Get-J1ComfyProcessPins $native -Walkthrough)
+        foreach($pin in @($frontend)+$processPins){
+            $null=Assert-SelectedAppFile $pin
+            $files+=[IO.File]::Open($pin.path,[IO.FileMode]::Open,[IO.FileAccess]::Read,[IO.FileShare]::Read)
+            $null=Assert-SelectedAppFile $pin
+        }
+        $pinned=[DateTime]::UtcNow;$record.pinned_after=$pinned.ToString('o')
+        Write-Host 'RC files are pinned. Open installed ComfyUI now. Wait for the baseline before queueing.'
+        $activation=[Diagnostics.Stopwatch]::StartNew()
+        while($activation.Elapsed.TotalSeconds -lt 90 -and -not $record.listener){
+            if(-not $held){$held=Get-J1NativeProcesses $native $pinned -Walkthrough -Pins $processPins}
+            if($held){$record.listener=Assert-J1ComfyListener $held -Starting}
+            if(-not $record.listener){Start-Sleep -Milliseconds 400}
+        }
+        if(-not $record.listener){throw 'Fresh RC Comfy activation did not reach its held listener within 90 seconds'}
+        $record.processes=@(foreach($entry in $held){
+            @{role=$entry.role;pid=$entry.pid;parent=$entry.parent;birth=$entry.handle_birth;sha256=$entry.sha256;bytes=$entry.bytes}
+        })
+        Add-Type -AssemblyName System.Net.Http
+        $handler=[Net.Http.HttpClientHandler]::new();$handler.AllowAutoRedirect=$false;$handler.UseProxy=$false
+        $client=[Net.Http.HttpClient]::new($handler)
+        $client.MaxResponseContentBufferSize=2097152
+        $before=Read-J1ComfyJobs $client $held 12000
+        $record.before=@($before.Values|Sort-Object operation_id -CaseSensitive)
+        $record.before_at=[DateTime]::UtcNow.ToString('o')
+        Write-Host 'Baseline captured. Queue one OA video job in ComfyUI. Answer any first-use question in person and wait for the collector to show Running.'
+        Watch-J1ComfyCancel $before $record {param($milliseconds) Read-J1ComfyJobs $client $held $milliseconds} $Seconds
+    }catch{
+        $record.reason=$_.Exception.Message
+    }finally{
+        if($client){$client.Dispose()}
+        foreach($file in $files){$file.Dispose()}
+        foreach($entry in $held){$entry.handle.Dispose()}
+        $stream=[IO.File]::Open($output,[IO.FileMode]::CreateNew,[IO.FileAccess]::Write,[IO.FileShare]::None)
+        try{
+            $data=[Text.UTF8Encoding]::new($false).GetBytes(($record|ConvertTo-Json -Depth 12))
+            $stream.Write($data,0,$data.Length)
+        }finally{$stream.Dispose()}
+    }
+    if($record.result -cne 'cancelled'){throw ('Comfy video cancellation unproven: '+$record.reason+'. Evidence: '+$output)}
+    return $output
+}
+function Get-J1GpuObservation([Diagnostics.Process]$Process) {
+    # OS cumulative compute-engine time is an execution observation. Merely
+    # finding a GPU/device or reading Comfy system_stats supplies no GPU proof.
+    Assert-FixtureMutationSafe
+    $Process.Refresh()
+    if($Process.HasExited){throw 'J1 owned Comfy process exited before GPU observation'}
+    $birth=$Process.StartTime.ToUniversalTime().ToString('o')
+    $image=$Process.MainModule.FileName
+    $identity=Get-SelectedFileIdentity $image
+    $rows=@(Get-CimInstance -ClassName Win32_PerfRawData_GPUPerformanceCounters_GPUEngine -Filter ("Name LIKE 'pid_"+$Process.Id+"_%'") -ErrorAction Stop)
+    if($rows.Count -gt 128){throw 'J1 GPU observation exceeds owned process bound'}
+    $counters=@()
+    foreach($row in $rows){
+        if($row.Name -cnotmatch ('^pid_'+$Process.Id+'_luid_[0-9A-Fa-fx]+_[0-9A-Fa-fx]+_phys_[0-9]+_eng_[0-9]+_engtype_(?:Compute|Compute_[0-9]+)$')){continue}
+        $counters+=@{name=[string]$row.Name;running_time=[string]$row.RunningTime;timestamp=[string]$row.Timestamp_PerfTime;frequency=[string]$row.Frequency_PerfTime}
+    }
+    $Process.Refresh()
+    if($Process.HasExited -or $Process.StartTime.ToUniversalTime().ToString('o') -cne $birth -or
+        $Process.MainModule.FileName -cne $image -or (Get-SelectedFileIdentity $image) -cne $identity){throw 'J1 GPU actor changed during OS observation'}
+    return @{pid=$Process.Id;creation_utc=$birth;image=@{path=$image;identity=$identity;sha256=(Get-FileHash -LiteralPath $image -Algorithm SHA256).Hash.ToLowerInvariant();bytes=(Get-Item -LiteralPath $image).Length};counters=$counters;observed_at=[DateTime]::UtcNow.ToString('o')}
+}
+function Get-SelectedFileIdentity([string]$Path,[switch]$Directory,$HeldSourceRequest) {
     if(-not $script:SelectedFileIdentityProbe -or -not [IO.Path]::IsPathRooted($Path) -or $Path.Contains('"') -or $Path -match '[\r\n]'){throw 'Selected canonical SDK identity probe and absolute safe path required'}
     $probe=$script:SelectedFileIdentityProbe
-    $null=Assert-SelectedAppFile $probe.helper;$null=Assert-SelectedAppFile $probe.manifest
+    $null=Assert-SelectedAppFile $probe.helper
+    if($HeldSourceRequest){
+        if(-not $probe.source_request -or -not $HeldSourceRequest.CanRead -or
+            $HeldSourceRequest.Name -ine $probe.source_request.path){throw 'Held source request differs from the probe binding'}
+    }elseif($probe.source_request){
+        $null=Assert-SelectedAppFile $probe.source_request
+        $source=Get-Content -LiteralPath $probe.source_request.path -Raw|ConvertFrom-Json
+        if(([Security.Principal.WindowsIdentity]::GetCurrent().Name.Split('\')[-1]) -ine 'WDAGUtilityAccount' -or $source.kind -cne 'sandbox_upgrade' -or $source.release_sdk_eligible -ne $false -or
+            $source.core.upgrade_probe.path -cne $probe.helper.path -or $source.core.upgrade_probe.sha256 -cne $probe.helper.sha256 -or $source.core.upgrade_probe.bytes -ne $probe.helper.bytes){throw 'Private held-file probe differs from its source-bound Sandbox request'}
+    }else{$null=Assert-SelectedAppFile $probe.manifest}
     $info=New-Object Diagnostics.ProcessStartInfo
     $info.FileName=$probe.helper.path;$info.Arguments='--file-identity "'+$Path+'"'
+    if($Directory){$info.Arguments+=' --directory'}
     $result=Invoke-FixtureProcess $info 10
-    $null=Assert-SelectedAppFile $probe.helper;$null=Assert-SelectedAppFile $probe.manifest
+    $null=Assert-SelectedAppFile $probe.helper
+    if(-not $HeldSourceRequest){
+        if($probe.source_request){$null=Assert-SelectedAppFile $probe.source_request}else{$null=Assert-SelectedAppFile $probe.manifest}
+    }
     if($result.ExitCode -ne 0 -or $result.Output.Length -gt 4096 -or $result.Diagnostics){throw 'Canonical SDK file identity probe refused or exceeded its output bound'}
     $value=$result.Output|ConvertFrom-Json
     if((@($value.PSObject.Properties.Name|Sort-Object)-join ',') -cne 'key,schema' -or
@@ -1526,6 +1975,11 @@ function Install-SelectedAppChain($Plans,[string]$Evidence,[string]$RequestPath)
         source_sha=$native.source_sha;tool_source=$native.tool_source;runtime_sha256=$native.runtime_sha256
         native_request=@{path=$RequestPath;sha256=(Get-FileHash -LiteralPath $RequestPath -Algorithm SHA256).Hash.ToLowerInvariant();bytes=(Get-Item -LiteralPath $RequestPath).Length}}
     foreach($plan in $Plans) {
+        if($plan.native){
+            $journal.apps+=@{id=$plan.app.id;package=$plan.app;root=$plan.root;native=$true;native_pending=$true;install_attempted=$false;installed=$false;steps=@()}
+            $journal|ConvertTo-Json -Depth 40|Set-Content -LiteralPath $Evidence -Encoding UTF8
+            continue
+        }
         $installer=New-Object -ComObject WindowsInstaller.Installer
         if(@($installer.ProductsEx($plan.compiled.product_code,'',7)).Count){throw 'Preexisting application integration is protected'}
         $row=@{id=$plan.app.id;product_code=$plan.compiled.product_code;upgrade_code=$plan.compiled.upgrade_code;package=$plan.app;measured_components=$plan.files;install_attempted=$false;installed=$false;host_owned=$false;steps=@()}
@@ -1605,8 +2059,19 @@ function Remove-SelectedAppChain($Plans,[string]$Evidence) {
     foreach($row in $rows) {
         try {
             $plan=@($Plans|Where-Object{$_.app.id -ceq $row.id})
-            if($plan.Count -ne 1 -or $plan[0].compiled.product_code -cne $row.product_code){throw 'Selected application cleanup identity differs'}
+            if($plan.Count -ne 1){throw 'Selected application cleanup identity differs'}
             $plan=$plan[0]
+            if($row.native) {
+                if(-not $plan.native -or $row.package.delivery.binary.sha256 -cne $plan.app.delivery.binary.sha256 -or
+                    $row.root -cne $plan.root){throw 'Native application cleanup differs from original delivery'}
+                # A partial setup has no removal authority. Retain its state for
+                # reconciliation rather than inventing ownership from a path.
+                if($row.install_attempted -and -not $row.removed){throw 'Native lifecycle did not confirm its source-owned removal; retain state'}
+                if(Test-Path -LiteralPath $row.root){throw 'Native application root survived its ordinary lifecycle removal'}
+                $row|Add-Member -NotePropertyName restored -NotePropertyValue $true -Force
+                continue
+            }
+            if($plan.compiled.product_code -cne $row.product_code){throw 'Selected application cleanup product differs'}
             if($row.install_attempted) {
                 $null=Assert-SelectedAppFile $plan.app
                 $installer=New-Object -ComObject WindowsInstaller.Installer
@@ -1655,8 +2120,10 @@ function Remove-SelectedAppChain($Plans,[string]$Evidence) {
     if($failures.Count){throw ('Selected app restoration incomplete: '+($failures -join ' | '))}
 }
 function Assert-NativeCore([string]$Central, [string]$Tools, [string]$PythonPath, [string]$RequestPath) {
+    $nativeHeld=$null
     $native = Get-Content -LiteralPath $RequestPath -Raw | ConvertFrom-Json
-    if ($native.kind -ne 'local_msi' -or -not $native.core -or $native.core.source_sha -ne $native.source_sha) {
+    $privateSandbox=$native.kind -ceq 'sandbox_upgrade' -and $native.proof_scope -ceq 'PRIVATE/SOURCE-BOUND' -and $native.release_sdk_eligible -eq $false -and ([Security.Principal.WindowsIdentity]::GetCurrent().Name.Split('\')[-1]) -ieq 'WDAGUtilityAccount'
+    if (($native.kind -ne 'local_msi' -and -not $privateSandbox) -or -not $native.core -or $native.core.source_sha -ne $native.source_sha) {
         throw 'Fixed native core request/source required'
     }
     $panel = Join-Path $Tools 'Abstraction Panel.exe'
@@ -1666,8 +2133,8 @@ function Assert-NativeCore([string]$Central, [string]$Tools, [string]$PythonPath
     if ((Get-FileHash -LiteralPath $panel -Algorithm SHA256).Hash.ToLowerInvariant() -ne $native.core.panel_sha256) {
         throw 'Native core presenter differs from exact MSI payload'
     }
-    Assert-InstalledNativePresenter $panel
-    foreach ($row in @($native.core.go,$native.core.journey,$native.core.helper,$native.core.native_library,$native.core.python) + @($native.core.python_files)) {
+    if(-not $privateSandbox){Assert-InstalledNativePresenter $panel}
+    foreach ($row in (@($native.core.go,$native.core.journey,$native.core.helper,$native.core.native_library,$native.core.python) + @($native.core.python_files) | Where-Object {$_})) {
         if ((Get-FileHash -LiteralPath $row.path -Algorithm SHA256).Hash.ToLowerInvariant() -ne $row.sha256 -or
             (Get-Item -LiteralPath $row.path).Length -ne $row.bytes) { throw 'Native core input changed' }
     }
@@ -1690,14 +2157,57 @@ function Assert-NativeCore([string]$Central, [string]$Tools, [string]$PythonPath
         # The shared helper constructs the context; a supplied context is not authority.
         $session.installed_chain=$chain
         $session.observations=@{fixture_owner=$chain.fixture_owner;runtime=$session.runtime;panel=$session.panel}
-        if ($native.adopter_case -ceq 'opencode') {
+        if ($native.adopter_case -cin @('opencode','j1')) {
             $session.observations.profile=Get-ProfileFolder UserProfile
         }
         $roles=$native.selected_app_readback.opencode.journey_payload_roles
         $cli=@($chain.apps|Where-Object{$_.id -ceq 'opencode'}|ForEach-Object{$_.files}|Where-Object{$_.id -ceq $roles.official_cli.id})
         if($cli.Count -ne 1){throw 'J1 exact installed official CLI member required'}
         $program=@{path=$cli[0].path;sha256=$cli[0].sha256;bytes=$cli[0].bytes}
-        $session.observations.j1_selection=Invoke-J1SelectionCollection $native $program $session.runtime $chain.fixture_owner.sid $directory
+        $selectionDirectory=$directory
+        if(@($chain.apps|Where-Object{$_.native}).Count){
+            $selectionDirectory=Join-Path $directory 'comfy-bootstrap'
+            New-Item -ItemType Directory -Path $selectionDirectory|Out-Null
+        }
+        if($privateSandbox){
+            if(-not $native.private_selection){throw 'Private Sandbox needs the existing installed operator selection projection'}
+            $session.observations.private_selection=$native.private_selection
+        }else{
+            $session.observations.j1_selection=Invoke-J1SelectionCollection $native $program $session.runtime $chain.fixture_owner.sid $selectionDirectory
+        }
+        if(@($chain.apps|Where-Object{$_.native}).Count) {
+            $null=Assert-J1NativeInputs $native
+            $rows=@($chain.apps|Where-Object{$_.native -and $_.id -ceq 'comfyui'})
+            if($rows.Count -ne 1){throw 'One original native Comfy lifecycle required'}
+            $row=$rows[0]
+            $row.install_attempted=$true
+            $chain|ConvertTo-Json -Depth 40|Set-Content -LiteralPath (Join-Path (Get-Location) 'selected-app-chain.json') -Encoding UTF8
+            $setup=Invoke-J1NativePhase $session $directory 'setup'
+            $row|Add-Member -NotePropertyName setup_result -NotePropertyValue $setup -Force
+            $session.observations.j1_native_payload=Get-J1NativePayloadObservation $native $directory
+            $payload=Get-Content -LiteralPath $session.observations.j1_native_payload.result.path -Raw|ConvertFrom-Json
+            $row|Add-Member -NotePropertyName files -NotePropertyValue @($payload.files) -Force
+            $row|Add-Member -NotePropertyName root_identity -NotePropertyValue $payload.root_identity -Force
+            $row.installed=$true;$row.native_pending=$false
+            $chain|ConvertTo-Json -Depth 40|Set-Content -LiteralPath (Join-Path (Get-Location) 'selected-app-chain.json') -Encoding UTF8
+            # Setup owns the person's model question and preparation. Observe
+            # current saved policy/eligibility again after that native step.
+            $session.observations.j1_selection=Invoke-J1SelectionCollection $native $program $session.runtime $chain.fixture_owner.sid $directory
+            $session.observations.j1_application=@{}
+            $session.observations.j1_application.observe=Invoke-J1ApplicationCollection $native $session.runtime $chain.fixture_owner.sid $directory 'observe'
+            $activatedAt=[DateTime]::UtcNow
+            $session.observations.j1_application.activate=Invoke-J1ApplicationCollection $native $session.runtime $chain.fixture_owner.sid $directory 'activate'
+            $nativeHeld=Get-J1NativeProcesses $native $activatedAt
+            try {
+                $session.observations.j1_comfy_instance=Get-J1NativeInstanceObservation $nativeHeld $directory
+                $session.observations.j1_comfy_frontend=Invoke-J1FrontendCollection $native $directory
+                $session.observations.j1_application.graph=Invoke-J1ApplicationCollection $native $session.runtime $chain.fixture_owner.sid $directory 'graph'
+            } catch {
+                try {Close-J1NativeProcesses $nativeHeld} finally {foreach($entry in $nativeHeld){$entry.handle.Dispose()};$nativeHeld=$null}
+                throw
+            }
+            $chain|ConvertTo-Json -Depth 40|Set-Content -LiteralPath (Join-Path (Get-Location) 'selected-app-chain.json') -Encoding UTF8
+        }
     }
     $session | ConvertTo-Json -Depth 30 | Set-Content -LiteralPath $request -Encoding UTF8
     if ($native.core.adopter_journey) {
@@ -1706,9 +2216,43 @@ function Assert-NativeCore([string]$Central, [string]$Tools, [string]$PythonPath
             throw 'Automated adopter journey requires its separate source-bound selection'
         }
         $result = Join-Path $directory 'adopter-journey-result.json'
+        $sceneCompleted=$false
         try {
-            Invoke-Bounded $PythonPath @('-B',"`"$($native.core.helper.path)`"",'--adopter-journey-request',"`"$request`"") 600 -ObservationPath (Join-Path $directory 'adopter-process.json')
+            if($nativeHeld) {
+                $gpuBackend=@($nativeHeld|Where-Object{$_.role -ceq 'backend'})
+                if($gpuBackend.Count -ne 1){throw 'One held native backend required before image scene'}
+                $gpuBefore=Get-J1GpuObservation $gpuBackend[0].handle
+                [IO.File]::WriteAllText((Join-Path $directory 'j1-gpu-before.json'),($gpuBefore|ConvertTo-Json -Depth 12),[Text.UTF8Encoding]::new($false))
+            }
+            Invoke-InstalledAdopterScene $PythonPath $native.core $request $directory
+            $sceneCompleted=$true
         } finally {
+            if($nativeHeld) {
+                try {
+                    # This observation is terminal data. It never rewrites the
+                    # immutable pre-execution request or its execution context.
+                    $gpuAfter=Get-J1GpuObservation $gpuBackend[0].handle
+                    [IO.File]::WriteAllText((Join-Path $directory 'j1-gpu-after.json'),($gpuAfter|ConvertTo-Json -Depth 12),[Text.UTF8Encoding]::new($false))
+                    Close-J1NativeProcesses $nativeHeld
+                    if($sceneCompleted){
+                        foreach($entry in $nativeHeld){$entry.handle.Dispose()};$nativeHeld=$null
+                        $restartDirectory=Join-Path $directory 'comfy-restarted'
+                        New-Item -ItemType Directory -Path $restartDirectory|Out-Null
+                        $restartAt=[DateTime]::UtcNow
+                        $activation=Invoke-J1ApplicationCollection $native $session.runtime $chain.fixture_owner.sid $restartDirectory 'activate'
+                        $nativeHeld=Get-J1NativeProcesses $native $restartAt
+                        try {
+                            $session.observations.j1_recovery=@{activate=$activation;instance=(Get-J1NativeInstanceObservation $nativeHeld $restartDirectory)}
+                            $recovery=Invoke-J1NativePhase $session $directory 'recovery'
+                            $row|Add-Member -NotePropertyName recovery_result -NotePropertyValue $recovery -Force
+                        } finally {Close-J1NativeProcesses $nativeHeld}
+                    }
+                    $removed=Invoke-J1NativePhase $session $directory 'remove'
+                    $row|Add-Member -NotePropertyName removal_result -NotePropertyValue $removed -Force
+                    $row|Add-Member -NotePropertyName removed -NotePropertyValue $true -Force
+                    $chain|ConvertTo-Json -Depth 40|Set-Content -LiteralPath (Join-Path (Get-Location) 'selected-app-chain.json') -Encoding UTF8
+                } finally {foreach($entry in $nativeHeld){$entry.handle.Dispose()}}
+            }
             # Retain failed/partial bytes before the ordinary lifecycle cleanup.
             if (Test-Path -LiteralPath $result -PathType Leaf) {
                 Copy-Item -LiteralPath $result -Destination (Join-Path (Split-Path -Parent $RequestPath) 'adopter-journey-result.json')
@@ -1880,6 +2424,11 @@ function Assert-UnelevatedToken([scriptblock]$IsAdministrator = {
 # them: every per-user upgrade log proves the exclusion order and a resolved
 # folder, every removal log proves no reboot is pending, and mutated copies of
 # each real log are refused.
+if ($Mode -eq 'ComfyCancelReadback') {
+    if(-not $PSBoundParameters.ContainsKey('ResultDirectory')){throw 'Explicit fresh evidence directory required'}
+    Invoke-J1ComfyCancelReadback $NativeCoreRequest $NativeCoreRequestSHA256 $ResultDirectory $CancellationSeconds
+    exit 0
+}
 if ($Mode -eq 'CheckLogs') {
     $logs = @(
         foreach ($path in @($UpgradeLogs -split '\|' | Where-Object { $_ })) { [pscustomobject]@{ Kind = 'upgrade'; Path = $path } }
@@ -1910,7 +2459,7 @@ if ($Mode -eq 'CheckLogs') {
 }
 if ($Mode -eq 'FailingCandidate') {
     if (-not $MsiPath -or -not $Output) { throw 'FailingCandidate needs -MsiPath and -Output' }
-    New-FailingCandidate (Resolve-Path -LiteralPath $MsiPath).Path $Output -NewProductCode:$NewProductCode
+    New-FailingCandidate (Resolve-Path -LiteralPath $MsiPath).Path $Output -NewProductCode:$NewProductCode -AppFailureBinary $AppFailureBinary
     "Prepared forced-failure candidate $Output"
     exit 0
 }
@@ -2031,7 +2580,7 @@ if ($Mode -eq 'User') {
     $tools = Join-Path $localAppData 'Programs\OpenAbstractions\tools'
     $script:fixtureOwner=@{sid=$identity.User.Value;session=[Diagnostics.Process]::GetCurrentProcess().SessionId;
         nonadmin=(-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator));
-        local_app_data=$localAppData;tools=$tools}
+        local_app_data=$localAppData;tools=$tools;pictures=(Get-ProfileFolder MyPictures)}
     $installed = $false
     $installAttempted = $false
     $predecessorAttempted = $false

@@ -39,6 +39,8 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       artifact_id: ${{ steps.verified_wheels.outputs.artifact-id }}
+      environment_id: ${{ steps.stage_wheels.outputs.environment_id }}
+      environment_sha256: ${{ steps.stage_wheels.outputs.environment_sha256 }}
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
         with:
@@ -47,6 +49,7 @@ jobs:
         with:
           python-version: '3.12'
       - name: stage exact qualified wheel bytes
+        id: stage_wheels
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
@@ -58,7 +61,8 @@ jobs:
           python3 scripts/pypi_publish.py \
             --repo "$GH_REPO" --run "$CANDIDATE_RUN" \
             --attempt "$CANDIDATE_ATTEMPT" --source "$CANDIDATE_SOURCE" \
-            --version "$RELEASE_VERSION" --output dist
+            --version "$RELEASE_VERSION" --output dist \
+            --environment-output "$GITHUB_OUTPUT"
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         id: verified_wheels
         with:
@@ -78,6 +82,22 @@ jobs:
       actions: read
       id-token: write
     steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-python@e797f83bcb11b83ae66e0230d6156d7c80228e7c # v6.0.0
+        with:
+          python-version: '3.12'
+      - name: require the verified artifact ID
+        shell: python
+        env:
+          VERIFIED_ARTIFACT_ID: ${{ needs.verify.outputs.artifact_id }}
+        run: |
+          import os
+          import re
+          if not re.fullmatch(r'[1-9][0-9]*', os.environ.get('VERIFIED_ARTIFACT_ID', '')):
+              raise SystemExit('missing or invalid verified PyPI artifact ID')
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           artifact-ids: ${{ needs.verify.outputs.artifact_id }}
@@ -87,6 +107,15 @@ jobs:
           test "$(find dist -maxdepth 1 -type f -name '*.whl' | wc -l)" -eq 4
           test "$(find dist -maxdepth 1 -type f | wc -l)" -eq 4
           sha256sum dist/*.whl
+      - name: recheck the qualified PyPI deployment environment
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          ENVIRONMENT_ID: ${{ needs.verify.outputs.environment_id }}
+          ENVIRONMENT_SHA256: ${{ needs.verify.outputs.environment_sha256 }}
+        run: |
+          python3 scripts/pypi_publish.py check-environment --repo "$GH_REPO" \
+            --environment-id "$ENVIRONMENT_ID" --environment-sha256 "$ENVIRONMENT_SHA256"
       - uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # v1.14.2
         with:
           packages-dir: dist/

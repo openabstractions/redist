@@ -102,7 +102,9 @@ def metadata(source: Path, license_file: Path, release_version: str | None = Non
                     {type(node.left), type(node.comparators[0])} != {ast.Name, ast.Constant})
                     for node in ast.walk(tree)):
                 raise ValueError('pure wheel has an ambiguous dependency marker')
-        requirement = match[1] + ('==' + release_version if match[2] else '')
+        # One version: a release wheel requires every OA sibling at its own version,
+        # whether the source names the placeholder or no version.
+        requirement = match[1] + '==' + release_version
         if extra:
             marker = '(' + marker + ') and ' if marker else ''
             marker += f'extra == "{extra}"'

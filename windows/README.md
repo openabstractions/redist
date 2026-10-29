@@ -51,6 +51,17 @@ installs a file anywhere else, fails an executable in a folder no `PATH` entry
 names, and fails a `PATH` entry that is anything but the resolved `tools\`
 directory itself — so the programs cannot move out from under `PATH`.
 
+## Helper release metadata
+
+Source builds may supply the paired `build.py` options
+`--agent-release-channel stable --agent-release-version MAJOR.MINOR.PATCH.SEQUENCE`.
+The catalogue producer records the helper's actual tool declarations and empty
+static requests, needs and activation verbs in the private `OA_AGENT_RELEASE`
+PE resource before linking and signing. Each ordered component is 0–65535.
+The release owner supplies both values explicitly. An omitted pair preserves
+legacy metadata and fresh Update review; the builder derives no release order
+from a filename, clock or source hash. Prebuilt executables retain their bytes.
+
 ## Scope
 
 The package is **dual-purpose**: `Scope="perUserOrMachine"`, and the person
@@ -104,10 +115,14 @@ whose endpoint is absent, once within the call's budget.
 **Just for you, the Panel also gets a Startup shortcut**, running
 `Abstraction Panel.exe --background`: the native Asks presenter that polls for
 pending questions in the unlocked session ([Panel window behavior](../monitor/README.md#windows)).
-Installed for everyone, this is left off for every
-account; enable it for your own sign-in by adding a shortcut to
-`Abstraction Panel.exe --background` to your Startup folder (Win+R,
-`shell:startup`). Existing `--tray` shortcuts select the same background mode.
+Installed for everyone, the installer adds no such
+shortcut; the runtime's reconciler (`serve/runtime_logon_windows.go`)
+owns the presenter's sign-in entry and writes it for an account once that
+account confirms an application registration; on a per-machine install this
+is still unobserved, and `applications@3 ReadSignInStart` reports it. The setup step's one answer confirms
+the apps it names (research/first-run/DECISION.md §4). To enable it sooner,
+add a shortcut to `Abstraction Panel.exe --background` to your Startup folder
+(Win+R, `shell:startup`). Existing `--tray` shortcuts select the same background mode.
 Open Abstraction Panel or OpenAbstractions Setup from Start when needed.
 The runtime host owns service work; this session process presents Asks dialogs.
 
@@ -160,9 +175,10 @@ then stays refused with a sentence naming the machine-wide installation.
 | Examples and the panel | `Tools` | on | three examples that run `openabstractions status`, `download` and `jobs` against this install, plus Abstraction Panel |
 | Add to PATH | `Path` | on, a tick of its own | `tools\` on `PATH`; untick it and the programs are still installed |
 | Local model stores | `LocalStores` | on | `inventoryd`, the `abstraction.storage/inventory-source@1` provider, and the declaration file that declares it |
-| Model host | `ModelHost` | on | `modelhostd` and, on Windows x64, OA's 24-file llama.cpp b10825 Vulkan bundle for Setup to stage after approval; Windows ARM64 has the provider but no reviewed bundled engine |
-| Local image generation | `LemonadeImage` | off, x64 only | `lemonaded`, the provider that serves image generation, transcription and speech through the Lemonade app Setup installs, and its declaration `lemonade-image.json` |
-| MCP gateway | `McpGateway` | off | `openabstractions-mcp`, the local stdio MCP server |
+| Model host | `ModelHost` | on | `modelhostd` and, on Windows x64, OA's 27-file llama.cpp b10825 Vulkan bundle (24 publisher files and the app-local Visual C++ runtime) for Setup to stage after approval; Windows ARM64 has the provider but no reviewed bundled engine |
+| Local image generation | `LemonadeImage` | on, x64 only | `lemonaded`, the provider that serves image generation, transcription and speech through the Lemonade app Setup installs, and its declaration `lemonade-image.json` |
+| PyTorch local pictures | `PyTorchImage` | on, x64 only | `pytorchd` alone; on a Strix Halo computer Setup downloads its 1.7 GB runtime component (CPython 3.12.10, PyTorch 2.11.0 on ROCm 7.13.0 for gfx1151, Hummingbird-XT source, their notices) once the release catalog pins it, and prepares the engine after the model approval |
+| MCP gateway | `McpGateway` | on | `openabstractions-mcp`, the local stdio MCP server |
 | Developer files | `Developer` | off | `USING.txt` with the Go module paths and client package names, and the optional curl adapter header when a build carries it |
 | NAS downloads | `NasDownload` | held, hidden | a reserved name that installs nothing; see below |
 
@@ -183,23 +199,37 @@ package is installed and cannot be written into a file the package carries.
 installs beside the runtime.
 
 **Local model stores**, on by default. `inventoryd` reads Ollama, Hugging
-Face, LM Studio, ComfyUI, FastFlowLM and Jan, and reports what each one holds
+Face, Lemonade, LM Studio, ComfyUI, FastFlowLM, Jan, StabilityMatrix, Pinokio,
+SwarmUI and the ASUS AI apps, and reports what each one holds
 and which program's own index says it uses each thing. It reads listings,
 sizes and index files; it hashes nothing and writes in no store. Reading is
 the line the rights model draws and it is the line this default follows. The
-declaration accepts those six stores by name; the runtime serves a described
+declaration accepts every store name those adapters fix (`snapshot.Stores`);
+the runtime serves a described
 store only when an `abstraction.storage/inventory.provide` rule for it exists
-as well.
+as well. The runtime writes that rule for the installed `inventoryd` on each
+declared store when it reads the declaration, and leaves a rule the person
+already set, a deny included. Operator programs hold
+`abstraction.storage/inventory.read` on the composed inventory by
+installation, which Setup uses to find a model the machine already holds.
+They also hold `abstraction.storage/content.read` on exactly the SHA-256 of
+each model file Setup's reviewed catalog pins, so the inventory shows Setup
+a hashed copy of one; every other digest stays unreadable to them.
 
 **Model host**, on by default in this Windows package. On x64, the MSI carries
 `tools\engines\llama-b10825-oa-win-vulkan-x64.zip`, a deterministic bundle
-derived from the reviewed publisher archive. It holds only the 24 files that
-`modelhostd` permits in the staged engine directory, including the LLVM notice;
-the publisher's RPC server and command-line tools are absent. The derivation
-receipt and publisher MIT license sit beside it. Setup checks the bundle
-against the provider's separate exact size and SHA-256 pin, then stages the
-engine after the person approves the chat setup. A manually selected original
-publisher ZIP remains an explicit recovery source under its own archive pin.
+derived from the reviewed publisher archive. It holds only the 27 files that
+`modelhostd` permits in the staged engine directory: 24 publisher files,
+including the LLVM notice, and the 3 Microsoft Visual C++ runtime files the
+publisher's build imports, deployed app-locally because a clean Windows lacks
+them. The publisher's RPC server and command-line tools are absent. The
+derivation receipt and publisher MIT license sit beside it. Setup checks the
+bundle against the provider's separate exact size and SHA-256 pin, then stages
+the engine after the person approves the chat setup. The original publisher
+ZIP lacks the runtime and is refused as an install source.
+`build.py` refuses a package in which any staged program, library or engine
+bundle member imports a Visual C++ runtime DLL that is not beside it
+(`runtime_imports.py`).
 The MSI does not start or install the engine, and it carries no model. On
 Windows ARM64 the ModelHost feature still installs `modelhostd`, but there is
 no reviewed ARM64 engine archive or default chat engine to stage. Calls made
@@ -220,16 +250,19 @@ rule and the host holds nothing. The provider-held wake is 0.4.0's stated
 provisional exception, which a wake lease held for the requesting
 application replaces after research (VISION 2026-10-02).
 
-**Local image generation**, off by default and in x64 builds only.
+**Local image generation**, on by default and in x64 builds only.
 `lemonaded` serves image generation, transcription and speech through the
 pinned Lemonade app, and the feature places its declaration
 `lemonade-image.json` beside it. Installing the feature starts no engine and
 downloads no model: Setup in the Panel installs the Lemonade app and
 downloads the reviewed backends and models after the person agrees, then
-configures the provider with `lemonaded`'s own verbs.
+configures the provider with `lemonaded`'s own verbs. The declaration names
+each model's files by hash and the provider's `installed.json` as its store;
+the runtime offers a model only while that record names it and the bytes on
+disk match, so a fresh install lists the host as unavailable.
 The runtime starts the provider on the first request that needs it.
 
-**MCP gateway**, off by default. `openabstractions-mcp` is a local stdio MCP
+**MCP gateway**, on by default. `openabstractions-mcp` is a local stdio MCP
 server an assistant starts by its absolute path; the runtime never starts it,
 and it ships no declaration. Installing it grants it nothing. Its rights are
 the Panel's kind — rules an operator writes for one exact executable path —
@@ -268,7 +301,22 @@ workflow signs each MSI before this helper pins the chain, then signs the Burn
 engine and outer Setup through `windows_signing.py`. Required final verification
 and promotion bind the exact signed bytes and public certificate policy.
 
-    py -3.12 apps/build_bundle.py --chain chain.json --bal-ext WixToolset.BootstrapperApplications.wixext.dll --out out
+    py -3.12 apps/build_bundle.py --chain chain.json --bal-ext WixToolset.BootstrapperApplications.wixext.dll --util-ext WixToolset.Util.wixext.dll --upgrade-binary payload/tools/openabstractions.exe --actions-dll oa_bundle_actions.dll --actions-receipt native-receipt.json --actions-receipt-sha256 <admitted-sha256> --out out
+
+Before using a development bundle:
+
+- **Scope preflight:** `py -3.12 apps/build_bundle.py --installed-scope`
+  reports an installed OpenAbstractions the per-machine core cannot upgrade.
+- **Upgrade over the previous preview:** install the new bundle over the
+  previous one with no uninstall first. A fresh install plans every core
+  feature from its default; only an upgrade plans them from the installed
+  core, and a feature that core never registered takes its fresh default.
+- **Finish:** the success page shows **Finish** and the ticked **Open
+  OpenAbstractions** box, with no other launch button. Finish opens the setup
+  question on a fresh install and the Panel when setup is already done. Try
+  Finish ticked and unticked after an install, a change and a repair: each
+  press closes Setup. The page has no other close button, so a Finish that
+  leaves Setup open means only the window's X closes it.
 
 The bundle installs this package per-machine, with one administrator prompt,
 like a redistributable, and the runtime serves every account (owner,
@@ -276,6 +324,36 @@ like a redistributable, and the runtime serves every account (owner,
 dual-purpose MSI. The application MSIs stay per-user, and each
 prefers the Panel a machine-wide installation records over a per-user one.
 Run on its own, this package still defaults to Just me.
+The bundle asks for administrator rights whenever it needs them and never
+fails with access denied (owner, 2026-10-31): every per-machine package in this
+per-user bundle is cached only while it runs (`Cache="remove"`), inside the
+elevated step Burn starts for it.
+The core is a permanent, visible package of the bundle, like a redistributable:
+removing or upgrading a bundle never uninstalls it, and the person removes it
+from Apps.
+
+**Settings → Apps shows one entry, OpenAbstractions** (owner, 2026-10-31):
+
+| Registration | In Apps | Removed by |
+|---|---|---|
+| OpenAbstractions (the core MSI) | shown | Apps; removes the runtime and Panel for every app |
+| OpenAbstractions Setup (the bundle) | hidden: modify and remove disabled, so Burn registers it as a system component | running Setup again → **Uninstall** |
+| an application's OA integration, such as OpenCode with OA | hidden | running Setup again → its box, or **Uninstall** |
+| an official application, such as OpenCode | its own entry | its own uninstaller |
+
+The hidden bundle stays registered, so the next Setup upgrades it and keeps
+its package cache. After the core's removal, an application's OA integration
+stays installed and says OpenAbstractions is unavailable in the application.
+
+The screens the person sees, one per state:
+
+- First install: the licence link and "I agree" box, **Options**, **Install** and **Cancel**.
+- Options, from a first install: one box per application, **OK** and **Cancel**, both back to the install screen.
+- Already installed (Setup run again; modify or repair): **Choose applications**, **Apply app choices**, **Uninstall** and **Cancel**.
+- Options, from that screen: the same boxes, **OK** and **Cancel**, both back to the installed screen.
+- Progress: the package being installed, the progress bar and **Cancel**.
+- Success: the finished heading and **Finish**. After an install, change or repair, a ticked **Open OpenAbstractions** box sits above it. Finish closes Setup and, while the box is ticked, opens OpenAbstractions in the installing account: the setup question when there is setup to do, otherwise the Panel. **Restart** appears only when Windows needs one, and then the box does not. The box is also hidden while Setup runs as administrator, where the setup step refuses to run. Each press of Finish writes one line to the Setup log: `Finish opened OpenAbstractions (--finish --update)`, `Finish closed Setup without opening OpenAbstractions`, or the launch error.
+- Failure: the failed heading, the log link and its message, **Close**, plus **Restart** only when Windows needs one.
 
 ## Commands
 
@@ -330,8 +408,11 @@ same command before the removal. A successor's upgrade runs neither, and a
 failure never stops the removal. An elevated removal of a per-user install
 skips both commands and leaves the engine folders locked; run
 `modelhostd engine unlock` and `lemonaded engine unlock` unelevated before it.
-A removal rolled back after the unlock leaves the engine folders writable, and
-the provider's next launch refuses them with its reinstall message.
+A removal rolled back after the unlock, or followed by a new install, leaves the
+engine folders writable. The model host's next start hashes its engine folder
+and makes it read-only again when every file matches the pin. The Lemonade
+provider's next launch refuses its folders, and Setup offers the Lemonade step
+again.
 
 A machine removal runs `openabstractions host sandbox-roots revoke` before the
 files go, which takes the two sandbox root entries back (a temporary
@@ -354,9 +435,11 @@ before it.
 
 ## Upgrade
 
-**Upgrades stop nothing.** Restart Manager stays on
-(`MSIRESTARTMANAGERCONTROL=0`, `MSIRMSHUTDOWN=0`) and ends the running host at
-`InstallValidate`, before any custom action. The early script, flushed by an
+Setup closes OA's own identified processes before Windows Installer starts.
+It does this under the upgrade exclusion, which the MSI continues through a
+per-run chain token. The package stops nothing. Restart Manager reports only
+other applications. It stays on (`MSIRESTARTMANAGERCONTROL=0`,
+`MSIRMSHUTDOWN=0`). The early script, flushed by an
 `InstallExecute` before any file is replaced, holds the upgrade exclusion
 (`service begin-upgrade`), registers its release at commit (`service
 end-upgrade`) and registers the rollback activation (`service start --related`
@@ -370,6 +453,19 @@ restart when the transaction ends; that and `StartUserRuntime` meet at one
 endpoint and one of them exits. Every installer command appends its failure to
 `upgrade-v1\installer-actions.txt` beside its scope's exclusion record, because
 Windows Installer discards custom action output.
+
+Running the bare MSI with msiexec retains Windows' files-in-use handling.
+
+When a package finds files in use, the Setup log names the package, the
+holders Windows reported and the answer:
+`OpenAbstractions: package <id> reports files in use (Restart Manager, answer
+<n>): ...`.
+
+This change's upgrade journeys are requalified from the latest predecessor
+build only; older predecessors are not requalified. The disposable full-UI
+journey first checks that the Burn log carries the per-run token on the early
+ExePackage command line; propagation to the elevated engine remains pending
+that separate run. No own/foreign-holder installed journey runs on the owner's PC.
 
 `RemoveExistingProducts` runs after `InstallFinalize`: the predecessor is removed
 once this version is committed, so a failure at any earlier point leaves the

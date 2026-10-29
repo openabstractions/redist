@@ -4,6 +4,20 @@ from artifact_attempts import PRODUCERS, select
 
 
 class ArtifactAttempts(unittest.TestCase):
+    def test_local_provenance_still_requires_same_run_language_artifacts(self):
+        source = "a" * 40
+        roles = [key for key in PRODUCERS if key != "SDK_PROVENANCE_ARTIFACT"]
+        jobs = [dict(name=PRODUCERS[key][0], run_attempt=2, head_sha=source,
+                     status="completed", conclusion="success") for key in roles]
+        artifacts = [dict(name=PRODUCERS[key][1] + "2", expired=False,
+                          workflow_run=dict(id=73, head_sha=source)) for key in roles]
+        self.assertEqual(set(select(jobs, artifacts, source, 73, 2, local_provenance=True)), set(roles))
+        with self.assertRaisesRegex(ValueError, "missing producing job"):
+            select(jobs, artifacts, source, 73, 2)
+        artifacts[0]["workflow_run"]["id"] = 74
+        with self.assertRaisesRegex(ValueError, "mismatched producer artifact"):
+            select(jobs, artifacts, source, 73, 2, local_provenance=True)
+
     def test_successful_producer_attempt_survives_verify_retry(self):
         source = "a" * 40
         jobs = []

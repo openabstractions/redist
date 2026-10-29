@@ -9,11 +9,14 @@
   The application records its folder in a JSON configuration file under the
   account's roaming application data. FindHostFolder (hostfolder.c, an
   immediate custom action in both sequences) reads it before the launch
-  conditions and sets HostFolder to <folder>\<subfolder>\. Install places the
+  conditions and sets HostFolder to <folder>\<subfolder>\. OAHOSTCONFIG, when
+  given, names another configuration file of that shape. Install places the
   extension's files in HostFolder\<name>, and records HostFolder under
   HKCU\Software\OpenAbstractions\Extensions\<id>; a repair, change or
   uninstall reads it back from there, so the folder the files went to is the
-  folder they leave. Uninstall removes the extension's files, the Python
+  folder they leave. An extension that registers its application also writes
+  the Applications record app.wxs writes, naming its manifest, so the Panel's
+  removal on uninstall matches the extension's own program. Uninstall removes the extension's files, the Python
   bytecode folders beside them, the files and folders the extension declares it
   writes, and the folders once they are empty. An extension that declares a
   Python setup script has it run by its host's venv after install (see
@@ -36,6 +39,19 @@
            Compressed="yes">
     <MajorUpgrade AllowSameVersionUpgrades="yes"
                   DowngradeErrorMessage="A newer $(var.Title) is already installed." />
+    <!-- The fresh-install caller has no predecessor to restore. Detect
+         every related version without adding it to the removal set. -->
+    <Property Id="OAFRESHONLY" Secure="yes" />
+    <Upgrade Id="$(var.UpgradeCode)">
+      <UpgradeVersion Minimum="0.0.0" IncludeMinimum="yes" OnlyDetect="yes"
+                      MigrateFeatures="no" Property="OAFRESHRELATED" />
+    </Upgrade>
+    <CustomAction Id="RefuseFreshExtensionReplacement"
+                  Error="A related integration is already installed. Resolve it before connecting." />
+    <InstallExecuteSequence>
+      <Custom Action="RefuseFreshExtensionReplacement" After="FindRelatedProducts"
+              Condition="OAFRESHONLY AND (Installed OR OAFRESHRELATED)" />
+    </InstallExecuteSequence>
     <MediaTemplate EmbedCab="yes" />
 
 <?if $(var.RequireOpenAbstractions) = "yes" ?>
@@ -67,6 +83,11 @@
     <Property Id="OaHostSubfolder" Value="$(var.HostSubfolder)" />
     <Property Id="OaExtensionName" Value="$(var.Folder)" />
     <SetProperty Id="OaHostConfig" Action="SetHostConfig" Value="$(var.HostConfig)" Before="AppSearch" Sequence="both" />
+    <!-- An application folder found elsewhere, such as a portable copy: the
+         caller writes a configuration file of the same shape naming that
+         folder and passes its full path as OAHOSTCONFIG. -->
+    <SetProperty Id="OaHostConfig" Action="SetChosenHostConfig" Value="[OAHOSTCONFIG]" After="SetHostConfig"
+                 Condition="OAHOSTCONFIG" Sequence="both" />
     <Binary Id="HostFolderAction" SourceFile="$(var.HostFolderDll)" />
     <CustomAction Id="FindHostFolder" BinaryRef="HostFolderAction" DllEntry="FindHostFolder"
                   Execute="immediate" Return="check" />
@@ -94,6 +115,17 @@
                        Name="folder" Type="string" Value="[HostFolder]" KeyPath="yes" />
         <RemoveRegistryKey Root="HKCU" Key="Software\OpenAbstractions\Extensions\$(var.ExtensionId)" Action="removeOnUninstall" />
       </Component>
+<?if $(var.RegisterApplication) = "yes" ?>
+      <!-- The Applications record app.wxs writes: it names the manifest the
+           Panel registers, whose program is this extension's, in the host's
+           folder. The Panel's removal reads that program when the
+           uninstaller's request arrives, before this record and the files
+           are removed. -->
+      <Component Id="ApplicationRecord">
+        <RegistryValue Root="HKCU" Key="Software\OpenAbstractions\Applications\$(var.ExtensionId)"
+                       Name="manifest" Type="string" Value="[ExtensionFolder]application-manifest.json" KeyPath="yes" />
+      </Component>
+<?endif?>
     </ComponentGroup>
 
 <?if $(var.PythonSetup) = "yes" ?>
@@ -122,7 +154,7 @@
                   Execute="deferred" Impersonate="yes" Return="check" />
     <CustomAction Id="ValidateRegistrationHost" BinaryRef="HostFolderAction" DllEntry="ValidateRegistrationHost"
                   Execute="immediate" Return="check" />
-    <!-- As app.wxs: this requests the person's Panel confirmation. It conveys
+    <!-- As app.wxs: the Panel registers the manifest without a question. It conveys
          no registration success, readiness or permission grant to the MSI. -->
     <CustomAction Id="RegisterApplication" Property="OaPanel"
                   ExeCommand="--register-application &quot;[ExtensionFolder]application-manifest.json&quot;"

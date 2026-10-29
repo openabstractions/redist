@@ -32,6 +32,26 @@ Runner = Callable[..., subprocess.CompletedProcess[str]]
 
 PANEL_MODULE = 'github.com/openabstractions/abstractions/monitor'
 PANEL_CATALOGUE = 'internal/setup/adopter_assets.json'
+PANEL_INSTALLER_RESOURCE = 'internal/panelres/rsrc_windows_amd64.syso'
+RUNTIME_MODULE = 'github.com/openabstractions/abstractions/serve'
+
+
+def runtime_program(row):
+    return _windows_build_owner().shipped_program_role(row[1].rsplit('@', 1)[0], row[2]) == 'runtime'
+
+
+def _windows_build_owner():
+    path = Path(__file__).parent.parent / 'windows/build.py'
+    if not path.is_file():
+        path = Path(__file__).resolve().parents[3] / 'installer/build.py'
+    sys.path.insert(0, str(path.parent))
+    try:
+        spec = importlib.util.spec_from_file_location('oa_shipped_images_build_owner', path)
+        owner = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(owner)
+        return owner
+    finally:
+        sys.path.pop(0)
 
 
 def require_program_package(raw, module, version, package):
@@ -56,7 +76,8 @@ def _panel_assets_owner():
     return owner,pin
 
 
-def select_panel_source(prepared_graph, proxy_root, catalogue_directory, *, expected_producer, expected_apps):
+def select_panel_source(prepared_graph, proxy_root, catalogue_directory, *, expected_producer, expected_apps,
+                        expected_installer_priors=None, history_environment=None, history_wix='wix'):
     """Join authenticated produced metadata to the selected immutable module ZIP.
 
     The caller receives catalogue_directory through the existing API artifact
@@ -93,6 +114,24 @@ def select_panel_source(prepared_graph, proxy_root, catalogue_directory, *, expe
     carrier = dict(module_zip=Path(proxy_root)/prefix,catalogue_path=directory/'panel-catalogue.json',
         module_row=module,expected_archive={key:archives[0][key] for key in ('bytes','sha256')},
         expected_catalogue=descriptor['catalogue'],producer=dict(expected_producer),expected_apps=list(expected_apps))
+    intake = directory / 'installer-priors' / 'installer-prior-intake.json'
+    if expected_installer_priors is not None:
+        path = Path(__file__).parent.parent / 'windows/windows_signing.py'
+        spec = importlib.util.spec_from_file_location('oa_panel_prior_intake_owner', path)
+        relay = importlib.util.module_from_spec(spec); spec.loader.exec_module(relay)
+        relay.installer_prior_descriptor(expected_installer_priors)
+        received = json.loads(intake.read_bytes(), object_pairs_hook=assets.strict_object)
+        if (set(received) != {'schema', 'descriptor', 'producer'} or received['schema'] != 1
+                or received['descriptor'] != expected_installer_priors or received['producer'] != expected_producer
+                or expected_installer_priors['source'] != prepared_graph['source']):
+            raise ValueError('Panel installer predecessor intake differs from authenticated prepared inputs')
+        archives = [intake.parent / str(i) / row['asset']['name'] for i, row in enumerate(expected_installer_priors['priors'])]
+        with tempfile.TemporaryDirectory(prefix='oa-panel-prior-history-') as temporary:
+            raw = relay.installer_prior_history(expected_installer_priors, archives, Path(temporary)/'history',
+                wix=history_wix,environment=history_environment)
+        carrier['installer_history'] = json.loads(raw)
+    elif intake.exists():
+        raise ValueError('Panel installer predecessor intake lacks independently selected authority')
     arguments = dict(carrier)
     module_zip,catalogue_path = arguments.pop('module_zip'),arguments.pop('catalogue_path')
     _panel_projection_inputs(module_zip,catalogue_path,**arguments)
@@ -100,7 +139,7 @@ def select_panel_source(prepared_graph, proxy_root, catalogue_directory, *, expe
 
 
 def _panel_projection_inputs(module_zip, catalogue_path, *, module_row, expected_archive,
-                             expected_catalogue, producer, expected_apps):
+                             expected_catalogue, producer, expected_apps, installer_history=None):
     """Read one authenticated module and catalogue; retain their distinct pins."""
     assets,catalogue_owner=_panel_assets_owner()
     def read(path, expected):
@@ -127,7 +166,7 @@ def _panel_projection_inputs(module_zip, catalogue_path, *, module_row, expected
         raise ValueError('Panel source module or producer identity differs')
     archive, archive_pin = read(module_zip, expected_archive)
     catalogue, catalogue_pin = read(catalogue_path, expected_catalogue)
-    rows = assets.roster_text(catalogue.decode('utf-8'))
+    rows = assets.panel_catalogue_rows(catalogue)
     if (rows.version != module_row['version'].removeprefix('v') or
             len(set(expected_apps)) != len(expected_apps) or
             {row['id'] for row in rows} != set(expected_apps)):
@@ -165,22 +204,45 @@ def _panel_projection_inputs(module_zip, catalogue_path, *, module_row, expected
                 for name, raw in sorted(values.items())]
     original = pins(files)
     files[PANEL_CATALOGUE] = catalogue
+    if installer_history is not None:
+        if (not isinstance(installer_history,dict) or set(installer_history) != {'schema','predecessors'}
+                or type(installer_history['schema']) is not int or installer_history['schema'] != 1
+                or not isinstance(installer_history['predecessors'],list) or not 1 <= len(installer_history['predecessors']) <= 8):
+            raise ValueError('Panel requires nonempty verified installer predecessor history')
+        seen=set()
+        for row in installer_history['predecessors']:
+            if (not isinstance(row,dict) or set(row) != {'product_code','msi_sha256','receipt_sha256','bundle_sha256',
+                    'gateway_id','gateway_path','gateway_sha256','gateway_bytes'}
+                    or not re.fullmatch(r'\{[0-9A-F]{8}-(?:[0-9A-F]{4}-){3}[0-9A-F]{12}\}',str(row['product_code']))
+                    or row['product_code'] in seen or not isinstance(row['gateway_id'],str) or not row['gateway_id']
+                    or any(c in row['gateway_id'] for c in '/\\:\0')
+                    or not isinstance(row['gateway_path'],str)
+                    or not row['gateway_path'].endswith('/OpenAbstractions/tools/openabstractions-mcp.exe')
+                    or type(row['gateway_bytes']) is not int or not 1 <= row['gateway_bytes'] <= 256 << 20
+                    or any(not re.fullmatch('[0-9a-f]{64}',str(row[key])) for key in ('msi_sha256','receipt_sha256','bundle_sha256','gateway_sha256'))):
+                raise ValueError('Panel installer predecessor history is malformed or duplicate')
+            seen.add(row['product_code'])
+        files['installer-gateway-history.json'] = json.dumps(installer_history,sort_keys=True,separators=(',',':')).encode()
+        if len(files['installer-gateway-history.json']) > 16384:
+            raise ValueError('Panel installer predecessor history exceeds the runtime resource bound')
     _, recipe = observed_input(Path(__file__))
     record = dict(recipe='monitor-compiled-catalogue-v1',
         recipe_input={key:recipe[key] for key in ('bytes','sha256')}, module=dict(module_row),
         catalogue_owner={key:catalogue_owner[key] for key in ('bytes','sha256')},
         source_archive=archive_pin, catalogue=catalogue_pin, producer=dict(producer),
         expected_apps=sorted(expected_apps), original_files=original, files=pins(files))
+    if installer_history is not None:record['installer_history'] = installer_history
     return files, record
 
 
 def prepare_panel_source(module_zip, catalogue_path, output, *, module_row, expected_archive,
-                         expected_catalogue, producer, expected_apps):
-    """Create one fresh exact monitor source with only its catalogue replaced."""
+                         expected_catalogue, producer, expected_apps, installer_history=None,
+                         resource_environment=None, resource_runner=None):
+    """Project the catalogue and selected installer history into fresh monitor source."""
     files, record = _panel_projection_inputs(module_zip, catalogue_path, module_row=module_row,
         expected_archive=expected_archive, expected_catalogue=expected_catalogue,
-        producer=producer, expected_apps=expected_apps)
-    output = Path(output)
+        producer=producer, expected_apps=expected_apps, installer_history=installer_history)
+    output = Path(output).absolute()
     if output.exists() or output.is_symlink() or output.is_junction():
         raise ValueError('Panel source projection must be new')
     for parent in output.parents:
@@ -190,18 +252,44 @@ def prepare_panel_source(module_zip, catalogue_path, output, *, module_row, expe
         target = output / name
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_bytes(raw)
+    if installer_history is not None:
+        environment=dict(os.environ if resource_environment is None else resource_environment)
+        go = str(Path(environment['GOROOT'])/'bin/go.exe') if 'GOROOT' in environment else shutil.which('go',path=environment.get('PATH'))
+        if not go or not Path(go).is_absolute():raise ValueError('Panel history requires an admitted absolute Go executable')
+        for key in ('GOOS','GOARCH','GOFLAGS','CGO_ENABLED','CC'):
+            environment.pop(key,None)
+        compiler=output/'icon/gen'
+        resource=output/PANEL_INSTALLER_RESOURCE
+        if not resource.is_file() or not compiler.is_dir():
+            raise ValueError('Panel history requires the original combined resource and source generator')
+        resource.unlink()  # The generator requires a fresh output in this new owned projection.
+        argv=[go,'run',*[str(compiler/name) for name in ('main.go','native.go','agent_release.go')],
+            '-installer-history-json',str(output/'installer-gateway-history.json'),
+            '-agent-release-object',str(resource),'-agent-release-arch','amd64','-installer-history-panel-dir',str(output)]
+        (resource_runner or subprocess.run)(argv,check=True,env=environment)
+        record['installer_resource']={k:observed_file(resource)[k] for k in ('bytes','sha256')}
+        record['resource_compiler']={k:observed_file(Path(go))[k] for k in ('bytes','sha256')}
+        record['files']=[dict(row,**record['installer_resource']) if row['path']==PANEL_INSTALLER_RESOURCE else row for row in record['files']]
     verify_panel_source(output, record, module_zip=module_zip, catalogue_path=catalogue_path,
         module_row=module_row, expected_archive=expected_archive, expected_catalogue=expected_catalogue,
-        producer=producer, expected_apps=expected_apps)
+        producer=producer, expected_apps=expected_apps, installer_history=installer_history)
     return record
 
 
 def verify_panel_source(output, provenance, *, module_zip, catalogue_path, module_row,
-                        expected_archive, expected_catalogue, producer, expected_apps):
+                        expected_archive, expected_catalogue, producer, expected_apps, installer_history=None):
     """Recompute from authenticated originals before/after link and cached reuse."""
     _, expected = _panel_projection_inputs(module_zip, catalogue_path, module_row=module_row,
         expected_archive=expected_archive, expected_catalogue=expected_catalogue,
-        producer=producer, expected_apps=expected_apps)
+        producer=producer, expected_apps=expected_apps, installer_history=installer_history)
+    if installer_history is not None:
+        for key in ('installer_resource','resource_compiler'):
+            pin=provenance.get(key)
+            if (not isinstance(pin,dict) or set(pin) != {'bytes','sha256'} or type(pin['bytes']) is not int
+                    or pin['bytes'] <= 0 or not re.fullmatch('[0-9a-f]{64}',str(pin['sha256']))):
+                raise ValueError('Panel installer resource provenance is incomplete')
+            expected[key]=dict(pin)
+        expected['files']=[dict(row,**expected['installer_resource']) if row['path']==PANEL_INSTALLER_RESOURCE else row for row in expected['files']]
     if provenance != expected:raise ValueError('Panel generated source provenance differs')
     output = Path(output)
     if output.is_symlink() or output.is_junction() or not output.is_dir():
@@ -246,14 +334,15 @@ def observed_input(path: Path) -> tuple[bytes, dict]:
 
 def observe_windows_builds(tools: Path, output: Path, provenance: Path,
                            runner: Runner | None = None, *, environment=None, receipt=None,
-                           panel_source=None) -> dict:
+                           panel_source=None, phase='all', provider_images=None) -> dict:
     """Retain actual child exits, including failed/interrupted observations."""
     if receipt is not None and (receipt.exists() or receipt.is_symlink()):
         raise ValueError('observed build receipt must be new')
     state = {'schema': 1, 'status': 'running', 'commands': []}
     try:
         result = _observe_windows_builds(tools, output, provenance, runner, environment=environment,
-                                        observation=state, panel_source=panel_source)
+                                        observation=state, panel_source=panel_source,
+                                        phase=phase, provider_images=provider_images)
     except BaseException as error:
         state.update(status='failed', failure=type(error).__name__)
         if receipt is not None:
@@ -265,7 +354,8 @@ def observe_windows_builds(tools: Path, output: Path, provenance: Path,
 
 
 def _observe_windows_builds(tools: Path, output: Path, provenance: Path,
-                            runner: Runner | None, *, environment, observation, panel_source=None) -> dict:
+                            runner: Runner | None, *, environment, observation, panel_source=None,
+                            phase='all', provider_images=None) -> dict:
     """Execute the fixed roster twice, retaining observed links and cache pins.
 
     Embedded modules describe the linked closure. Cache observations are not
@@ -292,6 +382,24 @@ def _observe_windows_builds(tools: Path, output: Path, provenance: Path,
     tools_text = tools_bytes.decode('utf-8')
     rows = release_rows(tools_text, 'tools.tsv')
     read_modules(tools, text=tools_text)
+    if phase not in ('all', 'providers', 'runtime'):
+        raise ValueError('unknown observed build phase')
+    if phase != 'all':
+        helpers.append(observed_input(Path(_windows_build_owner().__file__))[1])
+    if phase == 'runtime':
+        if not isinstance(provider_images, dict) or set(provider_images) != {'amd64', 'arm64'}:
+            raise ValueError('runtime build requires final signed provider images for both architectures')
+        owner = _windows_build_owner()
+        records = {arch: owner.encode_shipped_provider_images(images)
+                   for arch, images in provider_images.items()}
+        provider_images = {arch: owner.decode_shipped_provider_images(encoded)
+                           for arch, encoded in records.items()}
+    elif provider_images is not None:
+        raise ValueError('provider image inputs belong to the final runtime build')
+    if phase != 'all':
+        rows = [row for row in rows if runtime_program(row) == (phase == 'runtime')]
+        if not rows:
+            raise ValueError('observed build phase has no selected programs')
     if len({row[0].lower() for row in rows}) != len(rows):
         raise ValueError('observed Windows output names collide')
     for name, module, package, _, subsystem in rows:
@@ -366,6 +474,8 @@ def _observe_windows_builds(tools: Path, output: Path, provenance: Path,
                     raise ValueError('program module differs from prepared graph')
                 target = module + ('' if package == '.' else '/' + package) + '@' + version
                 flags = '-s -w -buildid=' + (' -H=windowsgui' if subsystem == 'windows' else '')
+                if phase == 'runtime' and records[arch]:
+                    flags += ' -X main.shippedProviderImages=' + records[arch]
                 destination = output / pass_name / arch / name
                 destination.parent.mkdir(parents=True, exist_ok=True)
                 projected = module == PANEL_MODULE and arch == 'amd64'
@@ -380,7 +490,7 @@ def _observe_windows_builds(tools: Path, output: Path, provenance: Path,
                     archive_row = graph_files['proxy/'+escape_module(module) + '/@v/' + version + '.zip']
                     if arguments['expected_archive'] != {key:archive_row[key] for key in ('bytes','sha256')}:
                         raise ValueError('Panel original module archive differs from prepared graph')
-                    projection = prepare_panel_source(module_zip,catalogue_path,source,**arguments)
+                    projection = prepare_panel_source(module_zip,catalogue_path,source,**arguments,resource_environment=dict(selected,GOROOT=info['GOROOT']))
                     link = command([go,'-C',str(source),'build','-ldflags',flags,'-o',str(destination),'.'],selected)
                     verify_panel_source(source,projection,module_zip=module_zip,catalogue_path=catalogue_path,**arguments)
                 else:
@@ -391,6 +501,8 @@ def _observe_windows_builds(tools: Path, output: Path, provenance: Path,
                     binary /= (module if package == '.' else package).rsplit('/', 1)[-1] + '.exe'
                     shutil.copyfile(binary, destination)
                     binary.unlink()  # Only the exact file in this task-owned GOPATH.
+                record_sha = (_windows_build_owner().verify_shipped_runtime_record(destination, provider_images[arch])
+                              if phase == 'runtime' else None)
                 metadata = command([go, 'version', '-m', str(destination)], selected)
                 consumed = []
                 for line in metadata['stdout'].splitlines():
@@ -429,6 +541,8 @@ def _observe_windows_builds(tools: Path, output: Path, provenance: Path,
                 program = {'pass': pass_name, 'arch': arch, 'name': name, 'module': module_version,
                     'package': package, 'feature': feature, 'subsystem': subsystem, 'link': link,
                     'metadata': metadata, 'artifact': observed_file(destination), 'consumed': consumed}
+                if record_sha is not None and program['artifact']['sha256'] != record_sha:
+                    raise ValueError('observed runtime changed after shipped record readback')
                 if projected:
                     verify_panel_source(source,projection,module_zip=module_zip,catalogue_path=catalogue_path,**arguments)
                     program['panel_source'] = projection
@@ -447,19 +561,24 @@ def _observe_windows_builds(tools: Path, output: Path, provenance: Path,
             retained.extend([*module['cache_files'], module['ziphash']])
     if any(pin != observed_file(Path(pin['path'])) for pin in retained):
         raise ValueError('consumed input or output changed during observed builds')
-    return dict(evidence, observed_windows_builds={'schema': 1, 'status': 'complete', 'producer': producer,
+    result = dict(evidence, observed_windows_builds={'schema': 1, 'status': 'complete', 'producer': producer,
         'provenance': provenance_pin, 'tools': tools_pin, 'helpers': helpers, 'compiler': compiler,
         'environment': {k: env[k] for k in ('GOENV', 'GOTOOLCHAIN', 'GOWORK', 'GOOS', 'CGO_ENABLED',
             'GOFLAGS', 'GOMODCACHE', 'GOCACHE', 'GOPATH', 'GOPROXY', 'GOSUMDB', 'GONOSUMDB',
             'GOPRIVATE', 'GONOPROXY', 'GOEXPERIMENT', 'GOAMD64', 'GOARM64', 'GOMAXPROCS') if k in env},
         'programs': programs, 'commands': calls, 'reproducible': True,
         'consumption_scope': 'embedded linked modules joined to actual cached zip/mod/info; not a source-file access trace'})
+    if phase != 'all':
+        result['observed_windows_builds']['phase'] = phase
+    if phase == 'runtime':
+        result['observed_windows_builds']['provider_images'] = provider_images
+    return result
 
 
 def admit_observed_windows_builds(original_bytes: bytes, observed_bytes: bytes, *,
         expected_graph: dict, expected_archive: dict, tools_bytes: bytes,
         expected_producer: dict, expected_helpers: list[dict], sdk_facts: dict,
-        expected_panel_source=None) -> list[dict]:
+        expected_panel_source=None, phase='all', expected_provider_images=None) -> list[dict]:
     """Admit hosted observations as unsigned facts; never open hosted paths.
 
     The caller authenticates the transport and supplies current prepared inputs
@@ -517,15 +636,25 @@ def admit_observed_windows_builds(original_bytes: bytes, observed_bytes: bytes, 
             any(observed[k] != value for k, value in original.items())):
         fail('prepared inputs or producer differ')
     build = observed['observed_windows_builds']
+    phase_fields = ({'phase'} if phase != 'all' else set()) | ({'provider_images'} if phase == 'runtime' else set())
+    if phase not in ('all', 'providers', 'runtime') or (phase != 'all' and build.get('phase') != phase):
+        fail('build phase')
+    if phase == 'runtime':
+        if (not isinstance(expected_provider_images, dict) or set(expected_provider_images) != {'amd64', 'arm64'}
+                or build.get('provider_images') != expected_provider_images):
+            fail('final signed provider inputs')
+        owner = _windows_build_owner()
+        records = {arch: owner.encode_shipped_provider_images(images)
+                   for arch, images in expected_provider_images.items()}
     if (set(build) != {'schema', 'status', 'producer', 'provenance', 'tools', 'helpers', 'compiler',
-                      'environment', 'programs', 'commands', 'reproducible', 'consumption_scope'} or
+                      'environment', 'programs', 'commands', 'reproducible', 'consumption_scope'} | phase_fields or
             type(build['schema']) is not int or build['schema'] != 1 or build['status'] != 'complete' or
             build['reproducible'] is not True or build['producer'] != expected_producer or
             pin(build['provenance']) != raw_pin(original_bytes) or pin(build['tools']) != raw_pin(tools_bytes) or
             build['consumption_scope'] != 'embedded linked modules joined to actual cached zip/mod/info; not a source-file access trace'):
         fail('incomplete observations or consumed input pins')
     if ([pin(p) for p in build['helpers']] != [pin(p) for p in expected_helpers] or
-            len(build['helpers']) != 2):
+            len(build['helpers']) != (2 if phase == 'all' else 3)):
         fail('source helper pins')
     compiler = build['compiler']; info = compiler['environment']; go = compiler['executable']['path']
     if (set(compiler) != {'executable', 'tools', 'environment', 'version'} or
@@ -558,6 +687,8 @@ def admit_observed_windows_builds(original_bytes: bytes, observed_bytes: bytes, 
             env.get('GOEXPERIMENT', '') != ''):
         fail('selected build environment')
     rows = release_rows(tools_bytes.decode('utf-8'), 'tools.tsv')
+    if phase != 'all':
+        rows = [row for row in rows if runtime_program(row) == (phase == 'runtime')]
     if (not rows or len({r[0].lower() for r in rows}) != len(rows) or
             any(not re.fullmatch(r'[A-Za-z0-9_. -]+\.exe', r[0]) or r[0] in ('.exe', '..exe')
                 for r in rows)): fail('roster collision or invalid output')
@@ -579,6 +710,8 @@ def admit_observed_windows_builds(original_bytes: bytes, observed_bytes: bytes, 
                 [pass_name, arch, name, module_version, package, feature, subsystem] or subsystem not in ('console', 'windows') or
                 module not in modules or modules[module]['version'] != version): fail('program identity')
         flags = '-s -w -buildid=' + (' -H=windowsgui' if subsystem == 'windows' else '')
+        if phase == 'runtime' and records[arch]:
+            flags += ' -X main.shippedProviderImages=' + records[arch]
         target = module + ('' if package == '.' else '/' + package) + '@' + version
         if projected:
             if package != '.' or expected_panel_source['module'] != modules[module] or expected_panel_source['producer'] != expected_producer:
@@ -631,7 +764,7 @@ def admit_observed_windows_builds(original_bytes: bytes, observed_bytes: bytes, 
             if remote(consumed['ziphash']['path']) != remote(env['GOMODCACHE']) + '/cache/download/' + cache_prefix + '.ziphash': fail('ziphash path')
         key = (arch, name)
         if pass_name == 'a':
-            output[key] = {'arch': arch, 'name': name, 'module': module_version, **artifact_pin}
+            output[key] = {'arch': arch, 'name': name, 'module': module_version, 'package': package, **artifact_pin}
             if projected:output[key]['panel_source'] = expected_panel_source
         elif artifact_pin != {k: output[key][k] for k in ('sha256', 'bytes')}: fail('two-pass output differs')
     return list(output.values())
@@ -925,25 +1058,43 @@ def main() -> int:
     parser.add_argument('--observe-windows-builds', type=Path,
                         help='execute the fixed tools roster twice under this output root')
     parser.add_argument('--provenance', type=Path, help='existing prepared module provenance for observed builds')
+    parser.add_argument('--build-phase', choices=('all', 'providers', 'runtime'), default='all')
+    parser.add_argument('--provider-images', type=Path,
+                        help='final signed provider SHA-256 images by architecture, for runtime linking')
     parser.add_argument('--panel-catalogue-directory',type=Path,
                         help='existing API-intake directory containing exact generated Panel build data')
     parser.add_argument('--panel-proxy',type=Path,help='verified prepared graph proxy containing the original module ZIP')
     parser.add_argument('--panel-apps',help='JSON list of independently selected current app-pin consumers')
     args = parser.parse_args()
+    if args.observe_windows_builds is None and (args.build_phase != 'all' or args.provider_images is not None):
+        parser.error('build phase and provider images require observed Windows builds')
     if args.observe_windows_builds is not None:
         if (args.tools is None or args.provenance is None or args.prepared_graph is not None or
                 args.prepared_sidecar is not None or args.release_version is not None or
                 args.prepared_directory is not None or args.workflow_environment or args.output.exists()):
             parser.error('observed Windows builds need tools, provenance and a new receipt output only')
+        if (args.build_phase != 'runtime' and (Path(__file__).parent.parent/'windows/installer-prior-authorities.json').is_file()
+                and any(row[1].rsplit('@',1)[0] == PANEL_MODULE for row in release_rows(args.tools.read_text(), 'tools.tsv'))
+                and not (Path(__file__).parent.parent/'installer-priors.json').is_file()):
+            raise ValueError('current RC Panel requires authenticated installer predecessor intake before compilation')
         panel_source=None
         panel_args=(args.panel_catalogue_directory,args.panel_proxy,args.panel_apps)
         if any(value is not None for value in panel_args):
             if any(value is None for value in panel_args):parser.error('Panel build input requires directory, proxy and selected apps together')
             original=json.loads(args.provenance.read_bytes())
+            prior_path=Path(__file__).parent.parent/'installer-priors.json'
+            prior_descriptor=json.loads(prior_path.read_bytes()) if prior_path.is_file() else None
+            selected_wix=None
+            if prior_descriptor is not None:
+                selected_wix=shutil.which('wix')
+                if not selected_wix:raise ValueError('pinned WiX is required before Panel predecessor extraction')
+                selected_wix=str(Path(selected_wix).resolve())
             panel_source=select_panel_source(original['graph'],args.panel_proxy,args.panel_catalogue_directory,
-                expected_producer=original['producer'],expected_apps=json.loads(args.panel_apps))
+                expected_producer=original['producer'],expected_apps=json.loads(args.panel_apps),
+                expected_installer_priors=prior_descriptor,**({'history_wix':selected_wix} if selected_wix is not None else {}))
         evidence = observe_windows_builds(args.tools, args.observe_windows_builds, args.provenance,
-            receipt=args.output,panel_source=panel_source)
+            receipt=args.output,panel_source=panel_source,phase=args.build_phase,
+            provider_images=json.loads(args.provider_images.read_bytes()) if args.provider_images else None)
     elif args.provenance is not None:
         parser.error('--provenance is only for observed Windows builds')
     elif any(value is not None for value in (args.panel_catalogue_directory,args.panel_proxy,args.panel_apps)):

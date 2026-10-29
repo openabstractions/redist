@@ -25,11 +25,15 @@ such as a ComfyUI custom node. adopters/<app>/extension.json describes it:
                                           time, emptied and removed on
                                           uninstall
    "include": [{"from": "abstraction-identity/py/abstraction/ipc",
-                "to": "oa_client/abstraction/ipc"}]}
+                "to": "oa_client/abstraction/ipc"}],
                                           optional: repository folders of
                                           OA's own code the payload carries,
                                           from the explicit include root to a
                                           payload folder
+   "programs": ["comfyui-connector.exe"]}
+                                          optional: programs the build
+                                          supplies (--program FILE), placed
+                                          at the top of the extension folder
 
 The setup script runs once the files are in place, as the installing
 account, and its outcome is ignored: a host whose venv does not exist yet
@@ -48,17 +52,24 @@ names an already built one. The upgrade code is derived from the extension
 id, in a namespace of its own, so every version of one extension upgrades the
 one before and no showcase application package. The package is UNSIGNED.
 
-Two options exist for tests only: --test-host-config FILE reads the
+Each program the description declares is a built file the caller supplies
+with --program FILE, whose name is the declared one; a declared program left
+out, or one not declared, is refused.
+
+Three options exist for tests only: --test-host-config FILE reads the
 application's configuration from FILE instead of the account's roaming
-AppData, and --test-without-openabstractions drops the requirement for an
-installed OpenAbstractions. A release build passes neither.
+AppData, --test-without-openabstractions drops the requirement for an
+installed OpenAbstractions, and --test-without-programs builds without the
+declared programs. A release build passes none.
 
 Usage:
   build_extension.py --extension FILE --publisher NAME --version X.Y.Z --out DIR
                      [--action-dll DLL] [--wix wix] [--cl cl]
                      [--include-root VERIFIED_SOURCE_WORKSPACE]
                      [--input-receipt RECEIVED_JSON --action-sha256 HEX --action-bytes N]
+                     [--program FILE ...]
                      [--test-host-config FILE] [--test-without-openabstractions]
+                     [--test-without-programs]
 
 Without arguments, prints this text.
 """
@@ -80,6 +91,9 @@ import xml.etree.ElementTree as ET
 
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parent.parent
+sys.path.insert(0, str(ROOT / 'scripts'))
+from file_boundary import ordinary_path  # noqa: E402
+
 _app_path = HERE/'build_app.py'
 _app_spec = importlib.util.spec_from_file_location('oa_extension_app_owner', _app_path)
 _app_owner = importlib.util.module_from_spec(_app_spec)
@@ -89,7 +103,8 @@ APP_ID, DEVICE_NAME, MEMBER_SEGMENT, MSI_VERSION = (
 
 WXS = "http://wixtoolset.org/schemas/v4/wxs"
 FIELDS = {"id", "title", "folder", "payload", "generated", "host"}
-OPTIONAL_FIELDS = {"python_setup", "generated_folders", "include", "register_application", "prepared_files"}
+OPTIONAL_FIELDS = {"python_setup", "generated_folders", "include", "register_application", "prepared_files", "programs", "discovery@1", "package@1", "retained-archive@1", "setup-host@1", "legacy@1"}
+PROGRAM = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*\.exe\Z")
 INCLUDE_FIELDS = {"from", "to"}
 NATIVE_LIBRARY = re.compile(r".*\.(?:dll|so|dylib|pyd)(?:\.[0-9]+)*\Z", re.IGNORECASE)
 SETUP_FIELDS = {"venv", "script"}
@@ -99,7 +114,7 @@ HOST_FIELDS = {"name", "config", "key", "subfolder", "download"}
 PLAIN = re.compile(r"[^\x00-\x1f\[\]{}<>&\"]{1,200}\Z")
 KEY = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,63}\Z")
 DOWNLOAD = re.compile(r"https://[A-Za-z0-9./_~%-]{1,300}\Z")
-SKIPPED_DIRECTORIES = {"__pycache__", "node_modules"}
+SKIPPED_DIRECTORIES = {"__pycache__", "node_modules", "testdata"}
 COMPILE = ["/nologo", "/W4", "/WX", "/O2", "/MT", "/GS", "/guard:cf", "/Brepro", "/LD"]
 LINK = ["/link", "/guard:cf", "/Brepro", "/DYNAMICBASE", "/NXCOMPAT", "msi.lib"]
 
@@ -121,13 +136,167 @@ def plain_text(value: object, what: str) -> str:
     return value
 
 
+def _unique_keys(pairs):
+    result = dict(pairs)
+    if len(result) != len(pairs):
+        raise ValueError("duplicate extension manifest key")
+    return result
+
+
+def _exact_object(value, keys, label):
+    if not isinstance(value, dict) or set(value) != set(keys.split()):
+        raise ValueError(f"{label} requires exactly {keys}")
+    return value
+
+
+def _validate_package(extension: dict) -> None:
+    if any(key.startswith("package@") and key != "package@1" for key in extension):
+        raise ValueError("unsupported package declaration version")
+    declaration = _exact_object(extension.get("package@1"), "id title identity artifact rollback integration", "package@1")
+    identity = _exact_object(declaration["identity"], "platform connector_sha256", "package identity")
+    artifact = _exact_object(declaration["artifact"], "id sha256", "package artifact")
+    integration = _exact_object(declaration["integration"], "connector registration", "package integration")
+    package_id = declaration["id"]
+    if (not isinstance(package_id, str) or not APP_ID.fullmatch(package_id)
+            or package_id != extension.get("id") or artifact["id"] != package_id or integration["registration"] != package_id):
+        raise ValueError("package, extension, release artifact and registration IDs must agree")
+    if identity != {"platform": "windows/amd64", "connector_sha256": "release-extension.connector_sha256"}:
+        raise ValueError("package identity requires the Windows x64 release-extension connector digest reference")
+    if artifact["sha256"] != "release-extension.sha256":
+        raise ValueError("package artifact requires the release-extension artifact digest reference")
+    if declaration["rollback"] != "keep-previous-digest-until-verified":
+        raise ValueError("package rollback must keep the previous digest until verification")
+    connector = plain_name(integration["connector"], "package connector")
+    programs = extension.get("programs")
+    if not PROGRAM.fullmatch(connector) or programs != [connector]:
+        raise ValueError("package connector must be the extension's declared connector program")
+    plain_text(declaration["title"], "package title")
+    plain_name(extension.get("folder"), "extension folder")
+    host = extension.get("host")
+    if not isinstance(host, dict):
+        raise ValueError("package extension host must be an object")
+    plain_name(host.get("subfolder"), "host subfolder")
+
+
+def _validate_retained_archive(extension: dict) -> None:
+    if any(key.startswith("retained-archive@") and key != "retained-archive@1" for key in extension):
+        raise ValueError("unsupported retained archive declaration version")
+    archive = extension.get("retained-archive@1")
+    fields = "component data_layout model_paths" if isinstance(archive, dict) and (
+        "data_layout" in archive or "model_paths" in archive) else "component"
+    if isinstance(archive, dict) and "launch_layout" in archive:
+        fields = "component data_layout model_paths launch_layout"
+    archive = _exact_object(archive, fields, "retained-archive@1")
+    if "package@1" not in extension:
+        raise ValueError("retained archive requires its extension's package@1")
+    component = archive["component"]
+    if not isinstance(component, str) or not APP_ID.fullmatch(component) or component == extension["id"]:
+        raise ValueError("retained archive component must be a distinct plain ID")
+    if "data_layout" in archive:
+        data = _exact_object(archive["data_layout"], "root user input temp", "retained archive data layout")
+        _host_relative_path(data["root"], "retained archive data root")
+        for key in ("user", "input", "temp"):
+            plain_name(data[key], "retained archive " + key)
+        model = _exact_object(archive["model_paths"], "file group categories", "retained archive model paths")
+        filename = plain_name(model["file"], "retained archive model file")
+        if not filename.endswith(".json"):
+            raise ValueError("retained archive model file must be JSON")
+        plain_name(model["group"], "retained archive model group")
+        categories = model["categories"]
+        if (not isinstance(categories, list) or len(categories) != 3
+                or any(not isinstance(name, str) or not re.fullmatch(r"[a-z][a-z0-9_]{0,31}", name) for name in categories)
+                or len(set(categories)) != 3):
+            raise ValueError("retained archive model paths require three distinct category keys")
+    if "launch_layout" in archive:
+        launch = _exact_object(archive["launch_layout"], "native_root portable_root image_recipe image_policy",
+                               "retained archive launch layout")
+        for key in ("native_root", "portable_root"):
+            _host_relative_path(launch[key], "retained archive " + key)
+        _host_relative_path(launch["image_recipe"], "retained archive image recipe", ".json")
+        if not isinstance(launch["image_policy"], str) or not APP_ID.fullmatch(launch["image_policy"]):
+            raise ValueError("retained archive image policy must be a plain ID")
+
+
+def _host_relative_path(value: object, label: str, suffix: str = "") -> str:
+    if (not isinstance(value, str) or len(value) > 200
+            or not re.search(re.escape(suffix) + r"\Z", value, re.IGNORECASE | re.ASCII)):
+        raise ValueError(f"{label} is not a plain relative host path")
+    parts = value.split("/")
+    if len(parts) > 4:
+        raise ValueError(f"{label} holds too many path components")
+    for part in parts:
+        plain_name(part, label)
+    return value
+
+
+def _host_path_list(value: object, label: str, suffix: str, *, one_segment: bool = False) -> None:
+    if not isinstance(value, list) or not 1 <= len(value) <= 4:
+        raise ValueError(f"{label} requires 1 to 4 ordered paths")
+    paths = [_host_relative_path(path, label, suffix) for path in value]
+    if len({path.lower() for path in paths}) != len(paths) or one_segment and any("/" in path for path in paths):
+        raise ValueError(f"{label} repeats a path or names another folder")
+
+
+def _validate_setup_host(extension: dict) -> None:
+    if any(key.startswith("setup-host@") and key != "setup-host@1" for key in extension):
+        raise ValueError("unsupported Setup host declaration version")
+    host = extension.get("setup-host@1")
+    fields = "desktop_program preferred_signed_program signed_scan_first_folder signed_scan_name local_installs settings install_base portable_launchers"
+    if isinstance(host, dict) and ("settings_keys" in host or "integration_marker" in host):
+        fields += " settings_keys integration_marker"
+    if isinstance(host, dict) and "process_folders" in host:
+        fields += " process_folders"
+    host = _exact_object(host, fields, "setup-host@1")
+    for name in ("desktop_program", "preferred_signed_program"):
+        path = _host_relative_path(host[name], name, ".exe")
+        if len(path.split("/")) != 3 or not path.startswith("Programs/"):
+            raise ValueError(f"{name} requires a dedicated folder in Programs")
+    plain_name(host["signed_scan_first_folder"], "signed scan folder")
+    if not isinstance(host["signed_scan_name"], str) or not re.fullmatch(r"[a-z0-9-]{1,24}", host["signed_scan_name"]):
+        raise ValueError("signed scan name must be a lowercase label")
+    _host_relative_path(host["local_installs"], "local installs")
+    _host_path_list(host["settings"], "host settings", ".json")
+    plain_name(host["install_base"], "host install base")
+    _host_path_list(host["portable_launchers"], "portable launchers", ".bat", one_segment=True)
+    if "settings_keys" in host:
+        keys = host["settings_keys"]
+        if (not isinstance(keys, list) or not 1 <= len(keys) <= 4
+                or any(not isinstance(key, str) or not KEY.fullmatch(key) for key in keys)
+                or len(set(keys)) != len(keys)):
+            raise ValueError("host settings keys require 1 to 4 distinct keys")
+        plain_name(host["integration_marker"], "integration marker")
+    if "process_folders" in host:
+        _host_path_list(host["process_folders"], "host process folders", "", one_segment=True)
+
+
+def parse_extension(raw: str) -> dict:
+    """Parse the extension, checking any versioned package or retained archive declaration."""
+    extension = json.loads(raw)
+    if not isinstance(extension, dict):
+        raise ValueError("extension manifest must be an object")
+    package = any(key.startswith("package@") for key in extension)
+    retained = any(key.startswith("retained-archive@") for key in extension)
+    setup_host = any(key.startswith("setup-host@") for key in extension)
+    if package or retained or setup_host:
+        extension = json.loads(raw, object_pairs_hook=_unique_keys)
+    if package:
+        _validate_package(extension)
+    if retained:
+        _validate_retained_archive(extension)
+    if setup_host:
+        _validate_setup_host(extension)
+    return extension
+
+
 def read_extension(path: Path) -> dict:
     """The extension description, checked for shape, with its payload folder
     made absolute."""
-    extension = json.loads(path.read_text(encoding="utf-8"))
-    if not isinstance(extension, dict) or not FIELDS <= set(extension) <= FIELDS | OPTIONAL_FIELDS:
+    extension = parse_extension(path.read_text(encoding="utf-8"))
+    if not FIELDS <= set(extension) <= FIELDS | OPTIONAL_FIELDS:
         raise ValueError("the extension file has exactly " + ", ".join(sorted(FIELDS)) + " and optionally " +
                          ", ".join(sorted(OPTIONAL_FIELDS)))
+    if "discovery@1" in extension and not isinstance(extension["discovery@1"], dict):
+        raise ValueError("discovery@1 must be an object")
     host = extension["host"]
     if not isinstance(host, dict) or set(host) != HOST_FIELDS:
         raise ValueError("host has exactly " + ", ".join(sorted(HOST_FIELDS)))
@@ -172,6 +341,13 @@ def read_extension(path: Path) -> dict:
         plain_name(name,'a prepared file')
         if pin is not None and (type(pin) is not dict or set(pin)!={'bytes','sha256'} or type(pin['bytes']) is not int or pin['bytes']<0 or not isinstance(pin['sha256'],str) or not re.fullmatch('[0-9a-f]{64}',pin['sha256'])):
             raise ValueError('prepared file lacks its exact size and hash')
+    programs = extension.setdefault("programs", [])
+    if not isinstance(programs, list) or len(set(programs)) != len(programs):
+        raise ValueError("programs is not a list of distinct program names")
+    for name in programs:
+        if not isinstance(name, str) or not PROGRAM.match(name):
+            raise ValueError(f"the program {name!r} is not a plain .exe name")
+        plain_name(name, "a program")
     include = extension.setdefault("include", [])
     if not isinstance(include, list):
         raise ValueError("include is not a list of folders")
@@ -179,15 +355,21 @@ def read_extension(path: Path) -> dict:
         if not isinstance(entry, dict) or set(entry) != INCLUDE_FIELDS:
             raise ValueError("an include has exactly " + ", ".join(sorted(INCLUDE_FIELDS)))
         for field in sorted(INCLUDE_FIELDS):
-            value = PurePosixPath(entry[field]) if isinstance(entry[field], str) else None
-            if value is None or value.is_absolute() or "\\" in entry[field] or not value.parts or \
-                    any(not MEMBER_SEGMENT.match(part) or DEVICE_NAME.match(part) for part in value.parts):
-                raise ValueError(f"include {field} is not a plain relative folder")
-    payload = (path.parent / plain_name(extension["payload"], "payload")).resolve()
-    if not payload.is_dir():
-        raise ValueError(f"the payload folder {payload} does not exist")
-    extension["payload"] = payload
+            _include_path(entry[field], field)
+    payload = path.parent / plain_name(extension["payload"], "payload")
+    try:
+        extension["payload"] = ordinary_path(payload, kind="directory")
+    except FileNotFoundError as error:
+        raise ValueError(f"the payload folder {payload} does not exist") from error
     return extension
+
+
+def _include_path(value, field):
+    name = PurePosixPath(value) if isinstance(value, str) else None
+    if (name is None or name.is_absolute() or "\\" in value or not name.parts
+            or any(not MEMBER_SEGMENT.match(part) or DEVICE_NAME.match(part) for part in name.parts)):
+        raise ValueError(f"include {field} is not a plain relative folder")
+    return name
 
 
 def _folder_files(root: Path, what: str) -> list[PurePosixPath]:
@@ -212,7 +394,7 @@ def _folder_files(root: Path, what: str) -> list[PurePosixPath]:
                         not entry.name.startswith("test_") and not entry.name.endswith(".test.mjs"):
                     files.append(relative)
 
-    walk(root, ())
+    walk(ordinary_path(root, kind="directory"), ())
     return files
 
 
@@ -230,18 +412,19 @@ def include_files(include: list[dict], payload: list[PurePosixPath], root: Path 
     The folder is reached from root one plain folder at a time, never through
     a link, so it lies inside the repository; no included file may take a
     payload file's place."""
-    root = Path(root)
-    if root.is_symlink() or root.is_junction() or not root.is_dir():
-        raise ValueError('include root must be an existing plain directory')
+    try:
+        root = ordinary_path(root, kind="directory")
+    except (OSError, ValueError) as error:
+        raise ValueError('include root must be an existing plain directory') from error
     found = {}
     names = {name.as_posix().casefold() for name in payload}
     for entry in include:
-        folder = root
-        for part in PurePosixPath(entry["from"]).parts:
-            folder = folder / part
-            if folder.is_symlink() or folder.is_junction() or not folder.is_dir():
-                raise ValueError(f"include {entry['from']} is not a plain folder in the repository")
-        target = PurePosixPath(entry["to"])
+        source_name = _include_path(entry["from"], "from")
+        target = _include_path(entry["to"], "to")
+        try:
+            folder = ordinary_path(root / Path(*source_name.parts), kind="directory")
+        except (OSError, ValueError) as error:
+            raise ValueError(f"include {entry['from']} is not a plain folder in the repository") from error
         for relative in _folder_files(folder, "included folder"):
             placed = target / relative
             if placed.as_posix().casefold() in names:
@@ -249,6 +432,31 @@ def include_files(include: list[dict], payload: list[PurePosixPath], root: Path 
             names.add(placed.as_posix().casefold())
             found[placed] = folder / Path(*relative.parts)
     return found
+
+
+def program_files(declared: list[str], supplied: list[Path], payload: list[PurePosixPath], included: dict,
+                  without: bool = False) -> dict:
+    """{payload name: built file} for the declared programs. Each is supplied
+    once as a plain file named as declared, taking no other file's place."""
+    found = {}
+    taken = {member.as_posix().casefold() for member in (*payload, *included)}
+    for path in supplied:
+        path = Path(path)
+        if path.name not in declared or path.name in found:
+            raise ValueError(f"the program {path.name} is not declared once in the extension's programs")
+        try:
+            admitted = ordinary_path(path, kind="file")
+        except (OSError, ValueError) as error:
+            raise ValueError(f"the program {path} is not a plain file") from error
+        placement = path.name.casefold()
+        if placement in taken:
+            raise ValueError(f"{path.name} is placed twice")
+        taken.add(placement)
+        found[path.name] = admitted
+    missing = [name for name in declared if name not in found]
+    if missing and not without:
+        raise ValueError("the extension's programs are not supplied: " + ", ".join(missing) + " (--program FILE)")
+    return {PurePosixPath(name): path for name, path in found.items()}
 
 
 def file_pin(path):
@@ -392,6 +600,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--cl", default="cl")
     parser.add_argument("--test-host-config", type=Path)
     parser.add_argument("--test-without-openabstractions", action="store_true")
+    parser.add_argument("--program", type=Path, action="append", default=[],
+                        help="a built program the extension declares; placed at the top of its folder")
+    parser.add_argument("--test-without-programs", action="store_true")
     args = parser.parse_args(argv)
     required = ("extension", "publisher", "version", "out")
     if all(getattr(args, name) is None for name in required):
@@ -414,6 +625,7 @@ def main(argv: list[str] | None = None) -> int:
             config = plain_text(str(args.test_host_config.resolve()), "--test-host-config")
         files = payload_files(extension["payload"])
         included = include_files(extension["include"], files, args.include_root if args.include_root is not None else ROOT)
+        included.update(program_files(extension["programs"], args.program, files, included, args.test_without_programs))
         files = files + sorted(included)
         inventory = {relative.as_posix(): file_pin(included.get(relative, extension['payload']/relative)) for relative in files}
         check_prepared_payload(extension, inventory)
@@ -504,9 +716,9 @@ def main(argv: list[str] | None = None) -> int:
                if extension['register_application'] else {})},
         'received_input_receipt':received,'msi':dict(file_pin(msi),path=str(msi)),
         'bundle_app_sha256':file_pin(out/'bundle-app.json')['sha256'],
-        'test_build':bool(args.test_host_config or args.test_without_openabstractions)}
+        'test_build':bool(args.test_host_config or args.test_without_openabstractions or args.test_without_programs)}
     (out/'installer-receipt.json').write_text(json.dumps(receipt,indent=2),encoding='utf-8')
-    note = ", TEST BUILD" if args.test_host_config or args.test_without_openabstractions else ""
+    note = ", TEST BUILD" if args.test_host_config or args.test_without_openabstractions or args.test_without_programs else ""
     print(f"ok    {msi.name} {msi.stat().st_size} bytes, {len(files)} files, UNSIGNED{note}")
     return 0
 

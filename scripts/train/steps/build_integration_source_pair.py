@@ -79,4 +79,4 @@ subprocess.run([sys.executable, str(root / 'scripts/package_comfyui_app.py'),
                 '--integration-run-attempt', os.environ['WHEEL_ATTEMPT'],
                 '--integration-bytes', str(integration_info['bytes']),
                 '--integration-sha256', integration_info['sha256'],
-                '--minimum-free-gib', '20' if desktop.get('schema')==2 else '1'], check=True)
+                '--minimum-free-gib', '1'], check=True)

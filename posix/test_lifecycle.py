@@ -15,20 +15,18 @@ SCRIPT_TIMEOUT = 15
 
 FORMER_DEFAULT_HOSTS = {'comfyui': b'{\n  "version": 2,\n  "declaration": {\n    "name": "comfyui",\n    "program": "",\n    "arguments": [],\n    "endpoint": "",\n    "transport": "http@1",\n    "contracts": [],\n    "resources": [\n      "profile:image"\n    ],\n    "activation": "attach",\n    "role": "host",\n    "host": {\n      "base": "http://127.0.0.1:8188",\n      "kind": "comfyui",\n      "hosted": false\n    }\n  },\n  "declared_by": "installation",\n  "declared_unix_ms": 0\n}\n', 'lemonade': b'{\n  "version": 2,\n  "declaration": {\n    "name": "lemonade",\n    "program": "",\n    "arguments": [],\n    "endpoint": "",\n    "transport": "http@1",\n    "contracts": [],\n    "activation": "attach",\n    "role": "host",\n    "host": {\n      "base": "http://127.0.0.1:13305",\n      "kind": "lemonade",\n      "hosted": false\n    }\n  },\n  "declared_by": "installation",\n  "declared_unix_ms": 0\n}\n', 'lmstudio': b'{\n  "version": 2,\n  "declaration": {\n    "name": "lmstudio",\n    "program": "",\n    "arguments": [],\n    "endpoint": "",\n    "transport": "http@1",\n    "contracts": [],\n    "activation": "attach",\n    "role": "host",\n    "host": {\n      "base": "http://127.0.0.1:1234",\n      "kind": "lmstudio",\n      "hosted": false\n    }\n  },\n  "declared_by": "installation",\n  "declared_unix_ms": 0\n}\n', 'ollama': b'{\n  "version": 2,\n  "declaration": {\n    "name": "ollama",\n    "program": "",\n    "arguments": [],\n    "endpoint": "",\n    "transport": "http@1",\n    "contracts": [],\n    "activation": "attach",\n    "role": "host",\n    "host": {\n      "base": "http://127.0.0.1:11434",\n      "kind": "ollama",\n      "hosted": false\n    }\n  },\n  "declared_by": "installation",\n  "declared_unix_ms": 0\n}\n'}
 
+# The fixtures run the shipped POSIX scripts under sh with POSIX tools and a
+# ':'-separated PATH. They run on the Linux and macOS runners (gate_select's
+# "POSIX installer lifecycle tests"); a Windows run reports them as skipped.
+@unittest.skipIf(os.name == "nt", "POSIX installer fixtures run on the Linux and macOS runners")
 class Lifecycle(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.root = Path(self.tmp.name).resolve()
         # Exercises naive shell quoting with characters a script must not
-        # trust unescaped. `<`, `|` and `\` are illegal in a Windows path
-        # component, so that platform keeps the rest of the alphabet: `&`,
-        # space, `$`, `;`, `'` and parens are all legal there and just as
-        # unsafe to interpolate unquoted.
-        if os.name == "nt":
-            self.home = self.root / "user & (home)$tail;'quote"
-        else:
-            self.home = self.root / "user & <home>|back\\slash"
+        # trust unescaped.
+        self.home = self.root / "user & <home>|back\\slash"
         self.share = self.home / ".local/share/abstraction"
         self.share.mkdir(parents=True)
         self.bin = self.root / "commands"
@@ -493,7 +491,10 @@ exit 1''')
         self.assertTrue(self.data.exists())
         self.assertNotIn("bootout", (self.root/"calls").read_text())
 
-    def test_linux_install_registers_runtime_and_checks_readiness(self):
+    # TD94: a fresh install with no registered app adds no login item. The
+    # installer starts the runtime once; only the runtime's Applications-driven
+    # reconciler enables the user unit, for confirmed apps.
+    def test_linux_install_starts_runtime_without_a_login_item(self):
         package = self.root/"package"
         payload = package/"payload"
         for rel, source in [(".local/share/abstraction/lifecycle.sh", "linux/lifecycle.sh"),
@@ -509,13 +510,15 @@ exit 1''')
         result = subprocess.run(["sh", str(package/"install.sh")], env=self.env, text=True, capture_output=True, timeout=10)
         self.assertEqual(result.returncode, 0, result.stderr)
         calls = (self.root/"calls").read_text()
-        self.assertIn("enable --now abstraction-runtime.service", calls)
+        start = "--user start abstraction-runtime.service"
+        self.assertIn(start, calls)
+        self.assertNotRegex(calls, r"(?m)^--user (re)?enable\b.*abstraction-runtime\.service")
         self.assertNotIn("abstraction-jobd.timer abstraction-runtime.service", calls)
-        # A 0.1.7 predecessor's sweep timer is disabled before the runtime is enabled.
-        self.assertLess(calls.index("disable abstraction-jobd.timer"), calls.index("enable --now abstraction-runtime.service"))
+        # A 0.1.7 predecessor's sweep timer is disabled before the runtime starts.
+        self.assertLess(calls.index("disable abstraction-jobd.timer"), calls.index(start))
         self.assertIn("cli status --timeout 1s", calls)
         self.assertLess(calls.index("stop abstraction-runtime.service"), calls.index("cli storage check"))
-        self.assertLess(calls.index("cli storage check"), calls.index("enable --now"))
+        self.assertLess(calls.index("cli storage check"), calls.index(start))
         self.assertTrue(self.data.exists())
 
     def test_linux_upgrade_preflight_failure_preserves_payload_and_manifest(self):

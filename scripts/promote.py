@@ -13,7 +13,7 @@ import io
 import importlib.util
 import json
 import os
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 import re
 import shutil
 import subprocess
@@ -31,6 +31,7 @@ MAX_RELEASE_ASSET_BYTES = _app_assets.MAX_RELEASE_ASSET_BYTES
 measured, roster, validate_release = _app_assets.measured, _app_assets.roster, _app_assets.validate_release
 
 REQUIRED_JOBS = {'candidate', 'windows-build', 'windows-native-build', 'windows-pe-sign',
+                 'windows-runtime-build', 'windows-runtime-sign',
                  'windows', 'windows-app-msi', 'windows-msi-sign', 'verify', 'linux',
                  'linux-verify', 'macos', 'draft', 'bundle', 'windows-bundle-sign',
                  'windows-bundle-verify'}
@@ -63,6 +64,8 @@ def final_release_facts(metadata, directory, names, setup_receipt):
         assets.append({'name': name, 'artifact': {'sha256': checksum, 'bytes': size}})
     signatures = {'result': 'pass', 'files': list(setup_receipt.get('signatures', {}).values()) +
                   [row['signature'] for row in setup_receipt.get('chain', []) if 'signature' in row]}
+    if 'catalog_opencode' in setup_receipt:
+        signatures['files'].append(setup_receipt['catalog_opencode']['signature'])
     return release_facts_owner().producer_record(metadata, assets, unsigned_platforms=['linux'], setup_signatures=signatures)
 
 
@@ -77,13 +80,18 @@ def windows_policy_bytes():
     return (windows_signing_directory() / 'certum_simplysign.json').read_bytes()
 
 
-def windows_signature_proof(receipt):
-    """Use the same reviewed certificate policy as the independent Windows verifier."""
-    windows = windows_signing_directory()
-    policy_bytes = windows_policy_bytes()
-    spec = importlib.util.spec_from_file_location('oa_promote_windows_signing', windows / 'windows_signing.py')
+def windows_signing_owner():
+    spec = importlib.util.spec_from_file_location(
+        'oa_promote_windows_signing', windows_signing_directory() / 'windows_signing.py')
     helper = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(helper)
+    return helper
+
+
+def windows_signature_proof(receipt):
+    """Use the same reviewed certificate policy as the independent Windows verifier."""
+    policy_bytes = windows_policy_bytes()
+    helper = windows_signing_owner()
     helper.verify_receipt(receipt, json.loads(policy_bytes), policy_sha256=hashlib.sha256(policy_bytes).hexdigest())
     return receipt
 
@@ -176,11 +184,230 @@ def pages(path, key, fetch=api):
     result = []
     for page in range(1, 101):
         data = fetch(f'{path}{"&" if "?" in path else "?"}per_page=100&page={page}')
-        entries = data[key]
+        entries = data if key is None else data[key]
+        if key is None and (not isinstance(entries, list) or len(entries) > 100
+                            or any(not isinstance(row, dict) for row in entries)):
+            raise ValueError('API list page is malformed')
         result.extend(entries)
         if len(entries) < 100:
             return result
     raise ValueError('API pagination exceeded 100 pages')
+
+
+LOCAL_RELEASE_REPO = 'openabstractions/redist'
+LOCAL_RELEASE_ACTOR = {'login': 'ReinisLusis', 'id': 13084295}
+
+
+def local_release_actor(fetch=api):
+    if (any(os.environ.get(key) for key in ('GH_TOKEN', 'GITHUB_TOKEN', 'GH_ENTERPRISE_TOKEN', 'GITHUB_ENTERPRISE_TOKEN'))
+            or os.environ.get('GH_HOST', 'github.com') != 'github.com'):
+        raise ValueError('local release requires the existing github.com gh login')
+    actor = fetch('user')
+    repository = fetch(f'repos/{LOCAL_RELEASE_REPO}')
+    if (any(actor.get(key) != value for key, value in LOCAL_RELEASE_ACTOR.items())
+            or repository.get('full_name') != LOCAL_RELEASE_REPO
+            or repository.get('private') is not False
+            or repository.get('archived') is not False
+            or repository.get('disabled') is not False
+            or repository.get('permissions', {}).get('push') is not True):
+        raise ValueError('local release actor or repository write permission differs')
+    return dict(LOCAL_RELEASE_ACTOR)
+
+
+def local_release_tag(version, commit, lookup=optional_api):
+    ref = f'refs/tags/{version}'
+    tag = lookup(f'repos/{LOCAL_RELEASE_REPO}/git/ref/tags/{version}')
+    if tag is None:
+        return False
+    if (tag.get('ref') != ref or tag.get('object', {}).get('type') != 'commit'
+            or tag['object'].get('sha') != commit):
+        raise ValueError('local release tag differs from the selected commit')
+    return True
+
+
+def local_release_list(version, fetch=api):
+    matches = []
+    for page in range(1, 101):
+        rows = fetch(f'repos/{LOCAL_RELEASE_REPO}/releases?per_page=100&page={page}')
+        if not isinstance(rows, list) or len(rows) > 100 or any(not isinstance(row, dict) for row in rows):
+            raise ValueError('local release listing is malformed')
+        matches.extend(row for row in rows if row.get('tag_name') == version)
+        if len(matches) > 1:
+            raise ValueError('local release listing is ambiguous')
+        if len(rows) < 100:
+            return matches[0] if matches else None
+    raise ValueError('local release listing exceeded 100 pages')
+
+
+def local_release_files(rows, retained):
+    expected = {}
+    for row in rows:
+        name, pin = row['name'], row['artifact']
+        path = Path(pin['path'])
+        if (not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._-]{0,199}', name) or name in expected
+                or path.name != name or not path.is_absolute() or pin not in retained
+                or not re.fullmatch(r'[0-9a-f]{64}', str(pin.get('sha256')))
+                or type(pin.get('bytes')) is not int or not 0 < pin['bytes'] < MAX_RELEASE_ASSET_BYTES):
+            raise ValueError('local release asset pin differs')
+        assert_local_release_file(path, pin)
+        expected[name] = pin
+    if not expected:
+        raise ValueError('local release asset roster is empty')
+    return expected
+
+
+def assert_local_release_file(path, pin):
+    import stat
+    for parent in (path, *path.parents):
+        info = parent.lstat()
+        if stat.S_ISLNK(info.st_mode) or getattr(info, 'st_file_attributes', 0) & 0x400:
+            raise ValueError('local release asset path is linked')
+    if (not stat.S_ISREG(path.lstat().st_mode)
+            or path.stat().st_nlink != 1
+            or measured(lambda: path.open('rb')) != (pin['bytes'], pin['sha256'])):
+        raise ValueError('local release asset bytes differ: ' + path.name)
+
+
+def local_release_identity(basis, release_id, *, fetch=api, allow_public=False):
+    version, actor = basis['version'], basis['actor']
+    prefix = f'repos/{LOCAL_RELEASE_REPO}'
+    if type(release_id) is not int or release_id < 1:
+        raise ValueError('local release has no journaled ID')
+    listed = local_release_list(version, fetch)
+    if listed is None:
+        raise ReadAPIError(f'{prefix}/releases/{release_id}', 'draft-not-visible')
+    if listed.get('id') != release_id:
+        raise ValueError('local release listing differs from its journaled draft')
+    release = fetch(f'{prefix}/releases/{release_id}')
+    author = release.get('author', {})
+    endpoint = f'https://uploads.github.com/{prefix}/releases/{release_id}/assets'
+    if (release.get('id') != release_id or release.get('tag_name') != version
+            or release.get('name') != version
+            or release.get('prerelease') is not False
+            or (release.get('draft') is not True and not (allow_public and release.get('draft') is False))
+            or release.get('body', '').replace('\r\n', '\n') != basis['body']
+            or any(author.get(key) != value for key, value in actor.items())
+            or release.get('upload_url') != endpoint + '{?name,label}'):
+        raise ValueError('local release ID, author, body or draft state differs')
+    return release
+
+
+def local_release_readback(basis, release_id, *, fetch=api, read_asset=None):
+    release = local_release_identity(basis, release_id, fetch=fetch)
+    prefix = f'repos/{LOCAL_RELEASE_REPO}'
+    assets, ids = {}, set()
+    for row in pages(f'{prefix}/releases/{release_id}/assets', None, fetch):
+        name, asset_id = row.get('name'), row.get('id')
+        wanted = basis['assets'].get(name)
+        if (wanted is None or name in assets or type(asset_id) is not int or asset_id < 1
+                or asset_id in ids or row.get('state') != 'uploaded' or row.get('size') != wanted['bytes']):
+            raise ValueError('local release asset roster or identity differs')
+        digest = row.get('digest')
+        if digest is None and read_asset is not None:
+            digest = 'sha256:' + read_asset(asset_id)
+        if digest != 'sha256:' + wanted['sha256']:
+            raise ValueError('local release asset digest differs: ' + name)
+        assets[name] = dict(id=asset_id, bytes=wanted['bytes'], sha256=wanted['sha256'])
+        ids.add(asset_id)
+    return release, assets, f'https://uploads.github.com/{prefix}/releases/{release_id}/assets'
+
+
+def local_release_draft(basis, state, save, mutate, *, fetch=api, lookup=optional_api, read_asset=None):
+    """Advance only journaled create-only writes. None requires reconciliation."""
+    version, commit = basis['version'], basis['commit']
+    prefix = f'repos/{LOCAL_RELEASE_REPO}'
+    if local_release_actor(fetch) != basis['actor']:
+        raise ValueError('local release actor changed after admission')
+
+    def begin(kind, **identity):
+        state['pending'] = dict(kind=kind, **identity)
+        save()
+
+    def acknowledge(**identity):
+        state.update(identity)
+        state.pop('pending', None)
+        save()
+
+    tag = local_release_tag(version, commit, lookup)
+    pending = state.get('pending', {})
+    if pending.get('kind') == 'tag':
+        if not tag:
+            return None
+        acknowledge(tag=commit)
+    elif 'tag' not in state:
+        if tag != basis['tag_present'] or local_release_list(version, fetch) is not None:
+            raise ValueError('local release tag or draft changed after admission')
+        if not tag:
+            begin('tag', commit=commit)
+            ref = f'refs/tags/{version}'
+            created = mutate(f'{prefix}/git/refs', {'ref': ref, 'sha': commit})
+            if (created.get('ref') != ref or created.get('object', {}).get('type') != 'commit'
+                    or created['object'].get('sha') != commit):
+                raise ValueError('local release create returned a different tag')
+            if not local_release_tag(version, commit, lookup):
+                return None
+        acknowledge(tag=commit)
+    elif not tag or state['tag'] != commit:
+        raise ValueError('local release journaled tag differs')
+
+    if state.get('pending', {}).get('kind') == 'draft':
+        # A visible tag/body cannot replace the unacknowledged numeric ID.
+        return None
+    if 'release_id' not in state:
+        if local_release_list(version, fetch) is not None:
+            raise ValueError('a release already exists for the selected tag')
+        if not local_release_tag(version, commit, lookup):
+            raise ValueError('local release tag disappeared before draft creation')
+        begin('draft', tag=version)
+        created = mutate(f'{prefix}/releases', dict(tag_name=version, target_commitish=commit,
+                         name=version, body=basis['body'], draft=True, prerelease=False))
+        release_id = created.get('id')
+        if type(release_id) is not int or release_id < 1:
+            return None
+        acknowledge(release_id=release_id)
+
+    def read():
+        _, assets, endpoint = local_release_readback(basis, state['release_id'], fetch=fetch, read_asset=read_asset)
+        return assets, endpoint
+
+    assets, endpoint = read()
+    known = state.get('assets', {})
+    pending = state.get('pending', {})
+    if pending:
+        if pending.get('kind') != 'asset' or pending.get('name') not in basis['assets']:
+            raise ValueError('local release pending write identity differs')
+        name = pending['name']
+        if name not in assets:
+            return None
+        if (set(assets) != set(known) | {name} or any(assets[key] != pin for key, pin in known.items())
+                or pending.get('id', assets[name]['id']) != assets[name]['id']):
+            raise ValueError('local release asset IDs changed during upload')
+        acknowledge(assets=assets)
+    elif assets != known:
+        raise ValueError('local release has assets outside the journaled upload history')
+
+    for name, pin in basis['assets'].items():
+        if name in assets:
+            continue
+        if (not local_release_tag(version, commit, lookup) or read()[0] != assets):
+            raise ValueError('local release changed before asset upload')
+        begin('asset', name=name, sha256=pin['sha256'])
+        uploaded = mutate(f'{endpoint}?name={name}', pin)
+        asset_id = uploaded.get('id')
+        if type(asset_id) is not int or asset_id < 1:
+            return None
+        state['pending']['id'] = asset_id
+        save()
+        observed, _ = read()
+        if observed == assets:
+            return None
+        if (set(observed) != set(assets) | {name}
+                or any(observed[key] != old for key, old in assets.items())
+                or observed[name]['id'] != asset_id):
+            raise ValueError('local release upload readback differs')
+        assets = observed
+        acknowledge(assets=assets)
+    return dict(release_id=state['release_id'], assets=assets)
 
 
 def inspect(repo, run_id, fetch=api):
@@ -300,7 +527,71 @@ def public_asset_names(directory, assets, version):
     return sorted(names.get(name, name) for name in assets)
 
 
-def unpack_setup(blob, digest, destination, version, packages, *, receipt_sink=None):
+def setup_catalog_files(archive, receipt, version, run):
+    """Bind the separate release package and close the private distribution."""
+    def metadata(name, limit):
+        if name not in archive.namelist() or archive.getinfo(name).file_size > limit:
+            raise ValueError('Setup Catalog metadata is missing or too large: ' + name)
+        return json.loads(archive.read(name))
+
+    proof = receipt['catalog_opencode']
+    context = metadata('app-chain-context.json', 8 << 20)
+    signer = windows_signing_owner()
+    owner = signer.bundle_owner()
+    distribution = owner.read_chain_context(metadata(signer.APP_DISTRIBUTION_CHAIN, 1 << 20), Path('.'))
+    physical = owner.read_chain_context(receipt['chain_context'], Path('.'))
+    if owner.burn_chain(distribution) != physical or distribution['version'] != version[1:]:
+        raise ValueError('Setup Catalog roster differs from its exact physical chain')
+    expected_chain = [(role, Path(member['file']).name, member['sha256'], member['bytes'])
+                      for role, _, member, _ in owner.chain_packages(physical)]
+    rows = receipt['chain']
+    if rows[0].get('id') == 'BeginCoreUpgrade':
+        if rows[0].get('name') != 'openabstractions.exe' or rows[0].get('role') != 'upgrade-supervisor':
+            raise ValueError('Setup Catalog has an unexpected upgrade supervisor')
+        rows = rows[1:]
+    if [(row.get('id'), row.get('name'), row.get('sha256'), row.get('bytes')) for row in rows] != expected_chain:
+        raise ValueError('Setup Catalog receipt differs from its physical chain')
+    if (not run or type(context.get('run_attempt')) is not int
+            or not 1 <= context['run_attempt'] <= run['run_attempt']
+            or context.get('source') != run['head_sha'] or context.get('run_id') != run['id']
+            or context.get('version') != version[1:]
+            or any(proof.get(key) != context[key] for key in ('source', 'run_id', 'run_attempt'))):
+        raise ValueError('Setup Catalog source or run differs from the promoted candidate')
+    apps = [app for app in distribution['apps'] if app['id'] == owner.CATALOG_ONLY_APP]
+    if len(apps) != 1:
+        raise ValueError('Setup Catalog requires one exact application package')
+    app = apps[0]
+    signer.producer_hosts(dict(distribution, apps=apps), {'opencode': context['expected_producers']['opencode']},
+                          source=proof['source'], run_id=proof['run_id'], run_attempt=proof['run_attempt'])
+    name = 'opencode-' + version[1:] + '.msi'
+    package = proof['package']
+    preflight = app['host']['preflight']
+    if (package.get('name') != name or Path(app['file']).name != name or package.get('version') != version[1:]
+            or package.get('upgrade_code') != '{8E0B8005-0E00-5720-9556-E5B984F15A96}'
+            or not re.fullmatch(r'\{[0-9A-F]{8}(?:-[0-9A-F]{4}){3}-[0-9A-F]{12}\}', str(package.get('product_code')))):
+        raise ValueError('Setup Catalog MSI identity differs')
+    for observed, expected in ((proof['signature'], app), (package, app), (proof['preflight'], preflight)):
+        if (observed.get('name') != Path(expected['file']).name
+                or any(observed.get(key) != expected[key] for key in ('sha256', 'bytes'))):
+            raise ValueError('Setup Catalog signed file differs from the admitted pin')
+    windows_signature_proof({'schema': 1, 'result': 'pass', 'policy_sha256': receipt['policy_sha256'],
+                             'files': [proof['signature'], proof['preflight']]})
+    pin = lambda row: (row['sha256'], row['bytes'])
+    files = {Path(member['file']).name: pin(member)
+             for _, _, member, app in owner.chain_packages(distribution) if app is not None}
+    for binding in context['expected_producers'].values():
+        if 'delivery' in binding:
+            delivery = binding['delivery']
+            for member in (delivery['binary'], *delivery['source']['parts']):
+                member_name = delivery['directory'] + '/' + member['name']
+                if member_name in files:
+                    raise ValueError('duplicate Setup Catalog distribution member')
+                files[member_name] = pin(member)
+    files.update({signer.APP_DISTRIBUTION_CHAIN: None, 'app-chain-context.json': None})
+    return name, files
+
+
+def unpack_setup(blob, digest, destination, version, packages, *, receipt_sink=None, run=None):
     """Check the Setup artifact and write the files it publishes.
 
     packages maps each verified-release package to its SHA-256; the bundle's
@@ -312,14 +603,17 @@ def unpack_setup(blob, digest, destination, version, packages, *, receipt_sink=N
         raise ValueError('downloaded Setup artifact digest differs from GitHub')
     with zipfile.ZipFile(io.BytesIO(blob) if isinstance(blob, bytes) else blob) as archive:
         entries = archive.infolist()
-        names = [item.filename for item in entries]
-        if len(names) != len(set(names)):
+        names = [item.filename for item in entries if not item.is_dir()]
+        directories = {item.filename.rstrip('/') for item in entries if item.is_dir()}
+        if len(entries) != len({item.filename.rstrip('/').casefold() for item in entries}):
             raise ValueError('duplicate Setup artifact entries')
         for item in entries:
-            if (item.is_dir() or '/' in item.filename or '\\' in item.filename
-                    or item.filename in ('.', '..')
-                    or (item.external_attr >> 16) & 0o170000 == 0o120000):
-                raise ValueError('Setup artifact entries must be ordinary root-level files')
+            kind = (item.external_attr >> 16) & 0o170000
+            if ('\\' in item.filename or ':' in item.filename
+                    or any(part in ('', '.', '..') for part in item.filename.rstrip('/').split('/'))
+                    or kind not in (0, 0o040000 if item.is_dir() else 0o100000)
+                    or (item.is_dir() and item.file_size)):
+                raise ValueError('Setup artifact contains an unsafe file or directory')
         for name in (SETUP_RECEIPT, SETUP_SUMS):
             if name not in names or archive.getinfo(name).file_size > 1024 * 1024:
                 raise ValueError('Setup artifact metadata is missing or too large: ' + name)
@@ -338,7 +632,16 @@ def unpack_setup(blob, digest, destination, version, packages, *, receipt_sink=N
         chain = receipt.get('chain')
         if not isinstance(chain, list) or not chain or not all(isinstance(entry, dict) for entry in chain):
             raise ValueError('Setup receipt has no package chain')
-        core = chain[0]
+        split = 'catalog_opencode' in receipt
+        if split:
+            catalog, internal = setup_catalog_files(archive, receipt, version, run)
+            cores = [row for row in chain if (row.get('id'), row.get('name')) == SETUP_CORE]
+            if len(cores) != 1:
+                raise ValueError('the Setup receipt lacks exactly one core MSI')
+            core = cores[0]
+        else:
+            internal = {}
+            core = chain[0]
         windows_signature_proof({'schema': 1, 'result': 'pass', 'policy_sha256': receipt.get('policy_sha256'),
                                  'files': [entry.get('signature', {}) for entry in chain]})
         if any(entry['signature'].get('sha256') != entry.get('sha256')
@@ -347,22 +650,29 @@ def unpack_setup(blob, digest, destination, version, packages, *, receipt_sink=N
         if (core.get('id'), core.get('name')) != SETUP_CORE or core.get('sha256') != packages.get(SETUP_CORE[1]):
             raise ValueError('the Setup bundle does not carry this release\'s abstraction-x64.msi')
         published = {exe: (bundle.get('sha256'), bundle.get('bytes'))}
-        for entry in chain[1:]:
+        if split:
+            if catalog in packages:
+                raise ValueError('Setup Catalog MSI collides with a verified release package')
+            published[catalog] = internal.pop(catalog)
+        for entry in ([] if split else chain[1:]):
             name = entry.get('name')
             if (not isinstance(name, str)
                     or not re.fullmatch(r'[a-z0-9][a-z0-9_-]{0,63}-' + re.escape(version[1:]) + r'\.msi', name)
                     or name in published or name in packages):
                 raise ValueError('Setup receipt names an unexpected application package')
             published[name] = (entry.get('sha256'), entry.get('bytes'))
-        if set(names) != set(published) | {SETUP_RECEIPT, SETUP_SUMS}:
+        if set(names) != set(published) | set(internal) | {SETUP_RECEIPT, SETUP_SUMS}:
             raise ValueError('Setup artifact file set differs from its receipt')
+        if directories - {parent.as_posix() for name in internal for parent in PurePosixPath(name).parents
+                          if parent != PurePosixPath('.')}:
+            raise ValueError('Setup artifact directory set differs from its receipt')
         checksums = {}
         for line in archive.read(SETUP_SUMS).decode('utf-8').splitlines():
             match = re.fullmatch(r'([0-9a-f]{64}) [ *](\S+)', line)
             if not match or match[2] in checksums:
                 raise ValueError('malformed or duplicate Setup checksum')
             checksums[match[2]] = match[1]
-        if set(checksums) != set(published) | {SETUP_RECEIPT}:
+        if set(checksums) != set(published) | set(internal) | {SETUP_RECEIPT}:
             raise ValueError('Setup checksum file does not cover exactly the bundle, its packages and receipt')
         for name in checksums:
             size, checksum = measured(lambda: archive.open(name))
@@ -370,6 +680,8 @@ def unpack_setup(blob, digest, destination, version, packages, *, receipt_sink=N
                 raise ValueError('Setup checksum mismatch: ' + name)
             if name in published and published[name] != (checksum, size):
                 raise ValueError('Setup receipt differs from the file: ' + name)
+            if name in internal and internal[name] is not None and internal[name] != (checksum, size):
+                raise ValueError('Setup internal member differs from the admitted file: ' + name)
             if size >= MAX_RELEASE_ASSET_BYTES:
                 raise ValueError('release asset must be under 2 GiB: ' + name)
         for name in published:
@@ -548,7 +860,7 @@ def owned_input_draft(repository, tag, source, identity, title, *, fetch=api, mu
         release = found[0]
     else:
         if not allow_create:
-            raise ValueError("PyTorch input tag exists without its owned draft")
+            raise ValueError("owned input draft is missing and creation is not admitted")
         payload = {"tag_name": tag, "target_commitish": source, "name": title,
                    "draft": True, "prerelease": True, "make_latest": "false", "body": body}
         with tempfile.TemporaryDirectory(prefix="oa-input-seed-") as temporary:
@@ -644,6 +956,243 @@ def seed_pytorch_main(argv):
     return 0
 
 
+PRIOR_REPOSITORY = 'openabstractions/redist'
+PRIOR_DRAFT_OWNER = 'ReinisLusis'
+
+
+def require_fixed_prior_volume(path):
+    if os.name != 'nt':
+        return
+    import ctypes
+    drive_type = ctypes.WinDLL('kernel32.dll', winmode=0x800).GetDriveTypeW
+    drive_type.argtypes = (ctypes.c_wchar_p,)
+    drive_type.restype = ctypes.c_uint
+    if drive_type(path.anchor) != 3:  # DRIVE_FIXED
+        raise ValueError('installer predecessor evidence requires a fixed local Windows volume')
+
+
+def stage_installer_priors(archives, evidence_root, source, draft_target, authority, *, fetch,
+                           optional_fetch, mutate, get):
+    """Stage reviewed archives. The owner keeps this release ID unpublished during upload."""
+    if source == draft_target or any(not re.fullmatch(r'[0-9a-f]{40}', value) for value in (source, draft_target)):
+        raise ValueError('predecessor staging requires distinct exact private source and redist target commits')
+    if authority.get('schema') != 1 or authority.get('version') != '0.8.0' or len(archives) != 2 or len(authority['priors']) != 2:
+        raise ValueError('predecessor staging requires two ordered original archives')
+    windows = windows_signing_owner()
+    receiver = pytorch_inputs_module()
+
+    def local_path(value, kind):
+        path = Path(value)
+        if (not path.is_absolute() or '..' in path.parts or str(path).startswith(('\\\\', '//'))
+                or os.name == 'nt' and not re.fullmatch(r'[A-Za-z]:', path.drive)):
+            raise ValueError('installer predecessor evidence requires an absolute local path')
+        require_fixed_prior_volume(path)
+        return windows.file_boundary.ordinary_path(path, kind=kind)
+
+    evidence_root = local_path(evidence_root, 'directory')
+
+    def admit_archive(value):
+        path = local_path(value, 'file')
+        try:
+            windows.file_boundary.relative_beneath_existing(path, evidence_root)
+        except windows.file_boundary.OutsideRoot as error:
+            raise ValueError('installer predecessor archive is outside the declared evidence root') from error
+        return path
+
+    paths = []
+    for archive in archives:
+        if (not isinstance(archive, dict) or set(archive) != {'path', 'bytes', 'sha256'}
+                or type(archive['bytes']) is not int or not 0 < archive['bytes'] <= 512 << 20
+                or not re.fullmatch(r'[0-9a-f]{64}', str(archive['sha256']))):
+            raise ValueError('installer predecessor requires exact reviewed archive pins')
+        paths.append(admit_archive(archive['path']))
+    if len(set(paths)) != 2:
+        raise ValueError('predecessor archives require two distinct local files')
+    names = ['installer-prior-1.zip', 'installer-prior-2.zip']
+    prefix = 'repos/' + PRIOR_REPOSITORY
+    with tempfile.TemporaryDirectory(prefix='oa-prior-stage-', dir=evidence_root) as temporary:
+        directory = local_path(temporary, 'directory')
+        uploads, readback = directory / 'uploads', directory / 'readback'
+        uploads.mkdir()
+        readback.mkdir()
+        pins = {}
+        rows = dict(zip(names, authority['priors']))
+        for path, name, approved in zip(paths, names, archives):
+            pin = {key: approved[key] for key in ('bytes', 'sha256')}
+            staged = uploads / name
+            with path.open('rb') as original, staged.open('xb') as target:
+                held = os.fstat(original.fileno())
+                if held.st_nlink != 1 or held.st_size != pin['bytes']:
+                    raise ValueError('installer predecessor archive size or link differs from reviewed input')
+                remaining = held.st_size
+                while remaining:
+                    chunk = original.read(min(remaining, 1 << 20))
+                    if not chunk:
+                        raise ValueError('installer predecessor archive shrank during staging')
+                    target.write(chunk)
+                    remaining -= len(chunk)
+                if original.read(1):
+                    raise ValueError('installer predecessor archive grew during staging')
+            if measured(lambda: staged.open('rb')) != (pin['bytes'], pin['sha256']):
+                raise ValueError('installer predecessor archive differs from its reviewed digest')
+            windows.installer_prior_members(staged, dict(rows[name], asset=pin))
+            pins[name] = pin
+        identity = {'purpose': 'installer-predecessor-inputs', 'draft_target': draft_target,
+                    'version': authority['version'],
+                    'priors': [dict(rows[name], name=name, **pins[name]) for name in names]}
+        body = json.dumps(identity, sort_keys=True) + '\n'
+        draft_key = hashlib.sha256(body.encode('utf-8')).hexdigest()
+        tag = 'oa-installer-priors-' + draft_key
+        ref = prefix + '/git/ref/tags/' + tag
+        title = 'Installer predecessor inputs ' + draft_key[:12]
+
+        def require_no_ref():
+            if optional_fetch(ref) is not None:
+                raise ValueError('installer predecessor staging requires an absent Git ref')
+
+        def recheck_local():
+            local_path(evidence_root, 'directory')
+            for path, name in zip(paths, names):
+                admit_archive(path)
+                pin = pins[name]
+                if path.stat().st_nlink != 1 or measured(lambda: path.open('rb')) != (pin['bytes'], pin['sha256']):
+                    raise ValueError('original installer predecessor archive changed: ' + path.name)
+
+        recheck_local()
+        actor = fetch('user')
+        if (not isinstance(actor, dict) or actor.get('login') != PRIOR_DRAFT_OWNER
+                or type(actor.get('id')) is not int or actor['id'] < 1):
+            raise ValueError('installer predecessor staging requires its authenticated draft owner')
+        commit = fetch(prefix + '/commits/' + draft_target)
+        if not isinstance(commit, dict) or commit.get('sha') != draft_target:
+            raise ValueError('installer predecessor redist target differs')
+        require_no_ref()
+        release = owned_input_draft(PRIOR_REPOSITORY, tag, draft_target, identity, title,
+                                    fetch=fetch, mutate=mutate)
+        release_id = release['id']
+        endpoint = f'https://uploads.github.com/{prefix}/releases/{release_id}/assets'
+
+        def selected_assets(release):
+            if not isinstance(release, dict):
+                raise ValueError('installer predecessor draft readback is malformed')
+            author = release.get('author', {})
+            if (release.get('id') != release_id or release.get('draft') is not True
+                    or release.get('prerelease') is not True or release.get('published_at') is not None
+                    or release.get('immutable') is not False or release.get('tag_name') != tag
+                    or release.get('target_commitish') != draft_target or release.get('name') != title
+                    or release.get('body', '').replace('\r\n', '\n') != body
+                    or not isinstance(author, dict) or author.get('login') != PRIOR_DRAFT_OWNER
+                    or author.get('id') != actor['id']
+                    or release.get('upload_url') != endpoint + '{?name,label}'
+                    or not isinstance(release.get('assets'), list)):
+                raise ValueError('installer predecessor draft identity differs')
+            selected, ids = {}, set()
+            for asset in release['assets']:
+                if not isinstance(asset, dict):
+                    raise ValueError('installer predecessor draft asset is malformed')
+                name = asset.get('name')
+                if (not isinstance(name, str) or name not in pins or name in selected
+                        or type(asset.get('id')) is not int
+                        or asset['id'] < 1 or asset['id'] in ids or asset.get('state') != 'uploaded'
+                        or asset.get('size') != pins[name]['bytes']
+                        or asset.get('digest') != 'sha256:' + pins[name]['sha256']):
+                    raise ValueError('installer predecessor draft asset differs')
+                ids.add(asset['id'])
+                selected[name] = {'repository': PRIOR_REPOSITORY, 'release_id': release_id,
+                                  'id': asset['id'], 'name': name, **pins[name]}
+            return selected
+
+        def current_assets():
+            return selected_assets(fetch(prefix + '/releases/' + str(release_id)))
+
+        def receive(assets):
+            if not assets:
+                return
+            selected = {name: dict(id=asset['id'], name=name, size_bytes=asset['bytes'],
+                                   sha256=asset['sha256']) for name, asset in assets.items()}
+            receiver.receive_assets(readback, PRIOR_REPOSITORY, selected, fetch=fetch, download=get, created=[])
+            for name, asset in assets.items():
+                windows.installer_prior_members(readback / name, dict(rows[name], asset=asset))
+
+        assets = selected_assets(release)
+        if current_assets() != assets:
+            raise ValueError('installer predecessor draft changed during admission')
+        receive(assets)
+        for name in names:
+            if name in assets:
+                continue
+            require_no_ref()
+            if current_assets() != assets:
+                raise ValueError('installer predecessor draft changed before upload')
+            staged = local_path(uploads / name, 'file')
+            pin = pins[name]
+            if staged.stat().st_nlink != 1 or measured(lambda: staged.open('rb')) != (pin['bytes'], pin['sha256']):
+                raise ValueError('installer predecessor staged archive changed before upload')
+            # Exact release ID and fixed host; a same-name upload cannot replace bytes.
+            mutate(['api', '--method', 'POST', endpoint + '?name=' + name, '-H',
+                    'Content-Type: application/zip', '--input', str(staged)], timeout=1200)
+            observed = current_assets()
+            if set(observed) != set(assets) | {name} or any(observed[key] != pin for key, pin in assets.items()):
+                raise ValueError('installer predecessor upload readback differs')
+            receive({name: observed[name]})
+            assets = observed
+        recheck_local()
+        final = owned_input_draft(PRIOR_REPOSITORY, tag, draft_target, identity, title,
+                                  fetch=fetch, mutate=mutate, allow_create=False)
+        if selected_assets(final) != assets or current_assets() != assets:
+            raise ValueError('installer predecessor final draft readback differs')
+        require_no_ref()
+        descriptor = {'schema': 1, 'source': source, 'version': authority['version'],
+                      'priors': [dict(rows[name], asset=assets[name]) for name in names]}
+        windows.installer_prior_descriptor(descriptor, authority=authority)
+        return {'descriptor': descriptor, 'archives': [dict(path=str(path), **pins[name])
+                                                       for path, name in zip(paths, names)]}
+
+
+def stage_installer_priors_main(argv):
+    parser = argparse.ArgumentParser(
+        description='Stage the exact predecessor pair in its owned unpublished redist draft.',
+        epilog='Keep this release ID unpublished throughout staging. GitHub has no conditional '
+               'upload that enforces draft state for an already selected release ID.')
+    parser.add_argument('--source-root', type=Path, required=True, help='clean exact private Source checkout')
+    parser.add_argument('--source', required=True, help='exact private Source SHA for the local descriptor')
+    parser.add_argument('--draft-target', required=True, help='existing exact redist commit for the draft')
+    parser.add_argument('--evidence-root', type=Path, required=True, help='ordinary local archive directory')
+    parser.add_argument('--archive', nargs=3, metavar=('PATH', 'BYTES', 'SHA256'), action='append',
+                        required=True, help='reviewed original archive pin in authority order')
+    parser.add_argument('--approve-draft-staging', action='store_true', required=True)
+    args = parser.parse_args(argv)
+    try:
+        archives = [dict(path=path, bytes=int(size), sha256=sha256) for path, size, sha256 in args.archive]
+    except ValueError:
+        parser.error('archive size must be an integer')
+    checkout = args.source_root.resolve()
+    git = ['git', '-C', str(checkout)]
+    top = subprocess.check_output([*git, 'rev-parse', '--show-toplevel'], text=True, timeout=30).strip()
+    head = subprocess.check_output([*git, 'rev-parse', 'HEAD'], text=True, timeout=30).strip()
+    dirty = subprocess.check_output([*git, 'status', '--porcelain=v1', '--untracked-files=all'],
+                                    text=True, timeout=30).strip()
+    if Path(top).resolve() != checkout or head != args.source or dirty:
+        parser.error('predecessor staging requires the clean exact private Source checkout')
+    authority = json.loads(subprocess.check_output(
+        [*git, 'show', 'HEAD:installer/installer-prior-authorities.json'], timeout=30))
+    github = 'https://api.github.com/'
+
+    def mutate(argv, **kwargs):
+        endpoint = argv[3] if argv[3].startswith('https://') else github + argv[3]
+        return command([*argv[:3], endpoint, *argv[4:], '--hostname', 'github.com'], **kwargs)
+
+    def get(argv, path):
+        download([*argv[:-1], github + argv[-1], '--hostname', 'github.com'], path)
+
+    result = stage_installer_priors(archives, args.evidence_root, args.source, args.draft_target, authority,
+                                   fetch=lambda path: api(github + path),
+                                   optional_fetch=lambda path: optional_api(github + path),
+                                   mutate=mutate, get=get)
+    print(json.dumps(result, sort_keys=True))
+    return 0
+
+
 def main(argv=None):
     internal = list(sys.argv[1:] if argv is None else argv)
     if internal[:1] == ['--msi-name']:
@@ -655,7 +1204,10 @@ def main(argv=None):
         return 0
     if internal[:1] == ["seed-pytorch-inputs"]:
         return seed_pytorch_main(internal[1:])
-    parser = argparse.ArgumentParser(description=__doc__, epilog="For exact draft input transport: seed-pytorch-inputs --help.")
+    if internal[:1] == ['stage-installer-priors']:
+        return stage_installer_priors_main(internal[1:])
+    parser = argparse.ArgumentParser(description=__doc__,
+                                     epilog="Draft inputs: seed-pytorch-inputs --help or stage-installer-priors --help.")
     parser.add_argument('--repo', default=os.environ.get('GH_REPO', 'openabstractions/redist'))
     parser.add_argument('--run', type=int, required=True, help='exact candidate workflow run ID')
     parser.add_argument('--status', action='store_true', help='read-only run, job, retained artifact and next-action summary')
@@ -701,7 +1253,7 @@ def main(argv=None):
         retained_setup = directory / 'setup-artifact.zip'
         download(['api', f'repos/{args.repo}/actions/artifacts/{setup["id"]}/zip'], retained_setup)
         setup_receipt = {}
-        setup_assets, setup_sums = unpack_setup(retained_setup, setup['digest'], directory, args.version, packages, receipt_sink=setup_receipt)
+        setup_assets, setup_sums = unpack_setup(retained_setup, setup['digest'], directory, args.version, packages, receipt_sink=setup_receipt, run=run)
         notes = directory / 'NOTES.md'
         if 'release_facts' not in metadata and '`' + setup_name(args.version) + '`' not in notes.read_text(encoding='utf-8'):
             raise ValueError('release notes do not name the signed ' + setup_name(args.version))

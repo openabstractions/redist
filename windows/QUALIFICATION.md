@@ -22,37 +22,57 @@ WiX needs no .NET SDK. Unzip the two NuGet packages and run the tool:
 When `modelhostd.exe` is supplied for x64, the build requires its `engine pin
 --json` output, `llama-b10825-oa-win-vulkan-x64.zip` and its derivation receipt
 in `modelhostengine`. It refuses a bundle whose filename, size, SHA-256,
-24-member allowlist or member digests differ from that provider-owned pin. The
+27-member allowlist or member digests differ from that provider-owned pin. The
 redist Windows producer obtains the pin from the same-source `modelhostd.exe`,
 retrieves the publisher's exact 35,227,898-byte ZIP under a bounded transfer,
-checks its SHA-256 and every kept member, then derives the fixed-layout bundle.
+checks its SHA-256 and every kept member, then derives the fixed-layout bundle
+with the three pinned Visual C++ runtime files from the build toolchain's
+redistributable folder (`--runtime`).
 The publisher ZIP never enters the MSI. Its source commit, prior attestation
 review and license inventory are recorded in
 `research/security-reviews/llama.cpp-b10825-win-vulkan-x64.md`. The separate
 `research/security-reviews/llama.cpp-b10825-oa-reduced-bundle.md` records the
-24-file derivation, deterministic output digest and excluded-tool check.
+27-file derivation, the app-local Visual C++ runtime, deterministic output digest and excluded-tool check.
 There is no ARM64 engine pin: the ARM64 package keeps `modelhostd` but gates
 the x64 bundle, receipt and its MIT/BoringSSL notices out. Building a package stages bytes only;
 it does not install or start the engine or any model.
 
-The optional x64 `PyTorchImage` feature requires `pytorchd.exe` and
-`--src pytorchengine=<prepared-input-directory>` together. That directory
-contains `pytorch-2.11.0-rocm7.13.0-cpython3.12.10-gfx1151-inputs.zip` and its
-same-basename `.manifest.json`, the existing `enginefiles.Manifest` emitted by
-the exact same-source `pytorchd setup inputs` command. Both installer source
-IDs bind the coordinated prepared `abstraction-provider-pytorch` commit.
-The packager verifies the ZIP with `pytorch_engine.verify_bundle`, checks its
-member pins and canonical metadata, and reports its measured size and SHA-256.
-ARM64 leaves all three feature files out. The ZIP retains the selected
-interpreter, wheels and Hummingbird license notices; model bytes are a separate
-Setup effect. No static PyTorch facade declaration is installed.
+The optional x64 `PyTorchImage` feature installs `pytorchd.exe` alone; an
+x64 build from this checkout with no `--bin` adds the `lemonadeimage` and
+`pytorchimage` sources itself, each a provider-only feature. The PyTorch runtime inputs never enter the core MSI (coordinator,
+2026-11-01: engines are separate components, and the 1.7 GB ZIP would bring
+the core near the 2 GB MSI and cabinet limits). They are their own release
+component: `pytorch-2.11.0-rocm7.13.0-cpython3.12.10-gfx1151-inputs.zip` and
+its same-basename `.manifest.json`, the `enginefiles.Manifest` the exact
+same-source `pytorchd setup inputs` command emits. Setup's catalog pins that
+ZIP as the `pytorch-engine` package, and its picture plan downloads it
+through the job service only when it selects the PyTorch engine. Both
+installer source IDs, `pytorchimage` and `pytorchengine`, bind the same
+`abstraction-provider-pytorch` commit. The ZIP retains the selected
+interpreter, wheels and Hummingbird license notices; model bytes are a
+separate Setup effect. No static PyTorch facade declaration is installed.
+
+Prepare the component once from local files, with no download:
+
+    go -C openabstractions-flat/abstraction-provider-pytorch/go build -o <dir>/pytorchd.exe ./cmd/pytorchd
+    py -3.12 installer/pytorch_engine.py prepare --pytorchd <dir>/pytorchd.exe \
+      --python-home <python.org CPython 3.12.10 x64 folder> \
+      --wheels <folders holding the lean lock's 25 wheels> \
+      --source <HummingbirdXT checkout at its reviewed commit>
+
+The pair is 1,673,323,779 bytes (SHA-256 `f8260fd1…e4f6`) and 88,994 bytes
+(`ba3c4c1d…2c8e`), `pytorch_engine.INPUT_PINS`. The interpreter copy leaves
+out every `__pycache__` folder, so two derivations give the same bytes. The
+0.4.0 pair carried the deriving account's byte caches and could not be
+rebuilt after its only copy was removed on 2026-10-31.
 
 **HOLD:** source fixtures and a local input directory establish packaging
 behavior only. Genuine native CI inputs, their provenance, final reviewed
 bundle identity, native qualification and installed acceptance remain required
-before this feature can ship. The candidate workflow refuses a supplied
-`pytorchd.exe` without the prepared ZIP and owner manifest. There is currently
-no approved native-input artifact intake. No live tool row or final artifact
+before this component can ship. The candidate workflow's intake and
+consumption route still passes `--src pytorchengine`, which the core build now
+ignores; the release owner retires that intake and publishes the ZIP as the
+component's release asset instead (ADD-ENG, 2026-11-01). There is currently no approved native-input artifact intake. No live tool row or final artifact
 pin is supplied by these structural changes.
 
 With only a .NET runtime installed, run the same `wix.dll` through

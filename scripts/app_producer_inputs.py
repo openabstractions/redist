@@ -21,8 +21,12 @@ import urllib.request
 import zipfile
 import types
 
-from app_assets import (optional_app_sources, roster, select_windows_addon_artifact,
-                        select_windows_wheel_artifact)
+if __package__ == 'research.org-edits.redist':
+    from .app_assets import (optional_app_sources, roster, select_windows_addon_artifact,
+                             select_windows_wheel_artifact)
+else:
+    from app_assets import (optional_app_sources, roster, select_windows_addon_artifact,
+                            select_windows_wheel_artifact)
 
 
 COMMIT = re.compile(r'[0-9a-f]{40}\Z')
@@ -241,10 +245,8 @@ def installer_source_pins(app, npm_pins, pypi_pins, app_pins, app_roster, versio
         raise ValueError('installer inputs require the exact charter OpenCode source')
     selected = [*npm, *exact_rows(pypi_pins, ('package', 'repository', 'commit', 'directory'))]
     if app == 'comfyui':
-        adopters = exact_rows(app_pins, ('app', 'repository', 'commit'))
-        if len(adopters) != 1 or adopters[0]['app'] != 'comfyui' or adopters[0]['repository'] != 'openabstractions/adopter-comfyui':
-            raise ValueError('Comfy installer lacks its exact public functional adopter source')
-        selected += adopters
+        adopters = optional_app_sources(app_pins, document['apps'], required_products=required)
+        selected.append(adopters['comfyui'])
     pins = {'openabstractions/redist':producer_source}
     for row in selected:
         repo, commit = row['repository'], row['commit']
@@ -616,7 +618,7 @@ def materialize_desktop_go(pins, source_root, input_root, sdk_receipt):
         raise
 
 
-def preflight(app, charter, destination, minimum_free_gib):
+def preflight(app, charter, destination, minimum_free_gib, *, candidate_source=None, run_id=None, run_attempt=None):
     if minimum_free_gib < 1:
         raise ValueError('disposable runner must retain at least one GiB free')
     Path(destination).mkdir(parents=True, exist_ok=True)
@@ -624,6 +626,7 @@ def preflight(app, charter, destination, minimum_free_gib):
     if app != 'comfyui':
         raise ValueError('unknown optional app producer')
     package = imported(Path(charter) / 'scripts/package_comfyui_app.py')
+    producer_floor=package.backend_producer_floor(candidate_source,run_id,run_attempt)
     backend = selected_comfy_backend(Path(charter).parent, destination, package)
     if backend is not None:
         descriptor = Path(destination) / 'backend-inputs.json'
@@ -635,11 +638,13 @@ def preflight(app, charter, destination, minimum_free_gib):
         extra_wheels = (0 if package._backend_reuses_snapshot_wheels(selected, pins) else
                         sum(pins[row['file']] for row in selected['wheels']))
         required = package._backend_capacity(sum(pins.values()) + len(raw), extra_wheels, None, 0, 0, 0,
-            max(minimum_free_gib << 30, package.backend_limits()['reserve_bytes']), phase='inputs')
+            max(minimum_free_gib << 30, producer_floor), phase='inputs')
         if free < required:
             raise OSError('AMD backend needs bounded snapshot/build/output space')
         print(json.dumps({'app': app, 'mode': 'manager-free-amd-backend', 'free_bytes': free,
                           'required_free_bytes': required, 'input_descriptor': backend,
+                          'work_root': str(Path(destination).resolve()),
+                          'producer_floor_bytes': producer_floor,
                           'capacity_scope': 'input lower bound; exact source/integration/tool phases admitted by producer'}, sort_keys=True))
         return
     # Downloaded inputs still have to fit *before* repack's own preflight.
@@ -692,6 +697,171 @@ def selected_comfy_backend(source_root, input_root, package):
     if not descriptor.is_file() or descriptor.stat().st_size != expected['bytes']:
         raise ValueError('selected AMD backend descriptor is not staged')
     package.backend_inputs(descriptor, expected['sha256'])
+    return dict(expected)
+
+
+def materialize_comfy_backend(source_root, input_root, *, candidate_source, run_id, run_attempt):
+    """Acquire the exact source-declared closure, without running recipe code.
+
+    The selected source owns every locator and archive member. Metadata, local
+    notices and the OA-authored wheel are authenticated before the first fetch.
+    The existing backend owner subsequently receives the complete file roster.
+    """
+    import tarfile
+    from urllib.parse import urlsplit
+    source_root,input_root=Path(source_root),Path(input_root)
+    package=imported(source_root/'abstractions/scripts/package_comfyui_app.py')
+    source_root,input_root=package._extended(source_root),package._extended(input_root)
+    def ordinary(path):
+        for parent in (path,*path.parents):
+            if parent.is_symlink() or parent.is_junction():raise ValueError('linked backend acquisition input')
+    ordinary(source_root);ordinary(input_root)
+    ordinary(source_root/'adopter-comfyui/.installer')
+    floor=package.backend_producer_floor(candidate_source,run_id,run_attempt)
+    policy=_selected_comfy_backend_policy(source_root/'adopter-comfyui/.installer/desktop-host.json')
+    if policy is None:raise ValueError('backend acquisition requires the source-selected AMD recipe')
+    expected=policy['build_inputs']['backend']
+    root=source_root/'adopter-comfyui/.installer/backend-inputs'
+    ordinary(root)
+    descriptor=package._backend_file(root,'backend-inputs.json')
+    if descriptor.stat().st_size!=expected['bytes']:raise ValueError('selected backend descriptor size differs')
+    value,pins=package._backend_input_descriptor(descriptor,expected['sha256'])
+    recipe_path=package._backend_file(root,'acquisition.json')
+    if recipe_path.stat().st_size>4<<20:raise ValueError('backend acquisition metadata exceeds limit')
+    recipe=json.loads(recipe_path.read_bytes())
+    if (set(recipe)!={'schema','descriptor','downloads','source_archives','files'} or type(recipe['schema']) is not int or recipe['schema']!=1 or
+            recipe['descriptor']!=expected or not all(isinstance(recipe[k],dict) for k in ('downloads','source_archives','files')) or
+            set(recipe['files'])!=set(pins)):
+        raise ValueError('backend acquisition differs from complete selected descriptor')
+    downloads=recipe['downloads'];sources=recipe['source_archives'];groups={};local={}
+    def pin_matches(path,pin):
+        return package._sha256(path)==(pin['bytes'],pin['sha256'])
+    def archive_name(name):
+        package._backend_parts(name)
+        return name
+    def bounded_pin(row):
+        if (set(row)!={'bytes','sha256'} or type(row['bytes']) is not int or row['bytes']<0 or
+                not isinstance(row['sha256'],str) or not SHA.fullmatch(row['sha256'])):
+            raise ValueError('invalid backend acquisition pin')
+    for ident,row in downloads.items():
+        if (not isinstance(row,dict) or set(row)!={'bytes','sha256','url','format'} or ident!=row['sha256'] or
+                row['format'] not in ('file','tar','zip')):raise ValueError('invalid backend download recipe')
+        bounded_pin({k:row[k] for k in ('bytes','sha256')})
+        if not isinstance(row['url'],str):raise ValueError('invalid backend supplier URL')
+        url=urlsplit(row['url'])
+        if (url.scheme!='https' or not url.netloc or url.username or url.password or url.query or url.fragment or
+                row['bytes']<=0 or row['bytes']>package.backend_limits()['expanded_bytes']):
+            raise ValueError('backend locator requires an exact original HTTPS input')
+    for name,row in sources.items():
+        archive_name(name);bounded_pin(row)
+        if row['bytes']>64<<20:raise ValueError('backend source metadata archive exceeds limit')
+        path=package._backend_file(root,name)
+        if not pin_matches(path,row):raise ValueError('backend source metadata archive changed')
+        local[name]=path
+    for name,selection in recipe['files'].items():
+        if not isinstance(selection,dict):raise ValueError('invalid backend acquisition member')
+        if set(selection) in ({'download'},{'download','member'}):
+            ident=selection['download']
+            if ident not in downloads:raise ValueError('backend file lacks a declared supplier locator')
+            if 'member' in selection:
+                archive_name(selection['member'])
+                if pins[name]['bytes']>64<<20:raise ValueError('backend selected member exceeds memory bound')
+                if downloads[ident]['format']=='file':raise ValueError('backend member requires an archive')
+            elif {k:downloads[ident][k] for k in ('bytes','sha256')}!={k:pins[name][k] for k in ('bytes','sha256')}:
+                raise ValueError('backend direct input differs from selected file')
+            groups.setdefault(('download',ident),[]).append((name,selection))
+        elif set(selection)=={'source','member'} and selection['source'] in sources:
+            archive_name(selection['member'])
+            if pins[name]['bytes']>64<<20:raise ValueError('backend source member exceeds memory bound')
+            groups.setdefault(('source',selection['source']),[]).append((name,selection))
+        else:raise ValueError('backend file has missing or ambiguous acquisition provenance')
+    if (set(downloads)!={ident for kind,ident in groups if kind=='download'} or
+            set(sources)!={ident for kind,ident in groups if kind=='source'}):
+        raise ValueError('backend recipe includes unused acquisition inputs')
+    def read_members(path,format,selected,write,*,exact=False):
+        wanted={}
+        for name,row in selected:
+            if 'member' in row:wanted.setdefault(row['member'],[]).append(name)
+        seen=set()
+        def receive(member,stream,size):
+            names=wanted[member]
+            if member in seen:raise ValueError('duplicate selected backend archive member')
+            seen.add(member)
+            if any(pins[n]['bytes']!=size for n in names):raise ValueError('backend archive member size differs')
+            raw=stream.read(size+1)
+            if len(raw)!=size or any(hashlib.sha256(raw).hexdigest()!=pins[n]['sha256'] for n in names):
+                raise ValueError('backend archive member differs from selected file')
+            for name in names:write(name,raw)
+        if format=='zip':
+            with zipfile.ZipFile(path) as archive:
+                for member in archive.infolist():
+                    if exact and member.filename not in wanted:raise ValueError('unknown backend source metadata member')
+                    if member.filename in wanted:
+                        if member.is_dir() or (member.external_attr>>16)&0o170000 not in (0,0o100000):
+                            raise ValueError('backend member must be an ordinary file')
+                        with archive.open(member) as stream:receive(member.filename,stream,member.file_size)
+        else:
+            with tarfile.open(path,'r|*') as archive:
+                for member in archive:
+                    if member.name in wanted:
+                        if not member.isfile():raise ValueError('backend member must be an ordinary file')
+                        with archive.extractfile(member) as stream:receive(member.name,stream,member.size)
+        if seen!=set(wanted):raise ValueError('selected backend archive member is missing')
+    # Every source-controlled byte is checked before any acquisition effect.
+    for name,path in local.items():
+        read_members(path,'zip',groups.get(('source',name),[]),lambda name,raw:None,exact=True)
+    if input_root.exists():
+        staged=input_root/'backend-inputs.json'
+        if staged.exists() or staged.is_symlink():
+            staged=package._backend_file(input_root,'backend-inputs.json')
+            if staged.stat().st_nlink!=1:raise ValueError('staged backend descriptor must be single-link')
+            if staged.read_bytes()!=descriptor.read_bytes():raise ValueError('staged descriptor changed')
+        for name,row in pins.items():
+            path=input_root/name
+            ordinary(path.parent)
+            if path.exists() or path.is_symlink():
+                if not pin_matches(package._backend_file(input_root,name),row):raise ValueError('staged backend input changed')
+    parent=input_root if input_root.exists() else input_root.parent
+    package.relative_beneath_existing(parent,parent.resolve())
+    descriptor_bytes=len(descriptor.read_bytes())
+    input_bytes=sum(row['bytes'] for row in pins.values())+descriptor_bytes
+    extra_wheels=(0 if package._backend_reuses_snapshot_wheels(value,pins) else
+                  sum(pins[row['file']]['bytes'] for row in value['wheels']))
+    producer_need=package._backend_capacity(input_bytes,extra_wheels,None,0,0,0,floor,phase='inputs')
+    pending=sum(row['bytes'] for name,row in pins.items() if not (input_root/name).exists())
+    pending+=0 if (input_root/'backend-inputs.json').exists() else descriptor_bytes
+    required=pending+max(producer_need,max((r['bytes'] for r in downloads.values()),default=0)+floor)
+    free=shutil.disk_usage(parent).free
+    if free<required:raise OSError('backend acquisition needs bounded final input and temporary archive space')
+    print(json.dumps(dict(app='comfyui',phase='acquisition',work_root=str(input_root.resolve()),free_bytes=free,required_free_bytes=required),sort_keys=True))
+    input_root.mkdir(parents=True,exist_ok=True)
+    def write(name,raw):
+        path=input_root/name
+        if path.exists():return
+        path.parent.mkdir(parents=True,exist_ok=True)
+        ordinary(path.parent)
+        package.relative_beneath_existing(path.parent,input_root)
+        with path.open('xb') as stream:stream.write(raw)
+    for name,path in local.items():read_members(path,'zip',groups[('source',name)],write,exact=True)
+    for ident,row in downloads.items():
+        selected=groups[('download',ident)]
+        if all((input_root/name).exists() for name,_ in selected):continue
+        with package.owned_temporary_tree(prefix='oa-backend-acquire-',parent=input_root) as work:
+            path=Path(work)/'input'
+            checked_download(row['url'],path,row['sha256'],row['bytes'],max_bytes=row['bytes'])
+            if row['format']!='file':read_members(path,row['format'],selected,write)
+            for name,selection in selected:
+                if 'member' not in selection:
+                    destination=input_root/name
+                    if not destination.exists():
+                        destination.parent.mkdir(parents=True,exist_ok=True)
+                        ordinary(destination.parent)
+                        package.relative_beneath_existing(destination.parent,input_root)
+                        shutil.copyfile(path,destination)
+    destination=input_root/'backend-inputs.json'
+    if destination.exists() and destination.read_bytes()!=descriptor.read_bytes():raise ValueError('staged descriptor changed')
+    if not destination.exists():destination.write_bytes(descriptor.read_bytes())
+    package.backend_inputs(destination,expected['sha256'])
     return dict(expected)
 
 
@@ -899,7 +1069,8 @@ def main(argv=None):
         print(json.dumps(pinned_input_receipt(pins,args.source_root,args.input_root),sort_keys=True))
     elif args.operation == 'preflight':
         preflight(args.app, Path(args.source_root) / 'abstractions', Path(args.input_root),
-                  args.minimum_free_gib)
+                  args.minimum_free_gib,candidate_source=args.candidate_source,
+                  run_id=args.run_id,run_attempt=args.run_attempt)
     else:
         package = imported(Path(args.source_root) / 'abstractions/scripts/package_comfyui_app.py')
         dest = Path(args.input_root)

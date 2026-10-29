@@ -4,7 +4,8 @@
 Each package is downloaded from its nuget.org URL into --dest and refused
 unless its size and SHA-256 are the recorded ones. Each extension's DLL is
 unpacked beside its package and refused unless its size and SHA-256 are the
-recorded ones too. The owner approved these three packages (2026-10-06).
+recorded ones too. The original three packages were approved on 2026-10-06;
+Util supplies the native product search in the 2026-11-06 early-upgrade design.
 
 Prints NAME=VALUE lines, and with --env appends them to that file (a GitHub
 Actions GITHUB_ENV):
@@ -15,6 +16,7 @@ Actions GITHUB_ENV):
                `dotnet tool install --global wix --version 5.0.2 --configfile`
   WIX_UI_EXT   WixToolset.UI.wixext.dll, for `wix build -ext`
   WIX_BAL_EXT  WixToolset.BootstrapperApplications.wixext.dll, for `wix build -ext`
+  WIX_UTIL_EXT WixToolset.Util.wixext.dll, for the native product search
 
 With --from DIR, the packages are copied from DIR instead of downloaded, and
 checked the same way.
@@ -50,6 +52,16 @@ def embedded_wixlib(dll: bytes) -> zipfile.ZipFile:
 
 NUGET = "https://api.nuget.org/v3-flatcontainer/"
 PACKAGES = {
+    "WixToolset.Util.wixext": {
+        "file": "wixtoolset.util.wixext.5.0.2.nupkg",
+        "url": NUGET + "wixtoolset.util.wixext/5.0.2/wixtoolset.util.wixext.5.0.2.nupkg",
+        "bytes": 888252,
+        "sha256": "dda1cc1b4d3b2305b1246f167c6af6fcded5000be84b3bbff3dda4f442bf4740",
+        "dll": "wixext5/WixToolset.Util.wixext.dll",
+        "dll_bytes": 944912,
+        "dll_sha256": "c76cd00e8800cf785ff3cffd2ed3475915b487c7a3d441a266175cdc326912eb",
+        "env": "WIX_UTIL_EXT",
+    },
     "wix": {
         "file": "wix.5.0.2.nupkg",
         "url": NUGET + "wix/5.0.2/wix.5.0.2.nupkg",

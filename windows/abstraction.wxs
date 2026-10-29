@@ -27,11 +27,20 @@
                   DowngradeErrorMessage="A newer OpenAbstractions is already installed. Remove it from Apps and features before installing this one." />
     <MediaTemplate EmbedCab="yes" />
 
+    <!-- Preview builds share the Panel's file version. Replace equal versions
+         while the predecessor remains installed through InstallFinalize.
+         The execute action overrides the Burn/Windows defaults for a new
+         product, preserving explicit modes and maintenance reinstalls.
+         e preserves newer files: https://learn.microsoft.com/en-us/windows/win32/msi/reinstallmode -->
+    <SetProperty Id="REINSTALLMODE" Value="emus" Before="CostInitialize" Sequence="execute"
+                 Condition="NOT Installed AND NOT REMOVE AND (NOT REINSTALLMODE OR REINSTALLMODE=&quot;muso&quot; OR REINSTALLMODE=&quot;omus&quot;)" />
+
     <Property Id="ARPURLINFOABOUT" Value="https://github.com/openabstractions" />
     <Property Id="ARPNOREPAIR" Value="1" />
     <!-- Native GUI session handling closes the per-user supervisor and its
          contained runtime. Keep graceful Restart Manager shutdown enabled. -->
     <Property Id="MSIRESTARTMANAGERCONTROL" Value="0" />
+    <Property Id="OAUPGRADECHAIN" Secure="yes" />
     <Property Id="MSIRMSHUTDOWN" Value="0" />
     <!-- AdminUser reports the installing token itself. Without this, Windows sets
          AdminUser wherever Privileged is set, including AlwaysInstallElevated for
@@ -60,8 +69,6 @@
     <?else?><?define NoModelHostEngine = " The reviewed ModelHost chat engine is not in this package; Windows ARM64 has no reviewed engine pin." ?><?endif?>
     <?if $(var.LemonadeImage) = yes ?><?define NoLemonadeImage = "" ?>
     <?else?><?define NoLemonadeImage = " Local image generation is not in it; this build has no qualified x64 lemonaded provider." ?><?endif?>
-    <?if $(var.TheNoiseImage) = yes ?><?define NoTheNoiseImage = "" ?>
-    <?else?><?define NoTheNoiseImage = " The TheNoise image adapter is not in this build." ?><?endif?>
     <?if $(var.PyTorchImage) = yes ?><?define NoPyTorchImage = "" ?>
     <?else?><?define NoPyTorchImage = " The PyTorch picture feature is not in this build." ?><?endif?>
     <?if $(var.McpGateway) = yes ?><?define NoMcpGateway = "" ?>
@@ -70,7 +77,7 @@
     <?else?><?define NoIpcLibrary = " The native IPC library for applications is not in it; this build was given none, and Windows ARM64 has no build of it." ?><?endif?>
     <?if $(var.SystemHelper) = yes ?><?define NoSystemHelper = "" ?>
     <?else?><?define NoSystemHelper = " The protected-operation helper is not in it; this build was given no source or binary for openabstractions-system." ?><?endif?>
-    <?define Absent = "$(var.NoSystemHelper)$(var.NoIpcLibrary)$(var.NoPanel)$(var.NoCpp)$(var.NoLocalStores)$(var.NoModelHost)$(var.NoModelHostEngine)$(var.NoLemonadeImage)$(var.NoTheNoiseImage)$(var.NoPyTorchImage)$(var.NoMcpGateway)" ?>
+    <?define Absent = "$(var.NoSystemHelper)$(var.NoIpcLibrary)$(var.NoPanel)$(var.NoCpp)$(var.NoLocalStores)$(var.NoModelHost)$(var.NoModelHostEngine)$(var.NoLemonadeImage)$(var.NoPyTorchImage)$(var.NoMcpGateway)" ?>
     <?if $(var.Absent) = "" ?>
     <Property Id="ARPCOMMENTS" Value="The OpenAbstractions runtime shares downloads, model access, credentials and permissions among applications." />
     <?else?>
@@ -108,9 +115,6 @@
                  of one is recorded in the runtime's own state, so this
                  package writing the file again does not bring it back. -->
             <Directory Id="DeclarationsFolder" Name="declarations" />
-          </Directory>
-          <Directory Id="ComponentEnginesFolder" Name="engines">
-            <Directory Id="PyTorchInputsFolder" Name="pytorch" />
           </Directory>
           <Directory Id="ExamplesFolder" Name="examples">
             <Directory Id="ExampleMachine" Name="what-this-machine-does" />
@@ -233,13 +237,15 @@
          those folders (start, serve supervisor, SDK activation) exits 3 while the
          installer lives. The commit action releases it. The rollback action
          releases it and runs the previous version's own activation. Order in
-         the early script, per scope: begin, commit release, rollback
-         activation. Rollback runs in reverse, so the record is released and
-         the previous runtime activated after the files are back. The early
+         the early script, per scope: rollback activation, begin, commit
+         release. The rollback action comes first so that it is part of the
+         script when begin itself fails after taking the exclusion. Rollback
+         runs in reverse, so the record is released and the previous runtime
+         activated after the files are back. The early
          InstallExecute flushes the chain before any file is replaced. -->
 
     <CustomAction Id="BeginMachineUpgradeExclusion" BinaryRef="UpgradeSupervisorCode"
-                  ExeCommand="service begin-upgrade --machine &quot;[APPLICATIONFOLDER].&quot; --related &quot;[WIX_UPGRADE_DETECTED]&quot;"
+                  ExeCommand="service begin-upgrade --machine &quot;[APPLICATIONFOLDER].&quot; --related &quot;[WIX_UPGRADE_DETECTED]&quot; --chain &quot;[OAUPGRADECHAIN]&quot;"
                   Execute="deferred" Impersonate="no" Return="check" />
     <CustomAction Id="EndMachineUpgradeExclusion" BinaryRef="UpgradeSupervisorCode"
                   ExeCommand="service end-upgrade --machine"
@@ -271,6 +277,35 @@
          predecessor is removed only after InstallFinalize. -->
     <CustomAction Id="RestartPreviousUserSupervisor" BinaryRef="UpgradeSupervisorCode"
                   ExeCommand="service start --related &quot;[WIX_UPGRADE_DETECTED]&quot;"
+                  Execute="rollback" Impersonate="yes" Return="ignore" />
+    <!-- Removal exclusion. A real removal holds the same exclusion for this
+         product's own folder before any file goes, and begin-removal closes
+         and awaits the identified OA processes running from it; activation
+         from the folder exits 3 until commit. Without it a client restarted
+         the host from the image being removed (owner's PC, 2026-11-01: a
+         packaged app's activation dispatched `serve supervisor` through the
+         desktop shell two seconds after Restart Manager stopped the host),
+         Windows Installer moved that in-use image aside, and the next install
+         left a runtime every client refused. Rollback restores the files,
+         releases the record and starts the host again. A successor's upgrade
+         (UPGRADINGPRODUCTCODE) holds its own exclusion and skips these. -->
+    <CustomAction Id="BeginMachineRemovalExclusion" BinaryRef="UpgradeSupervisorCode"
+                  ExeCommand="service begin-removal --machine &quot;[APPLICATIONFOLDER].&quot;"
+                  Execute="deferred" Impersonate="no" Return="check" />
+    <CustomAction Id="EndMachineRemovalExclusion" BinaryRef="UpgradeSupervisorCode"
+                  ExeCommand="service end-upgrade --machine"
+                  Execute="commit" Impersonate="no" Return="check" />
+    <CustomAction Id="RestartRemovedSupervisor" BinaryRef="UpgradeSupervisorCode"
+                  ExeCommand="service start --machine"
+                  Execute="rollback" Impersonate="no" Return="ignore" />
+    <CustomAction Id="BeginUserRemovalExclusion" BinaryRef="UpgradeSupervisorCode"
+                  ExeCommand="service begin-removal --user &quot;[APPLICATIONFOLDER].&quot;"
+                  Execute="deferred" Impersonate="yes" Return="check" />
+    <CustomAction Id="EndUserRemovalExclusion" BinaryRef="UpgradeSupervisorCode"
+                  ExeCommand="service end-upgrade --user"
+                  Execute="commit" Impersonate="yes" Return="check" />
+    <CustomAction Id="RestartRemovedUserSupervisor" BinaryRef="UpgradeSupervisorCode"
+                  ExeCommand="service start --user &quot;[APPLICATIONFOLDER].&quot; [ProductVersion]"
                   Execute="rollback" Impersonate="yes" Return="ignore" />
     <!-- Fresh machine installs and repairs register the host inside the
          transaction, with the elevated token the SCM needs, and undo it on
@@ -386,19 +421,37 @@
     <InstallExecuteSequence>
       <Custom Action="RefuseElevatedPerUserInstall" Before="CostInitialize"
               Condition="AdminUser AND NOT ALLUSERS AND NOT (REMOVE=&quot;ALL&quot;) AND NOT UPGRADINGPRODUCTCODE" />
-      <Custom Action="BeginMachineUpgradeExclusion" After="InstallInitialize"
+      <!-- Per scope: the rollback start first, then begin, then the commit
+           release. A rollback action runs only when it was reached before the
+           failure, so a begin that fails after taking the exclusion (a
+           process that does not stop in time) still releases it and starts
+           the host, instead of leaving activation refused until msiexec
+           ends. -->
+      <Custom Action="RestartPreviousSupervisor" After="InstallInitialize"
+              Condition="ALLUSERS AND WIX_UPGRADE_DETECTED AND NOT REMOVE" />
+      <Custom Action="BeginMachineUpgradeExclusion" After="RestartPreviousSupervisor"
               Condition="ALLUSERS AND WIX_UPGRADE_DETECTED AND NOT REMOVE" />
       <Custom Action="EndMachineUpgradeExclusion" After="BeginMachineUpgradeExclusion"
               Condition="ALLUSERS AND WIX_UPGRADE_DETECTED AND NOT REMOVE" />
-      <Custom Action="RestartPreviousSupervisor" After="EndMachineUpgradeExclusion"
-              Condition="ALLUSERS AND WIX_UPGRADE_DETECTED AND NOT REMOVE" />
-      <Custom Action="BeginUserUpgradeExclusion" After="RestartPreviousSupervisor"
+      <Custom Action="RestartPreviousUserSupervisor" After="EndMachineUpgradeExclusion"
+              Condition="NOT ALLUSERS AND WIX_UPGRADE_DETECTED AND NOT REMOVE" />
+      <Custom Action="BeginUserUpgradeExclusion" After="RestartPreviousUserSupervisor"
               Condition="NOT ALLUSERS AND WIX_UPGRADE_DETECTED AND NOT REMOVE" />
       <Custom Action="EndUserUpgradeExclusion" After="BeginUserUpgradeExclusion"
               Condition="NOT ALLUSERS AND WIX_UPGRADE_DETECTED AND NOT REMOVE" />
-      <Custom Action="RestartPreviousUserSupervisor" After="EndUserUpgradeExclusion"
-              Condition="NOT ALLUSERS AND WIX_UPGRADE_DETECTED AND NOT REMOVE" />
-      <InstallExecute After="RestartPreviousUserSupervisor" />
+      <Custom Action="RestartRemovedSupervisor" After="EndUserUpgradeExclusion"
+              Condition="ALLUSERS AND REMOVE=&quot;ALL&quot; AND NOT UPGRADINGPRODUCTCODE" />
+      <Custom Action="BeginMachineRemovalExclusion" After="RestartRemovedSupervisor"
+              Condition="ALLUSERS AND REMOVE=&quot;ALL&quot; AND NOT UPGRADINGPRODUCTCODE" />
+      <Custom Action="EndMachineRemovalExclusion" After="BeginMachineRemovalExclusion"
+              Condition="ALLUSERS AND REMOVE=&quot;ALL&quot; AND NOT UPGRADINGPRODUCTCODE" />
+      <Custom Action="RestartRemovedUserSupervisor" After="EndMachineRemovalExclusion"
+              Condition="NOT ALLUSERS AND REMOVE=&quot;ALL&quot; AND NOT UPGRADINGPRODUCTCODE" />
+      <Custom Action="BeginUserRemovalExclusion" After="RestartRemovedUserSupervisor"
+              Condition="NOT ALLUSERS AND REMOVE=&quot;ALL&quot; AND NOT UPGRADINGPRODUCTCODE" />
+      <Custom Action="EndUserRemovalExclusion" After="BeginUserRemovalExclusion"
+              Condition="NOT ALLUSERS AND REMOVE=&quot;ALL&quot; AND NOT UPGRADINGPRODUCTCODE" />
+      <InstallExecute After="EndUserRemovalExclusion" />
       <Custom Action="UnregisterSupervisor" Before="RemoveFiles"
               Condition="ALLUSERS AND REMOVE=&quot;ALL&quot; AND NOT UPGRADINGPRODUCTCODE" />
       <?if $(var.ModelHost) = yes ?>
@@ -538,7 +591,7 @@
     <?if $(var.Panel) = yes ?>
     <!-- The exe itself carries the icon: monitor/panel.rc packs
          monitor/icon/panel.ico at resource id 1 and go build links it in
-         through monitor/rsrc_windows_*.syso (monitor/README.md). WiX reads
+         through monitor/internal/panelres/rsrc_windows_*.syso (monitor/README.md). WiX reads
          that resource straight out of the staged binary rather than a
          second copy of the ico file, so ARPPRODUCTICON and both shortcuts
          below always show the same icon the exe does. -->
@@ -548,6 +601,12 @@
       <Component>
         <File Id="panel.exe" Name="Abstraction Panel.exe" Source="payload/tools/Abstraction Panel.exe" KeyPath="yes" />
       </Component>
+      <!-- The Asks presenter: the one program that draws native questions and
+           notifications (monitor/presenter_main_windows.go). The runtime's
+           sign-in entry and supervisor start it. -->
+      <Component>
+        <File Id="presenter.exe" Name="OpenAbstractions Presenter.exe" Source="payload/tools/OpenAbstractions Presenter.exe" KeyPath="yes" />
+      </Component>
       <Component Id="PanelAppModelLibrary">
         <File Id="abstraction_facade_appmodel.dll" Source="payload/tools/abstraction_facade_appmodel.dll" KeyPath="yes" />
       </Component>
@@ -556,8 +615,8 @@
       <Component Id="PanelStartMenu" Guid="E5D9EA35-65C8-4930-9FC0-06120E9F39BE">
         <!-- The AppUserModelID and toast activator make the Panel the sender of
              OA-held notifications (monitor/notification_windows.go, ASK-N7).
-             Windows starts the activator's LocalServer32 to deliver a click
-             after every OA process exited. -->
+             Windows starts the activator's LocalServer32, the presenter, to
+             deliver a click after every OA process exited. -->
         <Shortcut Id="PanelShortcutFile" Name="OpenAbstractions Panel"
                   Description="What this machine is doing with downloads, and what is holding the card"
                   Target="[#panel.exe]" WorkingDirectory="ToolsFolder" Icon="PanelIcon">
@@ -565,7 +624,7 @@
           <ShortcutProperty Key="System.AppUserModel.ToastActivatorCLSID" Value="{CC32C67F-0E49-4CC5-A212-C4CB329CD06C}" />
         </Shortcut>
         <RegistryValue Root="HKMU" Key="Software\Classes\CLSID\{CC32C67F-0E49-4CC5-A212-C4CB329CD06C}\LocalServer32"
-                       Type="string" Value="&quot;[#panel.exe]&quot; --background" />
+                       Type="string" Value="&quot;[#presenter.exe]&quot; --background" />
         <RemoveRegistryKey Root="HKMU" Key="Software\Classes\CLSID\{CC32C67F-0E49-4CC5-A212-C4CB329CD06C}"
                            Action="removeOnUninstall" />
         <RemoveFile Id="RemoveSetupShortcut" Name="OpenAbstractions Setup.lnk"
@@ -681,29 +740,15 @@
     </ComponentGroup>
     <?endif?>
 
-    <!-- Setup writes the TheNoise declaration after separate engine and
-         model approval. Its fixed CLI arguments name the journal-owned tree. -->
-    <?if $(var.TheNoiseImage) = yes ?>
-    <ComponentGroup Id="TheNoiseImageFiles">
-      <Component Directory="ToolsFolder">
-        <File Id="thenoise_provider.exe" Source="payload/tools/thenoise-provider.exe" KeyPath="yes" />
-      </Component>
-    </ComponentGroup>
-    <?endif?>
-
-    <!-- The x64 provider and its reviewed local runtime inputs ship together.
-         Setup prepares the component and writes its declaration after separate
-         model approval. Installation starts no interpreter or engine. -->
+    <!-- The x64 provider alone. Its 1.7 GB runtime input package is a
+         separate release component Setup downloads through the job service
+         only when its picture plan selects this engine; Setup then prepares
+         the component and writes the declaration after the model approval.
+         Installation starts no interpreter or engine. -->
     <?if $(var.PyTorchImage) = yes ?>
     <ComponentGroup Id="PyTorchImageFiles">
       <Component Directory="ToolsFolder">
         <File Id="pytorchd.exe" Source="payload/tools/pytorchd.exe" KeyPath="yes" />
-      </Component>
-      <Component Directory="PyTorchInputsFolder">
-        <File Id="pytorch_inputs.zip" Source="payload/engines/pytorch/pytorch-2.11.0-rocm7.13.0-cpython3.12.10-gfx1151-inputs.zip" KeyPath="yes" />
-      </Component>
-      <Component Directory="PyTorchInputsFolder">
-        <File Id="pytorch_inputs.manifest.json" Source="payload/engines/pytorch/pytorch-2.11.0-rocm7.13.0-cpython3.12.10-gfx1151-inputs.manifest.json" KeyPath="yes" />
       </Component>
     </ComponentGroup>
     <?endif?>
@@ -804,29 +849,22 @@
     <?endif?>
 
     <?if $(var.LemonadeImage) = yes ?>
-    <Feature Id="LemonadeImage" Level="1000" AllowAdvertise="no"
+    <Feature Id="LemonadeImage" Level="1" AllowAdvertise="no"
              Title="Local image generation"
              Description="Adds lemonaded, which serves image generation, transcription and speech through the Lemonade app. Get started in the Panel reviews and downloads the separate engine and model after you choose them. Installing this feature starts no engine and downloads no model.">
       <ComponentGroupRef Id="LemonadeImageFiles" />
     </Feature>
     <?endif?>
 
-    <?if $(var.TheNoiseImage) = yes ?>
-    <Feature Id="TheNoiseImage" Level="1000" AllowAdvertise="no" Title="TheNoise local pictures"
-             Description="Adds the TheNoise image adapter. Setup reviews the separate pinned engine and model downloads, then registers CPU image generation on demand. GPU qualification is pending. Installing this feature starts no engine and downloads no model.">
-      <ComponentGroupRef Id="TheNoiseImageFiles" />
-    </Feature>
-    <?endif?>
-
     <?if $(var.PyTorchImage) = yes ?>
-    <Feature Id="PyTorchImage" Level="1000" AllowAdvertise="no" Title="PyTorch local pictures"
-             Description="Adds the PyTorch provider and its reviewed interpreter, wheel and source inputs on Windows x64. Setup prepares the component after you choose a model. Installing this feature starts no engine and downloads no model.">
+    <Feature Id="PyTorchImage" Level="1" AllowAdvertise="no" Title="PyTorch local pictures"
+             Description="Adds the PyTorch provider on Windows x64. Setup downloads its reviewed interpreter, wheel and source package and prepares the engine after you choose a model. Installing this feature starts no engine and downloads nothing.">
       <ComponentGroupRef Id="PyTorchImageFiles" />
     </Feature>
     <?endif?>
 
     <?if $(var.McpGateway) = yes ?>
-    <Feature Id="McpGateway" Level="1000" AllowAdvertise="no"
+    <Feature Id="McpGateway" Level="1" AllowAdvertise="no"
              Title="MCP gateway"
              Description="openabstractions-mcp, a local stdio MCP server that gives an assistant six OA abilities: list applications, list models, one bounded completion, and submit, read or cancel durable image and video work. The runtime never starts it; an assistant does, by its absolute path. It holds nothing by being installed — grant it the applications and hosts it may reach with openabstractions rights.">
       <ComponentGroupRef Id="McpGatewayFiles" />

@@ -29,6 +29,19 @@ static __inline BOOL oa_native_same_handles(HANDLE a,HANDLE b) {
     OA_NATIVE_FILE_ID left,right;
     return oa_native_id(a,&left)&&oa_native_id(b,&right)&&oa_native_id_equal(&left,&right);
 }
+/* Native NTFS compatibility for the held-handle process-image check. A volume
+ * GUID spelling establishes local volume naming. It supplies no equality. */
+static __inline BOOL oa_native_local_ntfs_file_id(HANDLE file,BY_HANDLE_FILE_INFORMATION *id) {
+    WCHAR volume[64];
+    WCHAR *final=(WCHAR*)HeapAlloc(GetProcessHeap(),0,32768*sizeof(WCHAR));
+    if(!final)return FALSE;
+    DWORD length=GetFinalPathNameByHandleW(file,final,32768,VOLUME_NAME_GUID|FILE_NAME_OPENED);
+    BOOL local=length>=49&&length<32768&&!wcsncmp(final,L"\\\\?\\Volume{",11)&&final[47]==L'}'&&final[48]==L'\\';
+    HeapFree(GetProcessHeap(),0,final);
+    return local&&GetVolumeInformationByHandleW(file,NULL,0,NULL,NULL,NULL,volume,ARRAYSIZE(volume))&&
+        !wcscmp(volume,L"NTFS")&&GetFileInformationByHandle(file,id)&&
+        (id->nFileIndexHigh||id->nFileIndexLow);
+}
 static __inline void oa_native_close(OA_NATIVE_FILE *file) {
     DWORD saved=GetLastError();
     for(size_t n=file->count;n;n--)CloseHandle(file->chain[n-1]);

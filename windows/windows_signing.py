@@ -4,6 +4,7 @@ Authentication and release orchestration have separate existing owners. This
 helper runs on fresh signing hosts, or without credentials on verification hosts.
 """
 import argparse
+import _imp
 import base64
 import hashlib
 import json
@@ -16,10 +17,13 @@ import sys
 import shutil
 import tarfile
 import tempfile
-import time
+from time import sleep as wait_for_artifact_storage
 import zipfile
 import urllib.request
 import xml.etree.ElementTree as ET
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from scripts import file_boundary, git_env
 
 CODE_SIGNING = '1.3.6.1.5.5.7.3.3'
 TIME_STAMPING = '1.3.6.1.5.5.7.3.8'
@@ -680,12 +684,13 @@ def member(root, name):
     return target
 
 
-def signature_targets(payload_rows, binaries_root, architecture):
+def signature_targets(payload_rows, binaries_root, architecture, *, scope='all'):
     """Select existing payload PEs from the authoritative installer roster."""
     if architecture not in ('x64', 'arm64'):
         raise ValueError('unsupported Windows signing architecture')
     root = Path(binaries_root)
     targets = []
+    runtime_targets = set()
     for row in payload_rows:
         if len(row) != 7:
             raise ValueError('invalid payload signing row')
@@ -698,15 +703,312 @@ def signature_targets(payload_rows, binaries_root, architecture):
         target = root / name
         if target.is_file():
             targets.append(target)
+            if tuple(row[2:5]) == ('gobuild', 'charter', 'serve'):
+                runtime_targets.add(target)
     actual = {path for path in root.iterdir() if path.suffix.lower() in ('.exe', '.dll')}
     if actual != set(targets):
         raise ValueError('Windows binaries include an executable outside payload signing authority')
     if not targets:
         raise ValueError('Windows payload signing inventory is empty')
+    if scope == 'providers':
+        targets = [target for target in targets if target not in runtime_targets]
+    elif scope == 'runtime-owner':
+        targets = [target for target in targets if target in runtime_targets]
+    elif scope != 'all':
+        raise ValueError('unsupported executable signing subset')
     return sorted(targets)
 
 
+def windows_build_owner():
+    path = Path(__file__).with_name('build.py')
+    sys.path.insert(0, str(path.parent))
+    try:
+        spec = importlib.util.spec_from_file_location('oa_signed_provider_build_owner', path)
+        owner = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(owner)
+        return owner
+    finally:
+        sys.path.pop(0)
+
+
+def signed_provider_images(root, payload, policy, signtool, receipt, *, policy_sha256):
+    """Hash final, policy-verified provider images through the existing payload owner."""
+    retained = verify_receipt(receipt, policy, root, policy_sha256=policy_sha256)
+    proofs = {row['name']: row for row in retained['files']}
+    owner = windows_build_owner()
+    result = {}
+    for architecture, folder in (('x64', 'amd64'), ('arm64', 'arm64')):
+        directory = Path(root) / 'runtime/a' / folder
+        selected = signature_targets(payload, directory, architecture, scope='providers')
+        included = set(owner.included_provider_names(architecture, [path.name for path in selected]))
+        images = {}
+        for path in selected:
+            row = next(row for row in payload if PurePosixPath(row[1]).name == path.name)
+            # The actual operator root package has no program registration.
+            if path.name not in included or tuple(row[2:5]) == ('gobuild', 'panel', 'monitor') or path.suffix.lower() != '.exe':
+                continue
+            name = Path(os.path.relpath(path, root)).as_posix()
+            if name not in proofs:
+                raise ValueError('provider image lacks original signing proof')
+            actual = verify(path, policy, signtool)
+            if any(actual[key] != proofs[name][key] for key in ('bytes', 'sha256')):
+                raise ValueError('provider image changed after signing')
+            images[path.name] = actual['sha256']
+        result[folder] = images
+    return result
+
+
+def packaging_program_proof(root, architecture, policy, signtool, signatures, *,
+                            tools, graph, archive, producer, observation_owner=None, sdk_owner=None):
+    """Join the final observed link to actual signed bytes for normal staging."""
+    scripts = Path(__file__).parent.parent/'scripts'
+    if not (scripts/'module_provenance.py').is_file():
+        scripts = Path(__file__).resolve().parents[1]/'research/org-edits/redist'
+    def load(path, name):
+        spec = importlib.util.spec_from_file_location(name, path)
+        owner = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(owner)
+        return owner
+    owner = observation_owner or load(scripts/'module_provenance.py', 'oa_packaging_runtime_observation')
+    sdk_path = Path(__file__).parent.parent/'tools/windows_go_sdk.py'
+    if not sdk_path.is_file():sdk_path = Path(__file__).resolve().parents[1]/'scripts/windows_go_sdk.py'
+    sdk = sdk_owner or load(sdk_path, 'oa_packaging_runtime_sdk')
+    runtime = Path(root)/'runtime'
+    sdk_root = runtime/'build-sdk'
+    sdk_proof = (sdk_root/'windows-go-sdk-proof.json').read_bytes()
+    identity = json.loads(sdk_proof)['receipt']['source_identity']
+    facts = sdk.archived_compiler_facts(sdk_root/'archive.zip', identity)
+    sdk.admit_hosted_smoke(sdk_proof, (sdk_root/'smoke-receipt.json').read_bytes(),
+        (sdk_root/'named-pipe-race.log').read_bytes(), expected_facts=facts)
+    policy_sha = hashlib.sha256(Path(policy).read_bytes()).hexdigest()
+    selected_policy = json.loads(Path(policy).read_bytes())
+    images = signed_provider_images(root, payload_rows(Path(__file__).with_name('payload.tsv')),
+        selected_policy, signtool, signatures, policy_sha256=policy_sha)
+    expected_archive = {'bytes':Path(archive).stat().st_size,
+                        'sha256':hashlib.sha256(Path(archive).read_bytes()).hexdigest()}
+    helper_paths = [scripts/'module_provenance.py', scripts/'release_tsv_rows.py', Path(__file__).with_name('build.py')]
+    helpers = [{'path':str(path), 'sha256':hashlib.sha256(path.read_bytes()).hexdigest(), 'bytes':path.stat().st_size}
+               for path in helper_paths]
+    pins = owner.admit_observed_windows_builds((runtime/'final-runtime-provenance.json').read_bytes(),
+        (runtime/'windows-runtime-build-observation.json').read_bytes(),
+        expected_graph=json.loads(Path(graph).read_bytes()), expected_archive=expected_archive,
+        tools_bytes=Path(tools).read_bytes(), expected_producer=producer,
+        expected_helpers=helpers, sdk_facts=facts, phase='runtime', expected_provider_images=images)
+    folder = {'x64':'amd64', 'arm64':'arm64'}[architecture]
+    programs = []
+    for pin in pins:
+        if pin['arch'] != folder:continue
+        path = runtime/'a'/folder/pin['name']
+        before = setup_file_pin(path)
+        verify_go_content(path, {key:pin[key] for key in ('bytes','sha256')})
+        proof = verify(path, selected_policy, signtool)
+        if (any(proof[key] != before[key] for key in ('bytes','sha256')) or setup_file_pin(path) != before):
+            raise ValueError('signed runtime changed during compilation content admission')
+        programs.append({'arch':architecture, 'artifact':{'path':str(path),
+            **{key:proof[key] for key in ('bytes','sha256')}}, 'provider_images':images[folder]})
+    if not programs:raise ValueError('final runtime compilation proof is empty')
+    return {'provider_images':images[folder], 'programs':programs}
+
+
 INTAKE_RECEIPT = 'artifact-intake.json'
+
+
+def installer_prior_descriptor(value, *, authority=None):
+    """Portable prior selection; local paths and downloaded metadata grant no authority."""
+    if authority is None:
+        authority = json.loads(Path(__file__).with_name('installer-prior-authorities.json').read_bytes())
+    if (not isinstance(value, dict) or set(value) != {'schema', 'source', 'version', 'priors'}
+            or type(value['schema']) is not int or value['schema'] != 1
+            or not re.fullmatch('[0-9a-f]{40}', str(value['source']))
+            or value['version'] != authority['version'] or not isinstance(value['priors'], list)
+            or len(value['priors']) != len(authority['priors'])):
+        raise ValueError('installer predecessor descriptor differs from selected source authority')
+    ids = set()
+    for row, selected in zip(value['priors'], authority['priors']):
+        if (not isinstance(row, dict) or set(row) != {'receipt_sha256', 'product_code', 'asset'}
+                or any(row.get(k) != selected[k] for k in ('receipt_sha256', 'product_code'))):
+            raise ValueError('installer predecessor ordered receipt/product authority differs')
+        asset = row['asset']
+        if (not isinstance(asset, dict) or set(asset) != {'repository', 'release_id', 'id', 'name', 'sha256', 'bytes'}
+                or asset['repository'] != 'openabstractions/redist'
+                or any(type(asset[k]) is not int or asset[k] < 1 for k in ('release_id', 'id', 'bytes'))
+                or asset['bytes'] > 512 * 1024**2 or asset['id'] in ids
+                or not re.fullmatch('[A-Za-z0-9][A-Za-z0-9_.-]*\\.zip', str(asset['name']))
+                or PureWindowsPath(asset['name']).is_reserved()
+                or not re.fullmatch('[0-9a-f]{64}', str(asset['sha256']))):
+            raise ValueError('installer predecessor requires an exact same-repository portable archive asset')
+        ids.add(asset['id'])
+    return value
+
+
+def installer_prior_members(archive, selected):
+    """Read the original receipt and its exact sibling core/Setup bytes, without effects."""
+    path = Path(archive)
+    if path.is_symlink() or path.is_junction() or not path.is_file() or path.stat().st_nlink != 1:
+        raise ValueError('installer predecessor archive is missing or linked')
+    pin = selected['asset']
+    if path.stat().st_size != pin['bytes'] or hashlib.sha256(path.read_bytes()).hexdigest() != pin['sha256']:
+        raise ValueError('installer predecessor archive differs from frozen input')
+    try:
+        content = zipfile.ZipFile(path)
+    except zipfile.BadZipFile as error:
+        raise ValueError('installer predecessor archive is not a valid ZIP') from error
+    with content:
+        entries = content.infolist()
+        if (len(entries) != 3 or len({p.filename.casefold() for p in entries}) != 3
+                or any(p.is_dir() or PurePosixPath(p.filename).name != p.filename or '\\' in p.filename or ':' in p.filename
+                       or PureWindowsPath(p.filename).is_reserved() or p.flag_bits & 1
+                       or (p.external_attr >> 16) & 0o170000 not in (0,0o100000) for p in entries)
+                or sum(p.file_size for p in entries) > 512 * 1024**2):
+            raise ValueError('installer predecessor archive must contain only three ordinary sibling members')
+        try:
+            members = {entry.filename: content.read(entry) for entry in entries}
+        except (zipfile.BadZipFile,NotImplementedError,RuntimeError) as error:
+            raise ValueError('installer predecessor archive member cannot be verified') from error
+    raw = members.get('bundle-receipt.json', b'')
+    if len(raw) > 1 << 20 or hashlib.sha256(raw).hexdigest() != selected['receipt_sha256']:
+        raise ValueError('installer predecessor original receipt differs from selected authority')
+    receipt = json.loads(raw)
+    core = [p for p in receipt['chain'] if p['id'] == 'OpenAbstractions']
+    if len(core) != 1:
+        raise ValueError('installer predecessor needs one core MSI')
+    expected = {'bundle-receipt.json'}
+    for member in (receipt['bundle'], core[0]):
+        name = member['name']; expected.add(name)
+        if (PurePosixPath(name).name != name or '\\' in name or ':' in name or name not in members
+                or len(members[name]) != member['bytes']
+                or hashlib.sha256(members[name]).hexdigest() != member['sha256']):
+            raise ValueError('installer predecessor member differs from its authentic receipt')
+    if set(members) != expected:
+        raise ValueError('installer predecessor archive contains a foreign member')
+    return members
+
+
+def installer_prior_history(descriptor, archives, destination, *, wix='wix', authority=None, environment=None):
+    """Use the existing verified MSI extraction owner to derive the B3 history."""
+    installer_prior_descriptor(descriptor, authority=authority)
+    if len(archives) != len(descriptor['priors']):
+        raise ValueError('installer predecessor archive roster differs')
+    destination = Path(destination)
+    destination.mkdir()
+    triples = []
+    for index, (selected, archive) in enumerate(zip(descriptor['priors'], archives)):
+        members = installer_prior_members(archive, selected)
+        root = destination / str(index); root.mkdir()
+        for name, raw in members.items():
+            (root / name).write_bytes(raw)
+        triples.append((str(root / 'bundle-receipt.json'), selected['receipt_sha256'], selected['product_code']))
+    directory = Path(__file__).parent
+    _imp.acquire_lock()
+    saved_path = list(sys.path)
+    names = ('validate','runtime_imports','modelhost_engine','windows_signing')
+    saved = {name:sys.modules.get(name) for name in names}
+    try:
+        sys.path.insert(0,str(directory))
+        for name in names:
+            spec = importlib.util.spec_from_file_location(name,directory/(name+'.py'))
+            module = importlib.util.module_from_spec(spec);sys.modules[name]=module;spec.loader.exec_module(module)
+        spec = importlib.util.spec_from_file_location('oa_installer_prior_history_owner', directory/'build.py')
+        owner = importlib.util.module_from_spec(spec); spec.loader.exec_module(owner)
+        return owner.installer_gateway_history(triples, destination, wix,environment=environment)
+    finally:
+        sys.path[:] = saved_path
+        for name,value in saved.items():
+            if value is None:sys.modules.pop(name,None)
+            else:sys.modules[name]=value
+        _imp.release_lock()
+
+
+def receive_installer_priors(descriptor, destination, *, fetch, download, environment):
+    """Extend the existing same-repository authenticated asset intake, without publishing."""
+    installer_prior_descriptor(descriptor)
+    source = environment.get('GITHUB_SHA', '')
+    try:
+        run_id, attempt = int(environment['GITHUB_RUN_ID']), int(environment['GITHUB_RUN_ATTEMPT'])
+    except (KeyError, ValueError) as error:
+        raise ValueError('installer predecessor intake requires an actual CI run') from error
+    if (environment.get('GITHUB_ACTIONS') != 'true' or environment.get('GITHUB_REPOSITORY') != 'openabstractions/redist'
+            or not re.fullmatch('[0-9a-f]{40}', source) or min(run_id, attempt) < 1):
+        raise ValueError('installer predecessor intake requires actual same-repository CI context')
+    api = 'repos/openabstractions/redist/'
+    run = fetch(api + 'actions/runs/' + str(run_id))
+    if (run.get('id') != run_id or run.get('head_sha') != source or run.get('run_attempt') != attempt
+            or run.get('repository', {}).get('full_name') != 'openabstractions/redist'
+            or run.get('head_repository', {}).get('full_name') != 'openabstractions/redist'
+            or run.get('path') != '.github/workflows/candidate.yml' or run.get('event') != 'workflow_dispatch'):
+        raise ValueError('installer predecessor intake run differs from actual candidate')
+    # The shared input receiver owns direct API descriptor and downloaded-byte checks.
+    spec = importlib.util.spec_from_file_location('oa_prior_asset_receiver', Path(__file__).with_name('pytorch_engine.py'))
+    receiver = importlib.util.module_from_spec(spec); spec.loader.exec_module(receiver)
+    destination = Path(destination)
+    destination.mkdir()
+    for index, selected in enumerate(descriptor['priors']):
+        asset = selected['asset']
+        release = fetch(api + 'releases/' + str(asset['release_id']))
+        if (release.get('id') != asset['release_id'] or release.get('draft') is not True
+                or release.get('published_at') is not None or release.get('author', {}).get('login') != 'ReinisLusis'):
+            raise ValueError('installer predecessor asset requires the owned unpublished staging draft')
+        matches = [row for row in release.get('assets', []) if row.get('id') == asset['id']]
+        if (len(matches) != 1 or matches[0].get('name') != asset['name']
+                or matches[0].get('size') != asset['bytes'] or matches[0].get('digest') != 'sha256:' + asset['sha256']):
+            raise ValueError('installer predecessor asset differs from its frozen source descriptor')
+        folder = destination / str(index); folder.mkdir()
+        receiver.receive_assets(folder, asset['repository'], {asset['name']:dict(id=asset['id'], name=asset['name'],
+            sha256=asset['sha256'], size_bytes=asset['bytes'])}, fetch=fetch, download=download, created=[])
+        installer_prior_members(folder / asset['name'], selected)
+    receipt = dict(schema=1, descriptor=descriptor, producer=dict(source=source, run_id=run_id, run_attempt=attempt))
+    (destination / 'installer-prior-intake.json').write_text(json.dumps(receipt, sort_keys=True) + '\n', encoding='utf-8')
+    return receipt
+
+
+def check_installer_prior_intake(descriptor, destination, *, environment, authority=None):
+    """Revalidate same-run intake and original members after immutable artifact consumption."""
+    installer_prior_descriptor(descriptor, authority=authority)
+    expected = dict(source=environment['GITHUB_SHA'], run_id=int(environment['GITHUB_RUN_ID']),
+                    run_attempt=int(environment['GITHUB_RUN_ATTEMPT']))
+    if (environment.get('GITHUB_ACTIONS') != 'true'
+            or environment.get('GITHUB_REPOSITORY') != 'openabstractions/redist'
+            or not re.fullmatch('[0-9a-f]{40}', expected['source'])
+            or min(expected['run_id'], expected['run_attempt']) < 1):
+        raise ValueError('installer predecessor consumption requires actual same-repository CI context')
+    destination = Path(destination)
+    receipt = json.loads((destination / 'installer-prior-intake.json').read_bytes())
+    if receipt != dict(schema=1, descriptor=descriptor, producer=expected):
+        raise ValueError('installer predecessor intake differs from selected descriptor or same-run producer')
+    for index, selected in enumerate(descriptor['priors']):
+        installer_prior_members(destination / str(index) / selected['asset']['name'], selected)
+    return receipt
+
+
+def installer_history_readback(program, expected):
+    """Read the installed Panel resource as data; compare the exact ordered history."""
+    import ctypes
+    from ctypes import wintypes
+    kernel = ctypes.WinDLL('kernel32', use_last_error=True)
+    kernel.LoadLibraryExW.restype = wintypes.HMODULE
+    kernel.LoadLibraryExW.argtypes = [wintypes.LPCWSTR,wintypes.HANDLE,wintypes.DWORD]
+    kernel.FindResourceW.restype = wintypes.HRSRC
+    kernel.FindResourceW.argtypes = [wintypes.HMODULE,wintypes.LPCWSTR,ctypes.c_void_p]
+    kernel.SizeofResource.restype = wintypes.DWORD
+    kernel.SizeofResource.argtypes = [wintypes.HMODULE,wintypes.HRSRC]
+    kernel.LoadResource.restype = wintypes.HGLOBAL
+    kernel.LoadResource.argtypes = [wintypes.HMODULE,wintypes.HRSRC]
+    kernel.LockResource.restype = ctypes.c_void_p
+    kernel.LockResource.argtypes = [wintypes.HGLOBAL]
+    kernel.FreeLibrary.argtypes = [wintypes.HMODULE]
+    module = kernel.LoadLibraryExW(str(Path(program).resolve()),None,0x2|0x20)
+    if not module:raise ValueError('RC Panel cannot be read as a data image')
+    try:
+        resource = kernel.FindResourceW(module,'OA_INSTALLER_GATEWAY_HISTORY',ctypes.c_void_p(10))
+        if not resource:raise ValueError('RC Panel is missing installer predecessor history')
+        size = kernel.SizeofResource(module,resource)
+        if not 0 < size <= 1 << 20:raise ValueError('RC Panel installer predecessor resource exceeds bound')
+        data = ctypes.string_at(kernel.LockResource(kernel.LoadResource(module,resource)),size)
+        wanted = json.dumps(expected,sort_keys=True,separators=(',',':')).encode()
+        if data != wanted:raise ValueError('RC Panel installer predecessor history differs from authenticated original bundles')
+        return dict(sha256=hashlib.sha256(data).hexdigest(),bytes=len(data),history=expected)
+    finally:
+        kernel.FreeLibrary(module)
 
 
 def extract_retained_artifact(archive_path, artifact_id, digest, name, source, run_id, attempt, destination, *, receipt=None):
@@ -898,7 +1200,7 @@ def consume_artifact(artifact_id, digest, name, source, run_id, attempt, destina
             transient = result.returncode and bool(re.search(r'HTTP 503|ServerBusy', error, re.IGNORECASE))
             if not transient or attempt_index == 2:
                 break
-            time.sleep(15 * (attempt_index + 1))
+            wait_for_artifact_storage(15 * (attempt_index + 1))
         if result.returncode:
             raise ValueError('Windows producer artifact download digest differs')
         return extract_retained_artifact(archive_path, artifact_id, digest, name, source,
@@ -1229,12 +1531,64 @@ def application_context_policy():
     return owner
 
 
-def _application_file_state(path):
+def application_policy_helpers():
+    # The private checkout maps these two owners into scripts/ in its redist
+    # projection. Choose the source layout relative to this entry point.
+    root = Path(__file__).resolve().parents[1]
+    if (root / 'scripts/split.manifest').is_file():
+        from release.facts import validate_public_admission
+        helper = importlib.import_module('research.org-edits.redist.app_producer_inputs')
+    else:
+        scripts = root / 'scripts'
+        sys.path.insert(0, str(scripts))
+        from release_facts import validate_public_admission
+        helper = application_context_policy().load_owner(scripts / 'app_producer_inputs.py', 'application_input_owner')
+    return validate_public_admission, helper
+
+
+def application_source_policy(checkout, source, version):
+    """Read release policy data from the independently selected local redist commit."""
+    if not re.fullmatch('[0-9a-f]{40}', source or ''):
+        raise ValueError('Catalog policy requires an exact source commit')
+    checkout = file_boundary.ordinary_path(checkout, kind='directory')
+    command = ['git', '--no-replace-objects', '-C', str(checkout)]
+    environment = git_env.source_git_environment()
+    for key in SECRET_ENV:
+        environment.pop(key, None)
+    def read(*args):
+        return subprocess.check_output([*command, *args], env=environment, timeout=30)
+    if read('rev-parse', '--verify', 'HEAD').decode('ascii').strip() != source:
+        raise ValueError('Catalog policy checkout does not match the selected source')
+    owner = application_context_policy()
+    validate, helper = application_policy_helpers()
+    with tempfile.TemporaryDirectory(prefix='oa-catalog-policy-') as temporary:
+        policy_root = Path(temporary)
+        for name in ('apps.json', 'npm.tsv', 'pypi.tsv', 'app-sources.tsv'):
+            if int(read('cat-file', '-s', source + ':' + name)) > 1 << 20:
+                raise ValueError('Catalog source policy file exceeds its bound')
+            (policy_root / name).write_bytes(read('show', source + ':' + name))
+        required = owner.installer_scope(version, policy_root=policy_root, validate=validate)
+        _, sources = owner.selected_sources(required, version, producer_source=source, policy_root=policy_root, helper=helper, validate=validate)
+    return required, sources
+
+
+def _application_file_state(path, *, read_limit=None):
     """Bounded content measurement for the two app-context transport owners."""
     path = Path(path)
+    if read_limit is not None and (not path.is_file() or path.is_symlink() or path.is_junction()
+                                   or getattr(path.lstat(), 'st_file_attributes', 0) & 0x400):
+        raise ValueError('bounded application member must be an ordinary file')
     with path.open('rb') as stream:
         before = os.fstat(stream.fileno())
-        digest = hashlib.file_digest(stream, 'sha256').hexdigest()
+        if read_limit is None:
+            digest = hashlib.file_digest(stream, 'sha256').hexdigest()
+        else:
+            if before.st_nlink != 1 or not 0 < before.st_size <= read_limit:
+                raise ValueError('application member exceeds its bounded metadata size or is linked')
+            data = stream.read(before.st_size + 1)
+            if len(data) != before.st_size:
+                raise ValueError('bounded application member changed during readback')
+            digest = hashlib.sha256(data).hexdigest()
         after = os.fstat(stream.fileno())
     current = path.stat()
     def state(stat):
@@ -1244,6 +1598,8 @@ def _application_file_state(path):
     if (state(before) != state(after) or state(after) != state(current) or current.st_nlink != 1
             or path.is_symlink() or path.is_junction() or getattr(path.lstat(), 'st_file_attributes', 0) & 0x400):
         raise ValueError('application transport member changed or linked during measurement')
+    if read_limit is not None:
+        return data
     return (current.st_dev, current.st_ino), digest, current.st_size
 
 
@@ -1268,7 +1624,7 @@ def retained_application_context(root, context_path, *, source, run_id, artifact
             or not isinstance(artifact_digest, str) or not re.fullmatch('[0-9a-f]{64}', artifact_digest)):
         raise ValueError('application context requires independent enclosing artifact identity')
     intake_path = msi_extracted_member(root, 'SourceDir\\' + INTAKE_RECEIPT)
-    intake_bytes = intake_path.read_bytes()
+    intake_bytes = _application_file_state(intake_path, read_limit=8 << 20)
     intake = json.loads(intake_bytes)
     header = dict(schema=1, kind='windows-artifact-intake', source=source, run_id=run_id,
                   run_attempt=artifact_attempt,
@@ -1327,11 +1683,14 @@ def retained_application_context(root, context_path, *, source, run_id, artifact
         path = msi_extracted_member(root, 'SourceDir\\' + name.replace('/', '\\'))
         if _application_file_state(path) != state:
             raise ValueError('application context member changed during admission')
-    if intake_path.read_bytes() != intake_bytes:
+    if _application_file_state(intake_path, read_limit=8 << 20) != intake_bytes:
         raise ValueError('application context intake changed during admission')
     return (dict(expected_producers=context['expected_producers'], source=source,
                  run_id=run_id, run_attempt=context['run_attempt']),
             dict(sha256=context_digest, bytes=context_size))
+
+
+APP_DISTRIBUTION_CHAIN = 'app-distribution-chain.json'
 
 
 def copy_chain_distribution(chain_path, out, context_path=None, *, context_pin=None):
@@ -1347,6 +1706,11 @@ def copy_chain_distribution(chain_path, out, context_path=None, *, context_pin=N
         name = source.name
         if name.casefold() in names: raise ValueError('flat Setup distribution has a package name collision')
         names.add(name.casefold()); copies.append((source, name, package))
+    split = owner.burn_chain(chain) != chain
+    if split:
+        if APP_DISTRIBUTION_CHAIN in names:
+            raise ValueError('flat Setup application distribution context collides')
+        names.add(APP_DISTRIBUTION_CHAIN)
     if context_path is not None:
         context_path = Path(context_path)
         if 'app-chain-context.json' in names: raise ValueError('flat Setup distribution context collides')
@@ -1388,6 +1752,9 @@ def copy_chain_distribution(chain_path, out, context_path=None, *, context_pin=N
             shutil.copyfileobj(stream, target, length=1 << 20)
         if _application_file_state(source) != state or _application_file_state(destination)[1:] != state[1:]:
             raise ValueError('flat Setup distribution copy changed')
+    if split:
+        with (out / APP_DISTRIBUTION_CHAIN).open('x', encoding='utf-8') as stream:
+            stream.write(json.dumps(owner.chain_context(chain), indent=2) + '\n')
 
 
 def prepare_chain(root, release, out, policy, policy_sha256, *, expected_producers=None,
@@ -1630,15 +1997,16 @@ def restore_bundle_engine(engine, expected):
     path.write_bytes(data)
 
 
-def verify_bundle_actions(receipt,chain,ba,policy,signtool):
+def verify_bundle_actions(receipt,chain,ba,policy,signtool,*,catalog_maintenance=False):
     """Read the signed native BA payload, separate from application package roles."""
     owner=bundle_owner();expected=receipt.get('bootstrapper_native')
-    if not chain['apps']:
-        if expected is not None:raise ValueError('core-only bundle has an unexpected BA native role')
+    if not catalog_maintenance and not chain['apps'] and expected is None and 'upgrade' not in chain:
+        # Retained historical core-only receipts predate the chain minter.
         return None
     if (not isinstance(expected,dict) or set(expected)!={'name','sha256','bytes','inputs','receipt_sha256'}
             or expected['name']!=owner.ACTIONS_NAME
-            or expected['inputs']!=owner.bundle_actions_inputs([app['id'] for app in chain['apps']])['inputs']
+            or expected['inputs']!=owner.bundle_actions_inputs([app['id'] for app in chain['apps']],
+                catalog_maintenance=catalog_maintenance)['inputs']
             or not re.fullmatch('[0-9a-f]{64}',str(expected['receipt_sha256']))):
         raise ValueError('bundle BA native source/map differs from admitted builder receipt')
     files=list(Path(ba).rglob(owner.ACTIONS_NAME))
@@ -1652,8 +2020,95 @@ def verify_bundle_actions(receipt,chain,ba,policy,signtool):
     return proof
 
 
+def bundle_distribution_chain(root, owner, chain):
+    """An independently delivered app roster must project to this exact Burn chain."""
+    path = root / APP_DISTRIBUTION_CHAIN
+    if not os.path.lexists(path):
+        return chain
+    if (not path.is_file() or path.is_symlink() or path.is_junction()
+            or getattr(path.lstat(), 'st_file_attributes', 0) & 0x400 or path.stat().st_nlink != 1):
+        raise ValueError('Setup app distribution context is not an ordinary member')
+    with path.open('rb') as stream:
+        raw = stream.read((1 << 20) + 1)
+    if len(raw) > 1 << 20:
+        raise ValueError('Setup app distribution context exceeds its bound')
+    distribution = owner.read_chain_context(json.loads(raw), root)
+    physical = dict(chain)
+    physical.pop('upgrade', None)
+    if (owner.burn_chain(distribution) == distribution or
+            owner.chain_context(owner.burn_chain(distribution)) != owner.chain_context(physical)):
+        raise ValueError('Setup distribution does not project to its exact Burn chain')
+    return distribution
+
+
+def panel_contains_catalog(path, catalog):
+    # Retain overlap for matches spanning reads. Catalog metadata is bounded
+    # before this read and the caller rechecks the signed Panel's file pin.
+    overlap = b''
+    if not catalog:
+        return False
+    matches = 0
+    with path.open('rb') as stream:
+        while chunk := stream.read(1 << 20):
+            window = overlap + chunk
+            start = 0
+            while (found := window.find(catalog, start)) >= 0:
+                matches += 1
+                if matches > 1:
+                    return False
+                start = found + 1
+            overlap = window[-(len(catalog) - 1):] if len(catalog) > 1 else b''
+    return matches == 1
+
+
+# Signed Setup artifact 12407722379 from redist candidate run 39731444672,
+# attempt 2, at the public v0.4.0 tag c6814b795f63fb36dc5fe91dfc645157b43972fd.
+# The original receipt binds the published Setup EXE and x64 MSI.
+PUBLIC_V040_SETUP_RECEIPT_SHA256 = '055d9863352d1a049b6febb98120a2efdf68d9a464291342968d8d82cf698667'
+
+
+def legacy_setup_core(receipt, core_id):
+    chain = receipt.get('chain')
+    if (not isinstance(chain, list) or len(chain) != 1
+            or not isinstance(chain[0], dict) or chain[0].get('id') != core_id):
+        raise ValueError('legacy Setup needs exactly one core package')
+    row = chain[0]
+    return {'file': row['name'], 'sha256': row['sha256'], 'bytes': row['bytes']}
+
+
+def read_setup_predecessor_receipt(root):
+    root = Path(root)
+    file_boundary.ordinary_path(root, kind='directory')
+    receipt = root / 'bundle-receipt.json'
+    file_boundary.ordinary_path(receipt, kind='file')
+    return _application_file_state(receipt, read_limit=1 << 20)
+
+
+def published_setup_predecessor(root, raw):
+    """Receive the authentic legacy v0.4.0 pair for a Setup upgrade fixture."""
+    root = Path(root)
+    if hashlib.sha256(raw).hexdigest() != PUBLIC_V040_SETUP_RECEIPT_SHA256:
+        raise ValueError('legacy Setup predecessor differs from the public v0.4.0 receipt')
+    receipt = json.loads(raw)
+    setup = receipt['bundle']
+    core = legacy_setup_core(receipt, bundle_owner().CORE_ID)
+    if (setup.get('signed') is not True or setup.get('name') != 'OpenAbstractions-Setup-0.4.0.exe'
+            or core['file'] != 'abstraction-x64.msi'):
+        raise ValueError('public predecessor requires its signed Setup and core MSI')
+    for leaf, pin in ((setup['name'], setup), (core['file'], core)):
+        path = root / leaf
+        file_boundary.ordinary_path(path, kind='file')
+        _, digest, size = _application_file_state(path)
+        if digest != pin['sha256'] or size != pin['bytes']:
+            raise ValueError('public Setup predecessor package differs from its receipt: ' + leaf)
+    return {'setup': setup['name'], 'sha256': setup['sha256'], 'version': '0.4.0',
+            'apps': [], 'core': core, 'variables': [], 'problems': []}
+
+
 def check_bundle(root, policy, signtool, *, signing, policy_sha256, expected_producers=None,
-                 source=None, run_id=None, run_attempt=None, installed_readback=False):
+                 source=None, run_id=None, run_attempt=None, installed_readback=False, catalog_document=None):
+    if catalog_document is not None and (signing or not installed_readback):
+        raise ValueError("compiled Catalog verification requires signed installed readback")
     if installed_readback and signing:
         raise ValueError('installed readback requires independent signed bundle verification')
     root = Path(root)
@@ -1679,21 +2134,31 @@ def check_bundle(root, policy, signtool, *, signing, policy_sha256, expected_pro
         names.add(name)
     if 'chain_context' in receipt:
         chain = owner.read_chain_context(receipt['chain_context'], root)
-    elif len(original_chain) == 1 and original_chain[0]['id'] == owner.CORE_ID:
+    else:
         # Historical core-only receipts predate context. They retain the full
         # core manifest and native signature checks; application roles need context.
-        row = original_chain[0]
-        chain = {'core': {'file': row['name'], 'sha256': row['sha256'], 'bytes': row['bytes']}, 'apps': []}
-    else:
-        raise ValueError('application Setup requires its bound chain context')
+        chain = {'core': legacy_setup_core(receipt, owner.CORE_ID), 'apps': []}
+    early = [row for row in original_chain if row['id'] == 'BeginCoreUpgrade']
+    if early:
+        if len(early) != 1 or 'chain_context' not in receipt:
+            raise ValueError('early upgrade requires one current bound chain')
+        row = early[0]
+        chain['upgrade'] = {'file':row['name'], 'sha256':row['sha256'], 'bytes':row['bytes']}
     expected_chain = list(owner.chain_packages(chain))
     if (len(original_chain) != len(expected_chain)
             or any((row['id'], row['name'], row['sha256'], row['bytes']) !=
                    (pid, Path(package['file']).name, package['sha256'], package['bytes'])
                    for row, (pid, _, package, _) in zip(original_chain, expected_chain))):
         raise ValueError('Setup receipt differs from its bound package chain')
-    hosts = producer_hosts(chain, expected_producers, source=source, run_id=run_id, run_attempt=run_attempt,delivery_root=root)
-    for app in chain['apps']:
+    distribution = bundle_distribution_chain(root, owner, chain)
+    hosts = producer_hosts(distribution, expected_producers, source=source, run_id=run_id, run_attempt=run_attempt,delivery_root=root)
+    catalog_only = next((app for app in distribution['apps']
+                         if app['id'] == owner.CATALOG_ONLY_APP and distribution is not chain), None)
+    if catalog_only is None and 'catalog_opencode' in receipt:
+        raise ValueError('signed Setup Catalog proof has no separate distribution')
+    catalog_pin = None
+    upstream = {}
+    for app in distribution['apps']:
         if 'embedded_integration' in app:
             continue
         path = member(root, Path(app['file']).name)
@@ -1703,7 +2168,32 @@ def check_bundle(root, policy, signtool, *, signing, policy_sha256, expected_pro
         verify_msi_payload(path, policy, signtool, signed_container=False,
                            expected_payload=expected_producers[app['id']]['expected_payload'],
                            container_proof=proof)
-    upstream = {}
+        if app is catalog_only:
+            catalog_signature = proof
+            host = app.get('host', {})
+            if 'preflight' not in host or 'preparation' in host or app['id'] not in hosts:
+                raise ValueError('Catalog distribution requires the exact official host and preflight')
+            expected_host = hosts[app['id']]['host']
+            observed = verify_upstream(member(root, Path(host['file']).name), expected_host, signtool)
+            upstream[app['id']] = dict(observed, input=hosts[app['id']])
+            preflight = host['preflight']
+            proof = verify(member(root, Path(preflight['file']).name), policy, signtool)
+            if any(proof.get(key) != preflight[key] for key in ('sha256', 'bytes')):
+                raise ValueError('Catalog preflight differs from its authenticated pin')
+            file_pin = setup_file_pin(path)
+            catalogue = msi_catalogue_identity(path)
+            if (catalogue['version'] != distribution['version']
+                    or catalogue['upgrade_code'] != '{8E0B8005-0E00-5720-9556-E5B984F15A96}'
+                    or not re.fullmatch(r'\{[0-9A-F]{8}(?:-[0-9A-F]{4}){3}-[0-9A-F]{12}\}', catalogue['product_code'])
+                    or file_pin['name'] != 'opencode-' + catalogue['version'] + '.msi'):
+                raise ValueError('Catalog MSI identity differs from the admitted OpenCode release')
+            if any(file_pin[key] != app[key] for key in ('sha256', 'bytes')) or setup_file_pin(path) != file_pin:
+                raise ValueError('Catalog MSI changed during identity readback')
+            catalog_pin = file_pin | catalogue
+            catalog_proof = dict(package=catalog_pin, signature=catalog_signature,
+                                 preflight=proof, source=source, run_id=run_id, run_attempt=run_attempt)
+            if not signing and receipt.get('catalog_opencode') != catalog_proof:
+                raise ValueError('signed Setup Catalog proof differs from native verification')
     installed = None
     installed_paths = None
     # Core and own native helpers are embedded. Official hosts and app MSIs
@@ -1726,19 +2216,31 @@ def check_bundle(root, policy, signtool, *, signing, policy_sha256, expected_pro
         extracted = Path(temporary) / 'containers'
         run(['wix', 'burn', 'extract', bundle, '-o', extracted, '-oba', Path(temporary) / 'ba'])
         manifest = (Path(temporary) / 'ba/manifest.xml').read_text(encoding='utf-8-sig')
-        ba_proof=verify_bundle_actions(receipt,chain,Path(temporary)/'ba',policy,signtool)
+        comfy_delivery=hosts.get('comfyui',{}).get('delivery',{})
+        catalog_maintenance=(catalog_pin is not None or
+            comfy_delivery.get('identity',{}).get('distribution')=='oa-comfyui-native')
+        ba_proof=verify_bundle_actions(receipt,chain,Path(temporary)/'ba',policy,signtool,
+            catalog_maintenance=catalog_maintenance)
         if ba_proof is not None:
             if not signing and receipt.get('bootstrapper_native_signature')!=ba_proof:
                 raise ValueError('bundle BA native signature differs from final receipt')
             receipt['bootstrapper_native_signature']=ba_proof
+        upgrade_path = None
+        open_code_pin = catalog_pin
+        panel_pin = None
+        panel_path = None
         for row, (_, kind, package, app) in zip(original_chain, expected_chain):
-            role = ('core' if app is None else 'official-host' if package is app.get('host') else
+            role = ('upgrade-supervisor' if row['id'] == 'BeginCoreUpgrade' else 'core' if app is None else 'official-host' if package is app.get('host') else
                     'preflight' if package is app.get('host', {}).get('preflight') else
                     'preparation' if package is app.get('host', {}).get('preparation') else 'app-msi')
-            embedded = role in ('core', 'preflight', 'preparation')
+            embedded = role in ('core', 'preflight', 'preparation', 'upgrade-supervisor')
             paths = list(extracted.rglob(row['name'])) if embedded else [member(root, row['name'])]
             if len(paths) != 1:
                 raise ValueError('signed Setup lacks its exact embedded package')
+            if role == 'upgrade-supervisor':
+                paths[0] = member(extracted, paths[0].relative_to(extracted).as_posix())
+                setup_file_pin(paths[0])
+                upgrade_path = paths[0]
             if role == 'core' and installed_readback:
                 paths[0] = member(extracted, paths[0].relative_to(extracted).as_posix())
                 setup_file_pin(paths[0])
@@ -1749,6 +2251,14 @@ def check_bundle(root, policy, signtool, *, signing, policy_sha256, expected_pro
                 raise ValueError('embedded native helper differs from its sealed external copy')
             package['sha512'] = hashlib.sha512(data).hexdigest()
             row.update(role=role, type=kind, embedded=embedded)
+            if installed_readback and row['id'] == 'App_opencode':
+                # The phase verifies the signed member before returning this
+                # observation; the outer release signer remains the authority.
+                open_code_pin = setup_file_pin(paths[0]) | msi_catalogue_identity(paths[0])
+                if (setup_file_pin(paths[0]) != {key:open_code_pin[key] for key in ('name','sha256','bytes')}
+                        or any(open_code_pin[key] != row[key] for key in ('sha256','bytes'))):
+                    raise ValueError('OpenCode MSI changed during identity readback')
+
             if role == 'official-host':
                 expected_host=hosts[app['id']]['host']
                 if 'signature' in expected_host:
@@ -1761,6 +2271,12 @@ def check_bundle(root, policy, signtool, *, signing, policy_sha256, expected_pro
                 row['signature'] = verify(paths[0], policy, signtool)
                 if (row['signature']['sha256'], row['signature']['bytes']) != (row['sha256'], row['bytes']):
                     raise ValueError('own package changed during native signature verification')
+                if role == 'core' and 'upgrade' in chain:
+                    # The command and the MSI custom action must be the same
+                    # incoming native image, including its signed bytes.
+                    if upgrade_path is None:
+                        raise ValueError('core precedes its early upgrade supervisor')
+                    owner.check_upgrade_binary('wix', paths[0], upgrade_path)
                 if role == 'core' and installed_readback:
                     destination = Path(temporary) / 'core-readback'
                     destination.mkdir()
@@ -1773,25 +2289,57 @@ def check_bundle(root, policy, signtool, *, signing, policy_sha256, expected_pro
                     if any(proof.get(key) != runtime_pin[key] for key in ('sha256', 'bytes')) or setup_file_pin(runtime[0]) != runtime_pin:
                         raise ValueError('Setup runtime changed during native policy verification')
                     installed = {'core': setup_file_pin(paths[0]), 'runtime': runtime_pin}
+                    if catalog_pin is not None or any(item['id'] == 'App_opencode' for item in original_chain):
+                        panels = [file for name, file in core_msi_files(destination) if name == 'Abstraction Panel.exe']
+                        if len(panels) != 1:
+                            raise ValueError('signed Setup with OpenCode needs exactly one installed Panel')
+                        panel_path = panels[0]
+                        panel_pin = setup_file_pin(panel_path)
+                        panel_proof = verify(panel_path, policy, signtool)
+                        if any(panel_proof.get(key) != panel_pin[key] for key in ('sha256','bytes')) or setup_file_pin(panel_path) != panel_pin:
+                            raise ValueError('Setup Panel changed during native policy verification')
                     installed_paths = (paths[0], runtime[0])
                     if any(installed['core'][key] != row[key] for key in ('sha256', 'bytes')):
                         raise ValueError('Setup core changed during runtime readback')
         owner.check_manifest(manifest, chain)
         if installed_paths and any(setup_file_pin(path) != installed[key] for key, path in zip(('core', 'runtime'), installed_paths)):
             raise ValueError('Setup core or runtime changed before readback completed')
+        if catalog_document is not None:
+            if catalog_pin is None or panel_path is None or not panel_contains_catalog(panel_path, catalog_document):
+                raise ValueError('verified signed Panel does not contain the exact Catalog document')
+        if panel_path is not None and setup_file_pin(panel_path) != panel_pin:
+            raise ValueError('Setup Panel changed before readback completed')
     receipt['bundle'].update(sha256=outer_proof['sha256'], bytes=outer_proof['bytes'], signed=True)
     receipt['signatures'] = {'engine': engine_proof, 'bundle': outer_proof}
     receipt['policy_sha256'] = policy_sha256
     if upstream:
         receipt['upstream_signatures'] = upstream
     if signing:
+        if catalog_only is not None:
+            receipt['catalog_opencode'] = catalog_proof
         receipt_path.write_text(json.dumps(receipt, indent=2) + '\n')
-        sums = [root / row['name'] for row in original_chain[1:]] + [bundle, receipt_path]
+        # Match copy_chain_distribution's actual flat members. Core and the
+        # upgrade supervisor are embedded; application roles retain their
+        # external copies even when Burn also embeds a helper.
+        sums = [root / row['name'] for row, (_, _, _, app) in zip(original_chain, expected_chain)
+                if app is not None] + [bundle, receipt_path]
+        if catalog_only is not None:
+            sums.extend(root / Path(package['file']).name
+                        for _, _, package, app in owner.chain_packages(distribution) if app is catalog_only)
+            sums.append(root / APP_DISTRIBUTION_CHAIN)
+            sums.append(root / 'app-chain-context.json')
+            for binding in expected_producers.values():
+                if 'delivery' in binding:
+                    delivery = binding['delivery']
+                    sums.extend(root / delivery['directory'] / item['name']
+                                for item in (delivery['binary'], *delivery['source']['parts']))
         (root / 'SHA256SUMS.setup').write_text(''.join(
-            hashlib.sha256(path.read_bytes()).hexdigest() + '  ' + path.name + '\n' for path in sums))
+            _application_file_state(path)[1] + '  ' + path.relative_to(root).as_posix() + '\n' for path in sums))
     if installed_readback:
         if installed is None or setup_file_pin(bundle) != {key: receipt['bundle'][key] for key in ('name', 'sha256', 'bytes')}:
             raise ValueError('Setup changed or has no verified core runtime readback')
+        if open_code_pin is not None:
+            installed.update(opencode=open_code_pin,panel=panel_pin)
         return receipt, installed
     return receipt
 
@@ -1818,6 +2366,213 @@ def setup_installed_inputs(receipt, installed, fixture, policy, source, run_id, 
             'producer': setup_file_pin(fixture),
             'fixture': setup_file_pin(fixture.with_name('test_user_runtime.ps1')),
             'module': setup_file_pin(fixture.with_name('OAFixture.psm1'))}
+
+
+def setup_catalog_transition_inputs(previous, candidate, extension, runtime, panel, fixture, *,
+                                    source, run_id, run_attempt, version, model):
+    """Join already authenticated bundle inputs to the compiled Catalog MSI pin."""
+    if (not re.fullmatch('[0-9a-f]{40}', source or '') or type(run_id) is not int or run_id < 1
+            or type(run_attempt) is not int or run_attempt < 1
+            or not re.fullmatch(r'[0-9]+\.[0-9]+\.[0-9]+', version or '')
+            or not re.fullmatch(r'openabstractions/[A-Za-z0-9][A-Za-z0-9_./:+-]{0,127}', model or '')):
+        raise ValueError('Catalog transition requires exact source, run, version and fixture model')
+
+    def file_pin(value, name):
+        if (not isinstance(value, dict) or value.get('name') != name
+                or not re.fullmatch('[0-9a-f]{64}', str(value.get('sha256')))
+                or type(value.get('bytes')) is not int or value['bytes'] <= 0):
+            raise ValueError('Catalog transition file pin differs: '+name)
+        return {key:value[key] for key in ('name','sha256','bytes')}
+
+    def bundle(value):
+        record = value['bundle']
+        name = record.get('name', '')
+        if record.get('signed') is not True or not re.fullmatch(r'OpenAbstractions-Setup-[0-9]+\.[0-9]+\.[0-9]+\.exe', name):
+            raise ValueError('Catalog transition requires an authenticated signed Setup bundle')
+        return file_pin(record, name)
+
+    def package(value):
+        if (not isinstance(value, dict) or not re.fullmatch(r'[0-9]+\.[0-9]+\.[0-9]+', str(value.get('version')))
+                or value.get('upgrade_code') != '{8E0B8005-0E00-5720-9556-E5B984F15A96}'
+                or not re.fullmatch(r'\{[0-9A-F]{8}(?:-[0-9A-F]{4}){3}-[0-9A-F]{12}\}', str(value.get('product_code')))
+                or 'package_code' in value and not re.fullmatch(r'\{[0-9A-F]{8}(?:-[0-9A-F]{4}){3}-[0-9A-F]{12}\}', str(value['package_code']))):
+            raise ValueError('Catalog transition OpenCode MSI identity differs')
+        return file_pin(value, 'opencode-'+value['version']+'.msi') | {
+            key:value[key] for key in ('version','product_code','upgrade_code','package_code') if key in value}
+
+    prior_bundle, next_bundle = bundle(previous), bundle(candidate)
+    prior_app, next_app = package(previous['opencode']), package(candidate['opencode'])
+    if (next_bundle['name'] != f'OpenAbstractions-Setup-{version}.exe' or next_app['version'] != version
+            or next_bundle['sha256'] == prior_bundle['sha256'] or next_app['product_code'] == prior_app['product_code']
+            or next_app['sha256'] == prior_app['sha256']):
+        raise ValueError('Catalog transition requires distinct predecessor and candidate identities')
+    if extension != {'id':'opencode', 'file':next_app['name'], **{key:next_app[key]
+            for key in ('sha256','bytes','version','product_code','upgrade_code','package_code') if key in next_app}}:
+        raise ValueError('compiled Catalog pin differs from the authenticated signed OpenCode MSI')
+    return dict(schema=1, kind='setup-catalog-transition', source_sha=source, run_id=run_id,
+        run_attempt=run_attempt, version=version, model=model, previous_bundle=prior_bundle,
+        bundle=next_bundle, previous_opencode=prior_app, opencode=next_app,
+        runtime=file_pin(runtime,'openabstractions.exe'), panel=file_pin(panel,'Abstraction Panel.exe'),
+        fixture=setup_file_pin(fixture), verifier=setup_file_pin(Path(__file__)))
+
+
+def _admit_setup_catalog_artifact(directory, *, context, policy_source, source, run_id, run_attempt,
+                                  version, artifact_id, digest, attempt):
+    if context.parent.resolve() != directory.resolve():
+        raise ValueError('Catalog transition context must belong to its verified Setup root')
+    required, sources = application_source_policy(policy_source, source, version)
+    digest = digest.removeprefix('sha256:')
+    binding, _ = retained_application_context(directory, context, source=source, run_id=run_id,
+        artifact_id=artifact_id, artifact_name='setup-bundle-' + str(attempt),
+        artifact_digest=digest, artifact_attempt=attempt, version=version, required=required, sources=sources)
+    if type(run_attempt) is not int or binding['run_attempt'] != run_attempt:
+        raise ValueError('Catalog transition producer attempt differs from retained context')
+    return binding, dict(id=artifact_id, sha256=digest, attempt=attempt)
+
+
+def _admit_and_verify_setup_catalog_transition(previous_root, root, policy, signtool, *,
+                                                previous_intake, candidate_intake, **verification):
+    previous, prior_artifact = _admit_setup_catalog_artifact(previous_root, **previous_intake)
+    candidate, next_artifact = _admit_setup_catalog_artifact(root, **candidate_intake)
+    return signed_setup_catalog_transition(previous_root, root, policy, signtool,
+        previous_binding=previous, binding=candidate, artifacts=dict(previous=prior_artifact, candidate=next_artifact),
+        previous_version=previous_intake['version'], version=candidate_intake['version'], **verification)
+
+
+def signed_setup_upgrade_opencode(root, policy, signtool, *, policy_sha256, candidate_intake, catalog_path):
+    """Receive the signed candidate Catalog without requiring an earlier Catalog."""
+    binding, artifact = _admit_setup_catalog_artifact(root, **candidate_intake)
+    if binding['run_attempt'] != artifact['attempt']:
+        raise ValueError('signed Setup upgrade requires the exact producer attempt')
+    catalog = _application_file_state(file_boundary.ordinary_path(catalog_path, kind='file'), read_limit=1 << 20)
+    document = json.loads(catalog)
+    version = candidate_intake['version']
+    receipt, installed = check_bundle(root, policy, signtool, signing=False,
+        policy_sha256=policy_sha256, installed_readback=True, catalog_document=catalog, **binding)
+    app = installed.get('opencode')
+    if (receipt['bundle']['name'] != f'OpenAbstractions-Setup-{version}.exe'
+            or 'chain_context' not in receipt or any(row['id'] == 'App_opencode' for row in receipt['chain'])
+            or not app or app['version'] != version or 'package_code' not in app
+            or not isinstance(document, dict) or document.get('schema') != 2 or document.get('release_tag') != 'v' + version
+            or document.get('extensions') != [{'id': 'opencode', 'file': app['name'],
+                **{key: app[key] for key in ('sha256', 'bytes', 'version', 'product_code', 'upgrade_code', 'package_code')}}]):
+        raise ValueError('signed Setup upgrade requires its exact embedded OpenCode Catalog package')
+    owner = bundle_owner()
+    chain = owner.read_chain_context(receipt['chain_context'], root)
+    distribution = bundle_distribution_chain(Path(root), owner, chain)
+    host = next(row['host'] for row in distribution['apps'] if row['id'] == 'opencode')
+    host_pin = setup_file_pin(member(root, PurePosixPath(host['file']).name))
+    if any(host_pin[key] != host[key] for key in ('sha256', 'bytes')):
+        raise ValueError('signed Setup upgrade OpenCode Desktop host changed after verification')
+    files = validate_expected_payload(binding['expected_producers']['opencode']['expected_payload'])['files']
+    prefix = 'LocalAppDataFolder/Programs/OpenAbstractions/apps/opencode/'
+    plugin = f'plugin/{version}/'
+    roles = {'cli': 'cli/opencode.exe', 'plugin': plugin + 'index.js',
+        'lifecycle': plugin + 'installer/config-lifecycle.js',
+        'bun_config': PurePosixPath('installer', 'empty-bunfig.toml').as_posix()}
+    members = {}
+    for role, relative in roles.items():
+        rows = [row for row in files if row['path'] == prefix + relative]
+        if len(rows) != 1:
+            raise ValueError(f'signed OpenCode MSI lacks exact {role} File identity')
+        members[role] = rows[0]
+    plugin_members = [row for row in files if row['path'].startswith(prefix + plugin)]
+    return dict(source=binding['source'], run_id=binding['run_id'], run_attempt=binding['run_attempt'],
+        artifact=artifact, version=version, host=host_pin, members=members,
+        plugin_members=plugin_members,
+        bundle={key: receipt['bundle'][key] for key in ('sha256', 'bytes', 'name')},
+        **{key: installed[key] for key in ('opencode', 'runtime', 'panel')})
+
+
+def signed_setup_catalog_transition(previous_root, root, policy, signtool, *, policy_sha256,
+                                    previous_binding, binding, artifacts, catalog_path, fixture, previous_version, version, model,
+                                    installed_result=None):
+    """Authenticate both chains and derive or receive exact ordinary-user evidence."""
+    catalog_path = Path(catalog_path)
+    catalog_document = _application_file_state(catalog_path, read_limit=1 << 20)
+    catalog_pin = dict(name=catalog_path.name, bytes=len(catalog_document),
+                       sha256=hashlib.sha256(catalog_document).hexdigest())
+    catalog = json.loads(catalog_document)
+    extensions = catalog.get('extensions')
+    if (catalog.get('schema') != 2 or catalog.get('release_tag') != 'v' + version
+            or not isinstance(extensions, list) or len(extensions) != 1):
+        raise ValueError('Catalog document lacks its single versioned extension')
+    previous, old_installed = check_bundle(previous_root, policy, signtool, signing=False,
+        policy_sha256=policy_sha256, installed_readback=True, **previous_binding)
+    candidate, installed = check_bundle(root, policy, signtool, signing=False,
+        policy_sha256=policy_sha256, installed_readback=True, catalog_document=catalog_document, **binding)
+    if (previous['bundle']['name'] != f'OpenAbstractions-Setup-{previous_version}.exe'
+            or old_installed.get('opencode', {}).get('version') != previous_version):
+        raise ValueError('verified predecessor differs from its selected policy version')
+    if not any(row['id'] == 'App_opencode' for row in previous['chain']):
+        raise ValueError('predecessor Setup does not install OpenCode')
+    if any(row['id'] == 'App_opencode' for row in candidate['chain']):
+        raise ValueError('candidate Setup must leave OpenCode to Catalog')
+    if 'opencode' not in old_installed or 'opencode' not in installed:
+        raise ValueError('signed Setup chains lack OpenCode identity readback')
+    identity = {key: binding[key] for key in ('source', 'run_id', 'run_attempt')}
+    inputs = setup_catalog_transition_inputs(
+        dict(bundle=previous['bundle'], opencode=old_installed['opencode']),
+        dict(bundle=candidate['bundle'], opencode=installed['opencode']),
+        extensions[0], installed['runtime'], installed['panel'], fixture, version=version, model=model, **identity)
+    # The retained producer inventories were checked against the signed MSI
+    # members by check_bundle. The producer's unsigned container pin is not
+    # the signed package pin that the guest must open.
+    def opencode_files(producer_binding):
+        expected = validate_expected_payload(producer_binding['expected_producers']['opencode']['expected_payload'])
+        if not expected['files']:
+            raise ValueError('signed OpenCode MSI has no verified File inventory')
+        return [dict(row) for row in expected['files']]
+
+    inputs.update(previous_opencode_files=opencode_files(previous_binding),
+                  opencode_files=opencode_files(binding))
+    inputs.update(policy_sha256=policy_sha256, catalog=catalog_pin, artifacts=artifacts,
+                  predecessor={key: previous_binding[key] for key in ('source', 'run_id', 'run_attempt')})
+    if installed_result is None:
+        return inputs
+    return check_setup_catalog_transition(inputs, installed_result, version=version, **identity)
+
+
+def check_setup_catalog_transition(inputs, result, *, source, run_id, run_attempt, version):
+    """Verify the terminal standard-user observation before a release can use it."""
+    if (inputs.get('schema') != 1 or inputs.get('kind') != 'setup-catalog-transition'
+            or inputs.get('source_sha') != source or type(inputs.get('run_id')) is not int
+            or type(inputs.get('run_attempt')) is not int or inputs['run_id'] != run_id
+            or inputs['run_attempt'] != run_attempt or inputs.get('version') != version):
+        raise ValueError('Catalog transition source/run/attempt differs')
+    encoded = (json.dumps(inputs, sort_keys=True, separators=(',', ':'))+'\n').encode('utf-8')
+    if (result.get('result') != 'pass' or result.get('input_sha256') != hashlib.sha256(encoded).hexdigest()
+            or result.get('environment_disposition') != 'discarded'):
+        raise ValueError('Catalog transition lacks exact completed input and disposable account evidence')
+    account = result.get('account')
+    session = result.get('session')
+    if (not isinstance(account, str) or not re.fullmatch(r'S-1-5-21-(?:[0-9]+-){3}[0-9]+', account)
+            or type(session) is not int or session <= 0):
+        raise ValueError('Catalog transition requires one ordinary interactive account')
+    prior = inputs['previous_opencode']['product_code']
+    candidate = inputs['opencode']['product_code']
+    for name, candidate_state in (('before',-1),('after_burn',-1),('after_catalog',5)):
+        row = result.get(name, {})
+        if (row.get('account') != account or row.get('session') != session or row.get('elevated') is not False
+                or row.get('previous_product') != prior or row.get('candidate_product') != candidate
+                or type(row.get('candidate_state')) is not int or row['candidate_state'] != candidate_state
+                or type(row.get('previous_state')) is not int
+                or row['previous_state'] not in ((5,) if name == 'before' else (-1,5) if name == 'after_burn' else (-1,))):
+            raise ValueError('Catalog transition MSI or ordinary-user observation differs: '+name)
+        if name != 'before' and row.get('runtime_sha256') != inputs['runtime']['sha256']:
+            raise ValueError('Catalog transition did not observe the installed candidate core')
+    before, after = result['before'], result['after_catalog']
+    outcome = result.get('catalog', {})
+    if (any(type(row.get('model_exit')) is not int or row['model_exit'] != 0
+            or not isinstance(row.get('models'), list) or inputs['model'] not in row['models'] for row in (before,after))
+            or outcome.get('panel_sha256') != inputs['panel']['sha256']
+            or outcome.get('msi_sha256') != inputs['opencode']['sha256']
+            or outcome.get('transfer') != 'qualification-loopback'
+            or outcome.get('action') not in ('install','update','repair')
+            or not isinstance(outcome.get('step_id'), str) or not outcome['step_id']
+            or outcome.get('terminal_step_id') != outcome['step_id'] or outcome.get('failure') != ''):
+        raise ValueError('Catalog transition action or exact model evidence is incomplete')
+    return result
 
 
 def check_setup_installed(inputs, result, *, source, run_id, run_attempt, version):
@@ -1862,11 +2617,17 @@ def opencode_content_policy(plugin_version=None):
         'source':dict(common,url='https://github.com/BurntSushi/ripgrep/releases/download/15.1.0/ripgrep-15.1.0-x86_64-pc-windows-msvc.zip',
                       integrity='sha256-124510b94b6baa3380d051fdf4650eaa80a302c876d611e9dba0b2e18d87493a',
                       member='ripgrep-15.1.0-x86_64-pc-windows-msvc/rg.exe')}
+    rows['LocalAppDataFolder/Programs/OpenAbstractions/apps/opencode/desktop-fix/watcher.node']={
+        'sha256':'0251ee3ba7027af84a0cb8e0c2ffa1c5989eacf21bc091f95a7c5c00cc486e12','bytes':528896,
+        'source':{'application':'opencode','repository':'https://github.com/parcel-bundler/watcher','tag':'v2.5.1',
+                  'base':'664695dbb2488d53f782c3e2b8791c4c114731fb','pull':277,
+                  'pull_commit':'d09df163078cd54e422c8fbacacbf0359be3f52e',
+                  'build_commit':'052dc8d70871bc73d8ea1a30675f23347d144d98','member':'build/Release/watcher.node'}}
     if plugin_version is not None:
         if not isinstance(plugin_version,str) or not re.fullmatch(r'\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?',plugin_version):
             raise ValueError('invalid selected OpenCode plugin version')
         plugin='LocalAppDataFolder/Programs/OpenAbstractions/apps/opencode/plugin/'+plugin_version+'/node_modules/@msgpackr-extract/msgpackr-extract-win32-x64/'
-        source={'application':'opencode','version':'1.18.31','lock_sha256':'8920c6f07ac511ee6ed728e75a17476f54528ddf93e46c77c997a006694f281b'}
+        source={'application':'opencode','version':'1.18.31','lock_sha256':'004bae800738a8779a64091471e9aa09195542af844da713b6a55247aab6e412'}
         for member in ('node.abi115.node','node.napi.node'):
             original=rows[prefix+'config/node_modules/@msgpackr-extract/msgpackr-extract-win32-x64/'+member]
             rows[plugin+member]={'sha256':original['sha256'],'bytes':original['bytes'],'source':dict(source,**npm,member='package/'+member)}
@@ -1982,8 +2743,9 @@ def msi_extracted_member(extracted, source):
         if source != str(absolute):
             raise ValueError('MSI extraction source is not canonical')
         try:
-            relative = PureWindowsPath('SourceDir', *absolute.relative_to(extracted).parts)
-        except ValueError as error:
+            file_boundary.ordinary_path(absolute, kind='file')
+            relative = PureWindowsPath('SourceDir', *file_boundary.relative_beneath_existing(absolute, extracted).parts)
+        except (ValueError, OSError) as error:
             raise ValueError('MSI extraction source is outside its owned extraction') from error
     else:
         relative = PureWindowsPath(source)
@@ -2078,6 +2840,103 @@ def msi_member_readback(destination, *, extraction=None, source=None):
         if target.is_file() and str(target.resolve()).casefold() not in identities:
             raise ValueError('app MSI extraction contains a foreign member')
     return actual, members, extracted, tree
+
+
+MSI_FILE_CONTEXT_QUERY = r'''param([string]$Msi)
+$ErrorActionPreference = 'Stop'
+[Console]::OutputEncoding = New-Object System.Text.UTF8Encoding($false)
+$installer = New-Object -ComObject WindowsInstaller.Installer
+$db = $installer.OpenDatabase($Msi, 0)
+function Rows($sql, $names) {
+    $view = $db.OpenView($sql)
+    [void]$view.Execute()
+    $rows = @()
+    while ($record = $view.Fetch()) {
+        $row = @{}
+        for ($i=0; $i -lt $names.Count; $i++) { $row[$names[$i]] = $record.StringData($i+1) }
+        $rows += $row
+    }
+    [void]$view.Close()
+    return ,$rows
+}
+$files = Rows 'SELECT `File`, `Component_`, `FileName`, `FileSize` FROM `File`' @('id','component','name','bytes')
+$components = Rows 'SELECT `Component`, `Condition`, `Attributes` FROM `Component`' @('id','condition','attributes')
+$features = Rows 'SELECT `Feature`, `Feature_Parent` FROM `Feature`' @('id','parent')
+$links = Rows 'SELECT `Feature_`, `Component_` FROM `FeatureComponents`' @('feature','component')
+$product = Rows "SELECT ``Value`` FROM ``Property`` WHERE ``Property``='ProductCode'" @('value')
+$tables = Rows 'SELECT `Name` FROM `_Tables`' @('name')
+if (@($tables | Where-Object { $_.name -eq 'Condition' }).Count) {
+    $featureConditions = Rows 'SELECT `Feature_`, `Condition` FROM `Condition`' @('feature','condition')
+    if ($featureConditions.Count) { throw 'Conditional feature levels need an explicit supported applicability context' }
+}
+# These scope-only expressions have complete independent property context.
+# Other expressions may depend on costing, searches or machine state. Refuse
+# them rather than using this read-only session's incidental environment.
+$conditions = @($components | ForEach-Object { $_.condition } | Sort-Object -Unique)
+foreach ($condition in $conditions) {
+    if ($condition -notin @('', 'ALLUSERS', 'NOT ALLUSERS')) { throw "Unsupported component condition: $condition" }
+}
+# Ignore the registered product's existing state; no sequence/action executes.
+$session = $installer.OpenPackage($Msi, 1)
+$evaluated = @()
+foreach ($scope in @('user','machine')) {
+    $session.Property('ALLUSERS') = $(if ($scope -eq 'machine') { '1' } else { '' })
+    foreach ($condition in $conditions) {
+        $answer = $session.EvaluateCondition($condition)
+        if ($answer -notin @(0,1,2)) { throw 'Component condition did not evaluate' }
+        if ($condition -and $answer -eq 2) { throw 'Nonempty component condition returned no condition' }
+        $evaluated += @{scope=$scope; condition=$condition; applies=($answer -in @(1,2))}
+    }
+}
+@{files=$files; components=$components; features=$features; feature_components=$links;
+  product_code=$product[0].value; conditions=$evaluated} | ConvertTo-Json -Depth 6
+'''
+
+
+def msi_catalogue_identity(candidate):
+    """Read only the signed MSI's catalogue properties, without opening an install session."""
+    import msilib
+    database = msilib.OpenDatabase(str(candidate.resolve()), msilib.MSIDBOPEN_READONLY)
+    result = {}
+    for column, key in (('ProductCode','product_code'),('UpgradeCode','upgrade_code'),('ProductVersion','version')):
+        view = database.OpenView(f"SELECT Value FROM Property WHERE Property='{column}'")
+        try:
+            view.Execute(None)
+            record = view.Fetch()
+            if record is None:
+                raise ValueError('signed MSI lacks catalogue property: '+column)
+            result[key] = record.GetString(1)
+            if view.Fetch() is not None:
+                raise ValueError('signed MSI repeats catalogue property: '+column)
+        finally:
+            view.Close()
+    package_code = database.GetSummaryInformation(0).GetProperty(9)  # PID_REVNUMBER
+    if isinstance(package_code, bytes):
+        package_code = package_code.decode('ascii')
+    if not isinstance(package_code, str) or not re.fullmatch(r'\{[0-9A-F]{8}(?:-[0-9A-F]{4}){3}-[0-9A-F]{12}\}', package_code):
+        raise ValueError('signed MSI lacks an exact package code')
+    result['package_code'] = package_code
+    return result
+
+
+def msi_file_context(candidate):
+    """Read exact MSI tables and scope conditions, without executing actions."""
+    candidate = Path(candidate)
+    if (not candidate.is_file() or candidate.is_symlink() or candidate.is_junction()
+            or getattr(candidate.lstat(), 'st_file_attributes', 0) & 0x400):
+        raise ValueError('exact candidate MSI is missing or linked')
+    before = hashlib.sha256(candidate.read_bytes()).hexdigest()
+    with tempfile.TemporaryDirectory(prefix='oa-msi-file-context-') as folder:
+        script = Path(folder) / 'query.ps1'
+        script.write_text(MSI_FILE_CONTEXT_QUERY, encoding='utf-8-sig')
+        completed = subprocess.run(['powershell.exe', '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass',
+                                    '-File', str(script), '-Msi', str(candidate.resolve())],
+                                   capture_output=True, text=True, encoding='utf-8', timeout=60)
+    if completed.returncode:
+        raise ValueError('candidate MSI applicability read failed: ' + completed.stderr.strip())
+    if hashlib.sha256(candidate.read_bytes()).hexdigest() != before:
+        raise ValueError('candidate MSI changed during applicability read')
+    return json.loads(completed.stdout)
 
 
 def final_msi_members(actual):
@@ -2349,9 +3208,10 @@ def smoke_build(root):
 
 def phase_main(argv):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('operation', choices=('prepare-tools', 'check-native-source', 'prepare-chain',
+    parser.add_argument('operation', choices=('intake-installer-priors', 'check-installer-priors', 'prepare-tools', 'check-native-source', 'prepare-chain',
                         'copy-chain', 'smoke-build', 'smoke-sign', 'sign-pe', 'verify-pe', 'sign-msi',
-                        'verify-msis', 'verify-language', 'sign-bundle', 'verify-bundle', 'check-setup-installed'))
+                        'verify-msis', 'verify-language', 'sign-bundle', 'verify-bundle', 'check-setup-installed',
+                        'verify-setup-catalog-inputs', 'check-setup-catalog-transition', 'provider-images'))
     for name in ('root', 'policy', 'receipt', 'payload', 'pypi', 'npm', 'release', 'out', 'canonical'):
         parser.add_argument('--' + name, type=Path)
     parser.add_argument('--signtool')
@@ -2367,9 +3227,28 @@ def phase_main(argv):
     parser.add_argument('--run-attempt', type=int)
     parser.add_argument('--installed-inputs', type=Path)
     parser.add_argument('--installed-result', type=Path)
+    parser.add_argument('--previous-root', type=Path)
+    parser.add_argument('--previous-policy-source', type=Path)
+    parser.add_argument('--policy-source', type=Path)
+    parser.add_argument('--previous-producer-context', type=Path)
+    parser.add_argument('--previous-artifact-id', type=int)
+    parser.add_argument('--previous-artifact-digest')
+    parser.add_argument('--previous-artifact-attempt', type=int)
+    parser.add_argument('--previous-version')
+    parser.add_argument('--previous-source')
+    parser.add_argument('--previous-run-id', type=int)
+    parser.add_argument('--previous-run-attempt', type=int)
+    parser.add_argument('--catalog-document', type=Path)
+    parser.add_argument('--model')
     parser.add_argument('--setup-fixture', type=Path)
     parser.add_argument('--version')
-    parser.add_argument('--scope',choices=('all','native','runtime','apps','core'),default='all',
+    parser.add_argument('--program-architecture', choices=('x64', 'arm64'))
+    parser.add_argument('--runtime-build-attempt', type=int)
+    parser.add_argument('--program-tools', type=Path)
+    parser.add_argument('--program-graph', type=Path)
+    parser.add_argument('--program-archive', type=Path)
+    parser.add_argument('--prior-descriptor', type=Path)
+    parser.add_argument('--scope',choices=('all','native','runtime','providers','runtime-owner','apps','core'),default='all',
                         help='existing signing phase subset; retained inputs are verified before joining')
     parser.add_argument('--retained-signatures',type=Path)
     parser.add_argument('--native-family', action='append', choices=('facade',),
@@ -2377,15 +3256,32 @@ def phase_main(argv):
     parser.add_argument('--native-roster', type=Path,
                         help='select additional native families from the candidate Python source roster')
     args = parser.parse_args(argv)
+    if args.operation == 'check-installer-priors':
+        if args.prior_descriptor is None or args.root is None:
+            parser.error('installer predecessor consumption requires descriptor and retained root')
+        check_installer_prior_intake(json.loads(args.prior_descriptor.read_bytes()), args.root,
+            environment=os.environ)
+        return
+    if args.operation == 'intake-installer-priors':
+        if args.prior_descriptor is None or args.out is None:
+            parser.error('installer predecessor intake requires descriptor and new output')
+        def fetch(route):
+            return json.loads(subprocess.check_output(['gh', 'api', route], text=True))
+        def download(argv, target):
+            with target.open('wb') as stream:
+                subprocess.run(['gh', *argv], stdout=stream, check=True)
+        receive_installer_priors(json.loads(args.prior_descriptor.read_bytes()), args.out,
+            fetch=fetch, download=download, environment=os.environ)
+        return
     if args.native_roster:
         if args.native_family:
             parser.error('explicit native family and candidate roster are distinct selections')
         args.native_family = declared_native_families(args.native_roster)
-    allowed = ({'all','native','runtime'} if args.operation in ('sign-pe','verify-pe') else
+    allowed = ({'all','native','runtime','providers','runtime-owner'} if args.operation in ('sign-pe','verify-pe') else
                {'all','apps','core'} if args.operation == 'sign-msi' else {'all'})
-    if args.scope not in allowed or (args.retained_signatures is not None and args.scope not in ('runtime','core')):
+    if args.scope not in allowed or (args.retained_signatures is not None and args.scope not in ('runtime','providers','runtime-owner','core') and args.operation != 'provider-images'):
         parser.error('scope or retained signatures do not belong to this phase')
-    if (args.native_family or args.native_roster) and args.operation not in ('check-native-source', 'sign-pe', 'verify-pe', 'verify-language', 'verify-msis', 'sign-msi'):
+    if (args.native_family or args.native_roster) and args.operation not in ('check-native-source', 'sign-pe', 'verify-pe', 'verify-language', 'verify-msis', 'sign-msi', 'provider-images'):
         parser.error('native family does not belong to this phase')
     native_member_names(args.native_family)
     admitted_context_pin = None
@@ -2429,13 +3325,60 @@ def phase_main(argv):
     identity(policy)
     operation = verify if args.operation.startswith('verify') else sign
     root = args.root.resolve()
+    if args.operation == 'provider-images':
+        if args.retained_signatures is None or args.out is None:
+            parser.error('provider image handback requires original signature receipt and new output')
+        images = signed_provider_images(root, payload_rows(args.payload), policy, args.signtool,
+            json.loads(args.retained_signatures.read_bytes()),
+            policy_sha256=hashlib.sha256(args.policy.read_bytes()).hexdigest())
+        with args.out.open('x', encoding='utf-8') as stream:
+            stream.write(json.dumps(images, sort_keys=True, separators=(',', ':')) + '\n')
+        return 0
+    if args.operation in ('verify-setup-catalog-inputs', 'check-setup-catalog-transition'):
+        prepare = args.operation == 'verify-setup-catalog-inputs'
+        if (not all((args.previous_root, args.previous_policy_source, args.policy_source,
+                     args.previous_producer_context, args.previous_source,
+                     args.previous_run_id, args.previous_run_attempt, args.previous_version,
+                     args.previous_artifact_id, args.previous_artifact_digest, args.previous_artifact_attempt,
+                     args.catalog_document, args.setup_fixture, args.model, args.version, args.source, args.run_id,
+                     args.run_attempt, args.signtool, args.producer_context, args.artifact_id,
+                     args.artifact_digest, args.artifact_attempt))
+                or args.producer_bindings
+                or (prepare and (not args.out or args.installed_result))
+                or (not prepare and (not args.installed_result or args.out))):
+            parser.error('Catalog transition requires both retained Setup artifact contexts and an exact input or terminal operation')
+
+        terminal = None if prepare else json.loads(_application_file_state(args.installed_result, read_limit=1 << 20))
+        if not prepare and not isinstance(terminal, dict):
+            raise ValueError('Catalog transition requires an ordinary-user terminal object')
+        previous = dict(context=args.previous_producer_context, policy_source=args.previous_policy_source,
+            source=args.previous_source, run_id=args.previous_run_id, run_attempt=args.previous_run_attempt,
+            version=args.previous_version, artifact_id=args.previous_artifact_id,
+            digest=args.previous_artifact_digest, attempt=args.previous_artifact_attempt)
+        candidate = dict(context=args.producer_context, policy_source=args.policy_source, source=args.source,
+            run_id=args.run_id, run_attempt=args.run_attempt, version=args.version, artifact_id=args.artifact_id,
+            digest=args.artifact_digest, attempt=args.artifact_attempt)
+        value = _admit_and_verify_setup_catalog_transition(args.previous_root, root, policy, args.signtool,
+            policy_sha256=hashlib.sha256(args.policy.read_bytes()).hexdigest(),
+            previous_intake=previous, candidate_intake=candidate, catalog_path=args.catalog_document,
+            fixture=args.setup_fixture, model=args.model, installed_result=terminal)
+        if prepare:
+            with args.out.open('x', encoding='utf-8', newline='\n') as stream:
+                stream.write(json.dumps(value, sort_keys=True, separators=(',', ':')) + '\n')
+        return 0
     if args.operation == 'check-setup-installed':
         inputs = json.loads(args.installed_inputs.read_bytes())
         expected = setup_installed_inputs({'bundle': inputs['bundle']},
-            {key: inputs[key] for key in ('core', 'runtime')}, args.setup_fixture, args.policy,
+            {key: inputs[key] for key in ('core', 'runtime', 'opencode', 'panel') if key in inputs}, args.setup_fixture, args.policy,
             args.source, args.run_id, args.run_attempt, args.version)
         if expected != inputs or setup_file_pin(member(root, inputs['bundle']['name'])) != inputs['bundle']:
             raise ValueError('Setup installed input producer/policy or final bundle changed')
+        if ('opencode' in inputs) != ('panel' in inputs):
+            raise ValueError('signed Setup Catalog readback is incomplete')
+        if 'opencode' in inputs:
+            path = member(root, inputs['opencode']['name'])
+            if setup_file_pin(path) | msi_catalogue_identity(path) != inputs['opencode']:
+                raise ValueError('signed Setup OpenCode identity changed before terminal validation')
         check_setup_installed(inputs, json.loads(args.installed_result.read_bytes()),
                               source=args.source, run_id=args.run_id, run_attempt=args.run_attempt, version=args.version)
         return 0
@@ -2519,8 +3462,9 @@ def phase_main(argv):
         for architecture, folder in (('x64', 'amd64'), ('arm64', 'arm64')):
             directory = root / 'runtime/a' / folder
             if args.scope != 'native' and directory.exists():
-                targets.extend(signature_targets(payload_rows(args.payload), directory, architecture))
-        if args.scope != 'runtime':
+                targets.extend(signature_targets(payload_rows(args.payload), directory, architecture,
+                    scope=args.scope if args.scope in ('providers', 'runtime-owner') else 'all'))
+        if args.scope not in ('runtime', 'providers', 'runtime-owner'):
             selected = [member(root, name) for name in native_member_names(args.native_family)]
             actual = {path for path in (root / 'native').rglob('*') if path.suffix.lower() in ('.dll', '.node')}
             if actual != set(selected):
@@ -2552,11 +3496,16 @@ def phase_main(argv):
         raise ValueError('unknown Windows signature phase')
     # Serialize targets already selected above as relative wire member names.
     proofs = []
-    if args.scope in ('runtime','core'):
+    if args.scope in ('runtime','providers','runtime-owner','core'):
         if args.retained_signatures is None:raise ValueError('split signing requires retained exact prior signatures')
-        expected = (set(native_member_names(args.native_family)) if args.scope == 'runtime' else
+        expected = (set(native_member_names(args.native_family)) if args.scope in ('runtime','providers','runtime-owner') else
                     {'apps/apps/' + app['id'] + '/' + Path(app['file']).name
                      for app in staged['apps'] if 'embedded_integration' not in app})
+        if args.scope == 'runtime-owner':
+            for architecture, folder in (('x64', 'amd64'), ('arm64', 'arm64')):
+                expected.update(file_boundary.relative_beneath_existing(path, root).as_posix() for path in
+                    signature_targets(payload_rows(args.payload), root/'runtime/a'/folder, architecture,
+                        scope='providers'))
         policy_sha=hashlib.sha256(args.policy.read_bytes()).hexdigest()
         retained=json.loads(args.retained_signatures.read_bytes())
         # A native catalog delivery can have no MSI container. Its separately
@@ -2583,6 +3532,15 @@ def phase_main(argv):
                     canonical_appmodel=canonical_appmodel_member(root / 'canonical/native', path, args.native_family))
         proofs.append(dict(proof, name=Path(os.path.relpath(path, root)).as_posix()))
     receipt = {'schema': 1, 'policy_sha256': hashlib.sha256(args.policy.read_bytes()).hexdigest(), 'result': 'pass', 'files': proofs}
+    if args.program_architecture:
+        if args.operation != 'verify-pe' or args.runtime_build_attempt is None or args.runtime_build_attempt < 1:
+            parser.error('final program handback requires verify-pe and its exact runtime build attempt')
+        if any(path is None for path in (args.program_tools, args.program_graph, args.program_archive)):
+            parser.error('final program handback requires exact source roster and prepared graph/archive')
+        receipt['program_proof'] = packaging_program_proof(root, args.program_architecture, args.policy,
+            args.signtool, receipt, tools=args.program_tools, graph=args.program_graph,
+            archive=args.program_archive, producer={'source':os.environ['GITHUB_SHA'],
+                'run_id':int(os.environ['GITHUB_RUN_ID']), 'run_attempt':args.runtime_build_attempt})
     args.receipt.write_text(json.dumps(receipt, indent=2) + '\n')
     if args.native_roster:
         native_family_environment(args.github_env, args.native_family)
@@ -2610,7 +3568,8 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__, epilog=(
         'Hosted owner phases: prepare-tools, check-native-source, sign-pe, verify-pe, '
         'sign-msi, verify-msis, verify-language, prepare-chain, copy-chain, sign-bundle, verify-bundle, '
-        'smoke-build, smoke-sign. Use PHASE --help for its inputs. '
+        'smoke-build, smoke-sign, verify-setup-catalog-inputs, check-setup-catalog-transition. '
+        'Use PHASE --help for its inputs. '
         'consume --help describes exact immutable producer artifact intake.'))
     parser.add_argument('operation', choices=('sign', 'verify'))
     parser.add_argument('--policy', type=Path, required=True, help='public Certum certificate policy; never credentials')

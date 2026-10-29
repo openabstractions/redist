@@ -484,6 +484,11 @@ MODES = {'native-oa': {'native-ipc', 'download-job', 'logging',
 # Target kinds name existing receiving boundaries. Website evidence binds the
 # built site artifact; it cannot be satisfied by an installer receipt.
 TARGET_OWNERS = {'windows-x64': 'installed', 'macos-arm64': 'installed', 'web': 'website'}
+J1_COMPARISON_BEHAVIOR = 'Count steps against the same app without OA and the retained MuseTree comparison; OA adds no step.'
+J1_COMPARISON_PROVENANCE = {'baseline': 'owner-attested', 'channel': 'chat-relay'}
+J1_CANVAS_BEHAVIOR = ('Missing assets, restart/cancel/failure/retry and canvas-replacement consent behave as promised; '
+                      'empty and warm stores remain distinct.')
+J1_CANVAS_PROVENANCE = {'source': 'owner-attested', 'channel': 'chat-relay'}
 
 
 def _strict_object(pairs):
@@ -513,6 +518,30 @@ def cited_text(text, heading):
     else:
         raise ValueError('citation needs an exact Markdown heading or VISION entry')
     return ''.join(lines[start:ends[0] if ends else len(lines)]).rstrip('\n') + '\n'
+
+
+VISION_LINE_ANCHOR = re.compile(r'(\]\((?:\.\./)*)VISION\.md#L(\d+)(?=\))')
+
+
+# Same pattern as scripts/vision_relink.ENTRY; test_facts pins the two equal. Kept literal
+# because source admission loads this file without scripts/.
+VISION_ENTRY = re.compile(r'^- (\*\*|~~)')
+
+
+def citation_digest(text, vision_text):
+    """SHA-256 of cited text with each VISION.md#L<n> link target resolved to the raw
+    heading line of the VISION entry at line n, so relinks keep the digest while a
+    repointed or struck decision changes it. An anchor on no entry heading keeps its number.
+    vision_text is a callable returning VISION.md, read only when an anchor exists."""
+    lines = []
+    def resolve(match):
+        if not lines:
+            lines.extend(vision_text().replace('\r\n', '\n').split('\n'))
+        n = int(match.group(2))
+        if 1 <= n <= len(lines) and VISION_ENTRY.match(lines[n - 1]):
+            return match.group(1) + 'VISION.md#' + lines[n - 1]
+        return match.group(0)
+    return hashlib.sha256(VISION_LINE_ANCHOR.sub(resolve, text).encode('utf-8')).hexdigest()
 
 
 def read_admission_scope(plan_text, version, read_text, previous=None):
@@ -549,8 +578,9 @@ def read_admission_scope(plan_text, version, read_text, previous=None):
         if row['path'] not in ('VISION.md', 'research/release-0.8.0/PLAN.md'):
             fail('scope_citation', key, 'citation must name its existing VISION or PLAN owner'); continue
         try:
-            raw = cited_text(read_text(row['path']), row['heading']).encode('utf-8')
-            if not SHA.fullmatch(str(row['text_sha256'])) or hashlib.sha256(raw).hexdigest() != row['text_sha256']:
+            digest = citation_digest(cited_text(read_text(row['path']), row['heading']),
+                                     lambda: read_text('VISION.md'))
+            if not SHA.fullmatch(str(row['text_sha256'])) or digest != row['text_sha256']:
                 fail('scope_citation', key, 'cited decision text changed')
         except (OSError, ValueError, TypeError) as error:
             fail('scope_citation', key, str(error))
@@ -714,6 +744,8 @@ def admission_outcomes(scope, selections, adopter_receipts, journey_receipts, *,
                 except (KeyError, OSError, ValueError, TypeError) as error:
                     fail('receiver_evidence', key, target, str(error))
                 required = requirement.get('behavior', requirement.get('outcomes', []))
+                comparison_provenance = None
+                canvas_provenance = None
                 observations_value = proof.get('observations', [])
                 if not isinstance(observations_value, list) or any(not isinstance(o, dict) for o in observations_value):
                     fail('receiver_observations', key, target, 'receiver observations must be objects')
@@ -723,6 +755,20 @@ def admission_outcomes(scope, selections, adopter_receipts, journey_receipts, *,
                     if len(observations) != 1 or observations[0].get('result') != 'pass':
                         fail('required_observation', key, target, 'missing passing observation: ' + behavior); continue
                     observation = observations[0]
+                    if (kind, key, target, behavior) == ('journeys', 'J-1', 'windows-x64', J1_COMPARISON_BEHAVIOR):
+                        comparison = observation.get('step_comparison')
+                        if not isinstance(comparison, dict) or any(
+                                comparison.get(field) != value for field, value in J1_COMPARISON_PROVENANCE.items()):
+                            fail('journey_comparison_provenance', key, target,
+                                 'J1 comparison requires an owner-attested baseline via chat-relay')
+                        else:
+                            comparison_provenance = dict(J1_COMPARISON_PROVENANCE)
+                    if (kind, key, target, behavior) == ('journeys', 'J-1', 'windows-x64', J1_CANVAS_BEHAVIOR):
+                        if observation.get('canvas_confirmation') != J1_CANVAS_PROVENANCE:
+                            fail('journey_canvas_provenance', key, target,
+                                 'J1 canvas confirmation requires owner attestation via chat-relay')
+                        else:
+                            canvas_provenance = dict(J1_CANVAS_PROVENANCE)
                     if kind == 'adopters' and behavior in ('native-ipc', 'download-job', 'logging'):
                         actor = observation.get('actor_identity', {})
                         if not isinstance(actor, dict) or actor.get('binding') != 'os-peer' or actor.get('executable_sha256') != chosen.get('executable_sha256'):
@@ -746,9 +792,14 @@ def admission_outcomes(scope, selections, adopter_receipts, journey_receipts, *,
                                 raise ValueError('owner recording bytes changed')
                         except (KeyError, OSError, ValueError, TypeError) as error:
                             fail('journey_recording', key, target, str(error))
-                outcomes[kind].append({'id': key, 'target': target,
+                outcome = {'id': key, 'target': target,
                     'state': 'pass' if len(findings) == before and not globally_pending else 'pending',
-                    'observations': list(required)})
+                    'observations': list(required)}
+                if outcome['state'] == 'pass' and comparison_provenance is not None:
+                    outcome['comparison_provenance'] = comparison_provenance
+                if outcome['state'] == 'pass' and canvas_provenance is not None:
+                    outcome['canvas_provenance'] = canvas_provenance
+                outcomes[kind].append(outcome)
     return {'scope_sha256': scope_hash, 'outcomes': outcomes, 'findings': findings,
             'accepted': not findings}
 
@@ -758,7 +809,15 @@ def render_admission_outcomes(report):
     lines = ['## Demonstrated scope', '']
     for kind in ('adopters', 'journeys'):
         for row in report['outcomes'][kind]:
-            details = ': ' + ', '.join(row.get('observations', [])) if row.get('observations') else ''
+            observations = row.get('observations', [])
+            if (kind, row['id'], row['target'], row['state']) == ('journeys', 'J-1', 'windows-x64', 'pass'):
+                if row.get('comparison_provenance') == J1_COMPARISON_PROVENANCE:
+                    observations = [behavior + ' (baseline owner-attested via chat-relay)'
+                                    if behavior == J1_COMPARISON_BEHAVIOR else behavior for behavior in observations]
+                if row.get('canvas_provenance') == J1_CANVAS_PROVENANCE:
+                    observations = [behavior + ' (canvas owner-attested via chat-relay)'
+                                    if behavior == J1_CANVAS_BEHAVIOR else behavior for behavior in observations]
+            details = ': ' + ', '.join(observations) if observations else ''
             lines.append('- ' + row['id'] + ' (' + row['target'] + '): ' + row['state'] + details + '.')
     return '\n'.join(lines) + '\n'
 
@@ -796,7 +855,7 @@ def scope_selection(scope, rows):
 def source_admission(root, source_sha, version, *, candidate_artifacts=None,
                      selections=(), adopter_receipts=(), journey_receipts=(),
                      inputs_sha256='', probe_source_sha256='', receiving_context=None,
-                     previous=None, installed_receipts=()):
+                     previous=None, installed_receipts=(), public_surfaces=SURFACES):
     """Read the source-owned scope into the existing preparation/Job report.
 
     Source preflight calls without native inputs deliberately reports pending.
@@ -835,7 +894,7 @@ def source_admission(root, source_sha, version, *, candidate_artifacts=None,
     # Public claims are independently checkable even when a scope citation is
     # stale. Keep their findings together without accepting the invalid scope.
     try:
-        public_facts = check(root, source_sha)
+        public_facts = check(root, source_sha, surfaces=public_surfaces)
         for binding in public_facts['inputs']:
             raw = read(binding['path'], True)
             if hashlib.sha256(raw).hexdigest() != binding['sha256']:
@@ -862,7 +921,7 @@ def source_admission(root, source_sha, version, *, candidate_artifacts=None,
     return value
 
 
-def validate_admission_report(report, root, source_sha, version, *, require_delivery=True):
+def validate_admission_report(report, root, source_sha, version, *, require_delivery=True, public_surfaces=SURFACES):
     """Check report structure and exact input hashes; this grants no provenance.
 
     Delivery callers first revalidate through the existing receiving owner and
@@ -876,7 +935,8 @@ def validate_admission_report(report, root, source_sha, version, *, require_deli
             not report.get('inputs') or digest({k: v for k, v in report.items() if k != 'report_sha256'}) != report.get('report_sha256')):
         raise ValueError('required adopter/journey admission is pending or differs from exact completed owner report')
     if not require_delivery:
-        declared = source_admission(root, source_sha, version)
+        surfaces = public_surfaces() if callable(public_surfaces) else public_surfaces
+        declared = source_admission(root, source_sha, version, public_surfaces=surfaces)
         if (declared.get('scope_valid') is not True or any(report.get(key) != declared.get(key)
                 for key in ('scope_sha256', 'inputs'))):
             raise ValueError('preparation declaration differs from current accepted source scope/catalogue')
@@ -908,7 +968,7 @@ def public_admission(report, selections):
     return value
 
 
-def scope_declaration(root, version, *, emit=False, read_text=None):
+def scope_declaration(root, version, *, emit=False, read_text=None, refresh=None):
     """Emit/check the existing source catalogue's normalized PLAN projection.
 
     This declaration contains no source commit or completed package proof. It
@@ -917,7 +977,33 @@ def scope_declaration(root, version, *, emit=False, read_text=None):
     """
     root = Path(root)
     read = read_text or (lambda path: (root / path).read_text(encoding='utf-8-sig'))
-    scope, findings = read_admission_scope(read('research/release-0.8.0/PLAN.md'), version, read)
+    plan_path = 'research/release-0.8.0/PLAN.md'
+    plan = read(plan_path)
+    scope, findings = read_admission_scope(plan, version, read)
+    refreshed_plan = None
+    if refresh is not None:
+        rows = scope.get('decisions', []) if isinstance(scope, dict) else []
+        if not isinstance(rows, list):
+            raise ValueError('scope declaration: ' + json.dumps(findings, sort_keys=True))
+        selected = [row for row in rows if isinstance(row, dict) and row.get('id') == refresh]
+        if len(selected) != 1:
+            raise ValueError('citation refresh requires one existing decision id')
+        allowed = {'code': 'scope_citation', 'id': refresh, 'message': 'cited decision text changed'}
+        if any(finding != allowed for finding in findings):
+            raise ValueError('scope declaration: ' + json.dumps(findings, sort_keys=True))
+        row = selected[0]
+        block = SCOPE_FENCE.search(plan)
+        # Locate the existing digest tokens after the normal strict scope reader
+        # validated their records. Preserve all other PLAN text and formatting.
+        tokens = list(re.finditer(r'"text_sha256"\s*:\s*"([0-9a-f]{64})"', block.group(1)))
+        if [token.group(1) for token in tokens] != [item['text_sha256'] for item in rows]:
+            raise ValueError('citation digest tokens differ from the validated scope')
+        token = tokens[next(index for index, item in enumerate(rows) if item is row)]
+        start, end = block.start(1) + token.start(1), block.start(1) + token.end(1)
+        digest_value = citation_digest(cited_text(read(row['path']), row['heading']),
+                                       lambda: read('VISION.md'))
+        refreshed_plan = plan[:start] + digest_value + plan[end:]
+        scope, findings = read_admission_scope(refreshed_plan, version, read)
     if findings:
         raise ValueError('scope declaration: ' + json.dumps(findings, sort_keys=True))
     path = 'monitor/internal/setup/adopter_assets.json'
@@ -925,6 +1011,8 @@ def scope_declaration(root, version, *, emit=False, read_text=None):
     if (not isinstance(document, dict) or document.get('schema') != 1 or
             document.get('release_tag') != 'v' + version or not isinstance(document.get('apps'), list)):
         raise ValueError('source adopter catalogue differs from declared release')
+    if refresh is not None and 'release_admission' in document:
+        validate_public_admission(document['release_admission'], version, document['apps'])
     selections = []
     for requirement in scope['adopters']:
         for row in document['apps']:
@@ -938,7 +1026,9 @@ def scope_declaration(root, version, *, emit=False, read_text=None):
                            for target in row['targets']] for kind in ('adopters', 'journeys')}}
     capsule = public_admission(report, selections)
     validate_public_admission(capsule, version, document['apps'])
-    if emit:
+    if emit or refresh is not None:
+        if refreshed_plan is not None:
+            (root / plan_path).write_text(refreshed_plan, encoding='utf-8', newline='\n')
         document['release_admission'] = capsule
         (root / path).write_text(json.dumps(document, indent=2) + '\n', encoding='utf-8', newline='\n')
     elif document.get('release_admission') != capsule:
@@ -994,13 +1084,17 @@ def main(argv=None):
     parser.add_argument('--record', type=Path)
     parser.add_argument('--check', action='store_true', help='check the named public source surfaces offline')
     parser.add_argument('--render', action='store_true', help='render appended build/signature facts from the same record')
-    parser.add_argument('--declaration', choices=('check', 'emit'), help='check or emit the existing source catalogue PLAN projection before commit')
+    parser.add_argument('--declaration', choices=('check', 'emit', 'refresh'), help='check/emit the source catalogue PLAN projection, or refresh one explicitly named existing citation and emit')
+    parser.add_argument('citation_id', nargs='?', help='existing citation id for --declaration refresh only')
     parser.add_argument('--version', help='declared release MAJOR.MINOR.PATCH')
     args = parser.parse_args(argv)
+    if (args.declaration == 'refresh') != (args.citation_id is not None):
+        parser.error('--declaration refresh requires exactly one existing citation id')
     if args.declaration:
         if not args.version or not requires_admission(args.version):
             parser.error('--declaration requires --version 0.8.0 or later')
-        print(json.dumps(scope_declaration(args.root, args.version, emit=args.declaration == 'emit'), sort_keys=True, indent=2))
+        print(json.dumps(scope_declaration(args.root, args.version, emit=args.declaration == 'emit',
+                                           refresh=args.citation_id), sort_keys=True, indent=2))
         return 0
     if args.render:
         record = args.record or latest_record(args.root)

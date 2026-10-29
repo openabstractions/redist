@@ -511,13 +511,16 @@ public sealed class OaInstalledPanelSmoke : IDisposable {
             AutomationElement window=AutomationElement.FromHandle(hwnd);
             AutomationElement document=window.FindFirst(TreeScope.Descendants,new PropertyCondition(AutomationElement.ControlTypeProperty,ControlType.Document));
             if(document==null) return;
-            string heading=page=="setup" ? "Get started" : "Apps";
+            string heading=page=="setup" ? "Catalog" : "Apps";
             AutomationElement title=document.FindFirst(TreeScope.Descendants,new PropertyCondition(AutomationElement.NameProperty,heading));
             if(title==null || title.Current.IsOffscreen) return;
             if(page=="setup") {
-                AutomationElement choice=document.FindFirst(TreeScope.Descendants,new AndCondition(new PropertyCondition(AutomationElement.ControlTypeProperty,ControlType.CheckBox),new PropertyCondition(AutomationElement.NameProperty,"ComfyUI")));
+                // The clean installed fixture has no saved choice. Require the
+                // settled arrival sentence and Review's actual initial state.
+                AutomationElement choices=document.FindFirst(TreeScope.Descendants,new PropertyCondition(AutomationElement.NameProperty,"Apps and engines"));
+                AutomationElement arrival=document.FindFirst(TreeScope.Descendants,new PropertyCondition(AutomationElement.NameProperty,"Choose an app below, then review its installation."));
                 AutomationElement review=document.FindFirst(TreeScope.Descendants,new AndCondition(new PropertyCondition(AutomationElement.ControlTypeProperty,ControlType.Button),new PropertyCondition(AutomationElement.NameProperty,"Review")));
-                ready=choice!=null && review!=null && review.Current.IsEnabled && !review.Current.IsOffscreen;
+                ready=choices!=null && arrival!=null && !arrival.Current.IsOffscreen && review!=null && !review.Current.IsEnabled;
             } else {
                 // The default page has its own content; sidebar text cannot satisfy it.
                 AutomationElement body=document.FindFirst(TreeScope.Descendants,new PropertyCondition(AutomationElement.NameProperty,"Your apps"));
@@ -530,7 +533,7 @@ public sealed class OaInstalledPanelSmoke : IDisposable {
                 AutomationElementCollection links=document.FindAll(TreeScope.Descendants,new PropertyCondition(AutomationElement.ControlTypeProperty,ControlType.Hyperlink));
                 foreach(AutomationElement link in links) {
                     if(link.Current.IsOffscreen) continue;
-                    AutomationElement state=link.FindFirst(TreeScope.Descendants,new OrCondition(new PropertyCondition(AutomationElement.NameProperty,"Running"),new PropertyCondition(AutomationElement.NameProperty,"Not running")));
+                    AutomationElement state=link.FindFirst(TreeScope.Descendants,new OrCondition(new PropertyCondition(AutomationElement.NameProperty,"Running"),new PropertyCondition(AutomationElement.NameProperty,"Registered")));
                     if(state!=null && !state.Current.IsOffscreen) { ready=true; return; }
                 }
             }
@@ -568,7 +571,113 @@ public sealed class OaInstalledPanelSmoke : IDisposable {
     } finally { $owned.Dispose() }
 }
 
-Export-ModuleMember -Function Assert-DisposableRunner, Assert-FixtureMutationSafe, Get-FixtureProcessClosure, Invoke-FixtureProcess, Invoke-Bounded, Protect-DiagnosticText,
+function Assert-SelectedAppFile($Binding, [switch]$AllowEmpty) {
+    $fields = if ($Binding -is [Collections.IDictionary]) { @($Binding.Keys) }
+        elseif ($null -ne $Binding -and $Binding.GetType().FullName -ceq 'System.Management.Automation.PSCustomObject') {
+            @($Binding.PSObject.Properties.Name)
+        }
+    $names = @($fields | Where-Object { $_ -cin @('file','path') })
+    if ($names.Count -ne 1 -or 'sha256' -cnotin $fields -or 'bytes' -cnotin $fields) {
+        throw 'Selected application file needs one file or path binding and exact bytes'
+    }
+    $path = if ($names[0] -ceq 'file') { $Binding.file } else { $Binding.path }
+    if ($path -isnot [string] -or -not [IO.Path]::IsPathRooted($path) -or $Binding.sha256 -cnotmatch '^[0-9a-f]{64}$' -or
+        ($Binding.bytes -isnot [int] -and $Binding.bytes -isnot [long]) -or $Binding.bytes -lt 0 -or
+        ($Binding.bytes -eq 0 -and -not $AllowEmpty)) {
+        throw 'Selected application file needs an absolute path and exact bytes'
+    }
+    $item = Get-Item -LiteralPath $path -ErrorAction Stop
+    if ($item.PSIsContainer -or ($item.Attributes -band [IO.FileAttributes]::ReparsePoint)) { throw 'Selected application file is not plain' }
+    $parent = $item.Directory
+    while ($parent) {
+        if ($parent.Attributes -band [IO.FileAttributes]::ReparsePoint) { throw 'Selected application ancestor is redirected' }
+        $parent = $parent.Parent
+    }
+    if ($item.Length -ne $Binding.bytes -or (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash.ToLowerInvariant() -cne $Binding.sha256) {
+        throw 'Selected application bytes changed'
+    }
+    return $item.FullName
+}
+
+function Get-SelectedIdentityProbe($Native) {
+    $sdk=$Native.sdk_smokes
+    if(-not $sdk -or -not [IO.Path]::IsPathRooted($sdk.directory) -or -not $sdk.manifest -or -not $sdk.sources){throw 'Authenticated current SDK manifest and selected source graph required before mutation'}
+    $manifestPath=Assert-SelectedAppFile $sdk.manifest
+    if($manifestPath -ine (Join-Path ([IO.Path]::GetFullPath($sdk.directory)) 'manifest.json')){throw 'SDK manifest differs from the selected preparation root'}
+    $manifest=Get-Content -LiteralPath $manifestPath -Raw|ConvertFrom-Json
+    if($manifest.schema -ne 1 -or -not $manifest.files -or -not $manifest.sources -or
+        (@($manifest.sources.PSObject.Properties.Name|Sort-Object)-join ',') -cne (@($sdk.sources.PSObject.Properties.Name|Sort-Object)-join ',') -or
+        -not $sdk.sources.PSObject.Properties['abstraction-identity']){throw 'SDK selected identity graph missing or changed'}
+    foreach($name in $sdk.sources.PSObject.Properties.Name){
+        $actual=$manifest.sources.PSObject.Properties[$name].Value;$expected=$sdk.sources.PSObject.Properties[$name].Value
+        if((@($actual.PSObject.Properties.Name|Sort-Object)-join ',') -cne 'commit,module,version' -or
+            $actual.module -cne $expected.module -or $actual.version -cne $expected.version -or $actual.commit -cne $expected.commit -or
+            $expected.commit -cnotmatch '^[0-9a-f]{40}$'){throw 'SDK manifest differs from independently selected source graph'}
+    }
+    $pin=$manifest.files.PSObject.Properties['go_probe.exe']
+    if(-not $pin -or $pin.Value -cnotmatch '^[0-9a-f]{64}$'){throw 'Selected SDK has no canonical identity probe pin'}
+    $path=Join-Path ([IO.Path]::GetFullPath($sdk.directory)) 'go_probe.exe'
+    $helper=@{path=$path;sha256=$pin.Value;bytes=(Get-Item -LiteralPath $path -ErrorAction Stop).Length}
+    $null=Assert-SelectedAppFile $helper
+    return @{helper=$helper;manifest=$sdk.manifest;sources=$sdk.sources}
+}
+
+function Assert-J1SelectionInputs($Native) {
+    if(-not $Native.core.adopter_journey){return}
+    $spec=$Native.j1_selection
+    if(-not $spec -or $spec.schema -ne 1 -or $spec.source_sha -cne $Native.core.source_sha -or
+        (@($spec.PSObject.Properties.Name|Sort-Object)-join ',') -cne 'node,schema,sdk,source_sha') {throw 'J1 explicit current SDK and pinned Node test tool required before installation'}
+    $null=Assert-SelectedAppFile $spec.node
+    $sdk=$spec.sdk
+    $null=Get-SelectedIdentityProbe ([pscustomobject]@{sdk_smokes=$sdk})
+    $manifest=Get-Content -LiteralPath $sdk.manifest.path -Raw|ConvertFrom-Json
+    $root=[IO.Path]::GetFullPath($sdk.directory).TrimEnd('\')
+    $pending=[Collections.Generic.Stack[string]]::new();$pending.Push($root)
+    $seen=@{};$total=0L
+    while($pending.Count){
+        foreach($item in @(Get-ChildItem -LiteralPath $pending.Pop() -Force)){
+            if($item.Attributes -band [IO.FileAttributes]::ReparsePoint){throw 'J1 SDK redirected member'}
+            if($item.PSIsContainer){$pending.Push($item.FullName);continue}
+            if($item.FullName -ieq $sdk.manifest.path){continue}
+            $name=$item.FullName.Substring($root.Length+1).Replace('\','/')
+            $total+=$item.Length
+            $pin=$manifest.files.PSObject.Properties[$name]
+            if($total -gt 536870912 -or $seen.Count -ge 40000 -or -not $pin -or $pin.Value -cnotmatch '^[0-9a-f]{64}$'){throw 'J1 SDK closure missing or exceeds bound'}
+            $null=Assert-SelectedAppFile @{path=$item.FullName;sha256=$pin.Value;bytes=$item.Length} -AllowEmpty
+            $seen[$name]=$true
+        }
+    }
+    if($seen.Count -ne @($manifest.files.PSObject.Properties).Count -or -not $seen.ContainsKey('j1_selection_probe.mjs')){throw 'J1 SDK closure differs'}
+    return $spec
+}
+
+function Invoke-J1SelectionCollection($Native,$Program,$Runtime,[string]$Account,[string]$Directory) {
+    $spec=Assert-J1SelectionInputs $Native
+    $request=Join-Path $Directory 'j1-selection-request.json';$result=Join-Path $Directory 'j1-selection-result.json';$process=Join-Path $Directory 'j1-selection-process.json'
+    foreach($path in @($request,$result,$process)){if(Test-Path -LiteralPath $path){throw 'J1 selection observation already exists'}}
+    [IO.File]::WriteAllText($request,(@{schema=1;account=$Account;program=$Program;runtime=$Runtime}|ConvertTo-Json -Depth 8),[Text.UTF8Encoding]::new($false))
+    $probe=Join-Path $spec.sdk.directory 'j1_selection_probe.mjs'
+    $info=[Diagnostics.ProcessStartInfo]::new();$info.FileName=$spec.node.path
+    $info.Arguments='"'+$probe+'" "'+$request+'" "'+$result+'"';$info.WorkingDirectory=$Directory
+    # Explicit test-tool environment, with no endpoint/addon override or Node preload.
+    $keep=@{};foreach($key in @('SystemRoot','WINDIR','COMSPEC','PATHEXT','PROCESSOR_ARCHITECTURE','TEMP','TMP','USERPROFILE','LOCALAPPDATA','APPDATA')){if($info.EnvironmentVariables[$key]){$keep[$key]=$info.EnvironmentVariables[$key]}}
+    $info.EnvironmentVariables.Clear();foreach($key in $keep.Keys){$info.EnvironmentVariables[$key]=$keep[$key]}
+    $held=Invoke-FixtureProcess $info 45 -ObservationPath $process
+    if($held.ExitCode -ne 0){throw 'J1 current SDK selection collector failed; inspect retained process observation'}
+    $null=Assert-J1SelectionInputs $Native
+    return @{request=@{path=$request;sha256=(Get-FileHash -LiteralPath $request -Algorithm SHA256).Hash.ToLowerInvariant();bytes=(Get-Item -LiteralPath $request).Length}
+        result=@{path=$result;sha256=(Get-FileHash -LiteralPath $result -Algorithm SHA256).Hash.ToLowerInvariant();bytes=(Get-Item -LiteralPath $result).Length}
+        process=@{path=$process;sha256=(Get-FileHash -LiteralPath $process -Algorithm SHA256).Hash.ToLowerInvariant();bytes=(Get-Item -LiteralPath $process).Length}}
+}
+
+function Invoke-InstalledAdopterScene([string]$PythonPath, $Core, [string]$Request, [string]$Directory) {
+    $null=Assert-SelectedAppFile $Core.python
+    $null=Assert-SelectedAppFile $Core.helper
+    if($PythonPath -cne $Core.python.path){throw 'Native adopter interpreter differs from prepared caller'}
+    Invoke-Bounded $PythonPath @('-B',"`"$($Core.helper.path)`"",'--adopter-journey-request',"`"$Request`"") 600 -ObservationPath (Join-Path $Directory 'adopter-process.json')
+}
+
+Export-ModuleMember -Function Invoke-InstalledAdopterScene, Assert-SelectedAppFile, Get-SelectedIdentityProbe, Assert-J1SelectionInputs, Invoke-J1SelectionCollection, Assert-DisposableRunner, Assert-FixtureMutationSafe, Get-FixtureProcessClosure, Invoke-FixtureProcess, Invoke-Bounded, Protect-DiagnosticText,
     New-DisposableAccount, Grant-AccountAccess, Invoke-AccountProcess, Test-CimNotFound, Test-ProcessGone,
     Get-ProcessOwnerSid, Remove-DisposableAccount, Get-RuntimeProcesses, Get-PipeNames, Get-CapabilityPipes,
     Assert-NoRuntime, Get-InstalledProducts, Test-PathNames, Get-ProfileView, Assert-RealProfileView,

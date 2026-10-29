@@ -275,7 +275,11 @@ if [ "$managed" = yes ]; then
 	# Record manager ownership before a partial registration can fail.
     # Manager ownership was committed with the candidate ledger.
     disable_retired
-    manager enable --now abstraction-runtime.service
+    # Start once, never enable: the unit stays installed for demand start, and
+    # only the runtime's Applications-driven reconciler enables it at login,
+    # while a confirmed app is registered (TD94). An upgrade keeps whatever
+    # login state the reconciler last wrote.
+    manager start abstraction-runtime.service
     manager is-active --quiet abstraction-runtime.service
     # Startup includes listener initialization; poll read-only readiness within one budget.
     timeout --kill-after=2s 15s sh -c '

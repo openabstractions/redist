@@ -19,8 +19,8 @@
   },
   "build_inputs": {
     "backend": {
-      "bytes": 1631406,
-      "sha256": "5871e9fc4a511c2c14781ee894625c96a1f0332ddc5d460b07677577c1581272"
+      "bytes": 1358818,
+      "sha256": "5bfc69d20471d8ebefd3370ddad43fe34e145a0ce0c4b4b2687e8048fd8d6667"
     },
     "go": {
       "bytes": 2551659,

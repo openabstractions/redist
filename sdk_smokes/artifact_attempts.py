@@ -12,9 +12,11 @@ PRODUCERS = {
 }
 
 
-def select(jobs, artifacts, source, run_id, current_attempt):
+def select(jobs, artifacts, source, run_id, current_attempt, *, local_provenance=False):
     result = {}
     for variable, (job_name, prefix) in PRODUCERS.items():
+        if local_provenance and variable == 'SDK_PROVENANCE_ARTIFACT':
+            continue
         matching = [job for job in jobs if job.get("name") == job_name]
         if not matching or any(type(job.get("run_attempt")) is not int for job in matching):
             raise ValueError("missing producing job attempt: " + job_name)
@@ -44,10 +46,12 @@ def main():
     parser.add_argument("--attempt", type=int, required=True)
     parser.add_argument("--github-env", type=Path, required=True)
     parser.add_argument("--shell-env", type=Path, required=True)
+    parser.add_argument("--local-provenance", action="store_true")
     args = parser.parse_args()
     jobs = json.loads(args.jobs.read_text(encoding="utf-8"))["jobs"]
     artifacts = json.loads(args.artifacts.read_text(encoding="utf-8"))["artifacts"]
-    names = select(jobs, artifacts, args.source, args.run_id, args.attempt)
+    names = select(jobs, artifacts, args.source, args.run_id, args.attempt,
+                   local_provenance=args.local_provenance)
     with args.github_env.open("a", encoding="utf-8") as output:
         for key, value in names.items():
             output.write(f"{key}={value}\n")

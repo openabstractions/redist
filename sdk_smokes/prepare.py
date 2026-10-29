@@ -17,6 +17,7 @@ import shutil
 import subprocess
 import tarfile
 import tempfile
+import zipfile
 
 
 HERE = Path(__file__).resolve().parent
@@ -154,7 +155,10 @@ def checkout_sources(root: Path, selected: dict[str, dict[str, str]]) -> None:
 
 
 def copy_probe(name: str, out: Path) -> None:
-    shutil.copy2(HERE / name, out / name)
+    source = HERE / name
+    if name == 'j1_comfy_frontend.test.mjs' and HERE.parent.name == 'installer':
+        source = HERE.parents[1] / 'adopters/comfyui/oa_downloads.test.mjs'
+    shutil.copy2(source, out / name)
 
 
 def prepare_python(out: Path, sources: Path, wheel_dir: Path) -> None:
@@ -174,31 +178,75 @@ def prepare_python(out: Path, sources: Path, wheel_dir: Path) -> None:
     checked("python", "-m", "py_compile", out / "python_probe.py")
 
 
-def prepare_javascript(out: Path, sources: Path, npm_dir: Path, temporary: Path) -> None:
+def javascript_archive_closure(by_name, metadata, names):
+    """Select transitive OA dependencies by their actual package.json names."""
+    selected = []
+    pending = list(names)
+    while pending:
+        name = pending.pop(0)
+        if name in selected:
+            continue
+        if name not in by_name:
+            raise RuntimeError("candidate npm artifact missing: " + name)
+        selected.append(name)
+        pending.extend(dependency for dependency in metadata[name].get('dependencies', {})
+                       if dependency.startswith('@openabstractions/'))
+    return [by_name[name] for name in selected]
+
+
+def node_environment() -> dict[str, str]:
+    return {key: value for key, value in os.environ.items()
+            if key.upper() not in ('NODE_OPTIONS', 'NODE_PATH')}
+
+
+def prepare_j1_node(npm_dir: Path, output: Path) -> Path:
+    if HERE.parent.name == 'installer':
+        raise ValueError('--j1-node-out requires the projected SDK verification checkout')
+    from node_build_inputs import NODE_VERSION, NODE_WINDOWS_NAME, NODE_WINDOWS_SHA256, checked_archive
+
+    bundle = npm_dir / 'build-inputs' / NODE_WINDOWS_NAME
+    checked_archive(bundle, NODE_WINDOWS_SHA256, 48 << 20)
+    prefix = f'node-v{NODE_VERSION}-win-x64/'
+    with zipfile.ZipFile(bundle) as archive:
+        image = archive.getinfo(prefix + 'node.exe')
+        notice = archive.getinfo(prefix + 'LICENSE')
+        if not 0 < image.file_size <= 128 << 20 or not 0 < notice.file_size <= 1 << 20:
+            raise ValueError('official Windows Node executable or license exceeds its bound')
+        output.mkdir()
+        for entry, name in ((image, 'node.exe'), (notice, 'LICENSE')):
+            with archive.open(entry) as source, (output / name).open('xb') as target:
+                shutil.copyfileobj(source, target, 1 << 20)
+    node = output / 'node.exe'
+    checked(node, '-e', f"if (process.version !== 'v{NODE_VERSION}' || "
+            "process.platform !== 'win32' || process.arch !== 'x64') process.exit(1)",
+            env=node_environment())
+    return node
+
+
+def prepare_javascript(out: Path, sources: Path, npm_dir: Path, temporary: Path, *, j1_node=None) -> None:
     archive = list(npm_dir.glob("*.tgz"))
     names = ("@openabstractions/ipc", "@openabstractions/ipc-win32-x64", "@openabstractions/facade",
              "@openabstractions/inference", "@openabstractions/router")
     by_name = {}
+    metadata_by_name = {}
     for package in archive:
         with tarfile.open(package, "r:gz") as content:
             metadata = json.load(content.extractfile("package/package.json"))
         if metadata["name"] in by_name:
             raise RuntimeError("duplicate candidate npm package: " + metadata["name"])
         by_name[metadata["name"]] = package
-    chosen = []
-    for name in names:
-        if name not in by_name:
-            raise RuntimeError("candidate npm artifact missing: " + name)
-        chosen.append(by_name[name])
+        metadata_by_name[metadata['name']] = metadata
+    chosen = javascript_archive_closure(by_name, metadata_by_name, names)
     packed = temporary / "npm-pack"
     packed.mkdir()
-    npm_env = dict(os.environ, NPM_CONFIG_CACHE=str(temporary / "npm-cache"))
-    node = shutil.which("node.exe")
-    if not node:
+    npm_env = dict(node_environment(), NPM_CONFIG_CACHE=str(temporary / "npm-cache"))
+    setup_node = shutil.which("node.exe")
+    if not setup_node:
         raise RuntimeError("setup-node did not provide node.exe")
-    npm_cli = Path(node).parent / "node_modules" / "npm" / "bin" / "npm-cli.js"
+    npm_cli = Path(setup_node).parent / "node_modules" / "npm" / "bin" / "npm-cli.js"
     if not npm_cli.is_file():
         raise RuntimeError("setup-node did not provide its matching npm CLI")
+    node = j1_node or setup_node
     checked(node, npm_cli, "pack", "--offline", "--ignore-scripts", "--pack-destination", packed,
             sources / "abstraction-config" / "javascript", env=npm_env)
     config = list(packed.glob("openabstractions-config-*.tgz"))
@@ -206,10 +254,10 @@ def prepare_javascript(out: Path, sources: Path, npm_dir: Path, temporary: Path)
         raise RuntimeError("pinned config source produced no npm package")
     checked(node, npm_cli, "install", "--offline", "--ignore-scripts", "--no-audit", "--no-fund",
             "--no-package-lock", "--prefix", out, *chosen, config[0], env=npm_env)
-    copy_probe("javascript_probe.mjs", out)
-    checked("node", "--check", out / "javascript_probe.mjs")
-    copy_probe("j1_selection_probe.mjs", out)
-    checked("node", "--check", out / "j1_selection_probe.mjs")
+    for name in ('javascript_probe.mjs', 'j1_selection_probe.mjs', 'j1_application_probe.mjs',
+                 'j1_comfy_frontend.test.mjs'):
+        copy_probe(name, out)
+        checked(node, '--check', out / name, env=npm_env)
 
 
 def check_go_selection(raw: str, rows: dict[str, dict[str, str]]) -> None:
@@ -226,6 +274,11 @@ def prepare_go(out: Path, selected: dict[str, dict[str, str]], rows: dict[str, d
     source = temporary / "go"
     source.mkdir()
     shutil.copy2(HERE / "go_probe.go", source / "main.go")
+    out.mkdir(parents=True, exist_ok=True)
+    copy_probe("go_probe.go", out)
+    sandbox = source / "sandbox_identity"
+    sandbox.mkdir()
+    shutil.copy2(HERE / "sandbox_identity/main.go", sandbox / "main.go")
     facade = selected["abstraction-facade"]["version"]
     core_row = rows.get(GO_CORE)
     if not core_row:
@@ -245,6 +298,7 @@ def prepare_go(out: Path, selected: dict[str, dict[str, str]], rows: dict[str, d
                                     cwd=source, env=env, text=True, timeout=600)
     check_go_selection(graph, rows)
     checked("go", "build", "-o", out / "go_probe.exe", ".", cwd=source, env=env)
+    checked("go", "build", "-tags=oa_source_probe", "-o", out / "sandbox_identity_probe.exe", "./sandbox_identity", cwd=source, env=env)
 
 
 def msvc_toolchain() -> dict:
@@ -279,7 +333,7 @@ def prepare_cpp(out: Path, sources: Path, temporary: Path) -> Path:
     cmake, generator = msvc_cmake()
     prefix = temporary / "cpp-prefix"
     for name, extra in (
-        ("abstraction-identity", ["-DBUILD_SHARED_LIBS=OFF"]),
+        ("abstraction-identity", ["-DBUILD_SHARED_LIBS=OFF", "-DABSTRACTION_IPC_BUILD_TESTS=OFF"]),
         ("abstraction-config", []),
         ("abstraction-facade", ["-DABSTRACTION_FACADE_BUILD_AGGREGATE=OFF",
                                 "-DABSTRACTION_FACADE_BUILD_RESOLUTION=ON"]),
@@ -288,8 +342,9 @@ def prepare_cpp(out: Path, sources: Path, temporary: Path) -> Path:
         checked(cmake, "-S", sources / name / "cpp", "-B", build, "-G", generator, "-A", "x64",
                 "-DCMAKE_INSTALL_PREFIX=" + str(prefix), "-DCMAKE_PREFIX_PATH=" + str(prefix),
                 "-DCMAKE_BUILD_TYPE=Release", *extra)
-        if name == "abstraction-identity":
-            checked(cmake, "--build", build, "--config", "Release", "--target", "abstraction_ipc")
+        # Installation receives the whole selected package. Its default build
+        # follows both current and older published target closures.
+        checked(cmake, "--build", build, "--config", "Release")
         checked(cmake, "--install", build, "--config", "Release")
     build = temporary / "build-sdk-cpp"
     checked(cmake, "-S", HERE, "-B", build, "-G", generator, "-A", "x64", "-DCMAKE_PREFIX_PATH=" + str(prefix),
@@ -331,6 +386,8 @@ def main() -> None:
     parser.add_argument("--npm", required=True, type=Path)
     parser.add_argument("--pypi", required=True, type=Path)
     parser.add_argument("--provenance", required=True, type=Path)
+    parser.add_argument("--local-provenance", action="store_true")
+    parser.add_argument("--j1-node-out", type=Path)
     parser.add_argument("--tools", type=Path, default=Path("tools.tsv"))
     args = parser.parse_args()
     out = args.out.resolve()
@@ -340,17 +397,19 @@ def main() -> None:
     if os.environ.get('GITHUB_SHA') and os.environ.get('GITHUB_RUN_ID'):
         name = os.environ.get('SDK_PROVENANCE_ARTIFACT', '')
         match = re.fullmatch(r'module-provenance-Windows-([1-9][0-9]*)', name)
-        if match:
-            expected = {'source': os.environ['GITHUB_SHA'], 'run_id': int(os.environ['GITHUB_RUN_ID']), 'run_attempt': int(match[1])}
+        attempt = os.environ.get('GITHUB_RUN_ATTEMPT', '') if args.local_provenance else match[1] if match else ''
+        if re.fullmatch(r'[1-9][0-9]*', attempt):
+            expected = {'source': os.environ['GITHUB_SHA'], 'run_id': int(os.environ['GITHUB_RUN_ID']), 'run_attempt': int(attempt)}
     rows = provenance_rows(args.provenance, args.tools, expected_producer=expected)
     selected = pins(rows)
+    j1_node = prepare_j1_node(args.npm, args.j1_node_out.resolve()) if args.j1_node_out else None
     out.mkdir(parents=True)
     with tempfile.TemporaryDirectory(prefix=".sdk-smokes-build-", dir=out.parent) as scratch:
         temporary = Path(scratch)
         sources = temporary / "sources"
         checkout_sources(sources, selected)
         prepare_python(out, sources, args.pypi)
-        prepare_javascript(out, sources, args.npm, temporary)
+        prepare_javascript(out, sources, args.npm, temporary, j1_node=j1_node)
         prepare_go(out, selected, rows, temporary)
         # C++ and Rust preparation reuses the pinned Identity source tree.
         prefix = prepare_cpp(out, sources, temporary)

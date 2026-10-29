@@ -129,7 +129,12 @@ dispatch ref may therefore be a later reviewed redist commit; the explicit
 candidate source input is checked against the candidate run and its artifacts.
 
 The upload job waits at the `pypi` environment gate and uses GitHub OIDC through
-PyPI Trusted Publishing. Before dispatch, the owner must verify that the
+PyPI Trusted Publishing. The verifier reads the existing GitHub environment
+and its deployment rules before staging wheels. The upload job compares the
+same environment ID and rules again before calling PyPI, including on an
+upload-only retry. The REST reads compare observed configuration. GitHub
+controls environment creation, job admission and approval. Before dispatch,
+the owner must verify that the
 `abstraction-ipc` PyPI publisher is configured for the `openabstractions/redist`
 repository, `.github/workflows/publish.yml` and `pypi` environment, including
 any required environment approval. The repository cannot verify those account

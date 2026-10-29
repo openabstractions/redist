@@ -44,21 +44,35 @@ def load_owner(path, name, *, source_bytes=None, admitted_boundary_pin=None):
     return owner
 
 
-def installer_scope(version):
-    sys.path.insert(0,str(pathlib.Path('scripts').resolve()))
-    from release_facts import validate_public_admission
-    document=json.loads(pathlib.Path('apps.json').read_bytes())
-    capsule=validate_public_admission(document.get('release_admission'),version,document['apps'],require_delivery=False)
-    return {row['id'] for row in capsule['outcomes']['adopters'] if row['target']=='windows-x64'}
+def installer_scope(version, *, policy_root=None, validate=None):
+    if validate is None:
+        sys.path.insert(0,str(pathlib.Path('scripts').resolve()))
+        from release_facts import validate_public_admission as validate
+    document=json.loads((pathlib.Path(policy_root or '.')/'apps.json').read_bytes())
+    capsule=validate(document.get('release_admission'),version,document['apps'],require_delivery=False)
+    required={row['id'] for row in capsule['outcomes']['adopters'] if row['target']=='windows-x64'}
+    component='none' if policy_root is not None else os.environ.get('APP_DELIVERY_ONLY','none')
+    if component!='none':
+        selector=load_owner('scripts/train/steps/select_app_producers.py','application_component_selection')
+        selector.delivery_context(os.environ)
+        required=set(selector.delivery_products(required,component,
+            first=os.environ.get('APP_PRODUCER_ONLY','none'),mode=os.environ.get('PRODUCER_MODE',''),
+            probe=os.environ.get('SIGNING_PROBE_ONLY')=='true',
+            diagnostic=os.environ.get('DIAGNOSTIC_HOST_SIGN_ONLY')=='true'))
+    return required
 
 
-def selected_sources(required, version, *, checkout=False, producer_source=None):
-    helper=load_owner('scripts/app_producer_inputs.py','application_input_owner')
+def selected_sources(required, version, *, checkout=False, producer_source=None, policy_root=None, helper=None, validate=None):
+    if helper is None:
+        helper=load_owner('scripts/app_producer_inputs.py','application_input_owner')
     pins,errors={},[]
     for app in sorted(required):
         try:
-            selected=helper.installer_source_pins(app,'npm.tsv','pypi.tsv','app-sources.tsv','apps.json',version,
-                                                producer_source=producer_source or os.environ['CANDIDATE_SHA'])
+            policy=pathlib.Path(policy_root or '.')
+            selected=helper.installer_source_pins(app,*(str(policy/name) for name in
+                ('npm.tsv','pypi.tsv','app-sources.tsv','apps.json')),version,
+                                                producer_source=producer_source or os.environ['CANDIDATE_SHA'],
+                                                **({'validate': validate} if validate is not None else {}))
             for repo,commit in selected.items():
                 if repo in pins and pins[repo]!=commit:
                     raise ValueError('conflicting selected source: '+repo)
@@ -115,11 +129,14 @@ def application_backend_inputs(required,version):
     if not isinstance(expected,dict) or set(expected)!={'sha256','bytes'}:
         raise ValueError('source-selected custom Desktop backend input is not admitted')
     inputs=pathlib.Path('app-build-inputs');inputs.mkdir(exist_ok=True)
-    # The source recipe is not the full admitted file/wheel/tool descriptor.
-    # Its fixed-role acquisition owner must stage these exact bytes first.
+    helper.materialize_comfy_backend('sources',inputs,
+        candidate_source=os.environ['CANDIDATE_SHA'],run_id=int(os.environ['GITHUB_RUN_ID']),
+        run_attempt=int(os.environ['GITHUB_RUN_ATTEMPT']))
     closure_file(inputs,'backend-inputs.json',expected)
     shutil.copyfile(pathlib.Path(owner.__file__).parent/'desktop-host.json',inputs/'desktop-host.json')
-    helper.preflight('comfyui',pathlib.Path('sources/abstractions'),inputs,1)
+    helper.preflight('comfyui',pathlib.Path('sources/abstractions'),inputs,1,
+        candidate_source=os.environ['CANDIDATE_SHA'],run_id=int(os.environ['GITHUB_RUN_ID']),
+        run_attempt=int(os.environ['GITHUB_RUN_ATTEMPT']))
     package=load_owner('sources/abstractions/scripts/package_comfyui_app.py','application_backend_input_policy')
     if helper.selected_comfy_backend('sources',inputs,package)!=expected:
         raise ValueError('required custom Desktop cannot fall through to portable/CPU inputs')
@@ -142,7 +159,8 @@ def native_archive_selected(owner):
 
 def installer_chain_scope(required,owners):
     """Selected archive delivery is authenticated separately from Burn packages."""
-    return set(required)-({'comfyui'} if 'comfyui' in owners and native_archive_selected(owners['comfyui']) else set())
+    required = set(required) - {'opencode'}
+    return required-({'comfyui'} if 'comfyui' in owners and native_archive_selected(owners['comfyui']) else set())
 
 
 def application_control_inputs(required,version):
@@ -225,6 +243,20 @@ def receive_native_control(inputs,relay):
 
 
 def application_inputs(required, version):
+    if not required:
+        # The core-only chain still needs its source-owned BA token minter.
+        # Select the existing canonical MSVC owner without acquiring app SDKs.
+        selector=load_owner('sdk_smokes/prepare.py','core_bundle_host_tool_selection')
+        selection=selector.msvc_toolchain()
+        vcvars=pathlib.Path(selection['installation_path'])/'VC/Auxiliary/Build/vcvars64.bat'
+        if not vcvars.is_file():raise ValueError('selected Visual Studio developer environment is unavailable')
+        inputs=pathlib.Path('app-native/inputs');inputs.mkdir(parents=True)
+        (inputs/'selected-toolchain.json').write_text(json.dumps({
+            'installation_path':str(selection['installation_path']),
+            'installation_version':selection['installation_version']},sort_keys=True)+'\n')
+        with open(os.environ['GITHUB_ENV'],'a',encoding='utf-8') as output:
+            output.write('OA_APP_VCVARS='+str(vcvars.resolve())+'\n')
+        return
     helper,pins=selected_sources(required,version,checkout=True)
     owners=producer_owners(required)
     # Source admission precedes artifact/tool acquisition. A custom Desktop
@@ -232,6 +264,12 @@ def application_inputs(required, version):
     if 'comfyui' in owners:
         owner=owners['comfyui']
         if native_archive_selected(owner):
+            receipt=os.environ.get('OA_WINDOWS_GO_SDK_RECEIPT')
+            if not receipt:raise ValueError('native Comfy inputs require the canonical Windows Go SDK receipt')
+            # Production measures the role; the selected source policy below
+            # independently admits its descriptor and every materialized byte.
+            helper.materialize_desktop_go(pins,pathlib.Path('sources'),pathlib.Path('app-build-inputs'),
+                pathlib.Path(receipt))
             owner.native_host_tool_inputs(pathlib.Path('app-build-inputs'),go_descriptor_pin=owner.native_input_pins()['go'])
         else:
             owner.custom_desktop_policy()
@@ -375,6 +413,15 @@ def application_inputs(required, version):
 
 
 def application_native_prepare(required,version):
+    if not required:
+        compiler=shutil.which('cl.exe')
+        if not compiler:raise ValueError('selected Visual Studio developer environment is required')
+        base=pathlib.Path('app-native');inputs=base/'inputs'
+        closure_file(inputs,'selected-toolchain.json')
+        (inputs/'app-native-tools.json').write_text(json.dumps({
+            'tools':{'cl.exe':dict(pin(pathlib.Path(compiler)),path=str(pathlib.Path(compiler).resolve()))},
+            'runner_image':{name:os.environ.get(name) for name in ('ImageOS','ImageVersion','RUNNER_ARCH')}},sort_keys=True)+'\n')
+        return prepare_bundle_actions(set(),base,compiler)
     helper,pins=selected_sources(required,version)
     owners=producer_owners(required)
     base=pathlib.Path('app-native');inputs=base/'inputs'
@@ -438,28 +485,30 @@ def application_native_prepare(required,version):
         # The native producer owns its private temporary compiler stage.
         # Final output and selected-input receiving above remain mandatory.
     chain_required=installer_chain_scope(required,owners)
-    prepare_bundle_actions(chain_required,base,compiler['cl.exe'])
+    prepare_bundle_actions(chain_required,base,compiler['cl.exe'],catalog_maintenance=bool(required-chain_required))
 
 
-def prepare_bundle_actions(required,base,compiler):
+def prepare_bundle_actions(required,base,compiler,*,catalog_maintenance=False):
     """Compile the same source-owned role map before final package hashes exist."""
     owner=load_owner('windows/apps/build_bundle.py','application_bundle_actions')
-    facts=owner.bundle_actions_inputs(sorted(required))
+    facts=owner.bundle_actions_inputs(sorted(required),catalog_maintenance=catalog_maintenance)
     out=base/'shared-bundle';out.mkdir()
     (out/'actions_map.h').write_text(facts['header'],encoding='utf-8',newline='\n')
-    subprocess.run(owner.bundle_actions_compile(sorted(required),out.resolve(),compiler),check=True)
+    subprocess.run(owner.bundle_actions_compile(sorted(required),out.resolve(),compiler,
+        catalog_maintenance=catalog_maintenance),check=True)
     native=pin(closure_file(out,facts['output']))
     native=dict(name=facts['output'],sha256=native['sha256'],bytes=native['bytes'])
     (out/'bundle-actions-receipt.json').write_text(json.dumps({
         'schema':1,'inputs':facts['inputs'],'native':native},sort_keys=True)+'\n')
 
 
-def sign_bundle_actions(required,base,relay):
+def sign_bundle_actions(required,base,relay,*,catalog_maintenance=False):
     """Admit unsigned source/map bytes before the existing native signer runs."""
     owner=load_owner('windows/apps/build_bundle.py','application_bundle_actions_signing')
     out=base/'shared-bundle';receipt=closure_file(out,'bundle-actions-receipt.json')
     digest=pin(receipt)['sha256'];chain={'apps':[{'id':app} for app in sorted(required)]}
-    owner.check_bundle_actions(chain,closure_file(out,owner.ACTIONS_NAME),receipt,digest)
+    owner.check_bundle_actions(chain,closure_file(out,owner.ACTIONS_NAME),receipt,digest,
+        catalog_maintenance=catalog_maintenance)
     subprocess.run([sys.executable,'windows/windows_signing.py','sign',
         '--policy','windows/certum_simplysign.json','--signtool',os.environ['SIGNTOOL'],
         '--root',str(out),'--receipt',str(out/'signatures.json'),'--file',owner.ACTIONS_NAME],check=True)
@@ -471,7 +520,8 @@ def sign_bundle_actions(required,base,relay):
     value=json.loads(receipt.read_bytes());signed=proof['files'][0]
     value['native']={key:signed[key] for key in ('name','sha256','bytes')}
     receipt.write_text(json.dumps(value,sort_keys=True)+'\n')
-    owner.check_bundle_actions(chain,closure_file(out,owner.ACTIONS_NAME),receipt,pin(receipt)['sha256'])
+    owner.check_bundle_actions(chain,closure_file(out,owner.ACTIONS_NAME),receipt,pin(receipt)['sha256'],
+        catalog_maintenance=catalog_maintenance)
 
 
 def native_context(required,version,*,checkout):
@@ -493,6 +543,9 @@ def source_roles(app,owner,out,inputs,payload=None):
 
 
 def application_native_sign(required,version):
+    if not required:
+        relay=load_owner('windows/windows_signing.py','core_bundle_native_signing')
+        return sign_bundle_actions(set(),pathlib.Path('app-native'),relay)
     helper,owners,base,inputs=native_context(required,version,checkout=True)
     relay=load_owner('windows/windows_signing.py','application_native_signing')
     closed,errors={},[]
@@ -567,7 +620,7 @@ def application_native_sign(required,version):
                 signatures=pin(closure_file(root,receipt_name)),native=files['launch-helper.exe']),sort_keys=True)+'\n',encoding='utf-8')
         elif app=='comfyui':seal_signed_desktop(root,version,relay,owners[app])
     chain_required=installer_chain_scope(required,owners)
-    sign_bundle_actions(chain_required,base,relay)
+    sign_bundle_actions(chain_required,base,relay,catalog_maintenance=bool(required-chain_required))
 
 
 def seal_signed_desktop(out,version,relay,desktop):
@@ -1225,8 +1278,9 @@ def application_package(required,version):
             pathlib.Path('setup/provenance/comfyui/corresponding-source.zip'))
     shared_bundle=base/'shared-bundle';bundle_owner=relay.bundle_owner()
     actions_receipt=closure_file(shared_bundle,'bundle-actions-receipt.json')
-    bundle_owner.check_bundle_actions(chain,closure_file(shared_bundle,bundle_owner.ACTIONS_NAME),
-        actions_receipt,pin(actions_receipt)['sha256'])
+    chain_required=installer_chain_scope(required,owners)
+    bundle_owner.check_bundle_actions(bundle_owner.burn_chain(chain),closure_file(shared_bundle,bundle_owner.ACTIONS_NAME),
+        actions_receipt,pin(actions_receipt)['sha256'],catalog_maintenance=bool(required-chain_required))
     actions_signatures=json.loads(closure_file(shared_bundle,'signatures.json').read_bytes())
     relay.verify_receipt(actions_signatures,policy,shared_bundle,policy_sha256=hashlib.sha256(policy_bytes).hexdigest())
     if len(actions_signatures['files'])!=1 or actions_signatures['files'][0]['name']!=bundle_owner.ACTIONS_NAME:
@@ -1814,26 +1868,106 @@ def final_native_archive(root,binding,selected,version,relay):
 
 
 def application_bundle(required,version):
-    command=[sys.executable,'windows/apps/build_bundle.py','--chain','setup/chain.json',
-             '--bal-ext',os.environ['WIX_BAL_EXT'],'--out','setup/bundle']
+    command=[sys.executable,'windows/apps/build_bundle.py',
+             '--bal-ext',os.environ['WIX_BAL_EXT'],'--util-ext',os.environ['WIX_UTIL_EXT'],'--out','setup/bundle']
+    catalog_comfy=False
     if required:
         relay=load_owner('windows/windows_signing.py','application_bundle_native_intake')
         root=pathlib.Path('signed-msis')
-        relay.retained_application_context(root,root/'app-chain-context.json',
+        admitted,_=relay.retained_application_context(root,root/'app-chain-context.json',
             source=os.environ['CANDIDATE_SHA'],run_id=int(os.environ['GITHUB_RUN_ID']),
             artifact_id=int(os.environ['APP_CONTEXT_ARTIFACT_ID']),
             artifact_name='windows-msi-signed-'+os.environ['APP_CONTEXT_ARTIFACT_ATTEMPT'],
             artifact_digest=os.environ['APP_CONTEXT_ARTIFACT_DIGEST'].removeprefix('sha256:'),
             artifact_attempt=int(os.environ['APP_CONTEXT_ARTIFACT_ATTEMPT']),version=version,required=required,
             sources=selected_sources(required,version)[1])
+        catalog_comfy=(admitted['expected_producers'].get('comfyui',{}).get('delivery',{}).get('variant')
+                       =='oa-comfyui-native')
         intake=json.loads(closure_file(root,relay.INTAKE_RECEIPT).read_bytes())
         name='apps/provenance/shared-bundle/bundle-actions-receipt.json'
         selected=[row for row in intake['files'] if row['name']==name]
         if len(selected)!=1:raise ValueError('signed artifact omits exact shared bundle native receipt')
         receipt=closure_file(root,name,selected[0]);directory=receipt.parent
-        command+=['--actions-dll',str(closure_file(directory,'oa_bundle_actions.dll').resolve()),
-            '--actions-receipt',str(receipt.resolve()),'--actions-receipt-sha256',selected[0]['sha256']]
-    subprocess.run(command,check=True)
+    else:
+        relay=load_owner('windows/windows_signing.py','core_bundle_native_intake')
+        root=pathlib.Path('core-bundle-native')
+        attempt=int(os.environ['CORE_NATIVE_ARTIFACT_ATTEMPT'])
+        intake=relay.consume_artifact(int(os.environ['CORE_NATIVE_ARTIFACT_ID']),
+            os.environ['CORE_NATIVE_ARTIFACT_DIGEST'].removeprefix('sha256:'),
+            'windows-app-native-signed-'+str(attempt),os.environ['CANDIDATE_SHA'],
+            int(os.environ['GITHUB_RUN_ID']),attempt,root,receipt=root/relay.INTAKE_RECEIPT)
+        name='shared-bundle/bundle-actions-receipt.json'
+        selected=[row for row in intake['files'] if row['name']==name]
+        if len(selected)!=1:raise ValueError('signed artifact omits exact core-only bundle native receipt')
+        receipt=closure_file(root,name,selected[0]);directory=receipt.parent
+        policy_bytes=closure_file(pathlib.Path('.'),'windows/certum_simplysign.json').read_bytes()
+        policy=json.loads(policy_bytes)
+        proof=relay.verify_receipt(json.loads(closure_file(directory,'signatures.json').read_bytes()),
+            policy,directory,policy_sha256=hashlib.sha256(policy_bytes).hexdigest())
+        if len(proof['files'])!=1 or proof['files'][0]['name']!='oa_bundle_actions.dll':
+            raise ValueError('core-only bundle signature roster differs')
+        fresh=relay.verify(closure_file(directory,'oa_bundle_actions.dll'),policy,os.environ['SIGNTOOL'])
+        if any(fresh[key]!=proof['files'][0][key] for key in ('sha256','bytes')):
+            raise ValueError('core-only bundle native signature changed')
+    command+=['--actions-dll',str(closure_file(directory,'oa_bundle_actions.dll').resolve()),
+        '--actions-receipt',str(receipt.resolve()),'--actions-receipt-sha256',selected[0]['sha256']]
+    owner=load_owner('windows/apps/build_bundle.py','application_bundle_core_binary')
+    chain=owner.read_chain(pathlib.Path('setup/chain.json').resolve())
+    catalog_opencode=any(app['id']=='opencode' for app in chain['apps'])
+    if catalog_opencode != ('opencode' in required):
+        raise ValueError('Catalog maintenance recipient differs from the authenticated application set')
+    if catalog_opencode or catalog_comfy:
+        command+=['--catalog-maintenance']
+    with tempfile.TemporaryDirectory(prefix='oa-bundle-incoming-') as temporary:
+        binary=pathlib.Path(temporary)/'openabstractions.exe'
+        binary.write_bytes(owner.core_upgrade_binary('wix',pathlib.Path(chain['core']['file'])))
+        burn=pathlib.Path(temporary)/'burn-chain.json'
+        burn.write_text(json.dumps(owner.burn_chain(chain)),encoding='utf-8')
+        subprocess.run([*command,'--chain',str(burn),'--upgrade-binary',str(binary)],check=True)
+
+
+def panel_opencode_pin(required, version):
+    if 'opencode' not in required:
+        return None
+    relay=load_owner('windows/windows_signing.py','panel_opencode_signed_intake')
+    attempt=int(os.environ['OPENCODE_SIGNED_ATTEMPT'])
+    root=pathlib.Path('panel-signed-msis')
+    source=os.environ['CANDIDATE_SHA']
+    run_id=int(os.environ['GITHUB_RUN_ID'])
+    artifact_id=int(os.environ['OPENCODE_SIGNED_ID'])
+    digest=os.environ['OPENCODE_SIGNED_DIGEST'].removeprefix('sha256:')
+    name='windows-app-signed-'+str(attempt)
+    intake=relay.consume_artifact(artifact_id,digest,name,source,run_id,attempt,root,
+        receipt=root/relay.INTAKE_RECEIPT)
+    binding,_=relay.retained_application_context(root,root/'app-chain-context.json',
+        source=source,run_id=run_id,artifact_id=artifact_id,artifact_name=name,artifact_digest=digest,
+        artifact_attempt=attempt,version=version,required=required,sources=selected_sources(required,version)[1])
+    policy_raw=closure_file(pathlib.Path('.'),'windows/certum_simplysign.json').read_bytes()
+    policy=json.loads(policy_raw)
+    pins={row['name']:row for row in intake['files']}
+    proof_name='app-msi-signatures.json'
+    receipt=json.loads(bound_bytes(root,proof_name,pins[proof_name]))
+    proof=relay.verify_receipt(receipt,policy,policy_sha256=hashlib.sha256(policy_raw).hexdigest())
+    filename=f'opencode-{version}.msi'
+    relative='apps/apps/opencode/'+filename
+    rows=[row for row in proof['files'] if row['name']==relative]
+    if len(rows)!=1:
+        raise ValueError('authenticated signer receipt has no exact OpenCode MSI')
+    expected=relay.validate_expected_payload(binding['expected_producers']['opencode'].get('expected_payload'))
+    # Signing changes the MSI container bytes. The retained producer and the
+    # signer still have to agree on the exact installed payload.
+    if (expected['msi']['name']!=relative.removeprefix('apps/') or not expected['files']
+            or rows[0].get('msi_members')!=relay.final_msi_members(expected)):
+        raise ValueError('signed OpenCode MSI inventory differs from its authenticated producer')
+    path=closure_file(root,relative,rows[0])
+    actual=relay.verify(path,policy,os.environ['SIGNTOOL'])
+    if any(actual[key]!=rows[0][key] for key in ('sha256','bytes')):
+        raise ValueError('OpenCode MSI signature or bytes differ from signed intake')
+    properties=relay.msi_catalogue_identity(path)
+    if properties['version']!=version:
+        raise ValueError('compiled OpenCode MSI version differs from selected release')
+    closure_file(root,relative,rows[0])
+    return dict(id='opencode',file=filename,sha256=actual['sha256'],bytes=actual['bytes'],**properties)
 
 
 def application_stage_final(required,version):
@@ -1879,7 +2013,8 @@ def application_stage_final(required,version):
     document=json.loads(pathlib.Path('apps.json').read_bytes())
     # The current source catalogue can be empty. Preserve it; validate the actual
     # produced row under its unchanged source-owned candidate admission capsule.
-    document['apps']=[value for value in document['apps'] if value['id']!='comfyui']+[
+    document['apps']=[value for value in document['apps'] if value['id']!='comfyui' and
+        os.environ.get('APP_DELIVERY_ONLY','none')=='none']+[
         {key:value for key,value in row.items() if key!='release_tag'}]
     if modern:document['schema']=2
     rows=assets.roster_text(json.dumps(document))
@@ -1889,7 +2024,9 @@ def application_stage_final(required,version):
         current_sources={'comfyui':selected},repo=os.environ['GH_REPO'],
         final_intakes={'comfyui':intake},desktop_inputs={'comfyui':expected})
     catalogue,descriptor=assets.panel_pin_input(pathlib.Path('apps.json').read_bytes(),produced,
-        expected_apps=assets.panel_app_ids(required),producer=dict(source=os.environ['CANDIDATE_SHA'],
+        expected_apps=assets.panel_app_ids(required),
+        opencode=panel_opencode_pin(required,version) if os.environ.get('PANEL_OPENCODE_SIGNED')=='1' else None,
+        producer=dict(source=os.environ['CANDIDATE_SHA'],
             run_id=int(os.environ['GITHUB_RUN_ID']),run_attempt=int(os.environ['GITHUB_RUN_ATTEMPT'])))
     destination=pathlib.Path(os.environ['RUNNER_TEMP'])/'panel-catalogue'
     destination.mkdir()
@@ -1904,7 +2041,8 @@ def application_panel_inputs(required,version):
     expected=assets.panel_app_ids(required)
     if expected:raise ValueError('selected Panel applications require completed delivery intake')
     catalogue,descriptor=assets.panel_pin_input(pathlib.Path('apps.json').read_bytes(),[],
-        expected_apps=expected,producer=dict(source=os.environ['CANDIDATE_SHA'],
+        expected_apps=expected,opencode=panel_opencode_pin(required,version),
+        producer=dict(source=os.environ['CANDIDATE_SHA'],
             run_id=int(os.environ['GITHUB_RUN_ID']),run_attempt=int(os.environ['GITHUB_RUN_ATTEMPT'])))
     destination=pathlib.Path(os.environ['RUNNER_TEMP'])/'panel-catalogue'
     destination.mkdir()
@@ -2019,31 +2157,6 @@ def pin(path):
         for block in iter(lambda:stream.read(1<<20),b''):
             digest.update(block);size+=len(block)
     return {'file': str(path.resolve()), 'sha256':digest.hexdigest(),'bytes':size}
-def legacy_main():
-    version = os.environ['CANDIDATE_VERSION']
-    release = pathlib.Path('verified-release')
-    out = pathlib.Path('setup')
-    out.mkdir()
-    apps = []
-    for row in json.loads(pathlib.Path('apps.json').read_text(encoding='utf-8'))['apps']:
-        archive = release / row['binary_zip']
-        if not archive.is_file():
-            raise SystemExit('FAIL  the verified release lacks ' + row['binary_zip'])
-        manifest = pathlib.Path('windows/apps') / row['id'] / 'application-manifest.json'
-        text = manifest.read_text(encoding='utf-8')
-        names = sorted(set(re.findall(r'@([a-z][a-z0-9_]{0,63})@', text)))
-        title = json.loads(re.sub(r'@[a-z][a-z0-9_]{0,63}@', '', text))['title']
-        built = out / 'apps' / row['id']
-        subprocess.run([sys.executable, 'windows/apps/build_app.py', '--app-id', row['id'],
-                        '--title', title, '--publisher', 'OpenAbstractions', '--version', version,
-                        '--zip', str(archive), '--zip-sha256', row['binary_sha256'],
-                        '--zip-bytes', str(row['binary_bytes']), '--manifest', str(manifest),
-                        '--out', str(built),
-                        *[x for name in names for x in ('--define', f'{name}={row[name]}')]], check=True)
-        apps.append(dict(id=row['id'], title=title, **pin(built / f"{row['id']}-{version}.msi")))
-    chain = {'version': version, 'apps': apps}
-    (out / 'chain.json').write_text(json.dumps(chain, indent=2) + '\n', encoding='utf-8')
-    print(json.dumps(chain, indent=2))
 
 
 def main(argv=None):
@@ -2053,14 +2166,17 @@ def main(argv=None):
     version=os.environ['CANDIDATE_VERSION'].removeprefix('v')
     if tuple(map(int,version.split('-')[0].split('.')))<(0,8,0):
         if args.phase=='bundle':return application_bundle(set(),version)
-        if args.phase!='package':raise ValueError('historical producer supports its existing package route only')
-        return legacy_main()
+        # 0.8.0 retired the portable ComfyUI route these releases packaged; their
+        # published artifacts and history stay as they are.
+        raise ValueError('pre-0.8.0 application packages are published history; this producer builds 0.8.0 and later')
     required=installer_scope(version)
     if args.phase=='bundle':return application_bundle(required,version)
     if args.phase=='assemble-final':return application_final_capsule(required,version)
     if args.phase=='stage-final':return application_stage_final(required,version)
     if args.phase=='panel-inputs':return application_panel_inputs(required,version)
     if not required:
+        if args.phase in ('inputs','prepare-native','sign-native'):
+            return {'inputs':application_inputs,'prepare-native':application_native_prepare,'sign-native':application_native_sign}[args.phase](required,version)
         if args.phase=='package':
             retain_installer_chain({'version':version,'apps':[]},'setup')
             pathlib.Path('setup/producer-bindings.json').write_text('{}\n')

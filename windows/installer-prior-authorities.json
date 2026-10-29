@@ -1,0 +1,14 @@
+{
+  "schema": 1,
+  "version": "0.8.0",
+  "priors": [
+    {
+      "receipt_sha256": "91560bafee20862e3da5f8f0c7e935246bc32e7e02424b7d75ee1128f56991f2",
+      "product_code": "{C09574FE-DE11-40C5-8276-AFB86AE1934C}"
+    },
+    {
+      "receipt_sha256": "a275a4254d66bd5fd2f775f9feb9b3f9d1269a5193342ba79148fba1562969e4",
+      "product_code": "{A7404A97-0D00-40BB-B26F-A79C8D415746}"
+    }
+  ]
+}

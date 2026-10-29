@@ -185,12 +185,53 @@ def derive(python_home: Path, wheels: list[Path], source_repo: Path,
 # Source fragment for installer/pytorch_engine.py, before main().
 INPUT_REPOSITORY = "openabstractions/redist"
 INPUT_OWNER = "openabstractions/abstraction-provider-pytorch"
+# Derived 2026-11-01 from python.org CPython 3.12.10 without its __pycache__
+# folders, the 25 lean-lock wheels and the Hummingbird-XT pins; two
+# derivations gave the same bytes. The 0.4.0 pair (1,680,150,940 and 132,827
+# bytes) carried the deriving account's byte caches and could not be rebuilt.
 INPUT_PINS = {
-    BUNDLE_NAME: {"size_bytes": 1680150940,
-                  "sha256": "e5551aa84da6b6c029547df9d3e7db2e6ada03d1ecdadc8506d450bce05af18e"},
-    MANIFEST_NAME: {"size_bytes": 132827,
-                    "sha256": "89f876e1d9931e3883907ee35aff8eb4f493276a8bce52bafc17d775c58553d6"},
+    BUNDLE_NAME: {"size_bytes": 1673323779,
+                  "sha256": "f8260fd18d204793d8971a0e91a6e7ed1d15c6f8a2113ad8c5f1344e4218e4f6"},
+    MANIFEST_NAME: {"size_bytes": 88994,
+                    "sha256": "ba3c4c1dfd0a5ea3d7a5276771e2c68bfd3906c53b0972405d9d7ff385182c8e"},
 }
+
+
+def prepare(pytorchd: Path, python_home: Path, wheels: list[Path], source_repo: Path,
+            output: Path, *, run=None) -> dict:
+    """Write the owner manifest and the bundle a checkout build reads.
+
+    The same-source `pytorchd setup inputs` command emits the manifest; its
+    bytes and the derived bundle must equal INPUT_PINS. Reads local files
+    only; nothing is downloaded or started besides that read-only command."""
+    import subprocess
+    run = run or subprocess.run
+    output = Path(output)
+    command = [str(pytorchd), "setup", "inputs", "--python-home", str(python_home), "--source", str(source_repo)]
+    for folder in wheels:
+        command += ["--wheels", str(folder)]
+    result = run(command, capture_output=True, check=False)
+    if result.returncode:
+        raise ValueError("pytorchd setup inputs failed: " + result.stderr.decode("utf-8", "replace").strip())
+    manifest_bytes = result.stdout
+    pin = INPUT_PINS[MANIFEST_NAME]
+    actual = (len(manifest_bytes), hashlib.sha256(manifest_bytes).hexdigest())
+    if actual != (pin["size_bytes"], pin["sha256"]):
+        raise ValueError(f"PyTorch input manifest differs from the reviewed pin: {actual[0]} bytes sha256 {actual[1]}")
+    output.mkdir(parents=True, exist_ok=True)
+    manifest_path = output / MANIFEST_NAME
+    if manifest_path.exists() and manifest_path.read_bytes() != manifest_bytes:
+        raise FileExistsError("a different PyTorch input manifest is already prepared: " + str(manifest_path))
+    manifest_path.write_bytes(manifest_bytes)
+    manifest = load_manifest(manifest_path)
+    bundle = output / BUNDLE_NAME
+    if bundle.exists():
+        identity = verify_bundle(bundle, manifest)
+    else:
+        identity = derive(python_home, wheels, source_repo, bundle, manifest)
+    if identity != {"name": BUNDLE_NAME, **INPUT_PINS[BUNDLE_NAME]}:
+        raise ValueError("PyTorch input bundle differs from the reviewed pin: " + json.dumps(identity, sort_keys=True))
+    return identity
 
 
 def input_source(path: Path) -> str:
@@ -481,6 +522,20 @@ def main(argv=None):
     verify_parser = operations.add_parser("verify", help="verify a derived bundle against owner inputs")
     verify_parser.add_argument("--manifest", type=Path, required=True)
     verify_parser.add_argument("--bundle", type=Path, required=True)
+    prepare_parser = operations.add_parser(
+        "prepare", help="write the reviewed manifest and bundle a checkout build reads (default "
+                        ".build/engines/" + BUNDLE_NAME.removesuffix("-inputs.zip") + ")")
+    prepare_parser.add_argument("--pytorchd", type=Path, required=True,
+                                help="pytorchd.exe built from this checkout's abstraction-provider-pytorch")
+    prepare_parser.add_argument("--python-home", type=Path, required=True,
+                                help="python.org's CPython 3.12.10 x64 folder")
+    prepare_parser.add_argument("--wheels", type=Path, nargs="+", action="append", required=True,
+                                help="folders holding the lean lock's 25 wheels")
+    prepare_parser.add_argument("--source", type=Path, required=True,
+                                help="the Hummingbird-XT repository at its reviewed commit")
+    prepare_parser.add_argument("--out", type=Path,
+                                default=Path(__file__).resolve().parent.parent / ".build" / "engines"
+                                / BUNDLE_NAME.removesuffix("-inputs.zip"))
     for operation, help_text in (
             ("intake", "verify exact authenticated draft assets and attest genuine CI input intake"),
             ("consume", "verify the newest successful intake job and immutable same-run artifact")):
@@ -514,6 +569,11 @@ def main(argv=None):
                                     args.release_id, args.bundle_asset_id, args.manifest_asset_id,
                                     args.artifact_id, args.run_id, args.attempt,
                                     publication=publication, environment=dict(os.environ))
+        print(json.dumps(result, sort_keys=True))
+        return
+    if args.operation == "prepare":
+        wheels = [folder for group in args.wheels for folder in group]
+        result = prepare(args.pytorchd, args.python_home, wheels, args.source, args.out)
         print(json.dumps(result, sort_keys=True))
         return
     manifest = load_manifest(args.manifest)

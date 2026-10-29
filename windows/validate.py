@@ -27,9 +27,9 @@ HELD = {"NasDownload"}
 # abstraction.wxs and is recorded here so a level nobody meant to change is a
 # failure rather than a silent change of what a default install contains.
 LEVELS = {"Service": 1, "Tools": 1, "Path": 1, "Developer": 1000,
-          "LocalStores": 1, "ModelHost": 1, "LemonadeImage": 1000, "TheNoiseImage": 1000,
-          "PyTorchImage": 1000,
-          "McpGateway": 1000, "NasDownload": 0}
+          "LocalStores": 1, "ModelHost": 1, "LemonadeImage": 1,
+          "PyTorchImage": 1,
+          "McpGateway": 1, "NasDownload": 0}
 KINDS = {"gobuild", "copy", "authored"}
 # build.py's GOARCH keys. Not imported from build.py: build.py imports rows
 # from this module, and importing back would be circular. The two are kept
@@ -46,23 +46,40 @@ ARMS = {True: "SupervisorServiceMarker"}
 SUPERVISOR_ACTIONS = ("RegisterSupervisor", "RollbackSupervisor", "UnregisterSupervisor",
                       "BeginMachineUpgradeExclusion", "EndMachineUpgradeExclusion", "RestartPreviousSupervisor")
 UPGRADE_CONDITIONS = {"machine": "ALLUSERS AND WIX_UPGRADE_DETECTED AND NOT REMOVE",
-                      "user": "NOT ALLUSERS AND WIX_UPGRADE_DETECTED AND NOT REMOVE"}
-# The early script, in order. For each scope: hold the upgrade exclusion,
-# register its release on commit, then register the rollback activation.
-# InstallExecute flushes all six before any file is replaced, and rollback runs
-# them in reverse: release and activate after the files are restored. The
+                      "user": "NOT ALLUSERS AND WIX_UPGRADE_DETECTED AND NOT REMOVE",
+                      "machine removal": 'ALLUSERS AND REMOVE="ALL" AND NOT UPGRADINGPRODUCTCODE',
+                      "user removal": 'NOT ALLUSERS AND REMOVE="ALL" AND NOT UPGRADINGPRODUCTCODE'}
+# The early script, in order. For each scope: register the rollback
+# activation, hold the upgrade exclusion, then register its release on commit.
+# A rollback action runs only once the script has reached it, so it comes
+# before begin: a begin-upgrade that fails after taking the exclusion (an OA
+# process that does not stop in time) still releases it and starts the host,
+# instead of leaving every activation refused until msiexec ends.
+# InstallExecute flushes all twelve before any file is replaced, and rollback
+# runs them in reverse: release and activate after the files are restored. The
 # begin-upgrade closes remaining identified OA processes after holding the
 # exclusion. Restart Manager gets its earlier opportunistic pass at
 # InstallValidate. (action, scope, ExeCommand, Execute, Impersonate, Return)
 UPGRADE_CHAIN = (
-    ("BeginMachineUpgradeExclusion", "machine",
-     'service begin-upgrade --machine "[APPLICATIONFOLDER]." --related "[WIX_UPGRADE_DETECTED]"', "deferred", "no", "check"),
-    ("EndMachineUpgradeExclusion", "machine", "service end-upgrade --machine", "commit", "no", "check"),
     ("RestartPreviousSupervisor", "machine", "service start --machine", "rollback", "no", "ignore"),
+    ("BeginMachineUpgradeExclusion", "machine",
+     'service begin-upgrade --machine "[APPLICATIONFOLDER]." --related "[WIX_UPGRADE_DETECTED]" --chain "[OAUPGRADECHAIN]"', "deferred", "no", "check"),
+    ("EndMachineUpgradeExclusion", "machine", "service end-upgrade --machine", "commit", "no", "check"),
+    ("RestartPreviousUserSupervisor", "user", 'service start --related "[WIX_UPGRADE_DETECTED]"', "rollback", "yes", "ignore"),
     ("BeginUserUpgradeExclusion", "user",
      'service begin-upgrade --user "[APPLICATIONFOLDER]." --related "[WIX_UPGRADE_DETECTED]"', "deferred", "yes", "check"),
     ("EndUserUpgradeExclusion", "user", "service end-upgrade --user", "commit", "yes", "check"),
-    ("RestartPreviousUserSupervisor", "user", 'service start --related "[WIX_UPGRADE_DETECTED]"', "rollback", "yes", "ignore"),
+    # A real removal holds the same exclusion for its own folder, so no
+    # client activation restarts the host from an image being removed
+    # (owner's PC, 2026-11-01).
+    ("RestartRemovedSupervisor", "machine removal", "service start --machine", "rollback", "no", "ignore"),
+    ("BeginMachineRemovalExclusion", "machine removal",
+     'service begin-removal --machine "[APPLICATIONFOLDER]."', "deferred", "no", "check"),
+    ("EndMachineRemovalExclusion", "machine removal", "service end-upgrade --machine", "commit", "no", "check"),
+    ("RestartRemovedUserSupervisor", "user removal", 'service start --user "[APPLICATIONFOLDER]." [ProductVersion]', "rollback", "yes", "ignore"),
+    ("BeginUserRemovalExclusion", "user removal",
+     'service begin-removal --user "[APPLICATIONFOLDER]."', "deferred", "yes", "check"),
+    ("EndUserRemovalExclusion", "user removal", "service end-upgrade --user", "commit", "yes", "check"),
 )
 UPGRADE_BINARY = "payload/tools/openabstractions.exe"
 # After the new version is committed, and only then, the predecessor is
@@ -83,7 +100,7 @@ UPGRADE_MESSAGES = {
               f"(Binary UpgradeSupervisorCode = {UPGRADE_BINARY}), and the old product must be removed only "
               "after InstallFinalize",
     "flush": "abstraction.wxs: the early InstallExecute must follow the last exclusion action, "
-             "RestartPreviousUserSupervisor, so the exclusion is held before RemoveFiles and InstallFiles",
+             "EndUserRemovalExclusion, so the exclusion is held before RemoveFiles and InstallFiles",
     "stop": "abstraction.wxs: use the bounded begin-upgrade exclusion/stop owner; "
             "separate unscoped stop commands are refused and restart paths remain idempotent activations",
     "RestartPreviousUserSupervisor": "abstraction.wxs: a failed per-user upgrade must activate the previous runtime "
@@ -234,6 +251,39 @@ def check_engine_unlock(root, text):
         if not places or any(var not in stack for stack in places):
             bad.append(f"abstraction.wxs: {action} and its sequence row must sit inside <?if $(var.{var}) = yes ?>, "
                        f"the gate of {program}")
+    return bad
+
+
+def check_early_upgrade_bundle(root, bundle=None, go_source=None):
+    """Bind Burn's pre-MSI stop to the existing incoming supervisor owner."""
+    bundle = bundle if bundle is not None else ET.parse(HERE/'apps/bundle.wxs').getroot()
+    go_source = go_source if go_source is not None else (HERE.parent/'serve/userrelated_windows.go').read_text(encoding='utf-8')
+    bad = []
+    expected = dict(Id='BeginCoreUpgrade', SourceFile='$(var.UpgradeBinary)', PerMachine='yes', Vital='no', Cache='remove',
+                    DetectCondition='false', InstallCondition='OACorePrior = 5 AND WixBundleAction = 6',
+                    InstallArguments='service begin-upgrade --machine --installed --chain [OAUpgradeChain]',
+                    UninstallArguments='service start --machine')
+    chains = [e for e in bundle.iter() if untag(e) == 'Chain']
+    early = [e for e in bundle.iter() if e.get('Id') == 'BeginCoreUpgrade']
+    core = [e for e in bundle.iter() if untag(e) == 'MsiPackage' and e.get('Id') == 'OpenAbstractions']
+    if (len(early) != 1 or early[0].attrib != expected or len(core) != 1 or len(chains) != 1
+            or early[0] not in list(chains[0]) or core[0] not in list(chains[0])
+            or list(chains[0]).index(early[0]) + 1 != list(chains[0]).index(core[0])):
+        bad.append('bundle.wxs: exact per-machine non-vital early upgrade owner must immediately precede core MSI')
+    if len(core) != 1 or [e.attrib for e in core[0] if untag(e) == 'MsiProperty'] != [{'Name':'OAUPGRADECHAIN','Value':'[OAUpgradeChain]'}]:
+        bad.append('bundle.wxs: core MSI must receive OAUpgradeChain')
+    props = [e for e in root.iter() if untag(e) == 'Property' and e.get('Id') == 'OAUPGRADECHAIN']
+    if len(props) != 1 or props[0].attrib != {'Id':'OAUPGRADECHAIN','Secure':'yes'}:
+        bad.append('abstraction.wxs: OAUPGRADECHAIN must be Secure')
+    payloads = [e for e in bundle.iter() if untag(e) == 'Payload' and e.get('Name') == 'oa_bundle_actions.dll']
+    if len(payloads) != 1 or payloads[0].get('SourceFile') != '$(var.BundleActions)' or payloads[0].get('{http://wixtoolset.org/schemas/v4/wxs/bal}BAFunctions') != 'yes':
+        bad.append('bundle.wxs: every bundle must carry its BAFunctions DLL')
+    code = next(e.get('UpgradeCode') for e in root.iter() if untag(e) == 'Package')
+    searches = [e for e in bundle.iter() if untag(e) == 'ProductSearch']
+    if len(searches) != 1 or searches[0].attrib != {'UpgradeCode':code,'Result':'state','Variable':'OACorePrior'}:
+        bad.append('bundle.wxs: native core state search must use the core UpgradeCode')
+    if f'const coreUpgradeCode = "{{{code}}}"' not in go_source:
+        bad.append('serve: core UpgradeCode must match abstraction.wxs')
     return bad
 
 
@@ -594,6 +644,7 @@ def main():
     bad.extend(check_sandbox_roots(root))
     bad.extend(check_engine_unlock(root, text))
     bad.extend(check_upgrade_shutdown(root))
+    bad.extend(check_early_upgrade_bundle(root))
     bad.extend(check_elevated_scope(root))
     try:
         check_login_source(text)

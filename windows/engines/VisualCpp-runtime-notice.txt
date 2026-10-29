@@ -1,0 +1,28 @@
+Third-party notice: Microsoft Visual C++ runtime
+
+The model host engine (tools\engines\llama-b10825-oa-win-vulkan-x64.zip)
+includes msvcp140.dll, vcruntime140.dll and vcruntime140_1.dll from the
+Microsoft Visual C++ 2015-2026 Redistributable (x64), version 14.51.36231.
+They are copied unmodified and carry Microsoft's digital signature.
+Copyright (c) Microsoft Corporation. All rights reserved.
+
+These files are Distributable Code of Microsoft Visual Studio. OpenAbstractions
+redistributes them under the Microsoft Software License Terms for Visual
+Studio Community 2026:
+https://visualstudio.microsoft.com/license-terms/vs2026-ga-community/
+
+Your use of these files is subject to the following terms:
+- You may use them only as part of OpenAbstractions, to run its model host
+  engine.
+- You may not modify, reverse engineer, decompile or disassemble them,
+  except where applicable law permits it despite this limitation.
+- You may distribute them only unmodified as part of OpenAbstractions,
+  under these same terms.
+- You may not remove or alter Microsoft or supplier notices, bypass
+  technical limitations, or use these files contrary to applicable law.
+- Microsoft and its suppliers provide them "as is" and give no warranty or
+  support for them; Microsoft is not liable for any damages arising from
+  their use, to the extent applicable law allows.
+
+OpenAbstractions is not made, endorsed or supported by Microsoft. Microsoft
+and Visual C++ are trademarks of the Microsoft group of companies.

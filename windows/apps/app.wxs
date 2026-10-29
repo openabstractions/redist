@@ -8,9 +8,9 @@
   Install places the ZIP's files under
   %LOCALAPPDATA%\Programs\OpenAbstractions\apps\<AppId> and, last, starts the
   OpenAbstractions Panel with the application manifest the package carries:
-  the person confirms the registration in the Panel, which registers it with
-  its own application.manage. Uninstall starts the Panel to remove the entry,
-  with the same confirmation, before the files go. Installing grants no
+  the Panel registers it with its own application.manage and asks nothing.
+  Uninstall starts the Panel to remove the entry of the program this package
+  installed, before the files go. Installing grants no
   permission; the application asks at first use. Without OpenAbstractions
   the package refuses and names the release page to download it from; it
   downloads and installs nothing else.
@@ -23,7 +23,9 @@
            Scope="perUser"
            InstallerVersion="500"
            Compressed="yes">
-    <MajorUpgrade AllowSameVersionUpgrades="yes"
+    <!-- The app's predecessor removal belongs to this MSI transaction.
+         A failed app upgrade restores it while the completed core remains. -->
+    <MajorUpgrade AllowSameVersionUpgrades="yes" Schedule="afterInstallInitialize"
                   DowngradeErrorMessage="A newer $(var.AppTitle) is already installed." />
     <MediaTemplate EmbedCab="yes" />
 
@@ -74,9 +76,9 @@
       </Component>
     </ComponentGroup>
 
-    <!-- The Panel shows the manifest and registers it only after the
-         person's click; the installer does not wait for that click, and the
-         Panel prints nothing an installer could use to confirm it. -->
+    <!-- The Panel registers the manifest without a question; a refused
+         registration waits in Apps as Not connected. The installer does not
+         wait for the Panel, and the Panel prints no key. -->
     <CustomAction Id="RegisterApplication" Property="OaPanel"
                   ExeCommand="--register-application &quot;[#application.manifest]&quot;"
                   Execute="immediate" Return="asyncNoWait" />

@@ -1,29 +1,47 @@
 {
-  "version": 2,
-  "declaration": {
-    "name": "local-stores",
-    "program": "inventoryd.exe",
-    "arguments": [
-      "serve",
-      "--endpoint",
-      "{endpoint}"
-    ],
-    "endpoint": "local-stores",
-    "transport": "oa-native@1",
-    "contracts": [
-      "abstraction.storage/inventory-source@1"
-    ],
-    "resources": [
-      "store:ollama",
-      "store:huggingface",
-      "store:lmstudio",
-      "store:comfyui",
-      "store:fastflowlm",
-      "store:jan"
-    ],
-    "activation": "on_demand",
-    "role": "provider"
-  },
-  "declared_by": "installation",
-  "declared_unix_ms": 0
+  "program": "inventoryd.exe",
+  "providers": [
+    {
+      "name": "local-stores",
+      "arguments": [
+        "serve",
+        "--endpoint",
+        "{endpoint}"
+      ],
+      "endpoint": "local-stores",
+      "services": [
+        "abstraction.storage/inventory-source@1"
+      ],
+      "guarantees": [],
+      "activation": "on_demand",
+      "resources": [
+        "store:ollama",
+        "store:huggingface",
+        "store:lmstudio",
+        "store:comfyui",
+        "store:fastflowlm",
+        "store:jan",
+        "store:ollama-service",
+        "store:huggingface-default",
+        "store:jan-mlx",
+        "store:jan-external",
+        "store:lemonade-cache",
+        "store:lemonade-models",
+        "store:lemonade-extra",
+        "store:asus-aicreator",
+        "store:asus-llmserver",
+        "store:asus-whisperrecorder",
+        "store:stabilitymatrix",
+        "store:pinokio",
+        "store:swarmui"
+      ],
+      "models": [],
+      "required_extensions": [],
+      "engines": [],
+      "recipes": []
+    }
+  ],
+  "servers": [],
+  "remotes": [],
+  "applications": []
 }

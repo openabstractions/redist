@@ -125,12 +125,17 @@ def python_package_pins(path):
     return pins
 
 
-def optional_app_sources(path, rows):
-    return optional_app_sources_text(Path(path).read_text(encoding='utf-8'), rows)
+def optional_app_sources(path, rows, *, required_products=()):
+    return optional_app_sources_text(Path(path).read_text(encoding='utf-8'), rows,
+                                     required_products=required_products)
 
 
-def optional_app_sources_text(source, rows):
-    """Require the extra public adopter commit only for enabled ComfyUI."""
+def app_source_ids(rows, required_products=()):
+    return {'comfyui'} & ({row['id'] for row in rows} | set(required_products))
+
+
+def optional_app_sources_text(source, rows, *, required_products=(), allow_pending=False):
+    """Bind the public adopter source for an archive or installer obligation."""
     lines = [line for line in source.splitlines()
              if line and not line.startswith('>')]
     parsed = list(csv.reader(lines, delimiter='\t'))
@@ -143,8 +148,8 @@ def optional_app_sources_text(source, rows):
                 or not COMMIT.fullmatch(fields[2]) or fields[0] in sources):
             raise ValueError('unreviewed optional app public source pin')
         sources[fields[0]] = {'repository': fields[1], 'commit': fields[2]}
-    required = {'comfyui'} if any(row['id'] == 'comfyui' for row in rows) else set()
-    if set(sources) != required:
+    required = app_source_ids(rows, required_products)
+    if not set(sources) <= required or (not allow_pending and set(sources) != required):
         raise ValueError('enabled ComfyUI lacks exact public adopter source pin')
     return sources
 
@@ -1163,13 +1168,46 @@ def panel_pin_document(source_document, produced_rows, *, expected_apps):
     return raw
 
 
-def panel_pin_input(source_document, produced_rows, *, expected_apps, producer):
+OPENCODE_UPGRADE_CODE = '{8E0B8005-0E00-5720-9556-E5B984F15A96}'
+
+
+def panel_catalogue_rows(raw):
+    """Validate the compiled projection independently of the source roster."""
+    document = json.loads(raw, object_pairs_hook=strict_object)
+    if 'extensions' in document:
+        if document['schema'] != 2:
+            raise ValueError('Panel extension pins require schema 2')
+        extensions = document.pop('extensions')
+        version = document['release_tag'].removeprefix('v')
+        if not isinstance(extensions, list) or len(extensions) != 1:
+            raise ValueError('expected one signed OpenCode extension')
+        row = extensions[0]
+        if (not isinstance(row, dict) or set(row) != {'id','file','sha256','bytes','version','product_code','upgrade_code'}
+                or row['id'] != 'opencode' or row['file'] != f'opencode-{version}.msi' or row['version'] != version
+                or not isinstance(row['sha256'], str) or not SHA.fullmatch(row['sha256'])
+                or type(row['bytes']) is not int or not 0 < row['bytes'] < MAX_RELEASE_ASSET_BYTES
+                or not isinstance(row['product_code'], str)
+                or not re.fullmatch(r'\{[0-9A-F]{8}(?:-[0-9A-F]{4}){3}-[0-9A-F]{12}\}', row['product_code'])
+                or row['upgrade_code'] != OPENCODE_UPGRADE_CODE):
+            raise ValueError('invalid signed OpenCode extension projection')
+        # Legacy archive rows retain their exact source roster representation.
+        if document['apps'] and not multipart_row(document['apps'][0]):
+            document['schema'] = 1
+    return roster_text(json.dumps(document))
+
+
+def panel_pin_input(source_document, produced_rows, *, expected_apps, producer, opencode=None):
     """Bind generated build data to the already authenticated stage producer."""
     if (not isinstance(producer,dict) or set(producer) != {'source','run_id','run_attempt'} or
             not re.fullmatch('[0-9a-f]{40}',str(producer['source'])) or
             any(type(producer[key]) is not int or producer[key] <= 0 for key in ('run_id','run_attempt'))):
         raise ValueError('Panel catalogue requires exact current producer identity')
     raw = panel_pin_document(source_document,produced_rows,expected_apps=expected_apps)
+    if opencode is not None:
+        document = json.loads(raw)
+        document.update(schema=2, extensions=[opencode])
+        raw = (json.dumps(document, sort_keys=True) + '\n').encode('utf-8')
+        panel_catalogue_rows(raw)
     def pin(value):return dict(bytes=len(value),sha256=hashlib.sha256(value).hexdigest())
     source = source_document.encode('utf-8') if isinstance(source_document,str) else source_document
     descriptor = dict(schema=1,kind='monitor-compiled-catalogue-input',producer=dict(producer),

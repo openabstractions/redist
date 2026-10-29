@@ -9,6 +9,7 @@ payload.tsv uses a subset — service, localstores, modelhost and mcpgateway —
 of the names below.
 """
 import json
+import re
 
 # TSV "feature" column value -> WiX <Feature Id="...">.
 FEATURE_NAMES = {
@@ -17,12 +18,41 @@ FEATURE_NAMES = {
     "localstores": "LocalStores",
     "modelhost": "ModelHost",
     "lemonadeimage": "LemonadeImage",
-    "thenoiseimage": "TheNoiseImage",
     "pytorchimage": "PyTorchImage",
     "mcpgateway": "McpGateway",
     "developer": "Developer",
     "path": "Path",
 }
+
+
+def declaration_fields(items):
+    """Authored placement inputs have one unambiguous value per field."""
+    result = {}
+    for name, value in items:
+        if name in result:
+            raise ValueError("duplicate declaration field: " + name)
+        result[name] = value
+    return result
+
+
+def installed_provider_identity(spec):
+    """Placement projection of the seeded native RegistrationSpec files.
+
+    The runtime's registration codec owns semantic schema validation. Packaging
+    receives one native provider per filename and no other facets; it supplies
+    installation provenance rather than accepting a claim from this document.
+    """
+    facets = ("providers", "servers", "remotes", "applications")
+    if set(spec) != {"program", *facets} or not isinstance(spec["program"], str) or not spec["program"]:
+        raise ValueError("expected the closed native RegistrationSpec placement fields")
+    if any(not isinstance(spec[name], list) for name in facets):
+        raise ValueError("RegistrationSpec facets must be lists")
+    if len(spec["providers"]) != 1 or any(spec[name] for name in facets[1:]):
+        raise ValueError("one installed provider per declaration filename is required")
+    provider = spec["providers"][0]
+    if not isinstance(provider, dict) or "name" not in provider or not isinstance(provider["name"], str):
+        raise ValueError("installed provider name must be a string")
+    return provider["name"], spec["program"]
 
 
 def check_installed_declarations(paths, placed, authored, root, declarations):
@@ -48,21 +78,38 @@ def check_installed_declarations(paths, placed, authored, root, declarations):
                        f"the installation's declarations are written here and shipped as they stand")
             continue
         try:
-            file = json.loads((root / source).read_text(encoding="utf-8"))
+            file = json.loads((root / source).read_text(encoding="utf-8"), object_pairs_hook=declaration_fields)
         except (OSError, ValueError) as err:
             bad.append(f"{source}: unreadable declaration: {err}")
             continue
-        declaration = file.get("declaration", {})
-        name = declaration.get("name", "")
-        if file.get("version") != 2 or file.get("declared_by") != "installation":
-            bad.append(f"{source}: the installation ships version 2 declarations declared_by "
-                       f"installation; this one is version {file.get('version')!r} declared_by "
-                       f"{file.get('declared_by')!r}")
+        if not isinstance(file, dict):
+            bad.append(f"{source}: declaration must be an object")
+            continue
+        if "program" in file or any(name in file for name in ("providers", "servers", "remotes", "applications")):
+            try:
+                name, program = installed_provider_identity(file)
+            except ValueError as err:
+                bad.append(f"{source}: invalid installed provider placement: {err}")
+                continue
+            host = False
+        else:
+            declaration = file.get("declaration")
+            if not isinstance(declaration, dict):
+                bad.append(f"{source}: legacy declaration must be an object")
+                continue
+            name, program = declaration.get("name", ""), declaration.get("program", "")
+            host = declaration.get("role") == "host"
+            if file.get("version") != 2 or file.get("declared_by") != "installation":
+                bad.append(f"{source}: the installation ships version 2 declarations declared_by "
+                           f"installation; this one is version {file.get('version')!r} declared_by "
+                           f"{file.get('declared_by')!r}")
         if path.rsplit("/", 1)[-1] != f"{name}.json":
             bad.append(f"{source}: declares {name!r} and lands at {path}. The runtime reads a "
                        f"declaration file whose name is its declaration's name and reports any other")
-        program = declaration.get("program", "")
-        if declaration.get("role") == "host" or not program:
+        if not isinstance(program, str):
+            bad.append(f"{source}: installed program must be a string")
+            continue
+        if host or not program:
             continue
         if "/" in program or "\\" in program or program in (".", ".."):
             bad.append(f"{source}: names the program {program!r}. The install location is chosen "
@@ -89,6 +136,22 @@ def check_login_source(wxs, host_source=None):
     for old in ("LogonStart", "PanelTrayLogonStart"):
         if root.find(".//w:ComponentGroup[@Id='" + old + "']", ns) is not None or root.find(".//w:ComponentGroupRef[@Id='" + old + "']", ns) is not None:
             raise ValueError("unconditional login component survives: " + old)
+    # TD94: the package writes no login item in either scope. Only the
+    # runtime's Applications-driven reconciler writes the account's Run values,
+    # while a confirmed app is registered.
+    for element in root.iter():
+        tag = element.tag.split("}")[-1]
+        key = (element.get("Key") or "").replace("/", "\\").lower()
+        if tag in ("RegistryValue", "RegistryKey") and re.search(r"\\currentversion\\run(once)?(\\|$)", key):
+            raise ValueError("the package writes a login Run value: " + element.get("Key"))
+        if tag == "Shortcut" and element.get("Directory") == "StartupFolder":
+            raise ValueError("the package places a Startup shortcut: " + (element.get("Id") or "?"))
+    for startup in root.iterfind(".//w:StandardDirectory[@Id='StartupFolder']", ns):
+        if len(startup):
+            raise ValueError("the package installs into the Startup folder")
+    for component in root.iter("{http://wixtoolset.org/schemas/v4/wxs}Component"):
+        if component.get("Directory") == "StartupFolder":
+            raise ValueError("the package installs a component into the Startup folder")
     action = root.find(".//w:CustomAction[@Id='RemoveUserLogin']", ns)
     expected = dict(Id="RemoveUserLogin", BinaryRef="UpgradeSupervisorCode",
                     ExeCommand='service remove-login --user "[ToolsFolder]."',

@@ -230,7 +230,7 @@ def validate_backend_resource(value, *, expected=None):
     if (not isinstance(value, dict) or set(value) != fields or type(value['schema']) is not int
             or value['schema'] != 2 or value['variant'] != 'win-amd'
             or not isinstance(value['comfyui_ref'], str) or not re.fullmatch('[0-9a-f]{40}', value['comfyui_ref'])
-            or value['python_version'] != '3.13.17'):
+            or value['python_version'] != '3.12.10'):
         raise ValueError('invalid backend resource2')
     validate_data_release(value['data_release'])
     names = set()
@@ -272,12 +272,12 @@ def validate_embedded_integration(value, *, source_policy, oa_integration, backe
     if _archive_pin(backend_manifest)['name']!='backend-manifest.json':
         raise ValueError('embedded integration lacks the fixed backend manifest')
     if (not isinstance(manifest,dict) or manifest.get('manager') is not False
-            or manifest.get('python_version')!='3.13.17' or manifest.get('oa_integration')!=oa_integration):
+            or manifest.get('python_version')!='3.12.10' or manifest.get('oa_integration')!=oa_integration):
         raise ValueError('embedded integration backend profile differs')
     prefix='ComfyUI/custom_nodes/abstraction_downloads/'
     required={'__init__.py','oa_connect.py','oa_relay.py','oa_helper.py','oa_interpreter.py',
               'oa_atomic/abstraction_cas.py','oa_nodes/__init__.py','oa_client/abstraction/ipc/__init__.py',
-              'application-manifest.json','helper/python.exe','helper/python313.dll','helper/pyvenv.cfg'}
+              'application-manifest.json','helper/python.exe','helper/python312.dll','helper/pyvenv.cfg'}
     files=manifest.get('runtime_files')
     if (not isinstance(files,dict) or not 0 < len(files) <= BACKEND_RUNTIME_ENTRIES
             or not {prefix+name for name in required}<=set(files)):

@@ -5,7 +5,8 @@
   installer/apps/build_bundle.py, which names the applications; this file
   names none.
 
-  The chain is the core MSI first, then ShowcaseApplications, the package
+  Selected read-only application preflights precede the core MSI. The core
+  then precedes ShowcaseApplications, the package
   group build_bundle.py writes into apps.wxs: an optional official host EXE
   followed by its application MSI (installer/apps/build_app.py), outside the
   bundle's own container and installed only when its checkbox
@@ -34,31 +35,75 @@
   package records in HKLM.
 
   Preprocessor variables: Version, CoreMsi, ThemeFile, SuppressOptionsUI (yes
-  when no application is offered). apps.wxs is compiled beside this file.
+  when no application is offered), BundleIcon and BundleLogo (OA's mark:
+  the Panel's icon and its 64-pixel image, from build_bundle.brand_sources).
+  apps.wxs is compiled beside this file.
 -->
 <Wix xmlns="http://wixtoolset.org/schemas/v4/wxs"
-     xmlns:bal="http://wixtoolset.org/schemas/v4/wxs/bal">
+     xmlns:bal="http://wixtoolset.org/schemas/v4/wxs/bal"
+     xmlns:util="http://wixtoolset.org/schemas/v4/wxs/util">
 <?ifndef CoreFeatureSelection?>
 <?define CoreFeatureSelection = "no" ?>
 <?endif?>
+  <!-- The person sees one Apps entry, the core "OpenAbstractions" (owner,
+       2026-10-31). With modify and remove both disabled, Burn registers the
+       bundle as a system component: hidden from Apps, still registered for
+       related-bundle upgrades and its package cache. Running Setup again
+       changes or removes the applications. -->
   <Bundle Name="OpenAbstractions Setup"
           Manufacturer="OpenAbstractions"
           Version="$(var.Version)"
-          UpgradeCode="5C2E44B1-6F0B-4D7E-9B1F-2E7A0C3D9A41">
+          UpgradeCode="5C2E44B1-6F0B-4D7E-9B1F-2E7A0C3D9A41"
+          DisableModify="yes"
+          DisableRemove="yes"
+          IconSourceFile="$(var.BundleIcon)">
     <BootstrapperApplication>
       <bal:WixStandardBootstrapperApplication Theme="hyperlinkLicense"
                                               ThemeFile="$(var.ThemeFile)"
                                               SuppressOptionsUI="$(var.SuppressOptionsUI)"
+                                              LogoFile="$(var.BundleLogo)"
                                               LicenseUrl="https://github.com/openabstractions/redist/blob/main/LICENSE" />
-<?ifdef BundleActions?>
+      <!-- The window's title-bar and taskbar icon: the theme's Window names
+           this payload (build_bundle.WINDOW_ICON). -->
+      <Payload SourceFile="$(var.BundleIcon)" Name="openabstractions.ico" />
       <!-- Existing WixStdBA loads this own signed native extension. It changes
-           requested states at the supported per-package callback only. -->
+           requested states at the supported per-package callback only, and
+           owns the success page's Finish and "Open OpenAbstractions" box. -->
       <Payload SourceFile="$(var.BundleActions)" Name="oa_bundle_actions.dll" bal:BAFunctions="yes" />
-<?endif?>
     </BootstrapperApplication>
 
+    <!-- Finish with "Open OpenAbstractions" ticked starts the per-machine
+         core's Panel in the person's own session (owner, 2026-10-31): -finish
+         asks the setup question when there is setup to do and otherwise opens
+         the Panel (research/first-run/DECISION.md section 4). -->
+    <Variable Name="LaunchTarget" Value="[ProgramFiles64Folder]OpenAbstractions\tools\Abstraction Panel.exe" />
+    <Variable Name="LaunchArguments" Value="--finish" />
+    <Variable Name="LaunchUpgradeArguments" Value="--finish --update" />
+    <Variable Name="OAUpgradeChain" Type="string" Value="" />
+    <util:ProductSearch UpgradeCode="CEEF6550-5E44-4E83-8E18-A855C9D941CA" Result="state" Variable="OACorePrior" />
+
+    <!-- Cache="remove": Burn caches the core only while it installs or changes
+         it. The bundle itself is per-user (its applications are), so a run that
+         finds the per-machine core already present plans no elevation; the
+         default "keep" still caches a present package, into the per-machine
+         package cache, and fails with access denied (preview-1031d,
+         2026-10-31). Windows Installer keeps its own copy of the installed
+         core for repair and removal.
+         Permanent="yes" Visible="yes": a per-user bundle registers no
+         dependency on a per-machine package, so removing an earlier bundle
+         during an upgrade uninstalled the core nothing else held
+         (preview-1031f, 2026-10-31). Like a redistributable, the core stays
+         when a bundle goes and keeps its own entry in Apps, where the person
+         removes it. -->
     <Chain>
-      <MsiPackage Id="OpenAbstractions" SourceFile="$(var.CoreMsi)" Vital="yes" ForcePerMachine="yes" EnableFeatureSelection="$(var.CoreFeatureSelection)" />
+      <PackageGroupRef Id="SelectedApplicationPreflights" />
+      <ExePackage Id="BeginCoreUpgrade" SourceFile="$(var.UpgradeBinary)" PerMachine="yes" Vital="no" Cache="remove" DetectCondition="false"
+                  InstallCondition="OACorePrior = 5 AND WixBundleAction = 6"
+                  InstallArguments="service begin-upgrade --machine --installed --chain [OAUpgradeChain]"
+                  UninstallArguments="service start --machine" />
+      <MsiPackage Id="OpenAbstractions" SourceFile="$(var.CoreMsi)" Vital="yes" ForcePerMachine="yes" Cache="remove" Permanent="yes" Visible="yes" EnableFeatureSelection="$(var.CoreFeatureSelection)">
+        <MsiProperty Name="OAUPGRADECHAIN" Value="[OAUpgradeChain]" />
+      </MsiPackage>
       <PackageGroupRef Id="ShowcaseApplications" />
     </Chain>
   </Bundle>
