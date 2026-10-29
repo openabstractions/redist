@@ -531,6 +531,9 @@ jobs:
       artifact-attempt: ${{ github.run_attempt }}
       artifact-id: ${{ steps.inputs.outputs.artifact-id }}
       artifact-digest: ${{ steps.inputs.outputs.artifact-digest }}
+      runtime-artifact-attempt: ${{ github.run_attempt }}
+      runtime-artifact-id: ${{ steps.runtime-input.outputs.artifact-id }}
+      runtime-artifact-digest: ${{ steps.runtime-input.outputs.artifact-digest }}
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
         with:
@@ -555,6 +558,23 @@ jobs:
         with:
           name: abstraction-installer-prior-inputs-${{ github.run_attempt }}
           path: installer-prior-input/
+          compression-level: 0
+          if-no-files-found: error
+
+      - name: receive the exact app-local VC runtime from its owned unpublished input
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir vc-runtime-input
+          runtime_asset=$(python3 -c 'import sys; sys.path.insert(0,"windows"); import modelhost_engine as owner; from pathlib import Path; print(owner.runtime_asset(Path("windows/vc-runtime.json"))["archive"]["name"])')
+          runtime_tag=$(python3 -c 'import sys; sys.path.insert(0,"windows"); import modelhost_engine as owner; from pathlib import Path; print(owner.runtime_input_tag(owner.runtime_asset(Path("windows/vc-runtime.json"))))')
+          gh release download "$runtime_tag" --repo openabstractions/redist --pattern "$runtime_asset" --dir vc-runtime-input
+          python3 -c 'import sys; sys.path.insert(0,"windows"); import modelhost_engine as owner; from pathlib import Path; asset=owner.runtime_asset(Path("windows/vc-runtime.json")); owner.runtime_asset_bytes(Path("vc-runtime-input")/asset["archive"]["name"],asset)'
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        id: runtime-input
+        with:
+          name: vc-runtime-input-${{ github.run_attempt }}
+          path: vc-runtime-input/
           compression-level: 0
           if-no-files-found: error
 
@@ -765,9 +785,18 @@ jobs:
       # excluded RPC/CLI tools
       # never enter the MSI payload directory.
       - name: derive exact reviewed ModelHost engine bundle
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CANDIDATE_SHA: ${{ needs.candidate.outputs.sha }}
+          RUNTIME_ARTIFACT_ID: ${{ needs.installer-prior-input.outputs.runtime-artifact-id }}
+          RUNTIME_ARTIFACT_DIGEST: ${{ needs.installer-prior-input.outputs.runtime-artifact-digest }}
+          RUNTIME_ARTIFACT_ATTEMPT: ${{ needs.installer-prior-input.outputs.runtime-artifact-attempt }}
         run: |
           if [ -f a/amd64/modelhostd.exe ]; then
-            mkdir -p engine-input publisher-input runtime-input
+            mkdir -p engine-input publisher-input
+            python3 windows/windows_signing.py consume --artifact-id "$RUNTIME_ARTIFACT_ID" --digest "$RUNTIME_ARTIFACT_DIGEST" \
+              --name "vc-runtime-input-$RUNTIME_ARTIFACT_ATTEMPT" --source "$CANDIDATE_SHA" \
+              --run-id "$GITHUB_RUN_ID" --attempt "$RUNTIME_ARTIFACT_ATTEMPT" --out runtime-input --receipt runtime-input/artifact-intake.json
             a/amd64/modelhostd.exe engine pin --json > engine-input/pin.json
             runtime_asset=$(python3 -c 'import json; from pathlib import Path; print(json.loads(Path("windows/vc-runtime.json").read_text())["archive"]["name"])')
             runtime_folder=$(python3 -c 'import json; from pathlib import Path; print(json.loads(Path("windows/vc-runtime.json").read_text())["runtime"]["folder"])')
@@ -4493,7 +4522,7 @@ jobs:
 
   draft:
     if: ${{ needs.source-guard.result == 'success' && ((inputs.core_only && !cancelled() && inputs.producer_mode == 'train' && !inputs.signing_probe_only && !inputs.diagnostic_host_sign_only && inputs.app_producer_only == 'none' && inputs.app_delivery_only == 'none' && needs.candidate.result == 'success' && needs.windows-msi-sign.result == 'success' && needs.verify.result == 'success' && needs.linux.result == 'success' && needs.linux-verify.result == 'success' && needs.macos.result == 'success') || (!inputs.core_only && (inputs.app_delivery_only != 'comfyui' && (!inputs.diagnostic_host_sign_only && (!cancelled() && needs.candidate.result == 'success' && needs.windows-msi-sign.result == 'success' && needs.verify.result == 'success' && needs.linux.result == 'success' && needs.linux-verify.result == 'success' && needs.macos.result == 'success' && (needs.app_comfyui.result == 'success' || (needs.candidate.outputs.native-comfyui != 'true' && needs.app_comfyui.result == 'skipped')) && ((inputs.producer_mode == 'train' && needs.candidate.outputs.native-comfyui == 'true' && needs.windows-app-delivery.result == 'success') || ((inputs.producer_mode != 'train' || needs.candidate.outputs.native-comfyui != 'true') && needs.windows-app-delivery.result == 'skipped')) && inputs.producer_mode != 'train-graph' && (!inputs.signing_probe_only && (inputs.app_producer_only == 'none' || inputs.app_producer_only == ''))))))) }}
-    needs: [source-guard, candidate, windows-msi-sign, verify, linux, linux-verify, macos, app_comfyui, windows-app-delivery]
+    needs: [source-guard, candidate, windows-msi-sign, verify, linux, linux-verify, macos, app_comfyui, windows-app-delivery, installer-prior-input]
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -4595,6 +4624,19 @@ jobs:
               --outputs app-producer-outputs.json --candidate-source "$CANDIDATE_SHA" \
               --run-id "$GITHUB_RUN_ID" --predecessors "$APP_PRODUCERS"
           fi
+
+      - name: retain the verified app-local VC runtime as a final release asset
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CANDIDATE_SHA: ${{ needs.candidate.outputs.sha }}
+          RUNTIME_ARTIFACT_ID: ${{ needs.installer-prior-input.outputs.runtime-artifact-id }}
+          RUNTIME_ARTIFACT_DIGEST: ${{ needs.installer-prior-input.outputs.runtime-artifact-digest }}
+          RUNTIME_ARTIFACT_ATTEMPT: ${{ needs.installer-prior-input.outputs.runtime-artifact-attempt }}
+        run: |
+          python3 windows/windows_signing.py consume --artifact-id "$RUNTIME_ARTIFACT_ID" --digest "$RUNTIME_ARTIFACT_DIGEST" \
+            --name "vc-runtime-input-$RUNTIME_ARTIFACT_ATTEMPT" --source "$CANDIDATE_SHA" \
+            --run-id "$GITHUB_RUN_ID" --attempt "$RUNTIME_ARTIFACT_ATTEMPT" --out runtime-release-input --receipt runtime-release-input/artifact-intake.json
+          python3 -c 'import shutil,sys; sys.path.insert(0,"windows"); import modelhost_engine as owner; from pathlib import Path; asset=owner.runtime_asset(Path("windows/vc-runtime.json")); archive=asset["archive"]; source=Path("runtime-release-input")/archive["name"]; owner.runtime_asset_bytes(source,asset); target=Path("dist")/archive["name"]; shutil.copyfile(source,target); owner.runtime_asset_bytes(target,asset); Path("dist/SHA256SUMS.runtime").write_text(archive["sha256"]+"  "+archive["name"]+"\n",encoding="utf-8")'
 
       # Each line was computed by the job that made the bytes. Joining them is
       # not recomputing them, so the file is checked once more here against what

@@ -217,6 +217,11 @@ def runtime_asset_bytes(path: Path, asset: dict) -> dict:
     return result
 
 
+def runtime_input_tag(asset: dict) -> str:
+    """The owned unpublished transport for the already validated runtime pin."""
+    return "oa-vc-runtime-" + asset["runtime"]["version"] + "-" + asset["archive"]["sha256"][:12]
+
+
 def build_runtime_asset(path: Path, runtime: Path, identity: dict, asset: dict) -> dict:
     supplied = runtime_bytes(runtime, identity)
     path = Path(path)

@@ -19,6 +19,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import urllib.request
 import zipfile
 
 # Both the private source and public projection keep this dependency beside us.
@@ -78,6 +79,52 @@ def windows_signing_directory():
 
 def windows_policy_bytes():
     return (windows_signing_directory() / 'certum_simplysign.json').read_bytes()
+
+
+def runtime_release_policy(version):
+    """Read the unchanged source pin used by the provider's final download URL."""
+    if tuple(map(int, version.removeprefix('v').split('.'))) < (0, 8, 0):
+        return None
+    windows = windows_signing_directory()
+    path = windows / 'modelhost_engine.py'
+    import types
+    owner = types.ModuleType('oa_runtime_release_owner'); owner.__file__ = str(path)
+    exec(compile(path.read_bytes(), str(path), 'exec'), owner.__dict__)
+    pin = windows / 'vc-runtime.json'
+    if not pin.is_file():
+        pin = Path(__file__).resolve().parents[3] / 'monitor/internal/setup/vc_runtime_asset.json'
+    asset = owner.runtime_asset(pin)
+    if asset['release_tag'] != version:
+        raise ValueError('runtime asset release tag differs from the exact candidate version')
+    return owner, asset
+
+
+def runtime_release_asset(archive, version):
+    selected = runtime_release_policy(version)
+    if selected is None:
+        return None
+    owner, asset = selected
+    pin = asset['archive']; name = pin['name']
+    if archive.getinfo(name).file_size != pin['size_bytes']:
+        raise ValueError('final runtime ZIP size differs from its source pin')
+    with tempfile.TemporaryDirectory(prefix='oa-runtime-release-') as temporary:
+        target = Path(temporary) / name
+        with archive.open(name) as reader:
+            target.write_bytes(reader.read(pin['size_bytes'] + 1))
+        owner.runtime_asset_bytes(target, asset)
+    return name
+
+
+def verify_runtime_url(version, *, open_url=None):
+    """Read the frozen anonymous public URL before publication is complete."""
+    selected = runtime_release_policy(version)
+    if selected is None:
+        return
+    pin = selected[1]['archive']
+    with (open_url or urllib.request.urlopen)(pin['url'], timeout=30) as response:
+        raw = response.read(pin['size_bytes'] + 1)
+    if (len(raw), hashlib.sha256(raw).hexdigest()) != (pin['size_bytes'], pin['sha256']):
+        raise ValueError('published runtime URL differs from the frozen source size/hash')
 
 
 def windows_signing_owner():
@@ -878,6 +925,7 @@ def unpack_verified(blob, digest, destination, run, version):
             # Candidate unpack is also used before installed rehearsal. This
             # validates the declaration; completed delivery remains external.
             validate_public_admission(app_rows.admission, number, app_rows, run['head_sha'])
+            packages.add(runtime_release_asset(archive, version))
         if any(row['release_tag'] != version for row in app_rows):
             raise ValueError('optional app pin release tag differs from candidate')
         app_packages = validate_release(app_rows, metadata.get('apps', []), archive.open)
