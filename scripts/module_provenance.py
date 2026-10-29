@@ -16,6 +16,8 @@ import subprocess
 import sys
 import tempfile
 import zipfile
+from urllib.parse import urlsplit
+from urllib.request import url2pathname
 from typing import Callable
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -402,6 +404,13 @@ def _observe_windows_builds(tools: Path, output: Path, provenance: Path,
     if (not env.get('GOPROXY', '').startswith('file:///') or
             any(c in env['GOPROXY'] for c in ',|\r\n')):
         raise ValueError('observed Windows builds require the selected offline prepared proxy')
+    location=urlsplit(env['GOPROXY'])
+    proxy_path=url2pathname(location.path)
+    if (location.scheme!='file' or location.netloc or location.query or location.fragment
+            or proxy_path.startswith(('\\\\','//')) or '\x00' in proxy_path
+            or not Path(proxy_path).is_absolute()):
+        raise ValueError('observed Windows builds require a local prepared proxy directory')
+    prepared_proxy=Path(proxy_path)
     if (producer != {'source': env.get('GITHUB_SHA'), 'run_id': int(env.get('GITHUB_RUN_ID', '0')),
                      'run_attempt': int(env.get('GITHUB_RUN_ATTEMPT', '0'))} or
             not re.fullmatch(r'[0-9a-f]{40}', str(producer['source'])) or
@@ -486,7 +495,9 @@ def _observe_windows_builds(tools: Path, output: Path, provenance: Path,
         if module not in expected or expected[module]['version'] != version:
             raise ValueError('program module differs from prepared graph')
         member = escape_module(module) + '/@v/' + version + '.zip'
-        raw, pin = observed_input(Path(info['GOMODCACHE']) / 'cache/download' / member)
+        # The prepared proxy is complete before the first build. Go fills its
+        # download cache on demand; that cache is observed independently below.
+        raw, pin = observed_input(prepared_proxy / member)
         wanted = graph_files['proxy/' + member]
         if any(pin[key] != wanted[key] for key in ('sha256', 'bytes')):
             raise ValueError('program module archive differs from prepared graph')
