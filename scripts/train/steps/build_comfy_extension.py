@@ -157,7 +157,7 @@ def receive(shared, sources, pins, inputs, output, version, *, signed=False, pol
     """Recheck selected sources before native signing or package receiving."""
     _, graph_owner, builder, relay, received, descriptor = source_context(
         shared, sources, pins, inputs, version)
-    output = Path(output)
+    output = ordinary_path(output, kind='directory').resolve(strict=True)
     original = json.loads((output / 'extension-native-receipt.json').read_bytes())
     _, _, row = graph_context(sources, version, graph_owner)
     sdk = load(Path(sources) / 'redist/tools/windows_go_sdk.py', 'extension_receiving_go_sdk')

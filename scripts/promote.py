@@ -39,8 +39,8 @@ REQUIRED_JOBS = {'candidate', 'windows-build', 'windows-native-build', 'windows-
 SETUP_ARTIFACT = 'setup-bundle-'
 # GitHub reruns "all of the failed jobs and their dependent jobs" in a new
 # attempt (https://docs.github.com/en/rest/actions/workflow-runs#re-run-failed-jobs-from-a-workflow-run).
-# Every job except bundle is draft or upstream of it, so its failure reruns
-# draft and bundle and the new attempt makes both promoted artifacts.
+# Each retained artifact keeps its successful producer job's own attempt.
+# A downstream-only rerun can retain draft and signing from different attempts.
 UNFINISHED = ('failure', 'cancelled', 'timed_out')
 SETUP_RECEIPT = 'bundle-receipt.json'
 SETUP_SUMS = 'SHA256SUMS.setup'
@@ -643,43 +643,66 @@ def candidate_run(repo, run_id, source, run, jobs):
             or run.get('repository', {}).get('full_name') != repo
             or run.get('path') != '.github/workflows/candidate.yml'
             or run.get('event') != 'workflow_dispatch'
-            or run.get('status') != 'completed' or run.get('conclusion') != 'success'):
+            or run.get('status') != 'completed' or run.get('conclusion') != 'success'
+            or type(run.get('run_attempt')) is not int or run['run_attempt'] < 1):
         raise ValueError('candidate must be a successful manual candidate.yml run in this repository at the exact dispatch commit')
     names = [job.get('name') for job in jobs]
-    if not REQUIRED_JOBS.issubset(names) or len(names) != len(set(names)):
+    if (any(not isinstance(name,str) or not name for name in names)
+            or not REQUIRED_JOBS.issubset(names) or len(names) != len(set(names))):
         raise ValueError('candidate is missing required jobs or has ambiguous job names')
     for job in jobs:
-        if job.get('name') in ('windows-signing-probe', 'windows-signing-probe-build') and job.get('conclusion') == 'skipped':
+        if job.get('head_sha') != source or job.get('status') != 'completed':
+            raise ValueError('candidate job did not pass: ' + str(job.get('name')))
+        if job.get('conclusion') == 'skipped' and job.get('name') not in REQUIRED_JOBS:
             continue
-        if (job.get('head_sha') != source or job.get('status') != 'completed'
-                or job.get('conclusion') != 'success'):
+        if job.get('conclusion') != 'success':
             raise ValueError('candidate job did not pass: ' + str(job.get('name')))
 
 
-def run_artifact(name, source, artifacts):
+def run_artifact(name, source, artifacts, *, run_id=None):
     """The one retained artifact of exactly this name, with a digest and the
     candidate's source as its provenance."""
     found = [a for a in artifacts if a.get('name') == name]
     if len(found) != 1 or found[0].get('expired') is not False:
         raise ValueError(name + ' is missing, ambiguous or expired; rebuild and qualify a new candidate')
     artifact = found[0]
-    if not re.fullmatch(r'sha256:[0-9a-f]{64}', artifact.get('digest', '')):
+    if type(artifact.get('id')) is not int or artifact['id'] < 1:
+        raise ValueError('GitHub artifact has no positive exact ID: ' + name)
+    if not isinstance(artifact.get('digest'),str) or not re.fullmatch(r'sha256:[0-9a-f]{64}', artifact['digest']):
         raise ValueError('GitHub artifact has no SHA-256 digest: ' + name)
-    if artifact.get('workflow_run', {}).get('head_sha') != source:
+    provenance = artifact.get('workflow_run')
+    if (not isinstance(provenance,dict) or provenance.get('head_sha') != source
+            or (run_id is not None and (type(provenance.get('id')) is not int or provenance['id'] != run_id))):
         raise ValueError('artifact provenance differs from candidate source: ' + name)
     return artifact
 
 
+def producer_attempt(run, jobs, job_name):
+    """Use the exact successful producer record selected by inspect's paging."""
+    selected = [job for job in jobs if job.get('name') == job_name]
+    if len(selected) != 1:
+        raise ValueError('missing or ambiguous artifact producer job: ' + job_name)
+    job = selected[0]
+    attempt = job.get('run_attempt')
+    if (job.get('head_sha') != run['head_sha'] or type(job.get('run_id')) is not int or job['run_id'] != run['id']
+            or job.get('status') != 'completed' or job.get('conclusion') != 'success'
+            or type(attempt) is not int or not 1 <= attempt <= run['run_attempt']):
+        raise ValueError('artifact producer differs from exact run/source/attempt: ' + job_name)
+    return attempt
+
+
 def verified_artifact(repo, run_id, source, run, jobs, artifacts):
     candidate_run(repo, run_id, source, run, jobs)
-    return run_artifact(f'verified-release-{run["run_attempt"]}', source, artifacts)
+    attempt = producer_attempt(run, jobs, 'draft')
+    return run_artifact(f'verified-release-{attempt}', source, artifacts, run_id=run_id)
 
 
 def setup_artifact(repo, run_id, source, run, jobs, artifacts):
-    """The signed Setup bundle of the same run and attempt, by exact name,
+    """The signed Setup bundle of its successful producer attempt, by exact name,
     under the same run and job checks as the verified release."""
     candidate_run(repo, run_id, source, run, jobs)
-    return run_artifact(f'{SETUP_ARTIFACT}{run["run_attempt"]}', source, artifacts)
+    attempt = producer_attempt(run, jobs, 'windows-bundle-sign')
+    return run_artifact(f'{SETUP_ARTIFACT}{attempt}', source, artifacts, run_id=run_id)
 
 
 def setup_name(version):
@@ -913,7 +936,10 @@ def unpack_setup(blob, digest, destination, version, packages, *, receipt_sink=N
     return list(published), {name: checksums[name] for name in published}
 
 
-def unpack_verified(blob, digest, destination, run, version):
+def unpack_verified(blob, digest, destination, run, version, *, producer_attempt=None):
+    attempt = run['run_attempt'] if producer_attempt is None else producer_attempt
+    if type(attempt) is not int or not 1 <= attempt <= run['run_attempt']:
+        raise ValueError('verified release producer attempt is outside the exact run')
     outer = ((len(blob), hashlib.sha256(blob).hexdigest()) if isinstance(blob, bytes)
              else measured(lambda: Path(blob).open('rb')))
     if 'sha256:' + outer[1] != digest:
@@ -933,7 +959,7 @@ def unpack_verified(blob, digest, destination, run, version):
                 raise ValueError('verified release metadata is too large: ' + name)
         metadata = json.loads(archive.read('candidate.json'))
         expected = {'schema': 1, 'source': run['head_sha'], 'version': version,
-                    'run_id': run['id'], 'run_attempt': run['run_attempt']}
+                    'run_id': run['id'], 'run_attempt': attempt}
         if any(metadata.get(k) != value for k, value in expected.items()):
             raise ValueError('artifact metadata differs from requested candidate')
         if metadata.get('kind') != 'release-candidate':
@@ -1470,7 +1496,8 @@ def main(argv=None):
         directory = Path(tmp)
         retained = directory / 'candidate-artifact.zip'
         download(['api', f'repos/{args.repo}/actions/artifacts/{artifact["id"]}/zip'], retained)
-        assets, metadata = unpack_verified(retained, artifact['digest'], directory, run, args.version)
+        assets, metadata = unpack_verified(retained, artifact['digest'], directory, run, args.version,
+            producer_attempt=producer_attempt(run, jobs, 'draft'))
         sums = directory / 'SHA256SUMS'
         lines = sums.read_bytes().decode('utf-8').splitlines()
         packages = {line[66:]: line[:64] for line in lines}
@@ -1526,7 +1553,7 @@ def main(argv=None):
                      '--notes-file', str(notes)])
         if assets:
             command(['release', 'upload', args.version, '--repo', args.repo,
-                     *[str(directory / name) for name in assets]])
+                     *[str(directory / name) for name in assets]], timeout=7200)
     print(f'Drafted {args.version} from verified run {args.run}; packages were not rebuilt.')
     return 0
 

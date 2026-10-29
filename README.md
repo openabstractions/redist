@@ -16,7 +16,13 @@ release notes and `SHA256SUMS` together. Older release URLs keep their original 
 
 ## For people installing
 
-### Available now: 0.4.0
+### Available runtime
+
+Download the [latest OpenAbstractions release](https://github.com/openabstractions/redist/releases/latest).
+Its release notes identify the attached assets, checksums, signing state and
+package-specific installation evidence.
+
+### Historical 0.4.0 evidence
 
 Download [Open Abstractions 0.4.0](https://github.com/openabstractions/redist/releases/tag/v0.4.0).
 The release includes the shared runtime and tools built from pinned module versions.
@@ -51,7 +57,7 @@ Compare downloads against the release's `SHA256SUMS`:
 MSIs and Setup, unsigned Linux tarballs, and a signed, notarised and stapled
 macOS package. A checksum is not a signature.
 
-The 0.4.0 CLI provides:
+The runtime CLI provides:
 
     openabstractions status --json
     openabstractions probe --json
@@ -59,7 +65,7 @@ The 0.4.0 CLI provides:
 
 `status` reports service readiness. `probe` performs bounded reads and prints
 typed outcomes. `applications list` shows the caller's permission-filtered local
-application directory. The 0.4.0 installers register the shared runtime,
+application directory. The installers register the shared runtime,
 which supervises configured capabilities.
 Windows per-user installation starts it immediately and registers a windowless
 Startup launcher. Check `openabstractions status --json` for readiness. Consult
