@@ -290,6 +290,33 @@ def materialize_lemonade_inputs(native,helper,selected,inputs,tools):
     shutil.copyfile(evidence,inputs/'npm-acquisition.json')
 
 
+def prepare_opencode_plugin_inputs(helper, owner, inputs):
+    """Reuse the JavaScript producer's source-lock cache before offline bundling."""
+    root=pathlib.Path.cwd()
+    packages={row['package']:root/'sources'/row['repository'].split('/')[-1]/row['directory']
+        for row in helper.exact_rows(root/'npm.tsv',('package','repository','commit','directory'))}
+    pending=['@openabstractions/opencode'];linked={}
+    while pending:
+        name=pending.pop()
+        if name in linked:continue
+        source=packages[name]
+        manifest=json.loads(closure_file(source,'package.json').read_bytes())
+        if manifest['name']!=name:
+            raise ValueError('JavaScript source package differs from its pinned row: '+name)
+        linked[name]=source
+        required=set(manifest.get('dependencies',{}))
+        peer_metadata=manifest.get('peerDependenciesMeta',{})
+        required.update(peer for peer in manifest.get('peerDependencies',{})
+            if not peer_metadata.get(peer,{}).get('optional'))
+        pending.extend(sorted(dep for dep in required if dep.startswith('@openabstractions/')))
+    opencode=linked.pop('@openabstractions/opencode')
+    if opencode.resolve()!=pathlib.Path(owner.__file__).resolve().parent.parent:
+        raise ValueError('OpenCode cache source differs from the selected installer owner')
+    cache_owner=load_owner(opencode/'test/run_node_tests.py','application_opencode_dependency_cache')
+    cache_owner.prepare_dependency_cache(opencode,root,inputs/'opencode-dependencies',
+        linked=tuple(linked[name] for name in sorted(linked)))
+
+
 def application_inputs(required, version):
     if not required:
         # The core-only chain still needs its source-owned BA token minter.
@@ -384,6 +411,7 @@ def application_inputs(required, version):
             helper.checked_download(row['url'],bootstrap/row['file'],expected_sha512=row['sha512'],max_bytes=64<<20)
         helper.checked_download(opencode.RIPGREP['url'],inputs/'opencode-ripgrep.zip',expected_sha256=opencode.RIPGREP['sha256'],max_bytes=16<<20)
         shutil.copyfile(sdk/'npm'/('openabstractions-opencode-'+version+'.tgz'),inputs/'opencode-plugin.tgz')
+        prepare_opencode_plugin_inputs(helper,opencode,inputs)
     if 'comfyui' in owners:
         source=pathlib.Path(owners['comfyui'].__file__).parent/'desktop-host.json'
         shutil.copyfile(source,inputs/'desktop-host.json')
@@ -483,6 +511,8 @@ def application_native_prepare(required,version):
                 '--plugin',plugin['file'],'--plugin-sha256',plugin['sha256'],'--plugin-bytes',str(plugin['bytes']),
                 '--cli',str((inputs/'opencode-cli.zip').resolve()),'--parser-tgz',str((inputs/'jsonc-parser.tgz').resolve()),
                 '--bootstrap',str((inputs/'opencode-bootstrap').resolve()),'--ripgrep',str((inputs/'opencode-ripgrep.zip').resolve()),
+                '--package-set',str((base/'sdk/npm').resolve()),
+                '--dependency-cache',str((inputs/'opencode-dependencies').resolve()),
                 '--out',str(out),'--version',version,'--cl',compiler['cl.exe']]
         elif app=='comfyui' and native_archive_selected(owner):
             tools=native_go_tools(owner,helper,pins,inputs,

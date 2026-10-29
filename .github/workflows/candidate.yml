@@ -898,11 +898,13 @@ jobs:
           cmake --build build/shared --config Release
           cmake -S "$identity/cpp" -B build/static -DCMAKE_BUILD_TYPE=Release \
             -DBUILD_SHARED_LIBS=OFF -DABSTRACTION_IPC_BUILD_TESTS=OFF \
+            -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded \
             -DCMAKE_INSTALL_PREFIX="$PWD/build/prefix" "${arch[@]}"
           cmake --build build/static --config Release
           cmake --install build/static --config Release
           cmake -S "$identity/javascript" -B build/addon -DCMAKE_BUILD_TYPE=Release \
             -DCMAKE_PREFIX_PATH="$PWD/build/prefix" -DNODE_INCLUDE_DIR="$NODE_INCLUDE_DIR" \
+            -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded \
             "${node_lib[@]}" "${arch[@]}"
           cmake --build build/addon --config Release
           case "$RUNNER_OS" in
