@@ -55,6 +55,8 @@ NATIVE_CONTROL_ROOT = 'oa-control'
 # Match backendlaunch.controlTree: its own manifest adds the final enginefiles row.
 NATIVE_CONTROL_FILES = BACKEND_RUNTIME_ENTRIES-1
 NATIVE_CONTROL_BYTES = 512<<20
+BACKEND_DATA_REPOSITORY = 'openabstractions/redist'
+BACKEND_DATA_TAG_PREFIX = 'comfyui-data-win-amd-'
 
 
 def native_programs():
@@ -227,8 +229,16 @@ def backend_data_release(archive):
     validate_archive_set(archive, format='7z')
     rows = ''.join(f"{part['name']}:{part['sha256']}:{part['bytes']}\n"
                    for part in sorted(archive['parts'], key=lambda part: part['name']))
-    return {'repository': 'openabstractions/redist',
-            'tag': 'comfyui-data-win-amd-' + hashlib.sha256(rows.encode('utf-8')).hexdigest()[:12]}
+    return {'repository': BACKEND_DATA_REPOSITORY,
+            'tag': BACKEND_DATA_TAG_PREFIX + hashlib.sha256(rows.encode('utf-8')).hexdigest()[:12]}
+
+
+def validate_data_release_policy(value):
+    """The source selects the fixed DATA namespace before runtime bytes exist."""
+    expected = {'repository': BACKEND_DATA_REPOSITORY, 'tag_prefix': BACKEND_DATA_TAG_PREFIX}
+    if not isinstance(value, dict) or value != expected:
+        raise ValueError('backend DATA release policy requires the fixed OA repository and tag prefix')
+    return value
 
 
 def data_part_url(release, name):
@@ -777,7 +787,8 @@ def _desktop_pair(manifest, binary_zip, source_zip, source_pin, context):
                 member(pin)
                 if pin['name'] not in manifest['preserved_notice_paths']+manifest['added_notice_paths']:
                     raise ValueError('native archive omits selected archiver notice')
-        if validate_data_release(recipe.get('data_release'))!=resource['data_release']:
+        validate_data_release_policy(recipe.get('data_release'))
+        if backend_data_release(resource['archive'])!=resource['data_release']:
             raise ValueError('Desktop DATA locator differs from corresponding source policy')
         backend_receipt=source_metadata(resource['provenance']['producer_receipt'])
         expected_input=resource['provenance']['input_descriptor']
