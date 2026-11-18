@@ -101,7 +101,16 @@ jobs:
         timeout-minutes: 10
         shell: pwsh
         run: |
-          & powershell.exe -NoProfile -ExecutionPolicy Bypass -STA -File test_service_session.ps1 -Mode Verify -StatePath "$env:RUNNER_TEMP/oa-service-session.json"
+          $tokens=$null; $errors=$null
+          $ast=[Management.Automation.Language.Parser]::ParseFile((Resolve-Path test_user_runtime.ps1).Path,[ref]$tokens,[ref]$errors)
+          if ($errors.Count) { throw 'Package fixture did not parse' }
+          $owner=@($ast.FindAll({param($n) $n -is [Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -ceq 'Get-PackageProperty'},$true))
+          if ($owner.Count -ne 1) { throw 'Exact existing MSI property owner required' }
+          . ([scriptblock]::Create($owner[0].Extent.Text))
+          $packageVersion=[version](Get-PackageProperty (Resolve-Path pkg/abstraction-x64.msi).Path ProductVersion)
+          $activation=@()
+          if ($packageVersion -ge [version]'0.8.0') { $activation=@('-ActivateRuntime','-ActivationSeconds','600') }
+          & powershell.exe -NoProfile -ExecutionPolicy Bypass -STA -File test_service_session.ps1 -Mode Verify @activation -StatePath "$env:RUNNER_TEMP/oa-service-session.json"
           if ($LASTEXITCODE -ne 0) { throw "Session verification exited $LASTEXITCODE" }
           exit 0
       - name: remove installed package

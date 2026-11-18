@@ -10,7 +10,11 @@ param(
     [ValidateRange(1, 7200)][int]$CommandSeconds = 1800,
     # Verify only: the image the SCM-created instance runs. 0.1.8 and later run
     # the windowless host; a 0.1.7 predecessor installed for a rollback test runs jobdw.
-    [ValidateSet('openabstractionsw.exe','jobdw.exe')][string]$ExpectedImage = 'openabstractionsw.exe'
+    [ValidateSet('openabstractionsw.exe','jobdw.exe')][string]$ExpectedImage = 'openabstractionsw.exe',
+    # Current demand-start packages activate through their installed CLI in the
+    # actual RDP token. Historical predecessors retain their sign-in behavior.
+    [switch]$ActivateRuntime,
+    [ValidateRange(1, 600)][int]$ActivationSeconds = 300
 )
 $ErrorActionPreference = 'Stop'
 # No mutation in the default mode. Only disposable GitHub-hosted runners may run this fixture.
@@ -241,6 +245,81 @@ function Invoke-SessionCommand($Command, [string[]]$Arguments, [int]$Seconds, $A
     Write-Diagnostic "session command exit=$($result.ExitCode)" | Out-Null
     if ($result.ExitCode -ne 0) { throw "Session command exited $($result.ExitCode)" }
 }
+function New-SessionActivation([string]$Directory, [string]$Runtime, [string]$Module, [string]$Sid, [DateTime]$Deadline) {
+    if (Test-Path -LiteralPath $Directory) { throw 'Fresh session activation directory required' }
+    foreach ($path in @($Runtime,$Module)) {
+        $item=Get-Item -LiteralPath $path
+        if ($item.PSIsContainer -or ($item.Attributes -band [IO.FileAttributes]::ReparsePoint)) { throw 'Ordinary session activation inputs required' }
+    }
+    if ($Deadline.ToUniversalTime() -le [DateTime]::UtcNow) { throw 'Session activation deadline expired' }
+    [IO.Directory]::CreateDirectory($Directory) | Out-Null
+    $diagnostics=Join-Path $Directory 'diagnostics'
+    [IO.Directory]::CreateDirectory($diagnostics) | Out-Null
+    $moduleCopy=Join-Path $Directory 'OAFixture.psm1'
+    Copy-Item -LiteralPath $Module -Destination $moduleCopy
+    $runtimeHash=(Get-FileHash -LiteralPath $Runtime -Algorithm SHA256).Hash.ToLowerInvariant()
+    $moduleHash=(Get-FileHash -LiteralPath $moduleCopy -Algorithm SHA256).Hash.ToLowerInvariant()
+    $script=@'
+$ErrorActionPreference='Stop'
+$record=[ordered]@{ExitCode=$null;Closure='unknown';Sid=[Security.Principal.WindowsIdentity]::GetCurrent().User.Value;Session=(Get-Process -Id $PID).SessionId;Failure=''}
+try {
+    if ([DateTime]::UtcNow -ge [DateTime]::Parse('__DEADLINE__').ToUniversalTime()) { throw 'RDP activation deadline expired' }
+    if ($record.Sid -cne '__SID__') { throw 'RDP activation account differs' }
+    if ((Get-FileHash -LiteralPath '__RUNTIME__' -Algorithm SHA256).Hash.ToLowerInvariant() -cne '__RUNTIME_HASH__') { throw 'Installed activation image changed' }
+    if ((Get-FileHash -LiteralPath (Join-Path $PSScriptRoot 'OAFixture.psm1') -Algorithm SHA256).Hash.ToLowerInvariant() -cne '__MODULE_HASH__') { throw 'Activation process owner changed' }
+    Import-Module (Join-Path $PSScriptRoot 'OAFixture.psm1') -Force
+    $env:ABSTRACTION_RUNTIME_ENDPOINT=$null
+    $info=New-Object Diagnostics.ProcessStartInfo
+    $info.FileName='__RUNTIME__'
+    $info.Arguments='start --timeout 30s'
+    $info.WorkingDirectory=Split-Path $info.FileName
+    $result=Invoke-FixtureProcess $info 35 -ObservationPath (Join-Path $PSScriptRoot 'diagnostics/start-process.json')
+    [IO.File]::WriteAllText((Join-Path $PSScriptRoot 'diagnostics/start.stdout'),$result.Output,[Text.UTF8Encoding]::new($false))
+    [IO.File]::WriteAllText((Join-Path $PSScriptRoot 'diagnostics/start.stderr'),$result.Diagnostics,[Text.UTF8Encoding]::new($false))
+    $record.ExitCode=$result.ExitCode;$record.Closure=$result.Closure
+} catch { $record.Failure=$_.Exception.Message }
+$resultPath=Join-Path $PSScriptRoot 'diagnostics/start-result.json'
+[IO.File]::WriteAllText(($resultPath+'.tmp'),($record|ConvertTo-Json),[Text.UTF8Encoding]::new($false))
+[IO.File]::Move($resultPath+'.tmp',$resultPath)
+# The initial RDP program must stay alive for uninstall to observe the live
+# service instance after disconnect. The caller's bound ends it
+# even if the existing account/session Cleanup cannot run.
+while ([DateTime]::UtcNow -lt [DateTime]::Parse('__DEADLINE__').ToUniversalTime()) { Start-Sleep -Milliseconds 200 }
+'@
+    foreach ($entry in @(@('__RUNTIME__',$Runtime),@('__SID__',$Sid),@('__RUNTIME_HASH__',$runtimeHash),@('__MODULE_HASH__',$moduleHash),@('__DEADLINE__',$Deadline.ToUniversalTime().ToString('o')))) {
+        $script=$script.Replace($entry[0],$entry[1].Replace("'","''"))
+    }
+    $scriptPath=Join-Path $Directory 'activate.ps1'
+    [IO.File]::WriteAllText($scriptPath,$script,[Text.UTF8Encoding]::new($false))
+    $powershell=Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+    $arguments='-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "'+$scriptPath+'"'
+    $program='"'+$powershell+'" '+$arguments
+    if ($program.Length -gt 259) { throw 'RDP activation start program exceeds its native bound' }
+    return [pscustomobject]@{Directory=$Directory;Diagnostics=$diagnostics;Script=$scriptPath;Module=$moduleCopy;
+        ScriptSha256=(Get-FileHash -LiteralPath $scriptPath -Algorithm SHA256).Hash.ToLowerInvariant();ModuleSha256=$moduleHash;
+        Program=$powershell;Arguments=$arguments;StartProgram=$program}
+}
+function Set-SessionActivation($Client,$Activation) {
+    foreach ($entry in @(@($Activation.Script,$Activation.ScriptSha256),@($Activation.Module,$Activation.ModuleSha256))) {
+        if ((Get-FileHash -LiteralPath $entry[0] -Algorithm SHA256).Hash.ToLowerInvariant() -cne $entry[1]) { throw 'Pinned session activation source changed' }
+    }
+    # https://learn.microsoft.com/windows/win32/termserv/imstscsecuredsettings-startprogram
+    if (-not $Client.SecuredSettingsEnabled) { throw 'RDP client does not admit its official startup-program property' }
+    $Client.SecuredSettings.StartProgram=$Activation.StartProgram
+    $Client.SecuredSettings.WorkDir=$Activation.Directory
+}
+function Assert-SessionActivation($Activation,[int]$Session,[string]$Sid) {
+    $resultPath=Join-Path $Activation.Diagnostics 'start-result.json'
+    Wait-Condition { if (Test-Path -LiteralPath $resultPath -PathType Leaf) { $true } } 45 'installed start in the fresh RDP session' | Out-Null
+    $result=Get-Content -LiteralPath $resultPath -Raw | ConvertFrom-Json
+    if ($result.Session -ne $Session -or $result.Sid -cne $Sid) { throw 'Installed start ran outside the fresh RDP account/session' }
+    Write-Diagnostic "installed start exit=$($result.ExitCode) closure=$($result.Closure) session=$($result.Session)" | Out-Null
+    foreach ($name in @('start.stdout','start.stderr')) {
+        $path=Join-Path $Activation.Diagnostics $name
+        if (Test-Path -LiteralPath $path) { Write-Diagnostic (Protect-StatusText (Get-Content -LiteralPath $path -Raw)) | Out-Null }
+    }
+    if ($null -eq $result.ExitCode -or $result.ExitCode -ne 0 -or $result.Closure -cne 'known' -or $result.Failure) { throw "Installed demand-start activation failed: $($result.Failure)" }
+}
 # Removal is checked before Cleanup logs off the account and can terminate its processes.
 if ($Mode -eq 'VerifyRemoved') {
     $state = Get-Content $StatePath -Raw | ConvertFrom-Json
@@ -282,6 +361,7 @@ if ($Mode -eq 'Cleanup') {
 if ([Threading.Thread]::CurrentThread.ApartmentState -ne 'STA') { throw 'Use powershell.exe -STA -File for ActiveX hosting' }
 if (Test-Path $StatePath) { throw 'State already exists; clean previous fixture first' }
 if (-not $CommandPath -and ($CommandDirectory -or $CommandArguments.Count)) { throw 'CommandDirectory and CommandArguments need -CommandPath' }
+if ($ActivateRuntime -and ($ExpectedImage -cne 'openabstractionsw.exe' -or $CommandPath)) { throw 'Current RDP activation requires its fixed installed runtime and bounded recovery journey' }
 # Resolved before anything changes, so a bad hook changes nothing.
 $sessionCommand = if ($CommandPath) { Resolve-SessionCommand $CommandPath $CommandDirectory } else { $null }
 $started = Get-Date
@@ -299,6 +379,14 @@ $account = New-DisposableAccount -Name $user -GroupSid 'S-1-5-32-555'
 $password = $account.Credential.GetNetworkCredential().Password
 $state.Sid = $account.Sid
 $state | ConvertTo-Json | Set-Content -Encoding UTF8 $StatePath
+$activation=$null
+if ($ActivateRuntime) {
+    $activation=New-SessionActivation (Join-Path $env:RUNNER_TEMP ($user+'-activation')) `
+        (Join-Path $env:ProgramFiles 'OpenAbstractions\tools\openabstractions.exe') `
+        (Join-Path $PSScriptRoot 'OAFixture.psm1') $account.Sid ($started.ToUniversalTime().AddSeconds($ActivationSeconds))
+    Grant-AccountAccess -Path $activation.Directory -Sid $account.Sid -Access ReadExecute
+    Grant-AccountAccess -Path $activation.Diagnostics -Sid $account.Sid -Access Modify
+}
 Set-ItemProperty $rdpKey -Name fDenyTSConnections -Value 0
 Start-Service TermService
 $settings = Get-CimInstance -Namespace root/cimv2/terminalservices -ClassName Win32_TerminalServiceSetting
@@ -327,6 +415,7 @@ try {
     $client.AdvancedSettings7.EnableCredSspSupport = $true
     # The endpoint is strictly loopback; avoid an unattended self-signed certificate dialog.
     $client.AdvancedSettings7.AuthenticationLevel = 0
+    if ($activation) { Set-SessionActivation $client $activation }
     $client.Connect()
     # Connect is asynchronous. A token/process alone is not evidence of a completed GUI logon.
     $session = Wait-Condition {
@@ -343,6 +432,7 @@ try {
     } 90 'fresh RDP account session'
     $form.WindowState = 'Minimized'
     if ($session -eq (Get-Process -Id $PID).SessionId) { throw 'Fresh account reused runner session' }
+    if ($activation) { Assert-SessionActivation $activation $session $state.Sid }
     # The service template runs the windowless host, `openabstractionsw.exe serve supervisor --service`.
     $expectedImagePath = Join-Path $env:ProgramFiles ('OpenAbstractions\tools\' + $ExpectedImage)
     function Find-Instance {

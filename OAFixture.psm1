@@ -528,7 +528,7 @@ public sealed class OaInstalledPanelSmoke : IDisposable {
                 if(body==null || caption==null || body.Current.IsOffscreen || caption.Current.IsOffscreen) return;
                 // renderApps creates these nodes only after /apps/registrations
                 // answered. Static shell headings and an empty/loading body fail.
-                AutomationElement empty=document.FindFirst(TreeScope.Descendants,new PropertyCondition(AutomationElement.NameProperty,"No apps have registered yet."));
+                AutomationElement empty=document.FindFirst(TreeScope.Descendants,new PropertyCondition(AutomationElement.NameProperty,"No apps yet."));
                 if(empty!=null && !empty.Current.IsOffscreen) { ready=true; return; }
                 AutomationElementCollection links=document.FindAll(TreeScope.Descendants,new PropertyCondition(AutomationElement.ControlTypeProperty,ControlType.Hyperlink));
                 foreach(AutomationElement link in links) {

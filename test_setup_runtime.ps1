@@ -91,7 +91,7 @@ function Set-SetupSignature([Collections.IDictionary]$Report, [string]$Path, [bo
 }
 function Assert-MachineSupervisorConfiguration([string]$Configuration, [string]$Recovery, [string]$RecoveryFlag, [string]$ExpectedImage) {
     if ($Configuration -notmatch 'TYPE\s*:\s*50\s+USER_OWN_PROCESS\s+TEMPLATE') { throw 'Supervisor is not the per-user service template' }
-    if ($Configuration -notmatch 'START_TYPE\s*:\s*2\s+AUTO_START') { throw 'Supervisor template is not automatic' }
+    if ($Configuration -notmatch 'START_TYPE\s*:\s*3\s+DEMAND_START') { throw 'Supervisor template is not demand-start' }
     $expected = '"' + $ExpectedImage + '" serve supervisor --service'
     if ($Configuration -notmatch ('BINARY_PATH_NAME\s*:\s*' + [regex]::Escape($expected) + '(?:\r?\n|$)')) { throw 'Supervisor template image/arguments differ from installed windowless host' }
     if ($Recovery -notmatch 'RESET_PERIOD[^:]*:\s*3600') { throw 'Supervisor recovery reset period differs' }

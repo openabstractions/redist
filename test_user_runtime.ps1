@@ -972,14 +972,10 @@ foreach ($f in 'openabstractions.exe','openabstractionsw.exe','Abstraction Panel
 $path = (Get-ItemProperty 'HKCU:\Environment' -Name Path -ErrorAction Stop).Path
 if ($path -notlike "*$tools*") { throw "the user PATH does not carry $tools" }
 
-# What this scope promises instead of a service, in the words the
-# feature text uses: a Startup shortcut, and nothing that replaces the
-# supervisor if it dies before the next sign-in.
-$lnk = Join-Path $env:APPDATA 'Microsoft\Windows\Start Menu\Programs\Startup\Abstraction supervisor.lnk'
-if (-not (Test-Path $lnk)) { throw 'the Startup shortcut is what a per-user install gets instead of a service, and it is not there' }
-if ((Get-ItemProperty 'HKCU:\Software\OpenAbstractions\Abstraction\Supervisor' -Name atLogon).atLogon -ne 1) {
-  throw 'the per-user supervisor marker is not set'
-}
+# TD94: Applications-driven login reconciliation owns sign-in activation.
+# The MSI must leave no unconditional legacy Startup shortcut.
+$lnk = Join-Path (Get-ProfileFolder Startup) 'Abstraction supervisor.lnk'
+if (Test-Path -LiteralPath $lnk) { throw 'Per-user MSI installed an unconditional Startup shortcut' }
 
 # And what it must not have done. Every one of these is a machine-scope
 # act, and an install that had no administrator token and did them
@@ -994,7 +990,7 @@ foreach ($t in 'jobd','jobd-logon') {
     throw "a scheduled task named $t exists. This package registered one until it was replaced by the service and the Startup shortcut; a task coming back is that mechanism returning unannounced."
   }
 }
-'ok    programs, a user PATH entry, a Startup shortcut â€” and no service, no machine key, no task'
+'ok    programs, a user PATH entry and on-demand activation; no unconditional Startup, service, machine key or task'
 }
 function Assert-InstalledPanelWebView2([string]$Tools, [string]$EvidencePath = 'webview2-availability.txt') {
     $panel = Join-Path $Tools 'Abstraction Panel.exe'
@@ -1029,7 +1025,7 @@ function Assert-InstalledPanelShortcuts([string]$Tools, [string]$Package) {
     [void]$directoryView.Close()
     if ($directoryName -notin @('OpenAbstractions', 'Abstraction')) { throw 'Unknown package Panel menu directory' }
     $menu = Join-Path (Get-ProfileFolder Programs) $directoryName
-    $view = $database.OpenView('SELECT `Name`, `Arguments` FROM `Shortcut` WHERE `Target`=''[#panel.exe]'' AND `Directory`=''AbstractionMenuFolder''')
+    $view = $database.OpenView('SELECT `Name`, `Arguments` FROM `Shortcut` WHERE `Target`=''[#panel.exe]'' AND `Directory_`=''AbstractionMenuFolder''')
     $view.Execute()
     $cases = @()
     while ($row = $view.Fetch()) {
@@ -2279,6 +2275,18 @@ function Assert-NativeCore([string]$Central, [string]$Tools, [string]$PythonPath
         Copy-Item -LiteralPath $ordinaryResult -Destination (Join-Path (Split-Path -Parent $RequestPath) 'ordinary-result.json')
     }
 }
+function Invoke-InstalledUserActivation([string]$Central) {
+    Invoke-Bounded $Central @('start') 30
+}
+function Complete-UserFixtureAccount($Account, $PrimaryFailure) {
+    try { Remove-DisposableAccount -Account $Account -RuntimeProcessesOnly -RequirePresent }
+    catch {
+        # The conservative unknown-closure guard still refuses cleanup. Keep
+        # the original child failure visible instead of replacing its cause.
+        if (-not $PrimaryFailure) { throw }
+        Write-Warning ('Fixture account cleanup refused after the original failure: ' + (Protect-DiagnosticText $_.Exception.Message)) -WarningAction Continue
+    }
+}
 function Get-UserFixtureSeconds([bool]$HasPredecessor, [bool]$HasOrdinary, [int]$Soak = 0) {
     if ($Soak -notin @(0,3600)) { throw 'Soak duration must be zero or 3600' }
     $seconds = if ($HasPredecessor) { 600 } else { 300 }
@@ -2699,14 +2707,10 @@ if ($Mode -eq 'User') {
             'ok: logging/config ready immediately after MSI completion' | Set-Content 'post-install-activation.txt'
             $shortcutPath = Join-Path (Get-ProfileFolder Startup) 'Abstraction supervisor.lnk'
             if (@(Get-Service | Where-Object { $_.Name -like 'OpenAbstractionsSupervisor*' }).Count) { throw 'Per-user install registered a service' }
-            if (-not (Test-Path -LiteralPath $shortcutPath)) { throw 'Installed Startup shortcut missing' }
-            $shell = New-Object -ComObject WScript.Shell
-            $shortcut = $shell.CreateShortcut($shortcutPath)
-            Assert-InstalledShortcut $shortcut $tools
-            Push-Location $shortcut.WorkingDirectory
-            try { Invoke-Bounded $shortcut.TargetPath @($shortcut.Arguments) 30 } finally { Pop-Location }
+            if (Test-Path -LiteralPath $shortcutPath) { throw 'Per-user MSI installed an unconditional Startup shortcut' }
+            Invoke-InstalledUserActivation $central
             Assert-RuntimeReady $central runtime-status
-            'ok: installed shortcut invocation resolved logging/config as a non-admin account' | Set-Content 'activation.txt'
+            'ok: installed on-demand start resolved logging/config as a non-admin account' | Set-Content 'activation.txt'
             if ($SoakSeconds) {
                 Assert-InstalledRuntimeSoak $central $ExpectedRuntimeSha256 $ExpectedSupervisorSha256 $ExpectedSid $SoakSeconds (Join-Path (Get-Location) 'installed-soak.json') @($MsiPath,$PSCommandPath,(Join-Path $PSScriptRoot 'OAFixture.psm1'),$SoakRequestPath)
             }
@@ -2773,6 +2777,7 @@ if ($PredecessorMsiPath -and $PredecessorVersion -notmatch '^\d+\.\d+\.\d+$') { 
 if (@(Get-Service | Where-Object { $_.Name -like 'OpenAbstractionsSupervisor*' }).Count) { throw 'Run per-user verification on a separate clean runner' }
 $directory = Join-Path $env:ProgramData ('OA-User-Test-' + [Guid]::NewGuid().ToString('N'))
 $account = $null
+$fixtureFailure = $null
 try {
     # A standard Users-group account with a masked random password.
     $account = New-DisposableAccount -Prefix 'oa_ci'
@@ -2824,9 +2829,12 @@ exit $LASTEXITCODE
     $child = Invoke-AccountProcess -Account $account -FileName 'powershell.exe' -Arguments $arguments -WorkingDirectory $directory -Seconds (Get-UserFixtureSeconds ([bool]$PredecessorMsiPath) $false $SoakSeconds)
     $child.Output | Set-Content -Encoding UTF8 (Join-Path $directory 'fixture.log')
     $child.Diagnostics | Set-Content -Encoding UTF8 (Join-Path $directory 'fixture.err')
-    if ($child.ExitCode -ne 0) { throw "Per-user fixture exited $($child.ExitCode); inspect diagnostics" }
+    if ($child.ExitCode -ne 0) { throw ("Per-user fixture exited $($child.ExitCode): " + (Protect-DiagnosticText $child.Diagnostics)) }
     New-Item -ItemType Directory -Force -Path $ResultDirectory | Out-Null
     Assert-RuntimeRemoved $account.Sid (Join-Path $ResultDirectory 'account-removal-remaining.json')
+} catch {
+    $fixtureFailure = $_
+    throw
 } finally {
     try {
         if (Test-Path -LiteralPath $directory) {
@@ -2840,7 +2848,7 @@ exit $LASTEXITCODE
         }
     } catch { Write-Warning "Could not preserve all fixture diagnostics: $_" }
     # Account-owned runtime leftovers are cleanup only; no assertion becomes green here.
-    if ($account) { Remove-DisposableAccount -Account $account -RuntimeProcessesOnly -RequirePresent }
+    if ($account) { Complete-UserFixtureAccount $account $fixtureFailure }
     # Retain the fixture directory for runner disposal; never recursively delete
     # a path writable by the test account, which could contain reparse points.
 }

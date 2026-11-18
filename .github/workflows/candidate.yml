@@ -2789,7 +2789,7 @@ jobs:
           if ($text -notmatch 'TYPE\s*:\s*50\s+USER_OWN_PROCESS\s+TEMPLATE') {
             throw 'the service is not a SERVICE_USER_OWN_PROCESS template. Any other type is a service running as someone, and this design stores no password because it runs as whoever signs in.'
           }
-          if ($text -notmatch 'START_TYPE\s*:\s*2\s+AUTO_START') { throw 'the template is not AUTO_START, so nothing clones it at sign-in' }
+          if ($text -notmatch 'START_TYPE\s*:\s*3\s+DEMAND_START') { throw 'the template is not DEMAND_START; the installed start command owns activation' }
           if ($text -notmatch 'openabstractionsw\.exe" serve supervisor --service') {
             throw 'the registered image is not openabstractionsw.exe serve supervisor --service. openabstractions.exe is the console image, and the loader gives a console image a window in the session it runs in â€” a window at every sign-in is what this whole mechanism removed.'
           }
@@ -2808,14 +2808,14 @@ jobs:
           if ($qff -notmatch 'FAILURE_ACTIONS_ON_NONCRASH_FAILURES\s*:\s*TRUE') {
             throw 'recovery fires only on a process that died without reporting SERVICE_STOPPED. A supervisor that reports a tidy stop after failing to open its store is the case we most want restarted.'
           }
-          'ok    a USER_OWN_PROCESS template, auto-start, pointing at openabstractionsw.exe serve supervisor --service, with three restarts and the non-crash flag'
+          'ok    a USER_OWN_PROCESS template, demand-start, pointing at openabstractionsw.exe serve supervisor --service, with three restarts and the non-crash flag'
 
       - name: fresh interactive session and crash recovery
         id: instance
         shell: pwsh
         timeout-minutes: 5
         run: |
-          & powershell.exe -NoProfile -ExecutionPolicy Bypass -STA -File session-fixture/test_service_session.ps1 -Mode Verify -StatePath "$env:RUNNER_TEMP/oa-service-session.json"
+          & powershell.exe -NoProfile -ExecutionPolicy Bypass -STA -File session-fixture/test_service_session.ps1 -Mode Verify -ActivateRuntime -ActivationSeconds 300 -StatePath "$env:RUNNER_TEMP/oa-service-session.json"
           if ($LASTEXITCODE -ne 0) { throw "Fresh logon/recovery fixture exited $LASTEXITCODE" }
           "state=proven" >> $env:GITHUB_OUTPUT
           exit 0
