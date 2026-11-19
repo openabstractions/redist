@@ -414,16 +414,64 @@ while ([DateTime]::UtcNow -lt [DateTime]::Parse('__DEADLINE__').ToUniversalTime(
     if ($program.Length -gt 259) { throw 'RDP activation start program exceeds its native bound' }
     return [pscustomobject]@{Directory=$Directory;Diagnostics=$diagnostics;Script=$scriptPath;Module=$moduleCopy;
         ScriptSha256=(Get-FileHash -LiteralPath $scriptPath -Algorithm SHA256).Hash.ToLowerInvariant();ModuleSha256=$moduleHash;
-        Program=$powershell;Arguments=$arguments;StartProgram=$program}
+        Program=$powershell;Arguments=$arguments;StartProgram=$program;Deadline=$Deadline.ToUniversalTime().ToString('o')}
 }
-function Set-SessionActivation($Client,$Activation) {
+function Assert-SessionActivationInputs($Activation) {
     foreach ($entry in @(@($Activation.Script,$Activation.ScriptSha256),@($Activation.Module,$Activation.ModuleSha256))) {
         if ((Get-FileHash -LiteralPath $entry[0] -Algorithm SHA256).Hash.ToLowerInvariant() -cne $entry[1]) { throw 'Pinned session activation source changed' }
     }
-    # https://learn.microsoft.com/windows/win32/termserv/imstscsecuredsettings-startprogram
-    if (-not $Client.SecuredSettingsEnabled) { throw 'RDP client does not admit its official startup-program property' }
-    $Client.SecuredSettings.StartProgram=$Activation.StartProgram
-    $Client.SecuredSettings.WorkDir=$Activation.Directory
+}
+function Get-SessionActivationTask([string]$Name,[scriptblock]$Query) {
+    try{$tasks=@(if($Query){& $Query $Name}else{Get-ScheduledTask -TaskName $Name -TaskPath '\' -ErrorAction Stop})}
+    catch{if($_.CategoryInfo.Category -eq [Management.Automation.ErrorCategory]::ObjectNotFound){return};throw}
+    if($tasks.Count -eq 0){return}
+    if($tasks.Count -ne 1){throw 'One exact activation task required'}
+    return $tasks[0]
+}
+function Assert-SessionActivationTask($Task,$Record) {
+    $sid=if($Task.Principal.UserId -like 'S-1-*'){[Security.Principal.SecurityIdentifier]::new($Task.Principal.UserId).Value}
+        else{[Security.Principal.NTAccount]::new($Task.Principal.UserId).Translate([Security.Principal.SecurityIdentifier]).Value}
+    $actions=@($Task.Actions)
+    $limit=[Xml.XmlConvert]::ToTimeSpan($Task.Settings.ExecutionTimeLimit).TotalSeconds
+    if($Task.TaskName -cne $Record.Name -or $Task.TaskPath -cne '\' -or $sid -cne $Record.Sid -or
+        [int]$Task.Principal.LogonType -ne 3 -or [int]$Task.Principal.RunLevel -ne 0 -or $Task.Principal.GroupId -or
+        $Task.Triggers -or $actions.Count -ne 1 -or $actions[0].Execute -cne $Record.Program -or $actions[0].Arguments -cne $Record.Arguments -or
+        $actions[0].WorkingDirectory -cne $Record.Directory -or [int]$Task.Settings.MultipleInstances -ne 2 -or
+        $limit -le 0 -or $limit -gt $Record.LimitSeconds){throw 'Activation task differs from the exact interactive-account action'}
+}
+function Start-SessionActivationTask($Activation,[string]$Sid,[int]$Session,[hashtable]$State,[string]$StatePath,
+        [scriptblock]$Query,[scriptblock]$Register,[scriptblock]$Start,[scriptblock]$Build) {
+    if(($Query -or $Register -or $Start -or $Build) -and (-not $Query -or -not $Register -or -not $Start -or -not $Build)){throw 'Complete task I/O callbacks required'}
+    if($Session -le 0 -or $Sid -cne $State.Sid -or $State.ContainsKey('ActivationTask')){throw 'One fresh account/session activation required'}
+    Assert-SessionActivationInputs $Activation
+    $seconds=[int][Math]::Floor(([DateTime]::Parse($Activation.Deadline).ToUniversalTime()-[DateTime]::UtcNow).TotalSeconds)
+    if($seconds -le 0 -or $seconds -gt 600){throw 'Session activation deadline expired or exceeds caller bound'}
+    $record=@{Name=('OA-CI-RDP-'+[Guid]::NewGuid().ToString('N'));Sid=$Sid;Session=$Session;
+        Program=$Activation.Program;Arguments=$Activation.Arguments;Directory=$Activation.Directory;LimitSeconds=$seconds;Removed=$false}
+    if(Get-SessionActivationTask $record.Name $Query){throw 'Fresh activation task name required'}
+    $State.ActivationTask=$record
+    $State | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $StatePath -Encoding UTF8
+    $definition=if($Build){& $Build $record}else{
+        @{Action=(New-ScheduledTaskAction -Execute $record.Program -Argument $record.Arguments -WorkingDirectory $record.Directory);
+          Principal=(New-ScheduledTaskPrincipal -UserId $Sid -LogonType Interactive -RunLevel Limited);
+          Settings=(New-ScheduledTaskSettingsSet -ExecutionTimeLimit ([TimeSpan]::FromSeconds($seconds)) -MultipleInstances IgnoreNew)}
+    }
+    $action=$definition.Action;$principal=$definition.Principal;$settings=$definition.Settings
+    if($Register){& $Register $record.Name $action $principal $settings | Out-Null}
+    else{Register-ScheduledTask -TaskName $record.Name -TaskPath '\' -Action $action -Principal $principal -Settings $settings -ErrorAction Stop | Out-Null}
+    Assert-SessionActivationTask (Get-SessionActivationTask $record.Name $Query) $record
+    Assert-SessionActivationInputs $Activation
+    if($Start){& $Start $record.Name | Out-Null}else{Start-ScheduledTask -TaskName $record.Name -TaskPath '\' -ErrorAction Stop}
+    Write-Diagnostic 'RDP interactive activation task started=True' | Out-Null
+}
+function Remove-SessionActivationTask($Record,[string]$Sid,[scriptblock]$Query,[scriptblock]$Remove) {
+    if(($Query -or $Remove) -and (-not $Query -or -not $Remove)){throw 'Complete task I/O callbacks required'}
+    if($Record.Name -cnotmatch '^OA-CI-RDP-[0-9a-f]{32}$' -or $Record.Sid -cne $Sid -or $Record.Session -le 0){throw 'Unrecognized activation task ownership'}
+    $task=Get-SessionActivationTask $Record.Name $Query
+    if(-not $task){return}
+    Assert-SessionActivationTask $task $Record
+    if($Remove){& $Remove $Record.Name | Out-Null}else{Unregister-ScheduledTask -TaskName $Record.Name -TaskPath '\' -Confirm:$false -ErrorAction Stop}
+    if(Get-SessionActivationTask $Record.Name $Query){throw 'Activation task survived removal'}
 }
 function Assert-SessionActivation($Activation,[int]$Session,[string]$Sid) {
     $resultPath=Join-Path $Activation.Diagnostics 'start-result.json'
@@ -477,6 +525,12 @@ if ($Mode -eq 'Cleanup') {
     if ($state.User -notmatch '^oa_ci_[0-9a-f]{10}$') { throw 'Refusing unrecognized cleanup account' }
     $account = Get-LocalUser -Name $state.User -ErrorAction SilentlyContinue
     if ($account -and $state.Sid -and $account.SID.Value -ne $state.Sid) { throw 'Cleanup account SID changed' }
+    if($state.PSObject.Properties['ActivationTask']){
+        Remove-SessionActivationTask $state.ActivationTask $state.Sid
+        $state.ActivationTask.Removed=$true
+        $state | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $StatePath -Encoding UTF8
+        Write-Diagnostic 'RDP interactive activation task removed=True' | Out-Null
+    }
     # Restore connection policy even if subsequent account/session cleanup fails.
     if($state.PSObject.Properties['InitialProgramEnvironment']){
         Restore-SessionInitialEnvironment $state.InitialProgramEnvironment
@@ -531,7 +585,6 @@ if ($ActivateRuntime) {
         (Join-Path $PSScriptRoot 'OAFixture.psm1') $account.Sid ($started.ToUniversalTime().AddSeconds($ActivationSeconds))
     Grant-AccountAccess -Path $activation.Directory -Sid $account.Sid -Access ReadExecute
     Grant-AccountAccess -Path $activation.Diagnostics -Sid $account.Sid -Access Modify
-    Enable-SessionInitialEnvironment $StatePath $state
 }
 Set-ItemProperty $rdpKey -Name fDenyTSConnections -Value 0
 Start-Service TermService
@@ -561,8 +614,7 @@ try {
     $client.AdvancedSettings7.EnableCredSspSupport = $true
     # The endpoint is strictly loopback; avoid an unattended self-signed certificate dialog.
     $client.AdvancedSettings7.AuthenticationLevel = 0
-    if ($activation) { Set-SessionActivation $client $activation }
-    try{Write-SessionInitialProgramObservation $client $activation 'before-logon'}catch{Write-Warning 'RDP initial-program observation unavailable'}
+    try{Write-SessionInitialProgramObservation $client $null 'before-logon'}catch{Write-Warning 'RDP initial-program observation unavailable'}
     $client.Connect()
     # Connect is asynchronous. A token/process alone is not evidence of a completed GUI logon.
     $session = Wait-Condition {
@@ -579,7 +631,8 @@ try {
     } 90 'fresh RDP account session'
     $form.WindowState = 'Minimized'
     if ($session -eq (Get-Process -Id $PID).SessionId) { throw 'Fresh account reused runner session' }
-    try{Write-SessionInitialProgramObservation $client $activation 'after-logon' $session}catch{Write-Warning 'RDP initial-program observation unavailable'}
+    try{Write-SessionInitialProgramObservation $client $null 'after-logon' $session}catch{Write-Warning 'RDP initial-program observation unavailable'}
+    if($activation){Start-SessionActivationTask $activation $state.Sid $session $state $StatePath}
     if ($activation) { Assert-SessionActivation $activation $session $state.Sid }
     # The service template runs the windowless host, `openabstractionsw.exe serve supervisor --service`.
     $expectedImagePath = Join-Path $env:ProgramFiles ('OpenAbstractions\tools\' + $ExpectedImage)
