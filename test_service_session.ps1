@@ -252,6 +252,45 @@ function Restore-SessionInitialProgram([string]$Path,$Snapshot) {
     $actual=Get-SessionInitialProgramPolicy $Path
     if($actual.ValueExisted -ne $Snapshot.ValueExisted -or $actual.Kind -cne $Snapshot.Kind -or $actual.Value -ne $Snapshot.Value){throw 'Initial-program policy baseline was not restored'}
 }
+function Assert-SessionInitialEnvironment($Setting) {
+    foreach($name in @('InitialProgramPolicy','PolicySourceInitialProgramPath','PolicySourceStartIn')){
+        $value=$Setting.$name
+        if(($value -isnot [int] -and $value -isnot [uint32] -and $value -isnot [long]) -or $value -notin @(0,1,2)){
+            throw 'Unsupported connection initial-program policy enum'
+        }
+    }
+}
+function Get-SessionInitialEnvironment([scriptblock]$Query) {
+    if(-not $Query){$Query={Get-CimInstance -Namespace root/cimv2/terminalservices -ClassName Win32_TSEnvironmentSetting -Filter "TerminalName='RDP-Tcp'" -OperationTimeoutSec 2 -ErrorAction Stop}}
+    $settings=@(& $Query)
+    if($settings.Count -ne 1 -or $settings[0].TerminalName -ine 'RDP-Tcp'){throw 'One exact RDP-Tcp connection setting required'}
+    Assert-SessionInitialEnvironment $settings[0]
+    return $settings[0]
+}
+function Set-SessionInitialEnvironment($Setting,[ValidateSet(0,1,2)][int]$Value,[scriptblock]$Set) {
+    if($Set){& $Set $Setting $Value | Out-Null}
+    else{Set-CimInstance -InputObject $Setting -Property @{InitialProgramPolicy=[uint32]$Value} -ErrorAction Stop | Out-Null}
+}
+function Enable-SessionInitialEnvironment([string]$StatePath,[hashtable]$State,[scriptblock]$Query,[scriptblock]$Set) {
+    if($State.ContainsKey('InitialProgramEnvironment')){throw 'Connection initial-program baseline already recorded'}
+    $before=Get-SessionInitialEnvironment $Query
+    $State.InitialProgramEnvironment=@{InitialProgramPolicy=[int]$before.InitialProgramPolicy;
+        PolicySourceInitialProgramPath=[int]$before.PolicySourceInitialProgramPath;PolicySourceStartIn=[int]$before.PolicySourceStartIn;Restored=$false}
+    $State | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $StatePath -Encoding UTF8
+    Write-Diagnostic "RDP initial-program environment baseline policy=$($before.InitialProgramPolicy) source=$($before.PolicySourceInitialProgramPath) start-in-source=$($before.PolicySourceStartIn)" | Out-Null
+    # The documented Per User (0) policy admits the client-selected startup
+    # program. The observed Server-Override (1) selected an empty shell.
+    if($before.InitialProgramPolicy -eq 0){return}
+    Set-SessionInitialEnvironment $before 0 $Set
+    if((Get-SessionInitialEnvironment $Query).InitialProgramPolicy -ne 0){throw 'Connection did not admit per-user initial-program selection'}
+}
+function Restore-SessionInitialEnvironment($Snapshot,[scriptblock]$Query,[scriptblock]$Set) {
+    Assert-SessionInitialEnvironment $Snapshot
+    $actual=Get-SessionInitialEnvironment $Query
+    if($actual.InitialProgramPolicy -eq $Snapshot.InitialProgramPolicy){return}
+    Set-SessionInitialEnvironment $actual $Snapshot.InitialProgramPolicy $Set
+    if((Get-SessionInitialEnvironment $Query).InitialProgramPolicy -ne $Snapshot.InitialProgramPolicy){throw 'Connection initial-program baseline was not restored'}
+}
 function Format-SessionProgram([ValidateSet('client-start','server-start','policy-start')][string]$Label,[string]$Value,[string]$Expected) {
     $hash=[Security.Cryptography.SHA256]::Create()
     try{$digest=([BitConverter]::ToString($hash.ComputeHash([Text.Encoding]::UTF8.GetBytes($Value)))).Replace('-','').ToLowerInvariant()}
@@ -279,14 +318,11 @@ function Write-SessionInitialProgramObservation($Client,$Activation,[ValidateSet
         Write-Diagnostic "RDP $Phase inherit-client-program=$inherits" | Out-Null
     }catch{Write-Diagnostic "RDP $Phase inherit-client-program unavailable" | Out-Null}
     try{
-        $settings=@(Get-CimInstance -Namespace root/cimv2/terminalservices -ClassName Win32_TSEnvironmentSetting -Filter "TerminalName='RDP-Tcp'" -OperationTimeoutSec 2 -ErrorAction Stop)
-        if($settings.Count -ne 1){throw 'One connection setting required'}
+        $setting=Get-SessionInitialEnvironment
         foreach($name in @('InitialProgramPolicy','PolicySourceInitialProgramPath','PolicySourceStartIn')){
-            $value=$settings[0].$name
-            $enum=if($null -ne $value -and $value -in @(0,1,2)){[int]$value}else{'unavailable'}
-            Write-Diagnostic "RDP $Phase $name=$enum" | Out-Null
+            Write-Diagnostic "RDP $Phase $name=$($setting.$name)" | Out-Null
         }
-        Write-Diagnostic ("RDP $Phase "+(Format-SessionProgram 'policy-start' ([string]$settings[0].InitialProgramPath) $expected)) | Out-Null
+        Write-Diagnostic ("RDP $Phase "+(Format-SessionProgram 'policy-start' ([string]$setting.InitialProgramPath) $expected)) | Out-Null
     }catch{Write-Diagnostic "RDP $Phase connection-initial-program unavailable" | Out-Null}
 }
 function Wait-Condition([scriptblock]$Check, [int]$Seconds, [string]$Description) {
@@ -442,6 +478,13 @@ if ($Mode -eq 'Cleanup') {
     $account = Get-LocalUser -Name $state.User -ErrorAction SilentlyContinue
     if ($account -and $state.Sid -and $account.SID.Value -ne $state.Sid) { throw 'Cleanup account SID changed' }
     # Restore connection policy even if subsequent account/session cleanup fails.
+    if($state.PSObject.Properties['InitialProgramEnvironment']){
+        Restore-SessionInitialEnvironment $state.InitialProgramEnvironment
+        $state.InitialProgramEnvironment.Restored=$true
+        $state | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $StatePath -Encoding UTF8
+        Write-Diagnostic 'RDP initial-program environment baseline restored=True' | Out-Null
+    }
+    # Older diagnostic state recorded the registry flag instead.
     if($state.PSObject.Properties['InitialProgramPolicy']){
         Restore-SessionInitialProgram $initialProgramKey $state.InitialProgramPolicy
         $state.InitialProgramPolicy.Restored=$true
@@ -488,7 +531,7 @@ if ($ActivateRuntime) {
         (Join-Path $PSScriptRoot 'OAFixture.psm1') $account.Sid ($started.ToUniversalTime().AddSeconds($ActivationSeconds))
     Grant-AccountAccess -Path $activation.Directory -Sid $account.Sid -Access ReadExecute
     Grant-AccountAccess -Path $activation.Diagnostics -Sid $account.Sid -Access Modify
-    Enable-SessionInitialProgram $initialProgramKey $StatePath $state
+    Enable-SessionInitialEnvironment $StatePath $state
 }
 Set-ItemProperty $rdpKey -Name fDenyTSConnections -Value 0
 Start-Service TermService
