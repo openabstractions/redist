@@ -505,9 +505,15 @@ public sealed class OaInstalledPanelSmoke : IDisposable {
     }
     // Each UIA observation has its own bound. A hung provider cannot hang the
     // fixture or prevent owned-process cleanup; background probe threads do no writes.
-    public bool Ready(IntPtr hwnd, string page) {
+    public static void Observe(Action observation, int milliseconds) {
+        if(milliseconds<1 || milliseconds>30000) throw new ArgumentOutOfRangeException("milliseconds");
+        Thread probe=new Thread(()=>observation());
+        probe.IsBackground=true; probe.SetApartmentState(ApartmentState.STA); probe.Start();
+        if(!probe.Join(milliseconds)) throw new TimeoutException("Installed Panel UIA provider deadline");
+    }
+    public bool Ready(IntPtr hwnd, string page, int milliseconds) {
         bool ready=false; Exception failure=null;
-        Thread probe=new Thread(()=>{try {
+        Observe(()=>{try {
             AutomationElement window=AutomationElement.FromHandle(hwnd);
             AutomationElement document=window.FindFirst(TreeScope.Descendants,new PropertyCondition(AutomationElement.ControlTypeProperty,ControlType.Document));
             if(document==null) return;
@@ -537,9 +543,7 @@ public sealed class OaInstalledPanelSmoke : IDisposable {
                     if(state!=null && !state.Current.IsOffscreen) { ready=true; return; }
                 }
             }
-        } catch(Exception error) { failure=error; }});
-        probe.IsBackground=true; probe.SetApartmentState(ApartmentState.STA); probe.Start();
-        if(!probe.Join(1500)) throw new TimeoutException("Installed Panel UIA provider deadline");
+        } catch(Exception error) { failure=error; }}, milliseconds);
         if(failure!=null) return false;
         return ready;
     }
@@ -561,7 +565,8 @@ public sealed class OaInstalledPanelSmoke : IDisposable {
         do {
             if ($owned.Exited) { throw 'Installed shortcut exited before its native page became ready' }
             $window = $owned.Window()
-            if ($window -ne [IntPtr]::Zero -and $owned.Ready($window, $Page)) {
+            $remaining = [int][Math]::Max(0, [Math]::Min(30000, [Math]::Floor(($deadline - [DateTime]::UtcNow).TotalMilliseconds)))
+            if ($window -ne [IntPtr]::Zero -and $remaining -gt 0 -and $owned.Ready($window, $Page, $remaining)) {
                 return [ordered]@{ page=$Page; pid=$owned.Pid; target=$Target; arguments=$Arguments;
                     standardHandles='invalid'; nativeClass='abstraction.panel'; renderedPage=$true }
             }
