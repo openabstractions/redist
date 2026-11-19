@@ -675,7 +675,8 @@ def source_roles(app,owner,out,inputs,payload=None):
     if app=='comfyui':
         return owner.source_roles(pathlib.Path('windows/apps'))
     return owner.source_roles(out if payload is not None else None,
-                              inputs/'opencode-cli.zip' if payload is not None else None,payload)
+                              inputs/'opencode-cli.zip' if payload is not None else None,payload,
+                              **({'retained_inputs':out/'plugin-inputs'} if payload is not None else {}))
 
 
 def application_native_sign(required,version):
@@ -987,7 +988,8 @@ def inherited_desktop_package(native,inputs,expected_sources):
     return package
 
 
-def native_closure_files(app,out,producer,version,*,inputs,producer_receipt,desktop_signed_pin=None):
+def native_closure_files(app,out,producer,version,*,inputs,producer_receipt,desktop_signed_pin=None,
+                         opencode_owner=None,retained_inputs=False):
     """Original measured files, using the existing producer's fixed layout."""
     name={'lemonade':'native-receipt.json','comfyui':'preparation-native-receipt.json','opencode':'payload-receipt.json'}[app]
     receipt_path=closure_file(out,name);receipt=json.loads(receipt_path.read_bytes())
@@ -1021,6 +1023,38 @@ def native_closure_files(app,out,producer,version,*,inputs,producer_receipt,desk
         files['integration-payload.zip']=closure_file(out,'integration-payload.zip')
         if pin(files['integration-payload.zip'])['sha256']!=receipt['zip_sha256']:
             raise ValueError('prepared integration payload differs')
+        if retained_inputs and 'bundled_plugin' in receipt:
+            if opencode_owner is None:raise ValueError('retained OpenCode inputs require the selected owner')
+            for digest,value in opencode_owner.retained_plugin_inputs(receipt).items():
+                name='plugin-inputs/'+digest+'.tgz'
+                files[name]=closure_file(out,name,value)
+    return files
+
+
+def retain_opencode_inputs(owner,native,base):
+    receipt=json.loads(closure_file(native,'payload-receipt.json').read_bytes())
+    required=owner.retained_plugin_inputs(receipt)
+    if not required:return {}
+    candidates=[base/'native/opencode-bundled-plugin.tgz',base/'inputs/opencode-plugin.tgz',
+                *sorted((base/'sdk/npm').glob('*.tgz'))]
+    selected={}
+    for path in candidates:
+        path=closure_file(path.parent,path.name)
+        measured=pin(path);digest=measured['sha256']
+        if digest in required and all(measured[key]==required[digest][key] for key in ('sha256','bytes')):
+            selected.setdefault(digest,path)
+    if set(selected)!=set(required):raise ValueError('OpenCode composition input closure is incomplete')
+    directory=native/'plugin-inputs'
+    ordinary_path(directory,kind='directory',allow_missing=True);directory.mkdir(exist_ok=True)
+    files={}
+    for digest,path in selected.items():
+        target=directory/(digest+'.tgz')
+        ordinary_path(target,kind='file',allow_missing=True)
+        if not target.exists():
+            with target.open('xb') as destination,path.open('rb') as source:
+                shutil.copyfileobj(source,destination)
+        files['plugin-inputs/'+target.name]=closure_file(directory,target.name,required[digest])
+        closure_file(path.parent,path.name,required[digest])
     return files
 
 
@@ -1168,7 +1202,8 @@ def prepare_comfy_source_pair(owner,inputs,producer,destination):
     return pin(destination)
 
 
-def received_producer_closure(app,raw,*,expected_sources,producer_source,run_id,version,intake_files=None):
+def received_producer_closure(app,raw,*,expected_sources,producer_source,run_id,version,intake_files=None,
+                              opencode_owner=None):
     """Read original receipts only after the caller authenticates raw intake.
 
     Before archive production it measures the required originals. Credentialed
@@ -1263,7 +1298,8 @@ def received_producer_closure(app,raw,*,expected_sources,producer_source,run_id,
             raise ValueError('native application closure differs from authenticated API intake')
         return result
     files=native_closure_files(app,out,producer,version,inputs=inputs,producer_receipt=original,
-        desktop_signed_pin=admitted['provenance/comfyui/desktop-signed-receipt.json'] if app=='comfyui' and admitted is not None else None)
+        desktop_signed_pin=admitted['provenance/comfyui/desktop-signed-receipt.json'] if app=='comfyui' and admitted is not None else None,
+        opencode_owner=opencode_owner,retained_inputs=True)
     final_path=closure_file(raw,'apps/'+app+'/installer-receipt.json');final=json.loads(final_path.read_bytes())
     original_name={'lemonade':'native-receipt.json','comfyui':'preparation-native-receipt.json','opencode':'payload-receipt.json'}[app]
     native=json.loads(files[original_name].read_bytes())
@@ -1413,6 +1449,7 @@ def application_package(required,version):
         subprocess.run([canonical_tool(sys.executable),str(pathlib.Path(owner.__file__).resolve()),*arguments],check=True)
         if app=='lemonade':
             originals.update(lemonade_package_files(out,json.loads((target/'installer-receipt.json').read_bytes())))
+        if app=='opencode':originals.update(retain_opencode_inputs(owner,out,base))
         if app=='comfyui':
             originals['package/desktop-package-receipt.json']=closure_file(out,'package/desktop-package-receipt.json')
         row=json.loads((target/'bundle-app.json').read_bytes())
@@ -1476,7 +1513,8 @@ def application_package(required,version):
         if (inputs/name).is_file():shutil.copyfile(inputs/name,proof_inputs/name)
     for app in owners:
         received_producer_closure(app,pathlib.Path('setup'),expected_sources=producer['sources'],
-            producer_source=os.environ['CANDIDATE_SHA'],run_id=int(os.environ['GITHUB_RUN_ID']),version=version)
+            producer_source=os.environ['CANDIDATE_SHA'],run_id=int(os.environ['GITHUB_RUN_ID']),version=version,
+            opencode_owner=owners[app] if app=='opencode' else None)
     canonical=pathlib.Path('setup/provenance/canonical');canonical.mkdir()
     source=base/'sdk/canonical'
     receipt=json.loads((source/'signatures.json').read_bytes())
@@ -1645,7 +1683,8 @@ def application_bind(required,version):
     if original['sources']!=pins:raise ValueError('app producer source/SDK selection differs from current source')
     for app in owners:
         received_producer_closure(app,raw,expected_sources=pins,producer_source=os.environ['CANDIDATE_SHA'],
-                                  run_id=int(os.environ['GITHUB_RUN_ID']),version=version,intake_files=intake['files'])
+                                  run_id=int(os.environ['GITHUB_RUN_ID']),version=version,intake_files=intake['files'],
+                                  opencode_owner=owners[app] if app=='opencode' else None)
     for name in ('wix-ui.nupkg','WixToolset.UI.wixext.dll','opencode-cli.zip'):
         if (inputs/name).is_file():
             if any(pin(inputs/name)[key]!=original['build_inputs'][name][key] for key in ('sha256','bytes')):
@@ -2381,8 +2420,19 @@ def received_installer_chain(required, inputs, expected_producers, version, veri
                 raise ValueError('installer container differs from admitted producer payload')
             declared = (receipt.get('compiled_readback', {}).get('expected_payload')
                         if app == 'opencode' else receipt.get('expected_payload'))
+            schema=declared.get('schema') if isinstance(declared,dict) else None
+            received_schema=expected.get('schema')
+            same_schema=(type(schema) is int and schema in (1,2) and
+                         type(received_schema) is int and schema==received_schema)
+            # The source getter adds the finite content-PE policy during
+            # receiving. The mandatory verifier below validates those roles.
+            enriched_schema=(app=='opencode' and type(schema) is int and schema==1 and
+                type(received_schema) is int and received_schema==2 and
+                'supplier_content_pe' not in declared and
+                isinstance(expected.get('supplier_content_pe'),list) and bool(expected['supplier_content_pe']))
             if (not isinstance(declared, dict) or
-                    any(declared.get(key) != expected.get(key) for key in ('schema','files','binaries')) or
+                    not (same_schema or enriched_schema) or
+                    any(declared.get(key) != expected.get(key) for key in ('files','binaries')) or
                     not isinstance(declared.get('msi'),dict) or
                     dict(declared['msi'],name=pathlib.PurePosixPath(declared['msi'].get('name','')).name) !=
                     dict(expected['msi'],name=pathlib.PurePosixPath(expected['msi']['name']).name)):
