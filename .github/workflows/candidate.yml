@@ -1738,6 +1738,7 @@ jobs:
           name: windows-app-native-raw-${{ github.run_attempt }}
           path: |
             app-native/
+            !app-native/sdk-sources/
             !app-native/native/comfyui/backend-launch-build/
           include-hidden-files: true
           if-no-files-found: error
@@ -1809,6 +1810,7 @@ jobs:
           name: windows-app-native-signed-${{ github.run_attempt }}
           path: |
             app-native/
+            !app-native/sdk-sources/
             !app-native/native/comfyui/backend-launch-build/
           include-hidden-files: true
           if-no-files-found: error
@@ -1880,6 +1882,7 @@ jobs:
           path: |
             app-native/
             !app-native/artifact-intake.json
+            !app-native/sdk-sources/
             !app-native/native/comfyui/backend-launch-build/
           include-hidden-files: true
           if-no-files-found: error
@@ -1959,6 +1962,7 @@ jobs:
           path: |
             app-native/
             !app-native/artifact-intake.json
+            !app-native/sdk-sources/
             !app-native/native/comfyui/backend-launch-build/
           include-hidden-files: true
           if-no-files-found: error
