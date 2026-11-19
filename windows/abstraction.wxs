@@ -541,6 +541,12 @@
              %ProgramData%\abstraction\upgrade-v1 behind after uninstall. -->
         <RemoveFile Id="RemoveMachineInstallerActionLog" Name="installer-actions.txt"
                     Directory="MachineUpgradeFolder" On="uninstall" />
+        <!-- The scope and record CAS locks keep their sidecar files after
+             releasing the handles. Only these owned names are disposable. -->
+        <RemoveFile Id="RemoveMachineUpgradeAdmissionLock" Name="admission.lock"
+                    Directory="MachineUpgradeFolder" On="uninstall" />
+        <RemoveFile Id="RemoveMachineUpgradeExclusionLock" Name="exclusion.json.lock"
+                    Directory="MachineUpgradeFolder" On="uninstall" />
         <RemoveFolder Id="RemoveMachineUpgradeFolder" Directory="MachineUpgradeFolder" On="uninstall" />
       </Component>
     </ComponentGroup>

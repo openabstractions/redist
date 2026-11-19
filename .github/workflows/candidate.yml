@@ -2931,6 +2931,7 @@ jobs:
             machine-removal-after-failure-installer-actions.log
             service-session.log
             service-session-cleanup.log
+            service-session-activation/
             elevated-unscoped.log
           if-no-files-found: ignore
 

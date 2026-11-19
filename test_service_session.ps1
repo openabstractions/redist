@@ -261,6 +261,7 @@ function New-SessionActivation([string]$Directory, [string]$Runtime, [string]$Mo
     $moduleHash=(Get-FileHash -LiteralPath $moduleCopy -Algorithm SHA256).Hash.ToLowerInvariant()
     $script=@'
 $ErrorActionPreference='Stop'
+[IO.File]::WriteAllText(($PSScriptRoot+'\diagnostics\start-entry.txt'),[DateTime]::UtcNow.ToString('o'),[Text.UTF8Encoding]::new($false))
 $record=[ordered]@{ExitCode=$null;Closure='unknown';Sid=[Security.Principal.WindowsIdentity]::GetCurrent().User.Value;Session=(Get-Process -Id $PID).SessionId;Failure=''}
 try {
     if ([DateTime]::UtcNow -ge [DateTime]::Parse('__DEADLINE__').ToUniversalTime()) { throw 'RDP activation deadline expired' }
@@ -319,6 +320,20 @@ function Assert-SessionActivation($Activation,[int]$Session,[string]$Sid) {
         if (Test-Path -LiteralPath $path) { Write-Diagnostic (Protect-StatusText (Get-Content -LiteralPath $path -Raw)) | Out-Null }
     }
     if ($null -eq $result.ExitCode -or $result.ExitCode -ne 0 -or $result.Closure -cne 'known' -or $result.Failure) { throw "Installed demand-start activation failed: $($result.Failure)" }
+}
+# Snapshot the bounded wrapper's existing observations before account cleanup.
+# An absent entry/result remains absent evidence; no startup success is inferred.
+function Save-SessionActivationDiagnostics($Activation,[string]$Directory) {
+    if (-not $Activation) { return }
+    if (Test-Path -LiteralPath $Directory) { throw 'Fresh activation diagnostic output required' }
+    [IO.Directory]::CreateDirectory($Directory) | Out-Null
+    foreach ($name in @('start-entry.txt','start-process.json','start-result.json','start.stdout','start.stderr')) {
+        $path=Join-Path $Activation.Diagnostics $name
+        if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { continue }
+        $item=Get-Item -LiteralPath $path
+        if ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) { throw 'Ordinary activation diagnostics required' }
+        Copy-Item -LiteralPath $path -Destination (Join-Path $Directory $name)
+    }
 }
 # Removal is checked before Cleanup logs off the account and can terminate its processes.
 if ($Mode -eq 'VerifyRemoved') {
@@ -603,6 +618,8 @@ try {
     Write-Diagnostic "RDP loginComplete=$($hostControl.LoginComplete) disconnectReason=$($hostControl.DisconnectReason); $($_.Exception.Message)"
     throw
 } finally {
+    try { Save-SessionActivationDiagnostics $activation (Join-Path (Get-Location).Path 'service-session-activation') }
+    catch { Write-Warning "Could not retain activation diagnostics: $($_.FullyQualifiedErrorId)" }
     if ($client -and $client.Connected -ne 0) { $client.Disconnect() }
     $form.Close()
     $form.Dispose()
