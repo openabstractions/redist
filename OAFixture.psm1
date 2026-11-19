@@ -523,7 +523,7 @@ public sealed class OaInstalledPanelSmoke : IDisposable {
                 ready=choices!=null && arrival!=null && !arrival.Current.IsOffscreen && review!=null && !review.Current.IsEnabled;
             } else {
                 // The default page has its own content; sidebar text cannot satisfy it.
-                AutomationElement body=document.FindFirst(TreeScope.Descendants,new PropertyCondition(AutomationElement.NameProperty,"Your apps"));
+                AutomationElement body=document.FindFirst(TreeScope.Descendants,new OrCondition(new PropertyCondition(AutomationElement.NameProperty,"Your apps"),new PropertyCondition(AutomationElement.NameProperty,"Your apps Learn more")));
                 AutomationElement caption=document.FindFirst(TreeScope.Descendants,new PropertyCondition(AutomationElement.NameProperty,"Apps that use OpenAbstractions."));
                 if(body==null || caption==null || body.Current.IsOffscreen || caption.Current.IsOffscreen) return;
                 // renderApps creates these nodes only after /apps/registrations
