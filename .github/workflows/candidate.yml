@@ -8,6 +8,10 @@ on:
         description: Rebuild core MSI containers and Setup using fixed signed run 445994 input roles
         type: boolean
         default: false
+      windows_tail_bundle_resume:
+        description: Resume Setup assembly using the completed signed MSI and BA carrier from run 44642911527
+        type: boolean
+        default: false
       core_only:
         description: Core-only signed installer diagnostic; excludes all applications and cannot be promoted
         type: boolean
@@ -129,10 +133,15 @@ jobs:
         env:
           EXPECTED_SOURCE_SHA: ${{ inputs.source_sha }}
           WINDOWS_TAIL_ONLY: ${{ inputs.windows_tail_only }}
+          WINDOWS_TAIL_BUNDLE_RESUME: ${{ inputs.windows_tail_bundle_resume }}
           TAIL_VERSION: ${{ inputs.version }}
         run: |
           if [[ ! "$EXPECTED_SOURCE_SHA" =~ ^[0-9a-f]{40}$ || "$EXPECTED_SOURCE_SHA" != "$GITHUB_SHA" ]]; then
             echo 'FAIL dispatch requires the exact prepared public redist SHA'
+            exit 1
+          fi
+          if [ "$WINDOWS_TAIL_BUNDLE_RESUME" = true ] && [ "$WINDOWS_TAIL_ONLY" != true ]; then
+            echo 'FAIL windows_tail_bundle_resume requires windows_tail_only'
             exit 1
           fi
           if [ "$WINDOWS_TAIL_ONLY" = true ]; then
@@ -5182,7 +5191,7 @@ jobs:
   windows-tail-build:
     needs:
     - source-guard
-    if: ${{ needs.source-guard.result == 'success' && inputs.windows_tail_only && inputs.version == 'v0.8.0' && inputs.producer_mode == 'train'
+    if: ${{ needs.source-guard.result == 'success' && inputs.windows_tail_only && !inputs.windows_tail_bundle_resume && inputs.version == 'v0.8.0' && inputs.producer_mode == 'train'
       && !inputs.core_only && !inputs.signing_probe_only && !inputs.diagnostic_host_sign_only && inputs.app_producer_only == 'none' && inputs.app_delivery_only
       == 'none' && github.repository == 'openabstractions/redist' && github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/release/0.8.0'
       && github.actor == 'ReinisLusis' && github.triggering_actor == 'ReinisLusis' }}
@@ -5323,7 +5332,7 @@ jobs:
   windows-tail-msi-sign:
     needs:
     - windows-tail-build
-    if: ${{ inputs.windows_tail_only && success() && github.repository == 'openabstractions/redist' && github.event_name == 'workflow_dispatch'
+    if: ${{ inputs.windows_tail_only && !inputs.windows_tail_bundle_resume && success() && github.repository == 'openabstractions/redist' && github.event_name == 'workflow_dispatch'
       && github.ref == 'refs/heads/release/0.8.0' && github.actor == 'ReinisLusis' && github.triggering_actor == 'ReinisLusis' }}
     runs-on: windows-latest
     timeout-minutes: 90
@@ -5434,8 +5443,13 @@ jobs:
     environment: signing
   windows-tail-bundle:
     needs:
+    - source-guard
     - windows-tail-msi-sign
-    if: ${{ inputs.windows_tail_only && success() }}
+    if: ${{ !cancelled() && needs.source-guard.result == 'success' && inputs.windows_tail_only
+      && ((inputs.windows_tail_bundle_resume && needs.windows-tail-msi-sign.result == 'skipped')
+      || (!inputs.windows_tail_bundle_resume && needs.windows-tail-msi-sign.result == 'success'))
+      && github.repository == 'openabstractions/redist' && github.event_name == 'workflow_dispatch'
+      && github.ref == 'refs/heads/release/0.8.0' && github.actor == 'ReinisLusis' && github.triggering_actor == 'ReinisLusis' }}
     runs-on: windows-latest
     timeout-minutes: 90
     permissions:
@@ -5447,6 +5461,11 @@ jobs:
       CANDIDATE_SHA: ${{ github.sha }}
       CANDIDATE_VERSION: 0.8.0
       GH_TOKEN: ${{ github.token }}
+      MSI_SOURCE: ${{ inputs.windows_tail_bundle_resume && 'c19193b92579fd218e6b7449aa0a8efc9c046aea' || github.sha }}
+      MSI_RUN: ${{ inputs.windows_tail_bundle_resume && '44642911527' || github.run_id }}
+      MSI_ARTIFACT_ID: ${{ inputs.windows_tail_bundle_resume && '14586923496' || needs.windows-tail-msi-sign.outputs.artifact-id }}
+      MSI_ARTIFACT_DIGEST: ${{ inputs.windows_tail_bundle_resume && 'e4cabf4c7a08d08f8f9fc64796ebc0a8e7b57bc82ad83819f8f0fe18ae4109b6' || needs.windows-tail-msi-sign.outputs.artifact-digest }}
+      MSI_ARTIFACT_ATTEMPT: ${{ inputs.windows_tail_bundle_resume && '1' || needs.windows-tail-msi-sign.outputs.artifact-attempt }}
     outputs:
       artifact-id: ${{ steps.artifact.outputs.artifact-id }}
       artifact-digest: ${{ steps.artifact.outputs.artifact-digest }}
@@ -5459,25 +5478,21 @@ jobs:
       with:
         python-version: '3.12'
     - name: receive new windows-msi-signed
-      run: python3 windows/windows_signing.py consume --artifact-id "$ARTIFACT_ID" --digest "$ARTIFACT_DIGEST" --name "windows-msi-signed-$ARTIFACT_ATTEMPT"
-        --source "$GITHUB_SHA" --run-id "$GITHUB_RUN_ID" --attempt "$ARTIFACT_ATTEMPT" --out signed-msis --receipt signed-msis/artifact-intake.json
+      run: python3 windows/windows_signing.py consume --artifact-id "$MSI_ARTIFACT_ID" --digest "$MSI_ARTIFACT_DIGEST" --name "windows-msi-signed-$MSI_ARTIFACT_ATTEMPT"
+        --source "$MSI_SOURCE" --run-id "$MSI_RUN" --attempt "$MSI_ARTIFACT_ATTEMPT" --out signed-msis --receipt signed-msis/artifact-intake.json
       shell: bash
-      env:
-        ARTIFACT_ID: ${{ needs.windows-tail-msi-sign.outputs.artifact-id }}
-        ARTIFACT_DIGEST: ${{ needs.windows-tail-msi-sign.outputs.artifact-digest }}
-        ARTIFACT_ATTEMPT: ${{ needs.windows-tail-msi-sign.outputs.artifact-attempt }}
-    - name: receive original verified platform assets without restamping
+    - name: receive original canonical native files and complete app signature proof
       run: |-
-        python3 windows/windows_signing.py consume --artifact-id "$VERIFIED_RELEASE_ID" --digest "$VERIFIED_RELEASE_DIGEST" --name verified-release-1 --source "$RETAINED_SOURCE" --run-id "$RETAINED_RUN" --attempt "$VERIFIED_RELEASE_ATTEMPT" --out original-release --receipt original-release/artifact-intake.json
         python3 windows/windows_signing.py consume --artifact-id "$WINDOWS_PE_SIGNED_ID" --digest "$WINDOWS_PE_SIGNED_DIGEST" --name windows-pe-signed-1 --source "$RETAINED_SOURCE" --run-id "$RETAINED_RUN" --attempt "$WINDOWS_PE_SIGNED_ATTEMPT" --out canonical --receipt canonical/artifact-intake.json
+        python3 windows/windows_signing.py consume --artifact-id "$WINDOWS_APP_SIGNED_ID" --digest "$WINDOWS_APP_SIGNED_DIGEST" --name windows-app-signed-1 --source "$RETAINED_SOURCE" --run-id "$RETAINED_RUN" --attempt "$WINDOWS_APP_SIGNED_ATTEMPT" --out retained-apps --receipt retained-apps/artifact-intake.json
       shell: bash
       env:
-        VERIFIED_RELEASE_ID: '14574054622'
-        VERIFIED_RELEASE_DIGEST: 03e93ad92ee580a160b4cd8e3dae1060c4c4282bbec3eb3c54612d17b1809d15
-        VERIFIED_RELEASE_ATTEMPT: '1'
         WINDOWS_PE_SIGNED_ID: '14570789689'
         WINDOWS_PE_SIGNED_DIGEST: 519bc5f6c0709dbddae4a8259afbaaec5787aa99c597e70981cfc61c3bf2bfb4
         WINDOWS_PE_SIGNED_ATTEMPT: '1'
+        WINDOWS_APP_SIGNED_ID: '14571930972'
+        WINDOWS_APP_SIGNED_DIGEST: f4465373d669e59eac02add3d821ea670b801870ff51f9c4c82094000c67712e
+        WINDOWS_APP_SIGNED_ATTEMPT: '1'
     - name: pinned WiX packages
       run: python3 windows/wix_packages.py --dest wix-packages --env "$GITHUB_ENV"
     - name: wix
@@ -5490,7 +5505,7 @@ jobs:
       shell: bash
       run: python3 windows/windows_signing.py verify-msis --root signed-msis/core --canonical canonical/native/abstraction_ipc.dll --policy windows/certum_simplysign.json
         --signtool "$SIGNTOOL" --receipt new-core-native-verification.json --native-roster pypi.tsv
-    - name: compose ordinary release view with new core containers
+    - name: compose finite core view from independently native-verified containers
       run: |-
         python3 - <<'PY'
         import os,json,sys,hashlib,pathlib,shutil,subprocess
@@ -5498,24 +5513,48 @@ jobs:
         sys.path.insert(0,'windows')
         import windows_signing as s
 
-        shutil.copytree('original-release','release-view',ignore=shutil.ignore_patterns(s.INTAKE_RECEIPT))
+        Path('release-view').mkdir()
         for arch in ('x64','arm64'):
          shutil.copyfile('signed-msis/core/abstraction-'+arch+'.msi','release-view/abstraction-'+arch+'.msi')
-        # This is a derived file view, not a received/verified-release artifact.
+        # This finite derived core view grants no verified-release/API identity.
         files=sorted(p for p in Path('release-view').iterdir() if p.is_file() and p.name!='SHA256SUMS')
         Path('release-view/SHA256SUMS').write_text(''.join(hashlib.sha256(p.read_bytes()).hexdigest()+'  '+p.name+'\n' for p in files))
         PY
       shell: bash
-    - name: prepare signed chain with original app bindings
-      run: python3 windows/windows_signing.py prepare-chain --root signed-msis --release release-view --out setup --policy windows/certum_simplysign.json
-        --signtool "$SIGNTOOL" --producer-context signed-msis/app-chain-context.json --source "$GITHUB_SHA" --run-id "$GITHUB_RUN_ID" --version
-        0.8.0 --artifact-id "$CONTEXT_ID" --artifact-name "windows-msi-signed-$CONTEXT_ATTEMPT" --artifact-digest "$CONTEXT_DIGEST" --artifact-attempt
-        "$CONTEXT_ATTEMPT" --producer-source "$RETAINED_SOURCE" --producer-run-id "$RETAINED_RUN" --producer-run-attempt 1
+    - name: join complete original app signatures in a separate derived assembly view
+      run: |-
+        python3 - <<'PY'
+        import os,json,sys,hashlib,shutil
+        from pathlib import Path
+        sys.path.insert(0,'windows')
+        import windows_signing as s
+        policy_raw=Path('windows/certum_simplysign.json').read_bytes()
+        policy=json.loads(policy_raw);policy_sha=hashlib.sha256(policy_raw).hexdigest()
+        current=s.verify_receipt(json.loads(Path('signed-msis/signatures.json').read_bytes()),policy,
+         Path('signed-msis'),policy_sha256=policy_sha)
+        original=s.verify_receipt(json.loads(Path('retained-apps/signatures.json').read_bytes()),policy,
+         Path('retained-apps'),policy_sha256=policy_sha)
+        proofs={row['name']:row for row in current['files']}
+        for row in original['files']:
+         if row['name'] in proofs and proofs[row['name']]!=row:
+          raise ValueError('retained app signature proof conflicts with the new signed carrier')
+         proofs[row['name']]=row
+        for name,row in proofs.items():
+         actual=s.verify(s.member(Path('signed-msis'),name),policy,os.environ['SIGNTOOL'])
+         if any(actual[key]!=row[key] for key in ('sha256','bytes')):
+          raise ValueError('assembly signature member differs from its native-verified original bytes')
+        shutil.copytree('signed-msis','assembly-input',ignore=shutil.ignore_patterns(s.INTAKE_RECEIPT))
+        # Preserve both API-admitted roots; this is an ordinary derived view.
+        Path('assembly-input/signatures.json').write_text(json.dumps(dict(current,
+         files=[proofs[name] for name in sorted(proofs)]),sort_keys=True)+'\n')
+        PY
       shell: bash
-      env:
-        CONTEXT_ID: ${{ needs.windows-tail-msi-sign.outputs.artifact-id }}
-        CONTEXT_DIGEST: ${{ needs.windows-tail-msi-sign.outputs.artifact-digest }}
-        CONTEXT_ATTEMPT: ${{ needs.windows-tail-msi-sign.outputs.artifact-attempt }}
+    - name: prepare signed chain with original app bindings
+      run: python3 windows/windows_signing.py prepare-chain --root assembly-input --release release-view --out setup --policy windows/certum_simplysign.json
+        --signtool "$SIGNTOOL" --producer-context signed-msis/app-chain-context.json --source "$MSI_SOURCE" --run-id "$MSI_RUN" --version
+        0.8.0 --artifact-id "$MSI_ARTIFACT_ID" --artifact-name "windows-msi-signed-$MSI_ARTIFACT_ATTEMPT" --artifact-digest "$MSI_ARTIFACT_DIGEST" --artifact-attempt
+        "$MSI_ARTIFACT_ATTEMPT" --producer-source "$RETAINED_SOURCE" --producer-run-id "$RETAINED_RUN" --producer-run-attempt 1
+      shell: bash
     - name: assemble Setup from new signed core and BA
       run: |-
         python3 - <<'PY'
@@ -5540,13 +5579,9 @@ jobs:
       run: |-
         mkdir setup-dist
         cp setup/bundle/OpenAbstractions-Setup-0.8.0.exe setup/bundle/bundle-receipt.json setup-dist/
-        python3 windows/windows_signing.py copy-chain --root setup --out setup-dist --producer-context signed-msis/app-chain-context.json --source "$GITHUB_SHA" --run-id "$GITHUB_RUN_ID" --version 0.8.0 --artifact-id "$CONTEXT_ID" --artifact-name "windows-msi-signed-$CONTEXT_ATTEMPT" --artifact-digest "$CONTEXT_DIGEST" --artifact-attempt "$CONTEXT_ATTEMPT" --producer-source "$RETAINED_SOURCE" --producer-run-id "$RETAINED_RUN" --producer-run-attempt 1
+        python3 windows/windows_signing.py copy-chain --root setup --out setup-dist --producer-context signed-msis/app-chain-context.json --source "$MSI_SOURCE" --run-id "$MSI_RUN" --version 0.8.0 --artifact-id "$MSI_ARTIFACT_ID" --artifact-name "windows-msi-signed-$MSI_ARTIFACT_ATTEMPT" --artifact-digest "$MSI_ARTIFACT_DIGEST" --artifact-attempt "$MSI_ARTIFACT_ATTEMPT" --producer-source "$RETAINED_SOURCE" --producer-run-id "$RETAINED_RUN" --producer-run-attempt 1
         (cd setup-dist && sha256sum ./*.exe ./*.json $(ls ./*.msi 2>/dev/null) > SHA256SUMS.setup)
       shell: bash
-      env:
-        CONTEXT_ID: ${{ needs.windows-tail-msi-sign.outputs.artifact-id }}
-        CONTEXT_DIGEST: ${{ needs.windows-tail-msi-sign.outputs.artifact-digest }}
-        CONTEXT_ATTEMPT: ${{ needs.windows-tail-msi-sign.outputs.artifact-attempt }}
     - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
       id: artifact
       with:
