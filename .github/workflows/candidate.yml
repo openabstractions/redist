@@ -12,6 +12,10 @@ on:
         description: Resume Setup assembly using the completed signed MSI and BA carrier from run 44642911527
         type: boolean
         default: false
+      windows_tail_sign_resume:
+        description: Resume signing and verification using the completed raw Setup bundle from run 44647416372
+        type: boolean
+        default: false
       core_only:
         description: Core-only signed installer diagnostic; excludes all applications and cannot be promoted
         type: boolean
@@ -134,6 +138,7 @@ jobs:
           EXPECTED_SOURCE_SHA: ${{ inputs.source_sha }}
           WINDOWS_TAIL_ONLY: ${{ inputs.windows_tail_only }}
           WINDOWS_TAIL_BUNDLE_RESUME: ${{ inputs.windows_tail_bundle_resume }}
+          WINDOWS_TAIL_SIGN_RESUME: ${{ inputs.windows_tail_sign_resume }}
           TAIL_VERSION: ${{ inputs.version }}
         run: |
           if [[ ! "$EXPECTED_SOURCE_SHA" =~ ^[0-9a-f]{40}$ || "$EXPECTED_SOURCE_SHA" != "$GITHUB_SHA" ]]; then
@@ -143,6 +148,12 @@ jobs:
           if [ "$WINDOWS_TAIL_BUNDLE_RESUME" = true ] && [ "$WINDOWS_TAIL_ONLY" != true ]; then
             echo 'FAIL windows_tail_bundle_resume requires windows_tail_only'
             exit 1
+          fi
+          if [ "$WINDOWS_TAIL_SIGN_RESUME" = true ]; then
+            [ "$WINDOWS_TAIL_ONLY" = true ] && [ "$WINDOWS_TAIL_BUNDLE_RESUME" != true ] || {
+              echo 'FAIL windows_tail_sign_resume requires windows_tail_only and excludes windows_tail_bundle_resume'
+              exit 1
+            }
           fi
           if [ "$WINDOWS_TAIL_ONLY" = true ]; then
             [ "$TAIL_VERSION" = v0.8.0 ] && [ "$PRODUCER_MODE" = train ] &&
@@ -5191,7 +5202,7 @@ jobs:
   windows-tail-build:
     needs:
     - source-guard
-    if: ${{ needs.source-guard.result == 'success' && inputs.windows_tail_only && !inputs.windows_tail_bundle_resume && inputs.version == 'v0.8.0' && inputs.producer_mode == 'train'
+    if: ${{ needs.source-guard.result == 'success' && inputs.windows_tail_only && !inputs.windows_tail_bundle_resume && !inputs.windows_tail_sign_resume && inputs.version == 'v0.8.0' && inputs.producer_mode == 'train'
       && !inputs.core_only && !inputs.signing_probe_only && !inputs.diagnostic_host_sign_only && inputs.app_producer_only == 'none' && inputs.app_delivery_only
       == 'none' && github.repository == 'openabstractions/redist' && github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/release/0.8.0'
       && github.actor == 'ReinisLusis' && github.triggering_actor == 'ReinisLusis' }}
@@ -5332,7 +5343,7 @@ jobs:
   windows-tail-msi-sign:
     needs:
     - windows-tail-build
-    if: ${{ inputs.windows_tail_only && !inputs.windows_tail_bundle_resume && success() && github.repository == 'openabstractions/redist' && github.event_name == 'workflow_dispatch'
+    if: ${{ inputs.windows_tail_only && !inputs.windows_tail_bundle_resume && !inputs.windows_tail_sign_resume && success() && github.repository == 'openabstractions/redist' && github.event_name == 'workflow_dispatch'
       && github.ref == 'refs/heads/release/0.8.0' && github.actor == 'ReinisLusis' && github.triggering_actor == 'ReinisLusis' }}
     runs-on: windows-latest
     timeout-minutes: 90
@@ -5445,7 +5456,7 @@ jobs:
     needs:
     - source-guard
     - windows-tail-msi-sign
-    if: ${{ !cancelled() && needs.source-guard.result == 'success' && inputs.windows_tail_only
+    if: ${{ !cancelled() && needs.source-guard.result == 'success' && inputs.windows_tail_only && !inputs.windows_tail_sign_resume
       && ((inputs.windows_tail_bundle_resume && needs.windows-tail-msi-sign.result == 'skipped')
       || (!inputs.windows_tail_bundle_resume && needs.windows-tail-msi-sign.result == 'success'))
       && github.repository == 'openabstractions/redist' && github.event_name == 'workflow_dispatch'
@@ -5590,8 +5601,12 @@ jobs:
         if-no-files-found: error
   windows-tail-bundle-sign:
     needs:
+    - source-guard
     - windows-tail-bundle
-    if: ${{ inputs.windows_tail_only && success() && github.repository == 'openabstractions/redist' && github.event_name == 'workflow_dispatch'
+    if: ${{ !cancelled() && needs.source-guard.result == 'success' && inputs.windows_tail_only
+      && ((inputs.windows_tail_sign_resume && needs.windows-tail-bundle.result == 'skipped')
+      || (!inputs.windows_tail_sign_resume && needs.windows-tail-bundle.result == 'success'))
+      && github.repository == 'openabstractions/redist' && github.event_name == 'workflow_dispatch'
       && github.ref == 'refs/heads/release/0.8.0' && github.actor == 'ReinisLusis' && github.triggering_actor == 'ReinisLusis' }}
     runs-on: windows-latest
     timeout-minutes: 90
@@ -5605,6 +5620,11 @@ jobs:
       CANDIDATE_VERSION: 0.8.0
       GH_TOKEN: ${{ github.token }}
       OA_CERTUM_SIGNING_ONLY: '1'
+      RAW_SOURCE: ${{ inputs.windows_tail_sign_resume && '622e6198a3075d01fa0f5ded9dbf83ada4734413' || github.sha }}
+      RAW_RUN: ${{ inputs.windows_tail_sign_resume && '44647416372' || github.run_id }}
+      RAW_ARTIFACT_ID: ${{ inputs.windows_tail_sign_resume && '14588708492' || needs.windows-tail-bundle.outputs.artifact-id }}
+      RAW_ARTIFACT_DIGEST: ${{ inputs.windows_tail_sign_resume && 'a61103c2a62e6a31b4f5b78bf56c0563f7e42096f8cf5d0e5b76081061365402' || needs.windows-tail-bundle.outputs.artifact-digest }}
+      RAW_ARTIFACT_ATTEMPT: ${{ inputs.windows_tail_sign_resume && '1' || needs.windows-tail-bundle.outputs.artifact-attempt }}
     outputs:
       artifact-id: ${{ steps.artifact.outputs.artifact-id }}
       artifact-digest: ${{ steps.artifact.outputs.artifact-digest }}
@@ -5617,13 +5637,9 @@ jobs:
       with:
         python-version: '3.12'
     - name: receive new setup-bundle-raw
-      run: python3 windows/windows_signing.py consume --artifact-id "$ARTIFACT_ID" --digest "$ARTIFACT_DIGEST" --name "setup-bundle-raw-$ARTIFACT_ATTEMPT"
-        --source "$GITHUB_SHA" --run-id "$GITHUB_RUN_ID" --attempt "$ARTIFACT_ATTEMPT" --out setup-dist --receipt setup-dist/artifact-intake.json
+      run: python3 windows/windows_signing.py consume --artifact-id "$RAW_ARTIFACT_ID" --digest "$RAW_ARTIFACT_DIGEST" --name "setup-bundle-raw-$RAW_ARTIFACT_ATTEMPT"
+        --source "$RAW_SOURCE" --run-id "$RAW_RUN" --attempt "$RAW_ARTIFACT_ATTEMPT" --out setup-dist --receipt setup-dist/artifact-intake.json
       shell: bash
-      env:
-        ARTIFACT_ID: ${{ needs.windows-tail-bundle.outputs.artifact-id }}
-        ARTIFACT_DIGEST: ${{ needs.windows-tail-bundle.outputs.artifact-digest }}
-        ARTIFACT_ATTEMPT: ${{ needs.windows-tail-bundle.outputs.artifact-attempt }}
     - name: pinned WiX packages
       run: python3 windows/wix_packages.py --dest wix-packages --env "$GITHUB_ENV"
     - name: wix
@@ -5645,14 +5661,10 @@ jobs:
       run: ./windows/certum_simplysign.ps1 -Mode Connect -InstallerPath "$env:RUNNER_TEMP/simplysign.msi" -SessionPath "$env:RUNNER_TEMP/signing-session.json"
     - name: sign new detached engine and attached Setup
       run: python3 windows/windows_signing.py sign-bundle --policy windows/certum_simplysign.json --signtool "$SIGNTOOL" --root setup-dist --receipt
-        setup-dist/bundle-receipt.json --producer-context setup-dist/app-chain-context.json --source "$GITHUB_SHA" --run-id "$GITHUB_RUN_ID" --version
-        0.8.0 --artifact-id "$CONTEXT_ID" --artifact-name "setup-bundle-raw-$CONTEXT_ATTEMPT" --artifact-digest "$CONTEXT_DIGEST" --artifact-attempt
-        "$CONTEXT_ATTEMPT" --producer-source "$RETAINED_SOURCE" --producer-run-id "$RETAINED_RUN" --producer-run-attempt 1
+        setup-dist/bundle-receipt.json --producer-context setup-dist/app-chain-context.json --source "$RAW_SOURCE" --run-id "$RAW_RUN" --version
+        0.8.0 --artifact-id "$RAW_ARTIFACT_ID" --artifact-name "setup-bundle-raw-$RAW_ARTIFACT_ATTEMPT" --artifact-digest "$RAW_ARTIFACT_DIGEST" --artifact-attempt
+        "$RAW_ARTIFACT_ATTEMPT" --producer-source "$RETAINED_SOURCE" --producer-run-id "$RETAINED_RUN" --producer-run-attempt 1
       shell: bash
-      env:
-        CONTEXT_ID: ${{ needs.windows-tail-bundle.outputs.artifact-id }}
-        CONTEXT_DIGEST: ${{ needs.windows-tail-bundle.outputs.artifact-digest }}
-        CONTEXT_ATTEMPT: ${{ needs.windows-tail-bundle.outputs.artifact-attempt }}
     - name: disconnect owned signing session
       if: always()
       shell: pwsh
@@ -5669,7 +5681,7 @@ jobs:
   windows-tail-verify:
     needs:
     - windows-tail-bundle-sign
-    if: ${{ inputs.windows_tail_only && success() }}
+    if: ${{ !cancelled() && inputs.windows_tail_only && needs.windows-tail-bundle-sign.result == 'success' }}
     runs-on: windows-latest
     timeout-minutes: 90
     permissions:
