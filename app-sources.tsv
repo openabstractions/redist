@@ -1,4 +1,4 @@
 > Exact public source revision for OA adopter code assembled into optional app artifacts.
 > No app is enabled in apps.json yet. Fill a reviewed row only after local public-source preparation.
 app	repository	commit
-comfyui	openabstractions/adopter-comfyui	cdf3a9ecf382edafc8f974d201bd7e5318ef4a10
+comfyui	openabstractions/adopter-comfyui	7712df111924afb4d6fbf4b886d4a9c4566c97d1
