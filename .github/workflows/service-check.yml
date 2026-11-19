@@ -7,13 +7,17 @@ on:
         required: true
         type: string
       artifact_attempt:
-        description: Exact successful signing and verification attempt
+        description: Exact signing and verification producer attempt
         required: true
         type: string
       package_sha:
         description: Exact lowercase 40-hex source commit of the package run
         required: true
         type: string
+      diagnostic_failed_verify:
+        description: Diagnose a signed package whose fresh-session verification failed; outputs are nonqualifying
+        type: boolean
+        default: false
       windows_image:
         description: Windows image for the same fresh-session assertions
         type: choice
@@ -37,8 +41,11 @@ jobs:
           RUN_ID: ${{ inputs.artifact_run }}
           ATTEMPT: ${{ inputs.artifact_attempt }}
           PACKAGE_SHA: ${{ inputs.package_sha }}
+          DIAGNOSTIC_FAILED_VERIFY: ${{ inputs.diagnostic_failed_verify }}
         shell: pwsh
         run: |
+          if ($env:DIAGNOSTIC_FAILED_VERIFY -and $env:DIAGNOSTIC_FAILED_VERIFY -cnotin @('true','false')) { throw 'Diagnostic mode must be explicit true or false' }
+          $diagnostic = $env:DIAGNOSTIC_FAILED_VERIFY -ceq 'true'
           $run = gh api "repos/$env:GITHUB_REPOSITORY/actions/runs/$env:RUN_ID" | ConvertFrom-Json
           if ($LASTEXITCODE -ne 0) { throw 'Cannot read package run' }
           if ($env:RUN_ID -notmatch '^[1-9][0-9]*$' -or $env:ATTEMPT -notmatch '^[1-9][0-9]*$' -or $env:PACKAGE_SHA -cnotmatch '^[0-9a-f]{40}$') { throw 'Expected exact run, attempt and source SHA' }
@@ -46,8 +53,18 @@ jobs:
           if ($run.path -eq '.github/workflows/candidate.yml' -and $run.event -ne 'workflow_dispatch') { throw 'Candidate package must come from workflow_dispatch' }
           $jobs = gh api --paginate --slurp "repos/$env:GITHUB_REPOSITORY/actions/runs/$env:RUN_ID/attempts/$env:ATTEMPT/jobs?per_page=100" | ConvertFrom-Json
           if ($LASTEXITCODE -ne 0) { throw 'Cannot read package attempt jobs' }
-          foreach ($name in @('windows-msi-sign','verify')) {
-            if (@($jobs.jobs | Where-Object { $_.name -eq $name -and $_.head_sha -ceq $env:PACKAGE_SHA -and $_.run_attempt -eq [int]$env:ATTEMPT -and $_.status -eq 'completed' -and $_.conclusion -eq 'success' }).Count -ne 1) { throw "Package attempt lacks successful $name" }
+          $requiredJobs = @('windows-msi-sign','verify')
+          if ($diagnostic) { $requiredJobs = @('windows-msi-sign') }
+          foreach ($name in $requiredJobs) {
+            $matched = @($jobs.jobs | Where-Object { $_.name -eq $name -and $_.head_sha -ceq $env:PACKAGE_SHA -and $_.run_attempt -eq [int]$env:ATTEMPT -and $_.status -eq 'completed' -and $_.conclusion -eq 'success' })
+            if ($matched.Count -ne 1) { throw "Package attempt lacks successful $name" }
+            if ($diagnostic -and ($matched[0].run_id -ne [long]$env:RUN_ID -or @($jobs.jobs | Where-Object { $_.name -ceq $name }).Count -ne 1)) { throw 'Diagnostic signing job provenance mismatch' }
+          }
+          if ($diagnostic) {
+            $verifiers = @($jobs.jobs | Where-Object { $_.name -ceq 'verify' })
+            if ($run.id -ne [long]$env:RUN_ID -or $verifiers.Count -ne 1 -or $verifiers[0].run_id -ne [long]$env:RUN_ID -or $verifiers[0].head_sha -cne $env:PACKAGE_SHA -or $verifiers[0].run_attempt -ne [int]$env:ATTEMPT -or $verifiers[0].status -ne 'completed' -or $verifiers[0].conclusion -ne 'failure') { throw 'Diagnostic mode requires one exact completed failed verify job' }
+            $freshFailures = @($verifiers[0].steps | Where-Object { $_.name -ceq 'fresh interactive session and crash recovery' -and $_.status -eq 'completed' -and $_.conclusion -eq 'failure' })
+            if ($freshFailures.Count -ne 1) { throw 'Diagnostic mode requires the failed fresh-session verification step' }
           }
           $name = "abstraction-windows-$env:ATTEMPT"
           $artifacts = gh api --paginate --slurp "repos/$env:GITHUB_REPOSITORY/actions/runs/$env:RUN_ID/artifacts?per_page=100" | ConvertFrom-Json
@@ -60,7 +77,8 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'Package artifact download failed' }
           if ('sha256:' + (Get-FileHash package.zip -Algorithm SHA256).Hash.ToLowerInvariant() -cne $artifact.digest) { throw 'Package artifact digest mismatch' }
           Expand-Archive -LiteralPath package.zip -DestinationPath pkg
-          "Package source: $env:PACKAGE_SHA; fixture source: $env:GITHUB_SHA; source run: $env:RUN_ID; attempt: $env:ATTEMPT; artifact: $($artifact.id); digest: $($artifact.digest)" | Tee-Object package-source.txt
+          $label = if ($diagnostic) { 'DIAGNOSTIC-ONLY / NONQUALIFYING; ' } else { '' }
+          "${label}Package source: $env:PACKAGE_SHA; fixture source: $env:GITHUB_SHA; source run: $env:RUN_ID; attempt: $env:ATTEMPT; artifact: $($artifact.id); digest: $($artifact.digest)" | Tee-Object package-source.txt
           $checked = @{}
           foreach ($line in Get-Content pkg/SHA256SUMS.windows) {
             if ($line -notmatch '^([a-f0-9]{64})\s+\*?(abstraction-(?:x64|arm64)\.msi)$') { throw 'Unexpected checksum entry' }
@@ -73,7 +91,7 @@ jobs:
           exit 0
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
-          name: verified-windows-package
+          name: ${{ inputs.diagnostic_failed_verify && 'diagnostic-only-windows-package' || 'verified-windows-package' }}
           path: |
             pkg/
             package-source.txt
@@ -86,9 +104,10 @@ jobs:
       - name: download verified package
         env:
           GH_TOKEN: ${{ github.token }}
+          PACKAGE_ARTIFACT: ${{ inputs.diagnostic_failed_verify && 'diagnostic-only-windows-package' || 'verified-windows-package' }}
         shell: pwsh
         run: |
-          gh run download $env:GITHUB_RUN_ID -n verified-windows-package -D .
+          gh run download $env:GITHUB_RUN_ID -n $env:PACKAGE_ARTIFACT -D .
           if ($LASTEXITCODE -ne 0) { throw 'Verified package download failed' }
       - name: install machine scope
         id: install
@@ -133,13 +152,14 @@ jobs:
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         if: always()
         with:
-          name: service-diagnostics
+          name: ${{ inputs.diagnostic_failed_verify && 'diagnostic-only-service-diagnostics' || 'service-diagnostics' }}
           path: |
             package-source.txt
             machine-install.log
             machine-uninstall.log
             service-session.log
             service-session-cleanup.log
+            service-session-activation/
   per-user:
     needs: package
     runs-on: ${{ inputs.windows_image == 'windows-2022' && 'windows-2022' || 'windows-latest' }}
@@ -149,9 +169,10 @@ jobs:
       - name: download verified package
         env:
           GH_TOKEN: ${{ github.token }}
+          PACKAGE_ARTIFACT: ${{ inputs.diagnostic_failed_verify && 'diagnostic-only-windows-package' || 'verified-windows-package' }}
         shell: pwsh
         run: |
-          gh run download $env:GITHUB_RUN_ID -n verified-windows-package -D .
+          gh run download $env:GITHUB_RUN_ID -n $env:PACKAGE_ARTIFACT -D .
           if ($LASTEXITCODE -ne 0) { throw 'Verified package download failed' }
       - name: configure disposable consumer MSI policy
         shell: pwsh
@@ -225,7 +246,7 @@ jobs:
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         if: always()
         with:
-          name: per-user-runtime-diagnostics
+          name: ${{ inputs.diagnostic_failed_verify && 'diagnostic-only-per-user-runtime-diagnostics' || 'per-user-runtime-diagnostics' }}
           path: |
             package-source.txt
             user-runtime-diagnostics/

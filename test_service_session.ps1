@@ -41,6 +41,12 @@ public static class OASessions {
   [DllImport("wtsapi32.dll", SetLastError=true)] static extern bool WTSEnumerateSessions(IntPtr h, int reserved, int version, out IntPtr data, out int count);
   [DllImport("wtsapi32.dll", CharSet=CharSet.Unicode, SetLastError=true)] static extern bool WTSQuerySessionInformation(IntPtr h, int id, int field, out IntPtr data, out int bytes);
   [DllImport("wtsapi32.dll")] static extern void WTSFreeMemory(IntPtr p);
+  public static string InitialProgram(int session) {
+    IntPtr data; int bytes;
+    if (!WTSQuerySessionInformation(IntPtr.Zero,session,0,out data,out bytes)) throw new System.ComponentModel.Win32Exception(); // WTSInitialProgram
+    try { return Marshal.PtrToStringUni(data) ?? ""; }
+    finally { WTSFreeMemory(data); }
+  }
   [DllImport("wtsapi32.dll", SetLastError=true)] public static extern bool WTSLogoffSession(IntPtr h, int id, bool wait);
   public static int[] ForUser(string user) {
     IntPtr data; int count;
@@ -209,6 +215,80 @@ function Write-ServerDiagnostics {
     }
 }
 $rdpKey = 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server'
+$initialProgramKey = Join-Path $rdpKey 'WinStations\RDP-Tcp'
+function Get-SessionInitialProgramPolicy([string]$Path) {
+    $key=Get-Item -LiteralPath $Path -ErrorAction Stop
+    try {
+        $present=$key.GetValueNames() -contains 'fInheritInitialProgram'
+        $kind=if($present){$key.GetValueKind('fInheritInitialProgram').ToString()}else{$null}
+        $value=if($present){$key.GetValue('fInheritInitialProgram')}else{$null}
+        if($present -and ($kind -cne 'DWord' -or $value -notin @(0,1))){throw 'Unexpected initial-program policy type or value'}
+        return @{ValueExisted=[bool]$present;Kind=$kind;Value=$value;Restored=$false}
+    } finally { $key.Close() }
+}
+function Enable-SessionInitialProgram([string]$Path,[string]$StatePath,[hashtable]$State) {
+    if($State.ContainsKey('InitialProgramPolicy')){throw 'Initial-program policy baseline already recorded'}
+    $State.InitialProgramPolicy=Get-SessionInitialProgramPolicy $Path
+    # Persist the complete original value/presence/type before the first write.
+    $State | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $StatePath -Encoding UTF8
+    $before=$State.InitialProgramPolicy
+    $kind=if($before.ValueExisted){'DWord'}else{'absent'}
+    $value=if($before.ValueExisted){[bool]$before.Value}else{'absent'}
+    Write-Diagnostic "RDP initial-program baseline present=$($before.ValueExisted) kind=$kind inherit=$value" | Out-Null
+    if($State.InitialProgramPolicy.ValueExisted){Set-ItemProperty -LiteralPath $Path -Name fInheritInitialProgram -Value 1 -ErrorAction Stop}
+    else{New-ItemProperty -LiteralPath $Path -Name fInheritInitialProgram -PropertyType DWord -Value 1 -ErrorAction Stop | Out-Null}
+    $actual=Get-SessionInitialProgramPolicy $Path
+    if(-not $actual.ValueExisted -or $actual.Kind -cne 'DWord' -or $actual.Value -ne 1){throw 'Client initial-program selection did not take effect'}
+}
+function Restore-SessionInitialProgram([string]$Path,$Snapshot) {
+    if($Snapshot.ValueExisted -isnot [bool] -or
+        ($Snapshot.ValueExisted -and ($Snapshot.Kind -cne 'DWord' -or ($Snapshot.Value -isnot [int] -and $Snapshot.Value -isnot [long]) -or $Snapshot.Value -notin @(0,1))) -or
+        (-not $Snapshot.ValueExisted -and ($null -ne $Snapshot.Kind -or $null -ne $Snapshot.Value))){throw 'Invalid initial-program policy baseline'}
+    $actual=Get-SessionInitialProgramPolicy $Path
+    if($Snapshot.ValueExisted){
+        if($actual.ValueExisted){Set-ItemProperty -LiteralPath $Path -Name fInheritInitialProgram -Value $Snapshot.Value -ErrorAction Stop}
+        else{New-ItemProperty -LiteralPath $Path -Name fInheritInitialProgram -PropertyType DWord -Value $Snapshot.Value -ErrorAction Stop | Out-Null}
+    }elseif($actual.ValueExisted){Remove-ItemProperty -LiteralPath $Path -Name fInheritInitialProgram -ErrorAction Stop}
+    $actual=Get-SessionInitialProgramPolicy $Path
+    if($actual.ValueExisted -ne $Snapshot.ValueExisted -or $actual.Kind -cne $Snapshot.Kind -or $actual.Value -ne $Snapshot.Value){throw 'Initial-program policy baseline was not restored'}
+}
+function Format-SessionProgram([ValidateSet('client-start','server-start','policy-start')][string]$Label,[string]$Value,[string]$Expected) {
+    $hash=[Security.Cryptography.SHA256]::Create()
+    try{$digest=([BitConverter]::ToString($hash.ComputeHash([Text.Encoding]::UTF8.GetBytes($Value)))).Replace('-','').ToLowerInvariant()}
+    finally{$hash.Dispose()}
+    return "$Label length=$($Value.Length) sha256=$digest equals-requested=$($Value -ceq $Expected)"
+}
+function Write-SessionInitialProgramObservation($Client,$Activation,[ValidateSet('before-logon','after-logon')][string]$Phase,
+        [int]$Session=-1,[string]$PolicyPath=$initialProgramKey) {
+    $expected=if($Activation){$Activation.StartProgram}else{''}
+    try{
+        $secured=$Client.SecuredSettings
+        if($null -eq $secured){throw 'Client initial-program settings unavailable'}
+        $selected=$secured.StartProgram
+        if($null -eq $selected){throw 'Client initial program unavailable'}
+        Write-Diagnostic ("RDP $Phase "+(Format-SessionProgram 'client-start' ([string]$selected) $expected)) | Out-Null
+    }
+    catch{Write-Diagnostic "RDP $Phase client-start unavailable" | Out-Null}
+    if($Session -ge 0){
+        try{Write-Diagnostic ("RDP $Phase "+(Format-SessionProgram 'server-start' ([OASessions]::InitialProgram($Session)) $expected)) | Out-Null}
+        catch{Write-Diagnostic "RDP $Phase server-start unavailable" | Out-Null}
+    }
+    try{
+        $policy=Get-SessionInitialProgramPolicy $PolicyPath
+        $inherits=if($policy.ValueExisted){[bool]$policy.Value}else{'absent'}
+        Write-Diagnostic "RDP $Phase inherit-client-program=$inherits" | Out-Null
+    }catch{Write-Diagnostic "RDP $Phase inherit-client-program unavailable" | Out-Null}
+    try{
+        $settings=@(Get-CimInstance -Namespace root/cimv2/terminalservices -ClassName Win32_TSEnvironmentSetting -Filter "TerminalName='RDP-Tcp'" -OperationTimeoutSec 2 -ErrorAction Stop)
+        if($settings.Count -ne 1){throw 'One connection setting required'}
+        foreach($name in @('InitialProgramPolicy','PolicySourceInitialProgramPath','PolicySourceStartIn')){
+            $value=$settings[0].$name
+            $enum=if($null -ne $value -and $value -in @(0,1,2)){[int]$value}else{'unavailable'}
+            Write-Diagnostic "RDP $Phase $name=$enum" | Out-Null
+        }
+        Write-Diagnostic ("RDP $Phase "+(Format-SessionProgram 'policy-start' ([string]$settings[0].InitialProgramPath) $expected)) | Out-Null
+    }catch{Write-Diagnostic "RDP $Phase connection-initial-program unavailable" | Out-Null}
+}
 function Wait-Condition([scriptblock]$Check, [int]$Seconds, [string]$Description) {
     $deadline = [DateTime]::UtcNow.AddSeconds($Seconds)
     do {
@@ -361,6 +441,13 @@ if ($Mode -eq 'Cleanup') {
     if ($state.User -notmatch '^oa_ci_[0-9a-f]{10}$') { throw 'Refusing unrecognized cleanup account' }
     $account = Get-LocalUser -Name $state.User -ErrorAction SilentlyContinue
     if ($account -and $state.Sid -and $account.SID.Value -ne $state.Sid) { throw 'Cleanup account SID changed' }
+    # Restore connection policy even if subsequent account/session cleanup fails.
+    if($state.PSObject.Properties['InitialProgramPolicy']){
+        Restore-SessionInitialProgram $initialProgramKey $state.InitialProgramPolicy
+        $state.InitialProgramPolicy.Restored=$true
+        $state | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $StatePath -Encoding UTF8
+        Write-Diagnostic 'RDP initial-program baseline restored=True' | Out-Null
+    }
     foreach ($session in [OASessions]::ForUser($state.User)) {
         if ($session -eq (Get-Process -Id $PID).SessionId -or $session -eq 0) { throw 'Refusing to log off runner/session zero' }
         if (-not [OASessions]::WTSLogoffSession([IntPtr]::Zero,$session,$false)) { throw 'Test account logoff failed' }
@@ -401,6 +488,7 @@ if ($ActivateRuntime) {
         (Join-Path $PSScriptRoot 'OAFixture.psm1') $account.Sid ($started.ToUniversalTime().AddSeconds($ActivationSeconds))
     Grant-AccountAccess -Path $activation.Directory -Sid $account.Sid -Access ReadExecute
     Grant-AccountAccess -Path $activation.Diagnostics -Sid $account.Sid -Access Modify
+    Enable-SessionInitialProgram $initialProgramKey $StatePath $state
 }
 Set-ItemProperty $rdpKey -Name fDenyTSConnections -Value 0
 Start-Service TermService
@@ -431,6 +519,7 @@ try {
     # The endpoint is strictly loopback; avoid an unattended self-signed certificate dialog.
     $client.AdvancedSettings7.AuthenticationLevel = 0
     if ($activation) { Set-SessionActivation $client $activation }
+    try{Write-SessionInitialProgramObservation $client $activation 'before-logon'}catch{Write-Warning 'RDP initial-program observation unavailable'}
     $client.Connect()
     # Connect is asynchronous. A token/process alone is not evidence of a completed GUI logon.
     $session = Wait-Condition {
@@ -447,6 +536,7 @@ try {
     } 90 'fresh RDP account session'
     $form.WindowState = 'Minimized'
     if ($session -eq (Get-Process -Id $PID).SessionId) { throw 'Fresh account reused runner session' }
+    try{Write-SessionInitialProgramObservation $client $activation 'after-logon' $session}catch{Write-Warning 'RDP initial-program observation unavailable'}
     if ($activation) { Assert-SessionActivation $activation $session $state.Sid }
     # The service template runs the windowless host, `openabstractionsw.exe serve supervisor --service`.
     $expectedImagePath = Join-Path $env:ProgramFiles ('OpenAbstractions\tools\' + $ExpectedImage)
