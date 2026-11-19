@@ -64,6 +64,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 from pathlib import Path
 import re
 import shutil
@@ -1057,6 +1058,61 @@ def installed_scope_conflicts(related: list[dict]) -> list[str]:
             for row in related if row.get("assignment") != "1"]
 
 
+def external_output_inputs(chain: dict, out: Path) -> list:
+    """Reserve fresh WiX output names without exposing admitted input aliases."""
+    selected = []
+    for _, _, package, app in chain_packages(chain):
+        if app is None:
+            continue
+        source = Path(package['file'])
+        destination = out / source.name
+        ordinary_path(destination, kind='file', allow_missing=True)
+        ordinary_path(source, kind="file")
+        if source.stat().st_nlink != 1 or os.path.lexists(destination):
+            raise ValueError('external package requires a single-link input and fresh output')
+        selected.append((source, destination, sha256_and_size(source), source.stat()))
+    return selected
+
+
+def independent_external_outputs(selected: list) -> None:
+    """Detach only WiX-created aliases of exact authenticated package inputs."""
+    for source, destination, expected, admitted in selected:
+        ordinary_path(source, kind="file")
+        ordinary_path(destination, kind="file")
+        before, output = source.stat(), destination.stat()
+        if (before.st_dev, before.st_ino, before.st_mtime_ns) != (admitted.st_dev, admitted.st_ino, admitted.st_mtime_ns):
+            raise ValueError('WiX external input changed identity')
+        if sha256_and_size(source) != expected or sha256_and_size(destination) != expected:
+            raise ValueError('WiX external package differs from its admitted bytes')
+        if output.st_nlink == 1:
+            if before.st_nlink != 1:
+                raise ValueError('WiX external input acquired an unrelated link')
+            continue
+        identity = lambda value: (value.st_dev, value.st_ino, value.st_size, value.st_mtime_ns)
+        if identity(before) != identity(output) or before.st_nlink != 2 or output.st_nlink != 2:
+            raise ValueError('WiX external output is not its exact new input alias')
+        descriptor, temporary = tempfile.mkstemp(prefix='.external-', dir=destination.parent)
+        try:
+            with os.fdopen(descriptor, 'wb') as copy, source.open('rb') as original:
+                if identity(os.fstat(original.fileno())) != identity(before):
+                    raise ValueError('WiX external input changed before copying')
+                shutil.copyfileobj(original, copy, length=1 << 20)
+                copy.flush()
+                os.fsync(copy.fileno())
+            if (sha256_and_size(Path(temporary)) != expected or
+                    identity(source.stat()) != identity(before) or
+                    identity(destination.stat()) != identity(output)):
+                raise ValueError('WiX external package changed while copying')
+            ordinary_path(destination, kind="file")
+            os.replace(temporary, destination)
+            if (source.stat().st_nlink != 1 or destination.stat().st_nlink != 1 or
+                    sha256_and_size(source) != expected or sha256_and_size(destination) != expected):
+                raise ValueError('WiX external package did not retain independent exact bytes')
+        finally:
+            if os.path.exists(temporary):
+                os.unlink(temporary)
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="build_bundle.py", description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -1113,6 +1169,7 @@ def main(argv: list[str] | None = None) -> int:
             raise ValueError('upgrade supervisor collides with a flat bundle package name')
         for _, _, package, _ in chain_packages(chain):
             package["sha512"] = sha512(Path(package["file"]))
+        external = external_output_inputs(chain, out)
         out.mkdir(parents=True, exist_ok=True)
         upgrade = Path(chain['upgrade']['file'])
         carried_upgrade = out/upgrade.name
@@ -1143,6 +1200,7 @@ def main(argv: list[str] | None = None) -> int:
     if subprocess.run(command, cwd=out).returncode:
         return 1
     try:
+        independent_external_outputs(external)
         manifest, brand = bundle_readback(args.wix, bundle)
         built = check_manifest(manifest, chain)
         for problem in brand:

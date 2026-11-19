@@ -265,6 +265,159 @@ function Get-CapabilityPipes([string]$Sid, [switch]$Runtime) {
     @(Get-PipeNames | Where-Object { $_.StartsWith($prefix, [StringComparison]::Ordinal) })
 }
 
+# Read-only custody diagnostics. These observations grant no runtime authority.
+# Native logon enumeration discards foreign SID/session rows before returning;
+# no account names, authentication packages or arbitrary commands are retained.
+function Initialize-FixtureCustodyNative {
+    if ('OAFixtureCustody' -as [type]) { return }
+    Add-Type -TypeDefinition @'
+using System;
+using System.Collections.Generic;
+using System.ComponentModel;
+using System.IO.Pipes;
+using System.Runtime.InteropServices;
+using System.Security.Principal;
+public static class OAFixtureCustody {
+    [StructLayout(LayoutKind.Sequential)] struct Luid { public uint Low; public int High;
+        public string Hex() { return (((ulong)(uint)High << 32) | Low).ToString("x"); } }
+    [StructLayout(LayoutKind.Sequential)] struct Text { public ushort Length, Maximum; public IntPtr Buffer; }
+    // Only the documented SECURITY_LOGON_SESSION_DATA prefix through Sid is read.
+    [StructLayout(LayoutKind.Sequential)] struct LogonData {
+        public uint Size; public Luid Id; public Text User, Domain, Package;
+        public uint Type, Session; public IntPtr Sid;
+    }
+    [StructLayout(LayoutKind.Sequential)] struct ServiceStatus {
+        public uint Type, State, Controls, Win32Exit, ServiceExit, Checkpoint, WaitHint, Pid, Flags;
+    }
+    public class Logon { public string Sid, AuthenticationId; public uint Session, LogonType; }
+    public class Service { public string Name; public int Error; public uint State, Pid, Win32Exit; }
+    [DllImport("advapi32.dll", SetLastError=true)] static extern bool OpenProcessToken(IntPtr p, uint access, out IntPtr token);
+    [DllImport("advapi32.dll", SetLastError=true)] static extern bool GetTokenInformation(IntPtr token, int kind, byte[] data, uint size, out uint used);
+    [DllImport("kernel32.dll")] static extern bool CloseHandle(IntPtr h);
+    [DllImport("secur32.dll")] static extern uint LsaEnumerateLogonSessions(out uint count, out IntPtr list);
+    [DllImport("secur32.dll")] static extern uint LsaGetLogonSessionData(ref Luid id, out IntPtr data);
+    [DllImport("secur32.dll")] static extern uint LsaFreeReturnBuffer(IntPtr data);
+    [DllImport("advapi32.dll", CharSet=CharSet.Unicode, SetLastError=true)] static extern IntPtr OpenSCManager(string machine, string database, uint access);
+    [DllImport("advapi32.dll", CharSet=CharSet.Unicode, SetLastError=true)] static extern IntPtr OpenService(IntPtr manager, string name, uint access);
+    [DllImport("advapi32.dll", SetLastError=true)] static extern bool QueryServiceStatusEx(IntPtr service, int level, out ServiceStatus status, uint size, out uint needed);
+    [DllImport("advapi32.dll")] static extern bool CloseServiceHandle(IntPtr h);
+    [DllImport("kernel32.dll", SetLastError=true)] static extern bool GetNamedPipeServerProcessId(Microsoft.Win32.SafeHandles.SafePipeHandle pipe, out uint pid);
+    public static string AuthenticationId() {
+        IntPtr token;
+        if (!OpenProcessToken(new IntPtr(-1), 8, out token)) throw new Win32Exception(Marshal.GetLastWin32Error());
+        try {
+            byte[] data = new byte[64]; uint used;
+            if (!GetTokenInformation(token, 10, data, (uint)data.Length, out used)) throw new Win32Exception(Marshal.GetLastWin32Error());
+            if (used < 16) throw new InvalidOperationException("Token statistics prefix unavailable");
+            return (((ulong)BitConverter.ToUInt32(data,12)<<32)|BitConverter.ToUInt32(data,8)).ToString("x");
+        } finally { CloseHandle(token); }
+    }
+    public static Logon[] SessionLogons(string sid, uint session) {
+        uint count; IntPtr list;
+        uint error=LsaEnumerateLogonSessions(out count,out list);
+        if(error!=0) throw new InvalidOperationException("LSA enumeration status "+error);
+        try {
+            if(count>65536) throw new InvalidOperationException("LSA enumeration bound exceeded");
+            var rows=new List<Logon>();
+            for(ulong i=0;i<count;i++) {
+                var id=(Luid)Marshal.PtrToStructure(IntPtr.Add(list,checked((int)i*8)),typeof(Luid));
+                IntPtr data;
+                if(LsaGetLogonSessionData(ref id,out data)!=0) continue;
+                try {
+                    if(data==IntPtr.Zero || (uint)Marshal.ReadInt32(data)<Marshal.SizeOf(typeof(LogonData))) continue;
+                    var row=(LogonData)Marshal.PtrToStructure(data,typeof(LogonData));
+                    if(row.Session!=session || row.Sid==IntPtr.Zero) continue;
+                    string account=new SecurityIdentifier(row.Sid).Value;
+                    if(account==sid) rows.Add(new Logon { Sid=account, Session=row.Session, AuthenticationId=row.Id.Hex(), LogonType=row.Type });
+                } finally { if(data!=IntPtr.Zero) LsaFreeReturnBuffer(data); }
+            }
+            return rows.ToArray();
+        } finally { LsaFreeReturnBuffer(list); }
+    }
+    public static Service Query(string name) {
+        var result=new Service { Name=name };
+        IntPtr manager=OpenSCManager(null,null,1);
+        if(manager==IntPtr.Zero) { result.Error=Marshal.GetLastWin32Error(); return result; }
+        try {
+            IntPtr service=OpenService(manager,name,4); // SERVICE_QUERY_STATUS only; never starts a service.
+            if(service==IntPtr.Zero) { result.Error=Marshal.GetLastWin32Error(); return result; }
+            try {
+                ServiceStatus status; uint needed;
+                if(!QueryServiceStatusEx(service,0,out status,(uint)Marshal.SizeOf(typeof(ServiceStatus)),out needed)) result.Error=Marshal.GetLastWin32Error();
+                else { result.State=status.State; result.Pid=status.Pid; result.Win32Exit=status.Win32Exit; }
+            } finally { CloseServiceHandle(service); }
+        } finally { CloseServiceHandle(manager); }
+        return result;
+    }
+    public static uint PipeServer(string name, int milliseconds) {
+        using(var pipe=new NamedPipeClientStream(".",name,PipeDirection.InOut,PipeOptions.None,
+                System.Security.Principal.TokenImpersonationLevel.Anonymous)) {
+            pipe.Connect(milliseconds);
+            uint pid;
+            if(!GetNamedPipeServerProcessId(pipe.SafePipeHandle,out pid)) throw new Win32Exception(Marshal.GetLastWin32Error());
+            return pid;
+        }
+    }
+}
+'@
+}
+function Get-FixtureSessionLogons([string]$Sid,[int]$Session,[scriptblock]$Read) {
+    if (-not $Read) { Initialize-FixtureCustodyNative; $Read={param($s,$n) [OAFixtureCustody]::SessionLogons($s,$n)} }
+    foreach($row in @(& $Read $Sid $Session)) {
+        if($row.Sid -cne $Sid -or $row.Session -ne $Session) { continue }
+        if($row.AuthenticationId -cnotmatch '^[0-9a-f]{1,16}$' -or $row.LogonType -lt 0 -or $row.LogonType -gt 13) { throw 'Invalid filtered logon observation' }
+        @{AuthenticationId=[string]$row.AuthenticationId;LogonType=[int]$row.LogonType;Session=$Session;Sid=$Sid}
+    }
+}
+function Save-FixtureSessionLogons([string]$Path,[string]$Sid,[int]$Session,[scriptblock]$Read) {
+    $snapshot=@{Schema=1;Sid=$Sid;Session=$Session;Logons=@();Unavailable=$false}
+    try{$snapshot.Logons=@(Get-FixtureSessionLogons $Sid $Session $Read)}catch{$snapshot.Unavailable=$true}
+    try{[IO.File]::WriteAllText($Path,($snapshot|ConvertTo-Json -Depth 6),[Text.UTF8Encoding]::new($false))}catch{}
+}
+function Get-FixtureCustodySnapshot {
+    param([Parameter(Mandatory)][string]$Sid,[Parameter(Mandatory)][int]$Session,
+          [scriptblock]$ReadLogons,[scriptblock]$ReadProcesses,[scriptblock]$ReadOwner,[scriptblock]$ReadService,[scriptblock]$ReadPipe)
+    Initialize-FixtureCustodyNative
+    $current=[Security.Principal.WindowsIdentity]::GetCurrent()
+    if($current.User.Value -cne $Sid -or [Diagnostics.Process]::GetCurrentProcess().SessionId -ne $Session) { throw 'Custody snapshot requires the actual caller account/session' }
+    $luid=[OAFixtureCustody]::AuthenticationId()
+    $result=[ordered]@{Schema=1;Utc=[DateTime]::UtcNow.ToString('o');Sid=$Sid;Session=$Session;CallerPid=$PID;
+        AuthenticationId=$luid;LogonSids=@($current.Groups|ForEach-Object Value|Where-Object {$_ -match '^S-1-5-5-\d+-\d+$'});
+        SupervisorName=('OpenAbstractionsSupervisor_'+$luid);Logons=@();Services=@();Processes=@();RuntimePipe=$null;Unavailable=@()}
+    try{$result.Logons=@(Get-FixtureSessionLogons $Sid $Session $ReadLogons)}catch{$result.Unavailable+=@('logons')}
+    if(-not $ReadService){$ReadService={param($name) [OAFixtureCustody]::Query($name)}}
+    foreach($id in @(@($luid)+@($result.Logons|ForEach-Object AuthenticationId)|Select-Object -Unique)) {
+        $name='OpenAbstractionsSupervisor_'+$id
+        try{$row=& $ReadService $name;$result.Services+=@(@{Name=$name;Error=[int]$row.Error;State=[int]$row.State;Pid=[uint32]$row.Pid;Win32Exit=[int]$row.Win32Exit})}
+        catch{$result.Unavailable+=@('service-query')}
+    }
+    if(-not $ReadProcesses){$ReadProcesses={param($s) Get-RuntimeProcesses $s}}
+    if(-not $ReadOwner){$ReadOwner={param($p) Get-ProcessOwnerSid $p}}
+    try {
+        foreach($p in @(& $ReadProcesses $Sid)) {
+            if($p.SessionId -ne $Session -or (& $ReadOwner $p) -cne $Sid){continue}
+            $role='other-runtime'
+            if($p.CommandLine -match '\bserve\s+supervisor\s+--service(?:\s|$)'){$role='supervisor-service'}
+            elseif($p.CommandLine -match '\bserve\s+supervisor(?:\s|$)'){$role='supervisor-detached'}
+            elseif($p.CommandLine -match '\bserve\s+runtime\s+--supervised(?:\s|$)'){$role='runtime-supervised'}
+            elseif($p.Name -in @('Abstraction Panel.exe','OpenAbstractions Presenter.exe')){$role='presenter'}
+            $result.Processes+=@(@{Pid=[uint32]$p.ProcessId;ParentPid=[uint32]$p.ParentProcessId;Session=$Session;Sid=$Sid;
+                Image=[string]$p.ExecutablePath;CreatedUtc=[string]$p.CreationDate;Role=$role})
+        }
+    }catch{$result.Unavailable+=@('processes')}
+    if(-not $ReadPipe){$ReadPipe={param($name) [OAFixtureCustody]::PipeServer($name,250)}}
+    try{$result.RuntimePipe=@{ServerPid=[uint32](& $ReadPipe ('openabstractions-user-'+$Sid+'-runtime-v1'))}}
+    catch{$result.Unavailable+=@('runtime-pipe')}
+    return $result
+}
+
+function Save-FixtureCustodySnapshot([string]$Path,[string]$Sid,[int]$Session) {
+    # Optional diagnostics cannot replace the original held CLI outcome.
+    try { $snapshot=Get-FixtureCustodySnapshot $Sid $Session }
+    catch { $snapshot=@{Schema=1;Unavailable=@('custody-snapshot')} }
+    try { [IO.File]::WriteAllText($Path,($snapshot|ConvertTo-Json -Depth 8),[Text.UTF8Encoding]::new($false)) } catch {}
+}
+
 # Throws unless the SID has no runtime process and no capability pipe within $Seconds.
 function Assert-NoRuntime {
     param([Parameter(Mandatory)][string]$Sid, [ValidateRange(0, 600)][int]$Seconds = 20)
@@ -683,6 +836,7 @@ function Invoke-InstalledAdopterScene([string]$PythonPath, $Core, [string]$Reque
 }
 
 Export-ModuleMember -Function Invoke-InstalledAdopterScene, Assert-SelectedAppFile, Get-SelectedIdentityProbe, Assert-J1SelectionInputs, Invoke-J1SelectionCollection, Assert-DisposableRunner, Assert-FixtureMutationSafe, Get-FixtureProcessClosure, Invoke-FixtureProcess, Invoke-Bounded, Protect-DiagnosticText,
+    Initialize-FixtureCustodyNative, Get-FixtureSessionLogons, Save-FixtureSessionLogons, Get-FixtureCustodySnapshot, Save-FixtureCustodySnapshot,
     New-DisposableAccount, Grant-AccountAccess, Invoke-AccountProcess, Test-CimNotFound, Test-ProcessGone,
     Get-ProcessOwnerSid, Remove-DisposableAccount, Get-RuntimeProcesses, Get-PipeNames, Get-CapabilityPipes,
     Assert-NoRuntime, Get-InstalledProducts, Test-PathNames, Get-ProfileView, Assert-RealProfileView,

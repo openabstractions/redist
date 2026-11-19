@@ -361,7 +361,7 @@ function Invoke-SessionCommand($Command, [string[]]$Arguments, [int]$Seconds, $A
     Write-Diagnostic "session command exit=$($result.ExitCode)" | Out-Null
     if ($result.ExitCode -ne 0) { throw "Session command exited $($result.ExitCode)" }
 }
-function New-SessionActivation([string]$Directory, [string]$Runtime, [string]$Module, [string]$Sid, [DateTime]$Deadline) {
+function New-SessionActivation([string]$Directory, [string]$Runtime, [string]$Module, [string]$Sid, [DateTime]$Deadline, [switch]$ObserveCustody) {
     if (Test-Path -LiteralPath $Directory) { throw 'Fresh session activation directory required' }
     foreach ($path in @($Runtime,$Module)) {
         $item=Get-Item -LiteralPath $path
@@ -386,6 +386,7 @@ try {
     if ((Get-FileHash -LiteralPath (Join-Path $PSScriptRoot 'OAFixture.psm1') -Algorithm SHA256).Hash.ToLowerInvariant() -cne '__MODULE_HASH__') { throw 'Activation process owner changed' }
     Import-Module (Join-Path $PSScriptRoot 'OAFixture.psm1') -Force
     $env:ABSTRACTION_RUNTIME_ENDPOINT=$null
+    if (__OBSERVE_CUSTODY__) { Save-FixtureCustodySnapshot (Join-Path $PSScriptRoot 'diagnostics/custody-before.json') $record.Sid $record.Session }
     $info=New-Object Diagnostics.ProcessStartInfo
     $info.FileName='__RUNTIME__'
     $info.Arguments='start --timeout 30s'
@@ -398,6 +399,9 @@ try {
 $resultPath=Join-Path $PSScriptRoot 'diagnostics/start-result.json'
 [IO.File]::WriteAllText(($resultPath+'.tmp'),($record|ConvertTo-Json),[Text.UTF8Encoding]::new($false))
 [IO.File]::Move($resultPath+'.tmp',$resultPath)
+# Publish the authoritative CLI outcome before optional receiving diagnostics.
+# A slow or unavailable observation cannot consume its caller's result wait.
+if (__OBSERVE_CUSTODY__) { try { Save-FixtureCustodySnapshot (Join-Path $PSScriptRoot 'diagnostics/custody-after.json') $record.Sid $record.Session } catch {} }
 # The initial RDP program must stay alive for uninstall to observe the live
 # service instance after disconnect. The caller's bound ends it
 # even if the existing account/session Cleanup cannot run.
@@ -406,6 +410,7 @@ while ([DateTime]::UtcNow -lt [DateTime]::Parse('__DEADLINE__').ToUniversalTime(
     foreach ($entry in @(@('__RUNTIME__',$Runtime),@('__SID__',$Sid),@('__RUNTIME_HASH__',$runtimeHash),@('__MODULE_HASH__',$moduleHash),@('__DEADLINE__',$Deadline.ToUniversalTime().ToString('o')))) {
         $script=$script.Replace($entry[0],$entry[1].Replace("'","''"))
     }
+    $script=$script.Replace('__OBSERVE_CUSTODY__',('$'+$ObserveCustody.IsPresent.ToString().ToLowerInvariant()))
     $scriptPath=Join-Path $Directory 'activate.ps1'
     [IO.File]::WriteAllText($scriptPath,$script,[Text.UTF8Encoding]::new($false))
     $powershell=Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
@@ -479,6 +484,12 @@ function Assert-SessionActivation($Activation,[int]$Session,[string]$Sid) {
     $result=Get-Content -LiteralPath $resultPath -Raw | ConvertFrom-Json
     if ($result.Session -ne $Session -or $result.Sid -cne $Sid) { throw 'Installed start ran outside the fresh RDP account/session' }
     Write-Diagnostic "installed start exit=$($result.ExitCode) closure=$($result.Closure) session=$($result.Session)" | Out-Null
+    foreach ($name in @('session-logons.json','custody-before.json','custody-after.json')) {
+        $path=Join-Path $Activation.Diagnostics $name
+        if (Test-Path -LiteralPath $path -PathType Leaf) {
+            Write-Diagnostic ($name+' '+(Protect-StatusText (Get-Content -LiteralPath $path -Raw))) | Out-Null
+        }
+    }
     foreach ($name in @('start.stdout','start.stderr')) {
         $path=Join-Path $Activation.Diagnostics $name
         if (Test-Path -LiteralPath $path) { Write-Diagnostic (Protect-StatusText (Get-Content -LiteralPath $path -Raw)) | Out-Null }
@@ -491,7 +502,7 @@ function Save-SessionActivationDiagnostics($Activation,[string]$Directory) {
     if (-not $Activation) { return }
     if (Test-Path -LiteralPath $Directory) { throw 'Fresh activation diagnostic output required' }
     [IO.Directory]::CreateDirectory($Directory) | Out-Null
-    foreach ($name in @('start-entry.txt','start-process.json','start-result.json','start.stdout','start.stderr')) {
+    foreach ($name in @('start-entry.txt','start-process.json','start-result.json','start.stdout','start.stderr','session-logons.json','custody-before.json','custody-after.json')) {
         $path=Join-Path $Activation.Diagnostics $name
         if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { continue }
         $item=Get-Item -LiteralPath $path
@@ -582,7 +593,7 @@ $activation=$null
 if ($ActivateRuntime) {
     $activation=New-SessionActivation (Join-Path $env:RUNNER_TEMP ($user+'-activation')) `
         (Join-Path $env:ProgramFiles 'OpenAbstractions\tools\openabstractions.exe') `
-        (Join-Path $PSScriptRoot 'OAFixture.psm1') $account.Sid ($started.ToUniversalTime().AddSeconds($ActivationSeconds))
+        (Join-Path $PSScriptRoot 'OAFixture.psm1') $account.Sid ($started.ToUniversalTime().AddSeconds($ActivationSeconds)) -ObserveCustody
     Grant-AccountAccess -Path $activation.Directory -Sid $account.Sid -Access ReadExecute
     Grant-AccountAccess -Path $activation.Diagnostics -Sid $account.Sid -Access Modify
 }
@@ -632,7 +643,12 @@ try {
     $form.WindowState = 'Minimized'
     if ($session -eq (Get-Process -Id $PID).SessionId) { throw 'Fresh account reused runner session' }
     try{Write-SessionInitialProgramObservation $client $null 'after-logon' $session}catch{Write-Warning 'RDP initial-program observation unavailable'}
-    if($activation){Start-SessionActivationTask $activation $state.Sid $session $state $StatePath}
+    if($activation){
+        # Runner-side readback can observe the exact RDP logon even if the
+        # limited Interactive Task token cannot query that LSA record itself.
+        Save-FixtureSessionLogons (Join-Path $activation.Diagnostics 'session-logons.json') $state.Sid $session
+        Start-SessionActivationTask $activation $state.Sid $session $state $StatePath
+    }
     if ($activation) { Assert-SessionActivation $activation $session $state.Sid }
     # The service template runs the windowless host, `openabstractionsw.exe serve supervisor --service`.
     $expectedImagePath = Join-Path $env:ProgramFiles ('OpenAbstractions\tools\' + $ExpectedImage)
