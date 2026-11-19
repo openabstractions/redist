@@ -1208,13 +1208,16 @@ def panel_catalogue_rows(raw):
             ids.add(row['id'])
             app = row['id']
             specific = {'product_code','upgrade_code'} if app == 'opencode' else {'connector_sha256','connector_bytes'}
+            if app == 'opencode' and 'package_code' in row:
+                specific.add('package_code')
             if (set(row) != {'id','file','sha256','bytes','version', *specific}
                 or row['file'] != f'{app}-{version}.msi' or row['version'] != version
                 or not isinstance(row['sha256'], str) or not SHA.fullmatch(row['sha256'])
                 or type(row['bytes']) is not int or not 0 < row['bytes'] < MAX_RELEASE_ASSET_BYTES):
                 raise ValueError('invalid signed ' + ('OpenCode' if app == 'opencode' else 'ComfyUI') + ' extension projection')
-            if app == 'opencode' and (not isinstance(row['product_code'], str)
-                or not re.fullmatch(r'\{[0-9A-F]{8}(?:-[0-9A-F]{4}){3}-[0-9A-F]{12}\}', row['product_code'])
+            if app == 'opencode' and (any(not isinstance(row[key], str)
+                or not re.fullmatch(r'\{[0-9A-F]{8}(?:-[0-9A-F]{4}){3}-[0-9A-F]{12}\}', row[key])
+                for key in ('product_code','package_code') if key in row)
                 or row['upgrade_code'] != OPENCODE_UPGRADE_CODE):
                 raise ValueError('invalid signed OpenCode extension projection')
             if app == 'comfyui' and (not isinstance(row['connector_sha256'], str)
