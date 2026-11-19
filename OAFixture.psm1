@@ -290,7 +290,7 @@ public static class OAFixtureCustody {
         public uint Type, State, Controls, Win32Exit, ServiceExit, Checkpoint, WaitHint, Pid, Flags;
     }
     public class Logon { public string Sid, AuthenticationId; public uint Session, LogonType; }
-    public class Service { public string Name; public int Error; public uint State, Pid, Win32Exit; }
+    public class Service { public string Name; public int Error; public uint Type, State, Pid, Win32Exit; }
     [DllImport("advapi32.dll", SetLastError=true)] static extern bool OpenProcessToken(IntPtr p, uint access, out IntPtr token);
     [DllImport("advapi32.dll", SetLastError=true)] static extern bool GetTokenInformation(IntPtr token, int kind, byte[] data, uint size, out uint used);
     [DllImport("advapi32.dll", EntryPoint="GetTokenInformation", SetLastError=true)] static extern bool GetTokenInformationBuffer(IntPtr token, int kind, IntPtr data, uint size, out uint used);
@@ -373,7 +373,7 @@ public static class OAFixtureCustody {
             try {
                 ServiceStatus status; uint needed;
                 if(!QueryServiceStatusEx(service,0,out status,(uint)Marshal.SizeOf(typeof(ServiceStatus)),out needed)) result.Error=Marshal.GetLastWin32Error();
-                else { result.State=status.State; result.Pid=status.Pid; result.Win32Exit=status.Win32Exit; }
+                else { result.Type=status.Type; result.State=status.State; result.Pid=status.Pid; result.Win32Exit=status.Win32Exit; }
             } finally { CloseServiceHandle(service); }
         } finally { CloseServiceHandle(manager); }
         return result;
@@ -403,15 +403,33 @@ function Save-FixtureSessionLogons([string]$Path,[string]$Sid,[int]$Session,[scr
     try{$snapshot.Logons=@(Get-FixtureSessionLogons $Sid $Session $Read)}catch{$snapshot.Unavailable=$true}
     try{[IO.File]::WriteAllText($Path,($snapshot|ConvertTo-Json -Depth 6),[Text.UTF8Encoding]::new($false))}catch{}
 }
+function Get-FixtureUserManagerContext([string]$Sid,[int]$Session,[scriptblock]$Read) {
+    if($Session -lt 0 -or $Sid -cnotmatch '^S-1-5-21-\d+-\d+-\d+-\d+$'){throw 'Actual user SID/session required'}
+    $path='SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon\VolatileUserMgrKey\'+$Session+'\'+$Sid
+    if($Read){$value=& $Read $path}else{
+        $base=[Microsoft.Win32.RegistryKey]::OpenBaseKey([Microsoft.Win32.RegistryHive]::LocalMachine,[Microsoft.Win32.RegistryView]::Registry64)
+        try{
+            $key=$base.OpenSubKey($path,$false)
+            if(-not $key){throw [IO.FileNotFoundException]::new('User Manager context key unavailable')}
+            try{$value=@{Kind=[string]$key.GetValueKind('contextLuid');Value=$key.GetValue('contextLuid',$null)}}finally{$key.Dispose()}
+        }finally{$base.Dispose()}
+    }
+    if($null -eq $value.Value){throw [IO.FileNotFoundException]::new('User Manager context value unavailable')}
+    if($value.Kind -ceq 'DWord'){$number=[BitConverter]::ToUInt32([BitConverter]::GetBytes([int]$value.Value),0)}
+    elseif($value.Kind -ceq 'QWord'){$number=[BitConverter]::ToUInt64([BitConverter]::GetBytes([long]$value.Value),0)}
+    else{throw 'User Manager context must be a DWORD or QWORD'}
+    if($number -eq 0){throw 'User Manager context must be nonzero'}
+    return @{Luid=$number.ToString('x');Kind=[string]$value.Kind;SupervisorName=('OpenAbstractionsSupervisor_'+$number.ToString('x'))}
+}
 function Get-FixtureCustodySnapshot {
     param([Parameter(Mandatory)][string]$Sid,[Parameter(Mandatory)][int]$Session,
-          [scriptblock]$ReadLogons,[scriptblock]$ReadProcesses,[scriptblock]$ReadOwner,[scriptblock]$ReadService,[scriptblock]$ReadPipe)
+          [scriptblock]$ReadLogons,[scriptblock]$ReadProcesses,[scriptblock]$ReadOwner,[scriptblock]$ReadService,[scriptblock]$ReadPipe,[scriptblock]$ReadContext)
     Initialize-FixtureCustodyNative
     $current=[Security.Principal.WindowsIdentity]::GetCurrent()
     if($current.User.Value -cne $Sid -or [Diagnostics.Process]::GetCurrentProcess().SessionId -ne $Session) { throw 'Custody snapshot requires the actual caller account/session' }
     $luid=[OAFixtureCustody]::AuthenticationId()
     $result=[ordered]@{Schema=1;Utc=[DateTime]::UtcNow.ToString('o');Sid=$Sid;Session=$Session;CallerPid=$PID;
-        AuthenticationId=$luid;LogonSids=@();LogonSidSupervisorName=$null;
+        AuthenticationId=$luid;LogonSids=@();LogonSidSupervisorName=$null;UserManagerContext=$null;
         SupervisorName=('OpenAbstractionsSupervisor_'+$luid);Logons=@();Services=@();Processes=@();RuntimePipe=$null;Unavailable=@()}
     $logonSuffix=@()
     try{
@@ -419,11 +437,14 @@ function Get-FixtureCustodySnapshot {
         $result.LogonSids=@($nativeSid);$logonSuffix=@([OAFixtureCustody]::LogonSidSuffix($nativeSid))
         $result.LogonSidSupervisorName='OpenAbstractionsSupervisor_'+$logonSuffix[0]
     }catch{$result.Unavailable+=@('token-logon-sid')}
+    $contextSuffix=@()
+    try{$result.UserManagerContext=Get-FixtureUserManagerContext $Sid $Session $ReadContext;$contextSuffix=@($result.UserManagerContext.Luid)}
+    catch{$result.Unavailable+=@('user-manager-context')}
     try{$result.Logons=@(Get-FixtureSessionLogons $Sid $Session $ReadLogons)}catch{$result.Unavailable+=@('logons')}
     if(-not $ReadService){$ReadService={param($name) [OAFixtureCustody]::Query($name)}}
-    foreach($id in @(@($luid)+$logonSuffix+@($result.Logons|ForEach-Object AuthenticationId)|Select-Object -Unique)) {
+    foreach($id in @(@($luid)+$logonSuffix+$contextSuffix+@($result.Logons|ForEach-Object AuthenticationId)|Select-Object -Unique)) {
         $name='OpenAbstractionsSupervisor_'+$id
-        try{$row=& $ReadService $name;$result.Services+=@(@{Name=$name;Error=[int]$row.Error;State=[int]$row.State;Pid=[uint32]$row.Pid;Win32Exit=[int]$row.Win32Exit})}
+        try{$row=& $ReadService $name;$result.Services+=@(@{Name=$name;Error=[int]$row.Error;Type=[uint32]$row.Type;State=[int]$row.State;Pid=[uint32]$row.Pid;Win32Exit=[int]$row.Win32Exit})}
         catch{$result.Unavailable+=@('service-query')}
     }
     if(-not $ReadProcesses){$ReadProcesses={param($s) Get-RuntimeProcesses $s}}
@@ -871,7 +892,7 @@ function Invoke-InstalledAdopterScene([string]$PythonPath, $Core, [string]$Reque
 }
 
 Export-ModuleMember -Function Invoke-InstalledAdopterScene, Assert-SelectedAppFile, Get-SelectedIdentityProbe, Assert-J1SelectionInputs, Invoke-J1SelectionCollection, Assert-DisposableRunner, Assert-FixtureMutationSafe, Get-FixtureProcessClosure, Invoke-FixtureProcess, Invoke-Bounded, Protect-DiagnosticText,
-    Initialize-FixtureCustodyNative, Get-FixtureSessionLogons, Save-FixtureSessionLogons, Get-FixtureCustodySnapshot, Save-FixtureCustodySnapshot,
+    Initialize-FixtureCustodyNative, Get-FixtureSessionLogons, Save-FixtureSessionLogons, Get-FixtureUserManagerContext, Get-FixtureCustodySnapshot, Save-FixtureCustodySnapshot,
     New-DisposableAccount, Grant-AccountAccess, Invoke-AccountProcess, Test-CimNotFound, Test-ProcessGone,
     Get-ProcessOwnerSid, Remove-DisposableAccount, Get-RuntimeProcesses, Get-PipeNames, Get-CapabilityPipes,
     Assert-NoRuntime, Get-InstalledProducts, Test-PathNames, Get-ProfileView, Assert-RealProfileView,
