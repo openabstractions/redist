@@ -2125,6 +2125,20 @@ def verify_bundle_actions(receipt,chain,ba,policy,signtool,*,catalog_maintenance
     return proof
 
 
+def bundle_distribution_members(root, owner, distribution):
+    """Retain each authenticated external Catalog role, including non-Burn apps."""
+    result = []
+    for _, _, package, app in owner.chain_packages(distribution):
+        if app is None:
+            continue
+        path = member(root, Path(package['file']).name)
+        actual = setup_file_pin(path)
+        if any(actual[key] != package[key] for key in ('sha256', 'bytes')):
+            raise ValueError('Setup distribution member differs from its verified pin')
+        result.append(path)
+    return result
+
+
 def bundle_distribution_chain(root, owner, chain):
     """An independently delivered app roster must project to this exact Burn chain."""
     path = root / APP_DISTRIBUTION_CHAIN
@@ -2426,11 +2440,8 @@ def check_bundle(root, policy, signtool, *, signing, policy_sha256, expected_pro
         # Match copy_chain_distribution's actual flat members. Core and the
         # upgrade supervisor are embedded; application roles retain their
         # external copies even when Burn also embeds a helper.
-        sums = [root / row['name'] for row, (_, _, _, app) in zip(original_chain, expected_chain)
-                if app is not None] + [bundle, receipt_path]
-        if catalog_only is not None:
-            sums.extend(root / Path(package['file']).name
-                        for _, _, package, app in owner.chain_packages(distribution) if app is catalog_only)
+        sums = bundle_distribution_members(root, owner, distribution) + [bundle, receipt_path]
+        if distribution is not chain:
             sums.append(root / APP_DISTRIBUTION_CHAIN)
             sums.append(root / 'app-chain-context.json')
             for binding in expected_producers.values():
@@ -2707,11 +2718,11 @@ def check_setup_installed(inputs, result, *, source, run_id, run_attempt, versio
             inputs.get('source_sha') != source or type(inputs.get('run_id')) is not int or type(inputs.get('run_attempt')) is not int or
             inputs.get('run_id') != run_id or inputs.get('run_attempt') != run_attempt or inputs.get('version') != version):
         raise ValueError('Setup installed input source/run/attempt differs')
-    if (result.get('result') != 'pass' or result.get('ready') is not True or result.get('cleanup_verified') is not True or
-            any(type(result.get(key)) is not int or result[key] != 0 for key in ('install_exit', 'uninstall_exit', 'activation_exit')) or
+    if (result.get('result') != 'pass' or result.get('machine_configuration') != 'pass' or result.get('cleanup_verified') is not True or
+            any(type(result.get(key)) is not int or result[key] != 0 for key in ('install_exit', 'uninstall_exit')) or
             result.get('signed') is not True or result.get('authenticode', {}).get('valid') is not True or
             result.get('authenticode', {}).get('status') != 'Valid'):
-        raise ValueError('Setup install readiness or exact cleanup is incomplete')
+        raise ValueError('Setup install configuration or exact cleanup is incomplete')
     expected = {'artifact_source': source, 'acceptance_tool': source,
                 'bundle_sha256': inputs['bundle']['sha256'], 'bundle_bytes': inputs['bundle']['bytes'],
                 'installed_runtime_sha256': inputs['runtime']['sha256'],
@@ -2726,6 +2737,11 @@ def check_setup_installed(inputs, result, *, source, run_id, run_attempt, versio
             not isinstance(context.get('sid'), str) or not context['sid'].startswith('S-1-5-') or
             type(context.get('native_session')) is not int or context['native_session'] < 0):
         raise ValueError('Setup result lacks the explicit hosted elevated account/session context')
+    if (result.get('ready') is not False or result.get('activation') != 'refused by design (elevated)' or
+            type(result.get('activation_exit')) is not int or result['activation_exit'] == 0 or
+            result.get('activation_refusal') != "run from the user's unelevated session" or
+            result.get('runtime_absent_after_refusal') is not True):
+        raise ValueError('Setup elevated activation refusal or post-refusal runtime absence is incomplete')
     return result
 
 

@@ -31,7 +31,8 @@ An incomplete or failed journey remains failed; its finally block attempts exact
  bundle and exact installed core removal and retains their logs. No account is created.
 HostedElevated requires a disposable GitHub-hosted Windows runner, an elevated
 Administrator token and Valid Authenticode before dispatch. It proves elevated
-headless runner acceptance; standard-user MSI acceptance remains separate. Hosted
+headless installation/configuration/removal and the runtime's elevated-start
+refusal with no runtime remaining. Normal-user readiness remains separate. Hosted
 Windows Server/tooling does not prove interactive UAC, consumer Windows 11 visuals
 or hardware, or standard-user first-run. Image metadata is recorded as reported.
 '@
@@ -44,6 +45,7 @@ foreach ($value in @($ArtifactSource,$AcceptanceTool)) {
     if ($value -cnotmatch '^[0-9a-f]{40}$') { throw 'Exact source/tool commit is required' }
 }
 if ($Version -cnotmatch '^\d+\.\d+\.\d+$') { throw 'Exact package version is required' }
+if ($HostedElevated -and $SoakSeconds) { throw 'Hosted elevated Setup cannot run the normal-user runtime soak' }
 if ($SoakSeconds -and ($ExpectedSupervisorSha256 -cnotmatch '^[0-9a-f]{64}$' -or
     -not [IO.Path]::IsPathRooted($SoakRequestPath) -or -not (Test-Path -LiteralPath $SoakRequestPath -PathType Leaf))) { throw 'Rehearsal soak needs exact supervisor/request inputs' }
 if (-not [IO.Path]::IsPathRooted($BundlePath) -or -not [IO.Path]::IsPathRooted($ResultDirectory)) { throw 'Absolute package/result paths are required' }
@@ -79,7 +81,7 @@ function Get-SetupExecutionContext([bool]$Hosted) {
         hosted_elevated=$Hosted; github_actions=$env:GITHUB_ACTIONS; runner_environment=$env:RUNNER_ENVIRONMENT;
         runner_os=$env:RUNNER_OS; image_os=$env:ImageOS; image_version=$env:ImageVersion;
         stock_consumer_environment='unproven: runner tooling and image metadata do not establish stock consumer state';
-        limits=$(if ($Hosted) { 'Elevated headless hosted Windows acceptance; interactive UAC, consumer Windows 11 visuals/hardware and standard-user first-run unproven' } else { 'Unelevated real-profile Setup acceptance; host stock/hardware facts not inferred' }) }
+        limits=$(if ($Hosted) { 'Elevated hosted installation/configuration/removal and elevated-start refusal; normal-user readiness, interactive UAC, consumer Windows 11 visuals/hardware and standard-user first-run unproven' } else { 'Unelevated real-profile Setup acceptance; host stock/hardware facts not inferred' }) }
 }
 function Set-SetupSignature([Collections.IDictionary]$Report, [string]$Path, [bool]$RequireValid) {
     $signature=Get-AuthenticodeSignature -LiteralPath $Path
@@ -88,6 +90,15 @@ function Set-SetupSignature([Collections.IDictionary]$Report, [string]$Path, [bo
         publisher_policy='not evaluated here; windows_signing.verify_bundle owns publisher-policy verification' }
     $Report.signed=$Report.authenticode.valid
     if ($RequireValid -and $status -cne 'Valid') { throw "Hosted Setup requires Valid Authenticode; actual status: $status" }
+}
+function Assert-SetupElevatedRefusal($Activation) {
+    $reason="run from the user's unelevated session"
+    $expected='start refused: '+$reason
+    if ($null -eq $Activation.ExitCode -or $Activation.ExitCode -eq 0 -or
+        ([string]$Activation.Diagnostics -cnotmatch ('(?m)(?:^|: )'+[regex]::Escape($expected)+'\r?$'))) {
+        throw 'Hosted elevated activation did not return its exact unelevated-session refusal'
+    }
+    return $reason
 }
 function Assert-MachineSupervisorConfiguration([string]$Configuration, [string]$Recovery, [string]$RecoveryFlag, [string]$ExpectedImage) {
     if ($Configuration -notmatch 'TYPE\s*:\s*50\s+USER_OWN_PROCESS\s+TEMPLATE') { throw 'Supervisor is not the per-user service template' }
@@ -206,6 +217,9 @@ try {
     $machineConfig = Join-Path $env:ProgramData 'abstraction'
     if (-not (Test-Path -LiteralPath $machineConfig -PathType Container)) { throw 'Machine configuration folder absent' }
     if (@((Get-Acl -LiteralPath $machineConfig).Access | Where-Object { $_.IdentityReference -like '*\Users' -and $_.FileSystemRights -match 'CreateFiles|Write|FullControl|Modify' }).Count) { throw 'Users can write the machine configuration folder' }
+    $report.machine_configuration='pass'
+    $report.machine_version=$Version
+    $report.installed_runtime_sha256=$ExpectedRuntimeSha256
     $activationInfo=New-Object Diagnostics.ProcessStartInfo
     $activationInfo.FileName=$central
     $activationInfo.Arguments='start --timeout 30s'
@@ -213,15 +227,23 @@ try {
     [IO.File]::WriteAllText((Join-Path $taskRoot 'setup-runtime-start.stdout'),$activation.Output,[Text.UTF8Encoding]::new($false))
     [IO.File]::WriteAllText((Join-Path $taskRoot 'setup-runtime-start.stderr'),$activation.Diagnostics,[Text.UTF8Encoding]::new($false))
     $report.activation_exit=$activation.ExitCode
-    if ($activation.ExitCode -ne 0) { throw "Installed current-user activation exited $($activation.ExitCode)" }
-    Assert-RuntimeReady $central (Join-Path $taskRoot 'setup-runtime-status')
-    if ($SoakSeconds) {
-        Assert-InstalledRuntimeSoak $central $ExpectedRuntimeSha256 $ExpectedSupervisorSha256 $sid $SoakSeconds (Join-Path $taskRoot 'installed-soak.json') @($bundle,$PSCommandPath,$fixture,$module,$SoakRequestPath)
-        $report.soak_receipt_sha256=(Get-FileHash -LiteralPath (Join-Path $taskRoot 'installed-soak.json') -Algorithm SHA256).Hash.ToLowerInvariant()
+    if ($HostedElevated) {
+        $report.activation_refusal=Assert-SetupElevatedRefusal $activation
+        # Observe absence before uninstall can remove evidence of a forbidden start.
+        Assert-NoRuntime -Sid $sid -Seconds 0
+        Assert-NoRuntime -Sid 'S-1-5-18' -Seconds 0
+        $report.runtime_absent_after_refusal=$true
+        $report.activation='refused by design (elevated)'
+    } else {
+        if ($activation.ExitCode -ne 0) { throw "Installed current-user activation exited $($activation.ExitCode)" }
+        Assert-RuntimeReady $central (Join-Path $taskRoot 'setup-runtime-status')
+        if ($SoakSeconds) {
+            Assert-InstalledRuntimeSoak $central $ExpectedRuntimeSha256 $ExpectedSupervisorSha256 $sid $SoakSeconds (Join-Path $taskRoot 'installed-soak.json') @($bundle,$PSCommandPath,$fixture,$module,$SoakRequestPath)
+            $report.soak_receipt_sha256=(Get-FileHash -LiteralPath (Join-Path $taskRoot 'installed-soak.json') -Algorithm SHA256).Hash.ToLowerInvariant()
+        }
+        $report.ready=$true
+        $report.activation='ready'
     }
-    $report.ready=$true
-    $report.machine_version=$Version
-    $report.installed_runtime_sha256=$ExpectedRuntimeSha256
 } catch { $failure=$_; $report.failure=($_ | Out-String) } finally {
     if ($attempted) {
         try {
@@ -242,7 +264,10 @@ try {
         } catch { $report.cleanup_failure=($_ | Out-String); if (-not $failure) { $failure=$_ } }
     }
     $report.finished_utc=[DateTime]::UtcNow.ToString('o')
-    $report.result=if ($failure) { 'fail' } elseif ($report.ready -and $report.cleanup_verified) { 'pass' } else { 'not run' }
+    $activationComplete=if ($HostedElevated) {
+        $report.ready -eq $false -and $report.activation -ceq 'refused by design (elevated)' -and $report.runtime_absent_after_refusal -eq $true
+    } else { $report.ready -eq $true }
+    $report.result=if ($failure) { 'fail' } elseif ($activationComplete -and $report.cleanup_verified) { 'pass' } else { 'not run' }
     [IO.File]::WriteAllText((Join-Path $taskRoot 'receipt.json'),($report | ConvertTo-Json -Depth 6),[Text.UTF8Encoding]::new($false))
 }
 if ($failure) { throw $failure }

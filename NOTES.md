@@ -1,6 +1,5 @@
 OpenAbstractions 0.8.0 includes the shared runtime, the Panel and tools built
-from pinned module versions. The appended build record identifies delivered
-assets, signing status, package verification and tested architectures.
+from pinned module versions. Release assets and installation steps are listed below.
 
 ## Release 0.8.0
 
@@ -35,10 +34,13 @@ Changes since 0.4.0.
 runs. **Remove** cannot delete files that require Administrator access. An OpenCode
 update took about 65 seconds in an observed run. On Windows, OpenAbstractions
 starts when an app needs it; if it stops unexpectedly, it starts again on the next
-request, and Windows does not restart it automatically.
+request, and Windows does not restart it automatically. On Windows PCs where Smart
+App Control is on, Windows can block the bundled llama.cpp engine, and local chat
+through that engine does not start. Smart App Control can also block the official
+OpenCode installer, and the Apps Catalog then cannot install OpenCode.
 
-The redistributable carries native programs and the Windows app packages named in
-the appended record. Python wheels, Rust crates and npm packages have separate
+The redistributable carries native programs and the Windows app packages listed
+below. Python wheels, Rust crates and npm packages have separate
 source versions and publication status.
 
 ## Updating application code
@@ -53,7 +55,7 @@ pins.
 
 ## Candidate build targets
 
-[`tools.tsv`](tools.tsv) names the module versions and packages consumed by the
+[`tools.tsv`](https://github.com/openabstractions/redist/blob/v0.8.0/tools.tsv) names the module versions and packages consumed by the
 build workflow. These are workflow build targets, not a promise that every optional
 program appears in a final asset; installer feature selection can omit optional
 components.
@@ -69,19 +71,20 @@ components.
 
 The POSIX installer includes local-store inventory by default. Model host and
 MCP gateway are optional selections. Windows selections follow MSI feature
-configuration. The appended release record names the exact packages and
-features delivered in each asset.
+configuration.
 
 ## Installing
 
 **Windows.** Compare `OpenAbstractions-Setup-0.8.0.exe` with `SHA256SUMS`, then
-run it. Setup installs the runtime and the Panel. The Panel's Apps Catalog adds
-and maintains application integrations. The optional Windows packages are
-`opencode-0.8.0.msi`, `lemonade-2026.43.3-oa-0.8.0-windows-x64.msi` and
-`comfyui-0.8.0.msi`. Keep the Lemonade and ComfyUI MSI files beside Setup when
-selecting their optional packages.
-For ComfyUI, install ComfyUI from its official source first, and the catalog adds
-the OpenAbstractions integration to that installation.
+run it. Setup installs the runtime and the Panel. The Panel's Apps Catalog
+installs OpenCode through its official installer and adds the OpenAbstractions
+integration to an existing ComfyUI. Install ComfyUI from its official source
+first. `opencode-0.8.0.msi` and `comfyui-0.8.0.msi` are the integration packages
+the Catalog uses; they are also attached to the release.
+
+OpenAbstractions downloads the `pytorch-*-inputs.zip` and `pytorch-*-source.zip`
+files, their manifest and the `vc-runtime-*.zip` when needed. These support files
+need no manual installation.
 
 The direct core installers are `abstraction-0.8.0-x64.msi` and
 `abstraction-0.8.0-arm64.msi`. For an MSI, the default *Just me* scope installs under
@@ -95,8 +98,9 @@ runtime immediately. Subsequent Windows sign-in registration follows confirmed
 Applications and their conditional login policy. The runtime host restarts a
 runtime that fails, and the next
 `openabstractions start` or application that needs it starts a host that exited.
-The elevated scope registers the Windows per-user service, which starts the
-user's runtime host at sign-in and restarts it after a crash. Uninstall through
+An elevated install registers a Windows per-user service. In 0.8.0, ordinary
+user requests start the runtime host detached; Windows does not restart that
+host automatically after a crash. The next request starts it again. Uninstall through
 Windows' installed-apps settings or `msiexec /x <package.msi>`.
 
 **Linux.** Unpack the tarball for your architecture and run its `install.sh`.
@@ -114,12 +118,12 @@ not mean a package was signed, notarised or attached.
 
 In the folder containing the assets and checksum file:
 
-    sha256sum -c SHA256SUMS
+    sha256sum -c --ignore-missing SHA256SUMS
 
 In PowerShell, a single-file comparison can use:
 
-    (Get-FileHash abstraction-0.8.0-x64.msi -Algorithm SHA256).Hash.ToLower()
-    Select-String abstraction-0.8.0-x64.msi SHA256SUMS
+    (Get-FileHash OpenAbstractions-Setup-0.8.0.exe -Algorithm SHA256).Hash.ToLower()
+    Select-String OpenAbstractions-Setup-0.8.0.exe SHA256SUMS
 
 Checksums establish agreement with the published checksum file, not independent
 proof of origin. Signing, notarisation, attached assets and platform verification

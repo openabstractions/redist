@@ -115,6 +115,8 @@ PLAIN = re.compile(r"[^\x00-\x1f\[\]{}<>&\"]{1,200}\Z")
 KEY = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,63}\Z")
 DOWNLOAD = re.compile(r"https://[A-Za-z0-9./_~%-]{1,300}\Z")
 SKIPPED_DIRECTORIES = {"__pycache__", "node_modules", "testdata"}
+# Go modules and sources build the connector program; the package carries the built program.
+GO_MODULE_FILES = {"go.mod", "go.sum", "go.work", "go.work.sum"}
 COMPILE = ["/nologo", "/W4", "/WX", "/O2", "/MT", "/GS", "/guard:cf", "/Brepro", "/LD"]
 LINK = ["/link", "/guard:cf", "/Brepro", "/DYNAMICBASE", "/NXCOMPAT", "msi.lib"]
 
@@ -389,8 +391,11 @@ def _folder_files(root: Path, what: str) -> list[PurePosixPath]:
                 if NATIVE_LIBRARY.match(entry.name):
                     raise ValueError(f"{relative} is a native library; an extension carries none")
                 if entry.is_dir():
+                    if os.path.isfile(os.path.join(entry.path, "go.mod")):
+                        continue
                     walk(Path(entry.path), parts + (entry.name,))
-                elif entry.is_file() and not entry.name.endswith((".pyc", ".pyo")) and \
+                elif entry.is_file() and not entry.name.endswith((".pyc", ".pyo", ".go")) and \
+                        entry.name not in GO_MODULE_FILES and \
                         not entry.name.startswith("test_") and not entry.name.endswith(".test.mjs"):
                     files.append(relative)
 

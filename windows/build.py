@@ -1203,12 +1203,13 @@ def preview_stage(name, data, root, env):
         catalog_maintenance = packages is not None
         if catalog_maintenance:
             assembler.preview_catalog_document(packages,version)
-        facts = assembler.bundle_actions_inputs([],catalog_maintenance=catalog_maintenance)
+        facts = assembler.setup_actions_inputs(catalog_maintenance=catalog_maintenance)
         admitted = json.loads(inputs['actions_receipt'].read_bytes())
         if admitted.get('inputs') != facts['inputs']:
             raise ValueError('admitted actions receipt differs from current source/role map')
         (actions/'actions_map.h').write_text(facts['header'],encoding='utf-8',newline='\n')
-        run(assembler.bundle_actions_compile([],actions,str(inputs['cl']),catalog_maintenance=catalog_maintenance),native_env)
+        roles = [row['id'] for row in facts['inputs']['map']]
+        run(assembler.bundle_actions_compile(roles,actions,str(inputs['cl']),catalog_maintenance=catalog_maintenance),native_env)
         pin = preview_pin(actions/facts['output'])
         (actions/'native-receipt.json').write_text(json.dumps({'schema':1,'inputs':facts['inputs'],
             'native':{'name':facts['output'],'sha256':pin['sha256'],'bytes':pin['bytes']}}),encoding='utf-8')
@@ -1288,10 +1289,9 @@ def preview_stage(name, data, root, env):
         if data.get('local_packages'):
             preview_catalog_packages(Path(data['local_packages']), oc, out/'catalog-packages', version)
     elif name == 'bundle':
-        catalog_args = []
-        if data.get('local_packages') is not None:
+        catalog_maintenance = data.get('local_packages') is not None
+        if catalog_maintenance:
             assembler.preview_catalog_document(out/'catalog-packages',version,built=True)
-            catalog_args = ['--catalog-maintenance']
         bundle = out/'bundle';bundle.mkdir()
         pin = preview_pin(core/'abstraction-x64.msi')
         chain = {'version':version,'core':{'file':pin['path'],'sha256':pin['sha256'],'bytes':pin['bytes']},
@@ -1306,11 +1306,12 @@ def preview_stage(name, data, root, env):
             package['file'] = target.name
         chain_path = bundle/'chain.json';chain_path.write_text(json.dumps(chain),encoding='utf-8')
         actions = out/'actions'
-        run([python,'-B',root/'installer/apps/build_bundle.py','--chain',chain_path,'--bal-ext',inputs['bal'],
-            '--util-ext',inputs['util'],'--upgrade-binary',core/'payload/tools/openabstractions.exe',
-            '--out',bundle,'--wix',inputs['wix'],'--actions-dll',actions/assembler.ACTIONS_NAME,
-            '--actions-receipt',actions/'native-receipt.json','--actions-receipt-sha256',preview_pin(actions/'native-receipt.json')['sha256'],
-            *catalog_args],native_env)
+        run(assembler.setup_command(python=python,chain=chain_path,bal_ext=inputs['bal'],
+            util_ext=inputs['util'],upgrade_binary=core/'payload/tools/openabstractions.exe',
+            out=bundle,wix=inputs['wix'],actions_dll=actions/assembler.ACTIONS_NAME,
+            actions_receipt=actions/'native-receipt.json',
+            actions_receipt_sha256=preview_pin(actions/'native-receipt.json')['sha256'],
+            catalog_maintenance=catalog_maintenance),native_env)
         receipt = json.loads((bundle/'bundle-receipt.json').read_bytes())
         if receipt['bundle'].get('signed') is not False:raise ValueError('private bundle must remain unsigned')
     return 0

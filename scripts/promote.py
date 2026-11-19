@@ -762,6 +762,15 @@ def public_asset_names(directory, assets, version):
     return sorted(names.get(name, name) for name in assets)
 
 
+def setup_public_msis(owner, distribution, physical, version):
+    """0.8 publishes the Comfy integration beside the separate OpenCode MSI."""
+    selected = distribution if version == 'v0.8.0' else physical
+    return {Path(package['file']).name
+            for _, kind, package, app in owner.chain_packages(selected)
+            if app is not None and kind == 'MsiPackage'
+            and (version != 'v0.8.0' or app['id'] == 'comfyui')}
+
+
 def setup_catalog_files(archive, receipt, version, run, *,
                         producer_source=None, producer_run_id=None, producer_run_attempt=None):
     """Bind the Catalog MSI, external chain MSIs and private inventory."""
@@ -788,8 +797,15 @@ def setup_catalog_files(archive, receipt, version, run, *,
                       for role, _, member, _ in owner.chain_packages(physical)]
     rows = receipt['chain']
     if rows[0].get('id') == 'BeginCoreUpgrade':
-        if rows[0].get('name') != 'openabstractions.exe' or rows[0].get('role') != 'upgrade-supervisor':
+        upgrade = rows[0]
+        signature = upgrade.get('signature', {})
+        if (upgrade.get('name') not in ('openabstractions.exe', 'upgrade.exe')
+                or upgrade.get('role') != 'upgrade-supervisor'
+                or not isinstance(signature, dict)
+                or any(signature.get(key) != upgrade.get(key) for key in ('name', 'sha256', 'bytes'))):
             raise ValueError('Setup Catalog has an unexpected upgrade supervisor')
+        windows_signature_proof({'schema': 1, 'result': 'pass', 'policy_sha256': receipt['policy_sha256'],
+                                 'files': [signature]})
         rows = rows[1:]
     if [(row.get('id'), row.get('name'), row.get('sha256'), row.get('bytes')) for row in rows] != expected_chain:
         raise ValueError('Setup Catalog receipt differs from its physical chain')
@@ -840,10 +856,7 @@ def setup_catalog_files(archive, receipt, version, run, *,
                     raise ValueError('duplicate Setup Catalog distribution member')
                 files[member_name] = pin(member)
     files.update({signer.APP_DISTRIBUTION_CHAIN: None, 'app-chain-context.json': None})
-    # Physical application MSIs are uncompressed Burn payloads carried beside Setup.
-    external_msis = {Path(package['file']).name
-                     for _, kind, package, app in owner.chain_packages(physical)
-                     if app is not None and kind == 'MsiPackage'}
+    external_msis = setup_public_msis(owner, distribution, physical, version)
     return name, files, external_msis
 
 
@@ -916,18 +929,19 @@ def unpack_setup(blob, digest, destination, version, packages, *, receipt_sink=N
             if catalog in packages:
                 raise ValueError('Setup Catalog MSI collides with a verified release package')
             published[catalog] = internal.pop(catalog)
-        for entry in chain[1:]:
-            name = entry.get('name')
-            if split and name not in external_msis:
-                continue
-            if (not isinstance(name, str)
-                    or (not split and not re.fullmatch(
-                        r'[a-z0-9][a-z0-9_-]{0,63}-' + re.escape(version[1:]) + r'\.msi', name))
-                    or name in published or name in packages):
-                raise ValueError('Setup receipt names an unexpected application package')
-            published[name] = (entry.get('sha256'), entry.get('bytes'))
-            if split and internal.pop(name, None) != published[name]:
-                raise ValueError('Setup external MSI differs from its admitted distribution pin')
+        if split:
+            for name in sorted(external_msis):
+                if name in published or name in packages or name not in internal:
+                    raise ValueError('Setup receipt names an unexpected application package')
+                published[name] = internal.pop(name)
+        else:
+            for entry in chain[1:]:
+                name = entry.get('name')
+                if (not isinstance(name, str)
+                        or not re.fullmatch(r'[a-z0-9][a-z0-9_-]{0,63}-' + re.escape(version[1:]) + r'\.msi', name)
+                        or name in published or name in packages):
+                    raise ValueError('Setup receipt names an unexpected application package')
+                published[name] = (entry.get('sha256'), entry.get('bytes'))
         if set(names) != set(published) | set(internal) | {SETUP_RECEIPT, SETUP_SUMS}:
             raise ValueError('Setup artifact file set differs from its receipt')
         if directories - {parent.as_posix() for name in internal for parent in PurePosixPath(name).parents

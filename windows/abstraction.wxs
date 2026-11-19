@@ -24,7 +24,7 @@
          own uninstall fails, both products stay installed
          (https://learn.microsoft.com/en-us/windows/win32/msi/removeexistingproducts-action). -->
     <MajorUpgrade AllowSameVersionUpgrades="yes" Schedule="afterInstallFinalize"
-                  DowngradeErrorMessage="A newer OpenAbstractions is already installed. Remove it from Apps and features before installing this one." />
+                  DowngradeErrorMessage="A newer version of OpenAbstractions is already installed." />
     <MediaTemplate EmbedCab="yes" />
 
     <!-- Preview builds share the Panel's file version. Replace equal versions
@@ -79,10 +79,12 @@
     <?else?><?define NoSystemHelper = " The protected-operation helper is not in it; this build was given no source or binary for openabstractions-system." ?><?endif?>
     <?define Absent = "$(var.NoSystemHelper)$(var.NoIpcLibrary)$(var.NoPanel)$(var.NoCpp)$(var.NoLocalStores)$(var.NoModelHost)$(var.NoModelHostEngine)$(var.NoLemonadeImage)$(var.NoPyTorchImage)$(var.NoMcpGateway)" ?>
     <?if $(var.Absent) = "" ?>
-    <Property Id="ARPCOMMENTS" Value="The OpenAbstractions runtime shares downloads, model access, credentials and permissions among applications." />
+    <Property Id="ARPCOMMENTS" Value="Shared services for your apps." />
     <?else?>
     <Property Id="ARPCOMMENTS" Value="This build is incomplete and says so.$(var.Absent)" />
     <?endif?>
+    <!-- Settings > Apps offers Uninstall alone; Setup repairs the core. -->
+    <Property Id="ARPNOMODIFY" Value="1" />
     <Property Id="ApplicationFolderName" Value="OpenAbstractions" />
     <Property Id="WixAppFolder" Value="WixPerUserFolder" />
     <SetProperty Id="ARPINSTALLLOCATION" Value="[APPLICATIONFOLDER]" After="CostFinalize" />
@@ -651,7 +653,7 @@
              Windows starts the activator's LocalServer32, the presenter, to
              deliver a click after every OA process exited. -->
         <Shortcut Id="PanelShortcutFile" Name="OpenAbstractions Panel"
-                  Description="What this machine is doing with downloads, and what is holding the card"
+                  Description="Apps, models and permissions"
                   Target="[#panel.exe]" WorkingDirectory="ToolsFolder" Icon="PanelIcon">
           <ShortcutProperty Key="System.AppUserModel.ID" Value="OpenAbstractions.Panel" />
           <ShortcutProperty Key="System.AppUserModel.ToastActivatorCLSID" Value="{CC32C67F-0E49-4CC5-A212-C4CB329CD06C}" />
@@ -811,8 +813,8 @@
     <?endif?>
 
     <Feature Id="Service" Level="1" AllowAbsent="no" AllowAdvertise="no"
-             Title="Background supervisor"
-             Description="Runs the OpenAbstractions runtime and keeps accepted work going after the calling program closes. Confirmed applications in your account enable runtime and optional Panel login activation. With no confirmed applications, owned login entries are removed and the runtime stays installed. Supported clients can start it on demand; demand activation for every client is still a qualification prerequisite. The host restarts a runtime that fails, and upgrades restart it.">
+             Title="Background service"
+             Description="Keeps your apps' work running after they close.">
       <ComponentGroupRef Id="ServiceFiles" />
       <ComponentGroupRef Id="SupervisorService" />
       <ComponentGroupRef Id="MachineConfigFolderGroup" />
@@ -856,26 +858,25 @@
     <!-- Level 1 is ticked when the feature list opens and installed by a
          command line that names no ADDLOCAL. msiexec /i abstraction-x64.msi
          ADDLOCAL=Service,LocalStores installs exactly what it names, REMOVE=
-         takes a feature away, and Change in Apps and features reopens this
-         same list: nothing here is advertised and nothing is permanent, so a
-         feature left out today is added later without reinstalling the
-         product. -->
+         takes a feature away, and a later ADDLOCAL adds one: nothing here is
+         advertised and nothing is permanent, so a feature left out today is
+         added later without reinstalling the product. -->
     <?if $(var.LocalStores) = yes ?>
     <Feature Id="LocalStores" Level="1" AllowAdvertise="no"
-             Title="Local model stores"
-             Description="Reads every model store on this machine — Ollama, Hugging Face, LM Studio, ComfyUI, FastFlowLM and Jan — and reports what each one holds to applications that ask the runtime. It reads listings, sizes and the programs' own index files. It writes in no store, which is why it is ticked to begin with. Untick it and the runtime lists only what each application tells it.">
+             Title="Find existing models"
+             Description="Lists the models other apps, such as Ollama and LM Studio, already keep on this computer.">
       <ComponentGroupRef Id="LocalStoresFiles" />
     </Feature>
     <?endif?>
 
     <?if $(var.ModelHost) = yes ?>
     <?if $(var.ModelHostEngine) = yes ?>
-    <?define ModelHostDescription = "Installs modelhostd and OA's reduced, reviewed llama.cpp b10825 Windows x64 Vulkan bundle. Setup verifies and stages that bundled engine for chat; installation starts no engine or model. openabstractions models host writes the declaration after a model is selected." ?>
+    <?define ModelHostDescription = "Chats with models on this computer." ?>
     <?else?>
-    <?define ModelHostDescription = "Installs modelhostd. Windows ARM64 has no reviewed bundled local chat engine, so Setup cannot offer the x64 b10825 default. Installation starts no engine or model." ?>
+    <?define ModelHostDescription = "Chats with models on this computer. Windows on Arm has no chat engine yet." ?>
     <?endif?>
     <Feature Id="ModelHost" Level="1" AllowAdvertise="no"
-             Title="Model host"
+             Title="Local chat"
              Description="$(var.ModelHostDescription)">
       <ComponentGroupRef Id="ModelHostFiles" />
     </Feature>
@@ -883,8 +884,8 @@
 
     <?if $(var.LemonadeImage) = yes ?>
     <Feature Id="LemonadeImage" Level="1" AllowAdvertise="no"
-             Title="Local image generation"
-             Description="Adds lemonaded, which serves image generation, transcription and speech through the Lemonade app. Get started in the Panel reviews and downloads the separate engine and model after you choose them. Installing this feature starts no engine and downloads no model.">
+             Title="Pictures on AMD graphics"
+             Description="Makes pictures with your AMD graphics card.">
       <ComponentGroupRef Id="LemonadeImageFiles" />
     </Feature>
     <?endif?>
@@ -898,8 +899,8 @@
 
     <?if $(var.McpGateway) = yes ?>
     <Feature Id="McpGateway" Level="1" AllowAdvertise="no"
-             Title="MCP gateway"
-             Description="openabstractions-mcp, a local stdio MCP server that gives an assistant six OA abilities: list applications, list models, one bounded completion, and submit, read or cancel durable image and video work. The runtime never starts it; an assistant does, by its absolute path. It holds nothing by being installed — grant it the applications and hosts it may reach with openabstractions rights.">
+             Title="Assistant connection (MCP)"
+             Description="Lets an assistant such as Claude or OpenCode use your apps and models.">
       <ComponentGroupRef Id="McpGatewayFiles" />
     </Feature>
     <?endif?>

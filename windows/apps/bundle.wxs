@@ -34,7 +34,8 @@
   WiX pass ALLUSERS=1 to the dual-purpose core MSI. The application MSIs stay per-user and prefer the machine-wide Panel the core
   package records in HKLM.
 
-  Preprocessor variables: Version, CoreMsi, ThemeFile, SuppressOptionsUI (yes
+  Preprocessor variables: Version, CoreMsi, ThemeFile, LocalizationFile (the
+  theme's strings in Setup's own words), SuppressOptionsUI (yes
   when no application is offered), BundleIcon and BundleLogo (OA's mark:
   the Panel's icon and its 64-pixel image, from build_bundle.brand_sources).
   apps.wxs is compiled beside this file.
@@ -60,6 +61,7 @@
     <BootstrapperApplication>
       <bal:WixStandardBootstrapperApplication Theme="hyperlinkLicense"
                                               ThemeFile="$(var.ThemeFile)"
+                                              LocalizationFile="$(var.LocalizationFile)"
                                               SuppressOptionsUI="$(var.SuppressOptionsUI)"
                                               LogoFile="$(var.BundleLogo)"
                                               LicenseUrl="https://github.com/openabstractions/redist/blob/main/LICENSE" />
@@ -79,6 +81,10 @@
     <Variable Name="LaunchTarget" Value="[ProgramFiles64Folder]OpenAbstractions\tools\Abstraction Panel.exe" />
     <Variable Name="LaunchArguments" Value="--finish" />
     <Variable Name="LaunchUpgradeArguments" Value="--finish --update" />
+    <!-- thmutil refreshes a named checkbox from its numeric Burn variable
+         when the Success page appears. Bind the default before that refresh;
+         the person's later uncheck remains the value Finish observes. -->
+    <Variable Name="OaOpenCheckbox" Type="numeric" Value="1" />
     <Variable Name="OAUpgradeChain" Type="string" Value="" />
     <util:ProductSearch UpgradeCode="CEEF6550-5E44-4E83-8E18-A855C9D941CA" Result="state" Variable="OACorePrior" />
 

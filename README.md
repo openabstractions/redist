@@ -22,22 +22,13 @@ Download the [latest OpenAbstractions release](https://github.com/openabstractio
 Its release notes identify the attached assets, checksums, signing state and
 package-specific installation evidence.
 
-### Historical 0.4.0 evidence
-
-Download [Open Abstractions 0.4.0](https://github.com/openabstractions/redist/releases/tag/v0.4.0).
-The release includes the shared runtime and tools built from pinned module versions.
-Both Windows MSIs and OpenAbstractions-Setup-0.4.0.exe are signed with SHA-256
-Authenticode and an RFC 3161 SHA-256 timestamp. Linux tarballs are unsigned.
-The macOS universal package is Developer ID signed, notarised and stapled.
-Signed Setup verification, Windows x64 signed-MSI automated acceptance and
-macOS arm64 automated installed XPC acceptance passed. Earlier platform lifecycle
-receipts retain their original release scope. Windows/Linux ARM64 installation
-and Intel Mac execution remain untested. Manual Setup and human demonstrations
-remain deferred. See the release notes for exact assets, checksums and evidence.
-
 ### Installing
 
-The Windows MSI defaults to *Just me*, under
+On Windows, `OpenAbstractions-Setup-X.Y.Z.exe` installs the runtime and the
+Panel. The Panel's Apps Catalog installs OpenCode through its official
+installer and adds the OpenAbstractions integration to an existing ComfyUI.
+The direct core MSIs are `abstraction-X.Y.Z-x64.msi` and
+`abstraction-X.Y.Z-arm64.msi`. They default to *Just me*, under
 `%LOCALAPPDATA%\Programs\OpenAbstractions`. *Everyone* installs under
 `%ProgramFiles%\OpenAbstractions` and requires elevation. **Add to PATH** is
 optional; programs remain available by full path when it is unchecked.
@@ -51,11 +42,16 @@ and installation results are not promises made by this general README.
 
 Compare downloads against the release's `SHA256SUMS`:
 
-    sha256sum -c SHA256SUMS
+    sha256sum -c --ignore-missing SHA256SUMS
 
-**Check the release-specific signing notes.** Release 0.4.0 has signed Windows
-MSIs and Setup, unsigned Linux tarballs, and a signed, notarised and stapled
-macOS package. A checksum is not a signature.
+In PowerShell, hash the file and find its line in `SHA256SUMS`:
+
+    (Get-FileHash OpenAbstractions-Setup-X.Y.Z.exe -Algorithm SHA256).Hash.ToLower()
+    Select-String OpenAbstractions-Setup-X.Y.Z.exe SHA256SUMS
+
+**Check the release-specific signing notes.** Each release's appended
+**Signatures** section states the outcome for every asset. A checksum is not a
+signature.
 
 The runtime CLI provides:
 
@@ -67,13 +63,24 @@ The runtime CLI provides:
 typed outcomes. `applications list` shows the caller's permission-filtered local
 application directory. The installers register the shared runtime,
 which supervises configured capabilities.
-Windows per-user installation starts it immediately and registers a windowless
-Startup launcher. Check `openabstractions status --json` for readiness. Consult
+Windows per-user installation starts it immediately. Afterwards it starts when
+an app needs it. Check `openabstractions status --json` for readiness. Consult
 the selected release notes for the behavior qualified in that release.
 
 Developers can also run individual hosts in the foreground with
 `openabstractions serve logging`, `serve config` and `serve router-v1`. These
 commands do not install or register a service.
+
+### Previous releases
+
+[Open Abstractions 0.4.0](https://github.com/openabstractions/redist/releases/tag/v0.4.0)
+signed both Windows MSIs and `OpenAbstractions-Setup-0.4.0.exe` with SHA-256
+Authenticode and an RFC 3161 SHA-256 timestamp. Its Linux tarballs are
+unsigned. Its macOS universal package is Developer ID signed, notarised and
+stapled. Signed Setup verification, Windows x64 signed-MSI automated acceptance
+and macOS arm64 automated installed XPC acceptance passed. Windows and Linux
+ARM64 installation and Intel Mac execution were untested. The release notes
+list its exact assets and checksums.
 
 ## For developers using `go install`
 

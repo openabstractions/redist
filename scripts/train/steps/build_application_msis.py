@@ -218,9 +218,8 @@ def native_archive_selected(owner):
 
 
 def installer_chain_scope(required,owners):
-    """Selected archive delivery is authenticated separately from Burn packages."""
-    required = set(required) - {'opencode'}
-    return required-({'comfyui'} if 'comfyui' in owners and native_archive_selected(owners['comfyui']) else set())
+    """Setup chains the core alone (build_bundle.burn_chain); the Panel Catalog installs every app."""
+    return set()
 
 
 def application_control_inputs(required,version):
@@ -2093,21 +2092,16 @@ def final_native_archive(root,binding,selected,version,relay):
 
 
 def application_bundle(required,version):
-    command=[canonical_tool(sys.executable),'windows/apps/build_bundle.py',
-             '--bal-ext',os.environ['WIX_BAL_EXT'],'--util-ext',os.environ['WIX_UTIL_EXT'],'--out','setup/bundle']
-    catalog_comfy=False
     if required:
         relay=load_owner('windows/windows_signing.py','application_bundle_native_intake')
         root=pathlib.Path('signed-msis')
-        admitted,_=relay.retained_application_context(root,root/'app-chain-context.json',
+        relay.retained_application_context(root,root/'app-chain-context.json',
             source=os.environ['CANDIDATE_SHA'],run_id=int(os.environ['GITHUB_RUN_ID']),
             artifact_id=int(os.environ['APP_CONTEXT_ARTIFACT_ID']),
             artifact_name='windows-msi-signed-'+os.environ['APP_CONTEXT_ARTIFACT_ATTEMPT'],
             artifact_digest=os.environ['APP_CONTEXT_ARTIFACT_DIGEST'].removeprefix('sha256:'),
             artifact_attempt=int(os.environ['APP_CONTEXT_ARTIFACT_ATTEMPT']),version=version,required=required,
             sources=selected_sources(required,version)[1])
-        catalog_comfy=(admitted['expected_producers'].get('comfyui',{}).get('delivery',{}).get('variant')
-                       =='oa-comfyui-native')
         intake=json.loads(closure_file(root,relay.INTAKE_RECEIPT).read_bytes())
         name='apps/provenance/shared-bundle/bundle-actions-receipt.json'
         selected=[row for row in intake['files'] if row['name']==name]
@@ -2134,21 +2128,19 @@ def application_bundle(required,version):
         fresh=relay.verify(closure_file(directory,'oa_bundle_actions.dll'),policy,os.environ['SIGNTOOL'])
         if any(fresh[key]!=proof['files'][0][key] for key in ('sha256','bytes')):
             raise ValueError('core-only bundle native signature changed')
-    command+=['--actions-dll',str(closure_file(directory,'oa_bundle_actions.dll').resolve()),
-        '--actions-receipt',str(receipt.resolve()),'--actions-receipt-sha256',selected[0]['sha256']]
     owner=load_owner('windows/apps/build_bundle.py','application_bundle_core_binary')
     chain=owner.read_chain(pathlib.Path('setup/chain.json').resolve())
-    catalog_opencode=any(app['id']=='opencode' for app in chain['apps'])
-    if catalog_opencode != ('opencode' in required):
+    if any(app['id']=='opencode' for app in chain['apps']) != ('opencode' in required):
         raise ValueError('Catalog maintenance recipient differs from the authenticated application set')
-    if catalog_opencode or catalog_comfy:
-        command+=['--catalog-maintenance']
     with tempfile.TemporaryDirectory(prefix='oa-bundle-incoming-') as temporary:
         binary=pathlib.Path(temporary)/'openabstractions.exe'
         binary.write_bytes(owner.core_upgrade_binary('wix',pathlib.Path(chain['core']['file'])))
-        burn=pathlib.Path(temporary)/'burn-chain.json'
-        burn.write_text(json.dumps(owner.burn_chain(chain)),encoding='utf-8')
-        subprocess.run([*command,'--chain',str(burn),'--upgrade-binary',str(binary)],check=True)
+        # The shared Setup command projects the core-only chain (build_bundle.burn_chain).
+        subprocess.run(owner.setup_command(python=canonical_tool(sys.executable),chain=pathlib.Path('setup/chain.json').resolve(),
+            bal_ext=os.environ['WIX_BAL_EXT'],util_ext=os.environ['WIX_UTIL_EXT'],upgrade_binary=binary,
+            out=pathlib.Path('setup/bundle'),actions_dll=closure_file(directory,'oa_bundle_actions.dll').resolve(),
+            actions_receipt=receipt.resolve(),actions_receipt_sha256=selected[0]['sha256'],
+            catalog_maintenance=bool(required)),check=True)
 
 
 def panel_opencode_pin(required, version):

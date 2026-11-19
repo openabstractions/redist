@@ -8,6 +8,10 @@ on:
         description: Rebuild core MSI containers and Setup using fixed signed run 445994 input roles
         type: boolean
         default: false
+      windows_tail_ba_only:
+        description: Rebuild and sign only the Setup BA, retaining signed core and app MSI bytes from run 44642911527
+        type: boolean
+        default: false
       windows_tail_bundle_resume:
         description: Resume Setup assembly using the completed signed MSI and BA carrier from run 44642911527
         type: boolean
@@ -137,6 +141,7 @@ jobs:
         env:
           EXPECTED_SOURCE_SHA: ${{ inputs.source_sha }}
           WINDOWS_TAIL_ONLY: ${{ inputs.windows_tail_only }}
+          WINDOWS_TAIL_BA_ONLY: ${{ inputs.windows_tail_ba_only }}
           WINDOWS_TAIL_BUNDLE_RESUME: ${{ inputs.windows_tail_bundle_resume }}
           WINDOWS_TAIL_SIGN_RESUME: ${{ inputs.windows_tail_sign_resume }}
           TAIL_VERSION: ${{ inputs.version }}
@@ -152,6 +157,12 @@ jobs:
           if [ "$WINDOWS_TAIL_SIGN_RESUME" = true ]; then
             [ "$WINDOWS_TAIL_ONLY" = true ] && [ "$WINDOWS_TAIL_BUNDLE_RESUME" != true ] || {
               echo 'FAIL windows_tail_sign_resume requires windows_tail_only and excludes windows_tail_bundle_resume'
+              exit 1
+            }
+          fi
+          if [ "$WINDOWS_TAIL_BA_ONLY" = true ]; then
+            [ "$WINDOWS_TAIL_ONLY" = true ] && [ "$WINDOWS_TAIL_BUNDLE_RESUME" != true ] && [ "$WINDOWS_TAIL_SIGN_RESUME" != true ] || {
+              echo 'FAIL windows_tail_ba_only requires windows_tail_only and excludes bundle/sign resume'
               exit 1
             }
           fi
@@ -5233,7 +5244,13 @@ jobs:
       run: |-
         printf "Assembly source: %s; assembly run: %s; retained source: %s; retained run: %s; physical producer attempt: 1\n" "$GITHUB_SHA" "$GITHUB_RUN_ID" "$RETAINED_SOURCE" "$RETAINED_RUN" | tee -a "$GITHUB_STEP_SUMMARY"
         printf "Affected MSI/BA/Setup stages only; skipped original producers are retained evidence, not new executions.\n" >> "$GITHUB_STEP_SUMMARY"
+    - name: receive unchanged signed core and app carrier for BA only
+      if: ${{ inputs.windows_tail_ba_only }}
+      shell: bash
+      run: python3 windows/windows_signing.py consume --artifact-id 14586923496 --digest e4cabf4c7a08d08f8f9fc64796ebc0a8e7b57bc82ad83819f8f0fe18ae4109b6 --name windows-msi-signed-1
+        --source c19193b92579fd218e6b7449aa0a8efc9c046aea --run-id 44642911527 --attempt 1 --out retained-msis --receipt retained-msis/artifact-intake.json
     - name: consume fixed original signed payload roles
+      if: ${{ !inputs.windows_tail_ba_only }}
       run: |-
         python3 windows/windows_signing.py consume --artifact-id "$WINDOWS_RUNTIME_SIGNED_ID" --digest "$WINDOWS_RUNTIME_SIGNED_DIGEST" --name windows-runtime-signed-1 --source "$RETAINED_SOURCE" --run-id "$RETAINED_RUN" --attempt "$WINDOWS_RUNTIME_SIGNED_ATTEMPT" --out signed --receipt signed/artifact-intake.json
         python3 windows/windows_signing.py consume --artifact-id "$WINDOWS_APP_SIGNED_ID" --digest "$WINDOWS_APP_SIGNED_DIGEST" --name windows-app-signed-1 --source "$RETAINED_SOURCE" --run-id "$RETAINED_RUN" --attempt "$WINDOWS_APP_SIGNED_ATTEMPT" --out retained-apps --receipt retained-apps/artifact-intake.json
@@ -5250,14 +5267,18 @@ jobs:
         ABSTRACTION_WINDOWS_DIGEST: e2fd7a07b702ff61ee13dc64f96a661c98a5eb4b6a8cd1534ba019a9124e81b4
         ABSTRACTION_WINDOWS_ATTEMPT: '1'
     - name: pinned WiX packages
+      if: ${{ !inputs.windows_tail_ba_only }}
       run: python3 windows/wix_packages.py --dest wix-packages --env "$GITHUB_ENV"
     - name: wix
+      if: ${{ !inputs.windows_tail_ba_only }}
       run: |-
         dotnet tool install --global wix --version "$WIX_VERSION" --configfile "$WIX_NUGET_CONFIG"
         echo "$HOME/.dotnet/tools" >> "$GITHUB_PATH"
     - name: exact pinned Microsoft signature tools
+      if: ${{ !inputs.windows_tail_ba_only }}
       run: python3 windows/windows_signing.py prepare-tools --root "$RUNNER_TEMP/signing-tools" --github-env "$GITHUB_ENV"
     - name: verify retained programs with original producer identity
+      if: ${{ !inputs.windows_tail_ba_only }}
       run: |-
         cp -r signed/runtime/* .
         python3 windows/windows_signing.py verify-pe --policy windows/certum_simplysign.json --signtool "$SIGNTOOL" --root signed --payload windows/payload.tsv --receipt pe-verification.json --native-roster pypi.tsv --github-env "$GITHUB_ENV"
@@ -5278,6 +5299,7 @@ jobs:
         PY
       shell: bash
     - name: reuse original signed core engine through existing readback and static pin
+      if: ${{ !inputs.windows_tail_ba_only }}
       shell: bash
       run: |-
         python3 - <<'PY'
@@ -5303,6 +5325,7 @@ jobs:
         e.verify_bundle(engine/e.BUNDLE_NAME,engine/e.RECEIPT_NAME,e.pin(engine/'pin.json'))
         PY
     - name: rebuild only both core MSI containers
+      if: ${{ !inputs.windows_tail_ba_only }}
       run: |-
         mkdir -p tail/core
         for arch in x64 arm64; do
@@ -5322,10 +5345,12 @@ jobs:
       run: |-
         python3 - <<'PY'
         from pathlib import Path
-        Path('tail-build-ba.py').write_text("import os,json,sys,hashlib,pathlib,shutil,subprocess\nfrom pathlib import Path\nsys.path.insert(0,'windows')\nimport windows_signing as s\nsys.path.insert(0,'scripts/train/steps')\nimport build_application_msis as t\no=t.load_owner('windows/apps/build_bundle.py','tail_bundle_owner')\nf=Path('tail/core/abstraction-x64.msi')\nc=json.loads(Path('retained-apps/apps/chain.json').read_bytes())\nc=o.validate_chain(dict(c,core=dict(file=str(f.resolve()),sha256=hashlib.sha256(f.read_bytes()).hexdigest(),bytes=f.stat().st_size)),Path('retained-apps/apps'))\nb=o.burn_chain(c)\nt.prepare_bundle_actions({a['id'] for a in b['apps']},Path('tail'),'cl',catalog_maintenance=len(c['apps'])!=len(b['apps']))\n")
+        Path('tail-build-ba.py').write_text("import os,json,sys,hashlib,pathlib,shutil,subprocess\nfrom pathlib import Path\nsys.path.insert(0,'windows')\nimport windows_signing as s\nsys.path.insert(0,'scripts/train/steps')\nimport build_application_msis as t\no=t.load_owner('windows/apps/build_bundle.py','tail_bundle_owner')\nbase=Path('retained-msis') if os.environ.get('OA_BA_ONLY')=='true' else Path('retained-apps')\nf=base/'core/abstraction-x64.msi' if os.environ.get('OA_BA_ONLY')=='true' else Path('tail/core/abstraction-x64.msi')\nc=json.loads((base/'apps/chain.json').read_bytes())\nc=o.validate_chain(dict(c,core=dict(file=str(f.resolve()),sha256=hashlib.sha256(f.read_bytes()).hexdigest(),bytes=f.stat().st_size)),base/'apps')\nb=o.burn_chain(c)\nPath('tail').mkdir(exist_ok=True)\nt.prepare_bundle_actions({a['id'] for a in b['apps']},Path('tail'),'cl',catalog_maintenance=len(c['apps'])!=len(b['apps']))\n")
         PY
       shell: bash
     - name: compile fresh BA using new WXS map
+      env:
+        OA_BA_ONLY: ${{ inputs.windows_tail_ba_only }}
       run: |-
         call "%OA_TAIL_VCVARS%"
         if errorlevel 1 exit /b %errorlevel%
@@ -5376,7 +5401,27 @@ jobs:
         ARTIFACT_ID: ${{ needs.windows-tail-build.outputs.artifact-id }}
         ARTIFACT_DIGEST: ${{ needs.windows-tail-build.outputs.artifact-digest }}
         ARTIFACT_ATTEMPT: ${{ needs.windows-tail-build.outputs.artifact-attempt }}
+    - name: retain existing signed MSI bytes and receipts before BA signing
+      if: ${{ inputs.windows_tail_ba_only }}
+      shell: bash
+      run: |-
+        python3 windows/windows_signing.py consume --artifact-id 14586923496 --digest e4cabf4c7a08d08f8f9fc64796ebc0a8e7b57bc82ad83819f8f0fe18ae4109b6 --name windows-msi-signed-1 --source c19193b92579fd218e6b7449aa0a8efc9c046aea --run-id 44642911527 --attempt 1 --out retained-msis --receipt retained-msis/artifact-intake.json
+        python3 - <<'PY'
+        import sys,json,hashlib,shutil
+        from pathlib import Path
+        sys.path.insert(0,'windows')
+        import windows_signing as s
+        policy=Path('windows/certum_simplysign.json').read_bytes()
+        s.verify_receipt(json.loads(Path('retained-msis/signatures.json').read_bytes()),json.loads(policy),
+         Path('retained-msis'),policy_sha256=hashlib.sha256(policy).hexdigest())
+        Path('signed').mkdir()
+        for directory in ('core','apps'):
+         shutil.copytree(Path('retained-msis')/directory,Path('signed')/directory)
+        for name in ('signatures.json','app-chain-context.json'):
+         shutil.copyfile(Path('retained-msis')/name,Path('signed')/name)
+        PY
     - name: receive original apps and canonical native files
+      if: ${{ !inputs.windows_tail_ba_only }}
       run: |-
         python3 windows/windows_signing.py consume --artifact-id "$WINDOWS_APP_SIGNED_ID" --digest "$WINDOWS_APP_SIGNED_DIGEST" --name windows-app-signed-1 --source "$RETAINED_SOURCE" --run-id "$RETAINED_RUN" --attempt "$WINDOWS_APP_SIGNED_ATTEMPT" --out retained-apps --receipt retained-apps/artifact-intake.json
         python3 windows/windows_signing.py consume --artifact-id "$WINDOWS_PE_SIGNED_ID" --digest "$WINDOWS_PE_SIGNED_DIGEST" --name windows-pe-signed-1 --source "$RETAINED_SOURCE" --run-id "$RETAINED_RUN" --attempt "$WINDOWS_PE_SIGNED_ATTEMPT" --out signed/canonical --receipt signed/canonical/artifact-intake.json
@@ -5413,6 +5458,7 @@ jobs:
         CERTUM_OTP_URI: ${{ secrets.CERTUM_OTP_URI }}
       run: ./windows/certum_simplysign.ps1 -Mode Connect -InstallerPath "$env:RUNNER_TEMP/simplysign.msi" -SessionPath "$env:RUNNER_TEMP/signing-session.json"
     - name: sign rebuilt core MSI containers only
+      if: ${{ !inputs.windows_tail_ba_only }}
       run: python3 windows/windows_signing.py sign-msi --scope core --retained-signatures signed/app-msi-signatures.json --policy windows/certum_simplysign.json
         --signtool "$SIGNTOOL" --root signed --receipt signed/signatures.json --native-roster pypi.tsv --producer-context retained-apps/app-chain-context.json
         --source "$RETAINED_SOURCE" --run-id "$RETAINED_RUN" --version 0.8.0 --artifact-id 14571930972 --artifact-name windows-app-signed-1 --artifact-digest
@@ -5577,13 +5623,12 @@ jobs:
         o=s.bundle_owner()
         c=o.read_chain(Path('setup/chain.json').resolve())
         Path('setup/upgrade.exe').write_bytes(o.core_upgrade_binary('wix',Path(c['core']['file'])))
-        Path('setup/burn-chain.json').write_text(json.dumps(o.burn_chain(c)))
         receipt=Path('signed-msis/shared-bundle/bundle-actions-receipt.json')
-        subprocess.run([sys.executable,'windows/apps/build_bundle.py','--chain','setup/burn-chain.json',
-         '--bal-ext',os.environ['WIX_BAL_EXT'],'--util-ext',os.environ['WIX_UTIL_EXT'],'--upgrade-binary','setup/upgrade.exe',
-         '--actions-dll','signed-msis/shared-bundle/oa_bundle_actions.dll','--actions-receipt',str(receipt),
-         '--actions-receipt-sha256',hashlib.sha256(receipt.read_bytes()).hexdigest(),'--catalog-maintenance',
-         '--out','setup/bundle'],check=True)
+        subprocess.run(o.setup_command(python=sys.executable,chain=Path('setup/chain.json'),
+         bal_ext=os.environ['WIX_BAL_EXT'],util_ext=os.environ['WIX_UTIL_EXT'],upgrade_binary=Path('setup/upgrade.exe'),
+         actions_dll=Path('signed-msis/shared-bundle/oa_bundle_actions.dll'),actions_receipt=receipt,
+         actions_receipt_sha256=hashlib.sha256(receipt.read_bytes()).hexdigest(),catalog_maintenance=True,
+         out=Path('setup/bundle')),check=True)
         PY
       shell: bash
     - name: retain exact distribution and immutable original app context
@@ -5738,6 +5783,7 @@ jobs:
         path: setup-installed-inputs.json
         if-no-files-found: error
     - name: exact signed Setup hosted elevated install readiness and removal
+      if: ${{ !inputs.windows_tail_ba_only }}
       shell: powershell
       timeout-minutes: 25
       run: |

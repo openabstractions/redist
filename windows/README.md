@@ -171,14 +171,14 @@ then stays refused with a sentence naming the machine-wide installation.
 
 | feature | `ADDLOCAL` name | default | what it is |
 |---|---|---|---|
-| Background supervisor | `Service` | on, cannot be unticked | `openabstractions` and its windowless link `openabstractionsw`, and whatever starts the runtime host: a per-user service for everyone, a Startup shortcut for just you |
+| Background service | `Service` | on, cannot be unticked | `openabstractions` and its windowless link `openabstractionsw`, and whatever starts the runtime host: a per-user service for everyone, a Startup shortcut for just you |
 | Examples and the panel | `Tools` | on | three examples that run `openabstractions status`, `download` and `jobs` against this install, plus Abstraction Panel |
 | Add to PATH | `Path` | on, a tick of its own | `tools\` on `PATH`; untick it and the programs are still installed |
-| Local model stores | `LocalStores` | on | `inventoryd`, the `abstraction.storage/inventory-source@1` provider, and the declaration file that declares it |
-| Model host | `ModelHost` | on | `modelhostd` and, on Windows x64, OA's 27-file llama.cpp b10825 Vulkan bundle (24 publisher files and the app-local Visual C++ runtime) for Setup to stage after approval; Windows ARM64 has the provider but no reviewed bundled engine |
-| Local image generation | `LemonadeImage` | on, x64 only | `lemonaded`, the provider that serves image generation, transcription and speech through the Lemonade app Setup installs, and its declaration `lemonade-image.json` |
+| Find existing models | `LocalStores` | on | `inventoryd`, the `abstraction.storage/inventory-source@1` provider, and the declaration file that declares it |
+| Local chat | `ModelHost` | on | `modelhostd` and, on Windows x64, OA's 27-file llama.cpp b10825 Vulkan bundle (24 publisher files and the app-local Visual C++ runtime) for Setup to stage after approval; Windows ARM64 has the provider but no reviewed bundled engine |
+| Pictures on AMD graphics | `LemonadeImage` | on, x64 only | `lemonaded`, the provider that serves image generation, transcription and speech through the Lemonade app Setup installs, and its declaration `lemonade-image.json` |
 | PyTorch local pictures | `PyTorchImage` | on, x64 only | `pytorchd` alone; on a Strix Halo computer Setup downloads its 1.7 GB runtime component (CPython 3.12.10, PyTorch 2.11.0 on ROCm 7.13.0 for gfx1151, Hummingbird-XT source, their notices) once the release catalog pins it, and prepares the engine after the model approval |
-| MCP gateway | `McpGateway` | on | `openabstractions-mcp`, the local stdio MCP server |
+| Assistant connection (MCP) | `McpGateway` | on | `openabstractions-mcp`, the local stdio MCP server |
 | Developer files | `Developer` | off | `USING.txt` with the Go module paths and client package names, and the optional curl adapter header when a build carries it |
 | NAS downloads | `NasDownload` | held, hidden | a reserved name that installs nothing; see below |
 
@@ -198,7 +198,7 @@ package is installed and cannot be written into a file the package carries.
 `validate.py` fails a declaration whose program is not a file the same feature
 installs beside the runtime.
 
-**Local model stores**, on by default. `inventoryd` reads Ollama, Hugging
+**Find existing models** (`LocalStores`), on by default. `inventoryd` reads Ollama, Hugging
 Face, Lemonade, LM Studio, ComfyUI, FastFlowLM, Jan, StabilityMatrix, Pinokio,
 SwarmUI and the ASUS AI apps, and reports what each one holds
 and which program's own index says it uses each thing. It reads listings,
@@ -216,7 +216,7 @@ They also hold `abstraction.storage/content.read` on exactly the SHA-256 of
 each model file Setup's reviewed catalog pins, so the inventory shows Setup
 a hashed copy of one; every other digest stays unreadable to them.
 
-**Model host**, on by default in this Windows package. On x64, the MSI carries
+**Local chat** (`ModelHost`), on by default in this Windows package. On x64, the MSI carries
 `tools\engines\llama-b10825-oa-win-vulkan-x64.zip`, a deterministic bundle
 derived from the reviewed publisher archive. It holds only the 27 files that
 `modelhostd` permits in the staged engine directory: 24 publisher files,
@@ -250,7 +250,7 @@ rule and the host holds nothing. The provider-held wake is 0.4.0's stated
 provisional exception, which a wake lease held for the requesting
 application replaces after research (VISION 2026-10-02).
 
-**Local image generation**, on by default and in x64 builds only.
+**Pictures on AMD graphics** (`LemonadeImage`), on by default and in x64 builds only.
 `lemonaded` serves image generation, transcription and speech through the
 pinned Lemonade app, and the feature places its declaration
 `lemonade-image.json` beside it. Installing the feature starts no engine and
@@ -262,7 +262,7 @@ the runtime offers a model only while that record names it and the bytes on
 disk match, so a fresh install lists the host as unavailable.
 The runtime starts the provider on the first request that needs it.
 
-**MCP gateway**, on by default. `openabstractions-mcp` is a local stdio MCP
+**Assistant connection (MCP)** (`McpGateway`), on by default. `openabstractions-mcp` is a local stdio MCP
 server an assistant starts by its absolute path; the runtime never starts it,
 and it ships no declaration. Installing it grants it nothing. Its rights are
 the Panel's kind — rules an operator writes for one exact executable path —
@@ -292,9 +292,12 @@ Without OpenAbstractions it refuses and names the release page,
 https://github.com/openabstractions/redist/releases/latest; it downloads
 nothing.
 `apps/build_bundle.py` builds the bundle from a chain file that pins every
-package by SHA-256 and size. The chain is the core MSI first and then the
-applications, each behind a checkbox on the standard bootstrapper theme's
-Options page. After the build it reads the bundle's own manifest and checks
+package by SHA-256 and size. The shared preview/release command
+(`build_bundle.setup_command`) projects the core-only Setup chain;
+application packages install from the Panel Catalog. The bundle's strings
+come from `bundle.wxl`, which the builder writes from the pinned
+HyperlinkTheme strings with Setup's own words in place
+(`build_bundle.STRINGS`). After the build it reads the bundle's own manifest and checks
 the chain order and each package's size and SHA-512 against the pinned files.
 These build helpers produce unsigned development fixtures. The hosted release
 workflow signs each MSI before this helper pins the chain, then signs the Burn
@@ -337,8 +340,8 @@ from Apps.
 | Registration | In Apps | Removed by |
 |---|---|---|
 | OpenAbstractions (the core MSI) | shown | Apps; removes the runtime and Panel for every app |
-| OpenAbstractions Setup (the bundle) | hidden: modify and remove disabled, so Burn registers it as a system component | running Setup again → **Uninstall** |
-| an application's OA integration, such as OpenCode with OA | hidden | running Setup again → its box, or **Uninstall** |
+| OpenAbstractions Setup (the bundle) | hidden: modify and remove disabled, so Burn registers it as a system component | nothing to remove: it carries only the permanent core |
+| an application's OA integration, such as OpenCode with OA | hidden | its independent Catalog installation/removal owner |
 | an official application, such as OpenCode | its own entry | its own uninstaller |
 
 The hidden bundle stays registered, so the next Setup upgrades it and keeps
@@ -347,13 +350,13 @@ stays installed and says OpenAbstractions is unavailable in the application.
 
 The screens the person sees, one per state:
 
-- First install: the licence link and "I agree" box, **Options**, **Install** and **Cancel**.
-- Options, from a first install: one box per application, **OK** and **Cancel**, both back to the install screen.
-- Already installed (Setup run again; modify or repair): **Choose applications**, **Apply app choices**, **Uninstall** and **Cancel**.
-- Options, from that screen: the same boxes, **OK** and **Cancel**, both back to the installed screen.
-- Progress: the package being installed, the progress bar and **Cancel**.
-- Success: the finished heading and **Finish**. After an install, change or repair, a ticked **Open OpenAbstractions** box sits above it. Finish closes Setup and, while the box is ticked, opens OpenAbstractions in the installing account: the setup question when there is setup to do, otherwise the Panel. **Restart** appears only when Windows needs one, and then the box does not. The box is also hidden while Setup runs as administrator, where the setup step refuses to run. Each press of Finish writes one line to the Setup log: `Finish opened OpenAbstractions (--finish --update)`, `Finish closed Setup without opening OpenAbstractions`, or the launch error.
-- Failure: the failed heading, the log link and its message, **Close**, plus **Restart** only when Windows needs one.
+- First install: "Read the license terms." with its link, the "I agree" box, **Install** and **Cancel**.
+- Already installed (a registered bundle run again): "OpenAbstractions is installed", the caption "To remove it, open Settings > Apps > Installed apps.", **Repair** and **Cancel**.
+- Progress: "Installing OpenAbstractions", the package being installed (first "Preparing…"), the progress bar and **Cancel**. **Cancel** asks "Cancel installing OpenAbstractions?".
+- Files in use: "Close these apps to continue:", then "Close them and reopen them afterwards" or "Keep them open and restart later".
+- Success: "OpenAbstractions is ready" (after a repair, "OpenAbstractions is repaired") and **Finish**. After an install, change or repair, a ticked **Open OpenAbstractions** box sits above it. Finish closes Setup and, while the box is ticked, opens OpenAbstractions in the installing account: the setup question when there is setup to do, otherwise the Panel. **Restart** appears only when Windows needs one, and then the box does not. The box is also hidden while Setup runs as administrator, where the setup step refuses to run. Each press of Finish writes one line to the Setup log: `Finish opened OpenAbstractions (--finish --update)`, `Finish closed Setup without opening OpenAbstractions`, or the launch error.
+- Failure: "OpenAbstractions wasn't installed", "Try again. The log file shows what went wrong." with the log link, the error message, **Close**, plus **Restart** only when Windows needs one.
+- Restart, when Windows needs one: "Restart your computer to finish."
 
 ## Commands
 
@@ -375,8 +378,8 @@ Add a feature to an installation that does not have it:
 
     msiexec /i abstraction-x64.msi /qn ADDLOCAL=McpGateway
 
-or Apps and features → Abstraction → Modify → Change, which reopens the same
-feature list. Nothing here is advertised and nothing is permanent, so a
+Settings → Apps offers Uninstall alone for this package (`ARPNOMODIFY`), and
+Setup repairs it. Nothing here is advertised and nothing is permanent, so a
 feature left out today is added later without reinstalling the product, and
 `REMOVE=LocalStores` takes a feature away with its declaration file.
 

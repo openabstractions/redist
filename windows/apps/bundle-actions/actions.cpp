@@ -155,8 +155,8 @@ static BOOL awaitMaintenance(OA_ACTIONS_CONTEXT* current, HWND window, BOOL defe
     dialog.dwFlags = TDF_CALLBACK_TIMER | TDF_SHOW_MARQUEE_PROGRESS_BAR | TDF_POSITION_RELATIVE_TO_WINDOW;
     dialog.dwCommonButtons = TDCBF_OK_BUTTON;
     dialog.pszWindowTitle = L"OpenAbstractions Setup";
-    dialog.pszMainInstruction = L"Updating desktop integration";
-    dialog.pszContent = L"Setup is waiting for OpenAbstractions to finish this step.";
+    dialog.pszMainInstruction = L"Updating the OpenCode connection";
+    dialog.pszContent = L"This takes a moment.";
     dialog.pfCallback = maintenanceTimer;
     dialog.lpCallbackData = reinterpret_cast<LONG_PTR>(&wait);
     if (FAILED(TaskDialogIndirect(&dialog, NULL, NULL, NULL)) || !wait.exited) return FALSE;
@@ -179,7 +179,7 @@ static int maintenanceChoice(HWND window)
     dialog.dwFlags = TDF_POSITION_RELATIVE_TO_WINDOW;
     dialog.pszWindowTitle = L"OpenAbstractions Setup";
     dialog.pszMainInstruction = L"OpenCode is running";
-    dialog.pszContent = L"Close OpenCode and select Retry, or select Later to finish the integration update from OpenAbstractions.";
+    dialog.pszContent = L"Close OpenCode, then select Retry. Later updates it when OpenCode closes.";
     dialog.cButtons = ARRAYSIZE(choices);
     dialog.pButtons = choices;
     dialog.nDefaultButton = RetryMaintenance;
@@ -200,7 +200,7 @@ static BOOL finishMaintenance(OA_ACTIONS_CONTEXT* current, HWND window)
         (station.dwFlags & WSF_VISIBLE)) {
         if (elevated) {
             current->engine->Log(BOOTSTRAPPER_LOG_LEVEL_STANDARD, L"OpenAbstractions: desktop integration needs the installing person's Settings.");
-            MessageBoxW(window, L"Open OpenAbstractions Settings from your desktop to finish the integration update.",
+            MessageBoxW(window, L"Open OpenAbstractions to finish updating OpenCode.",
                 L"OpenAbstractions Setup", MB_OK | MB_ICONINFORMATION);
             return TRUE;
         }
@@ -226,8 +226,8 @@ static BOOL finishMaintenance(OA_ACTIONS_CONTEXT* current, HWND window)
     }
     current->engine->Log(BOOTSTRAPPER_LOG_LEVEL_ERROR, L"OpenAbstractions: desktop integration did not complete.");
     MessageBoxW(window, current->maintenanceUnobserved ?
-        L"Setup could not confirm the desktop integration update. Open OpenAbstractions Settings to check its status." :
-        L"Setup could not confirm the desktop integration update. Select Finish to check again.",
+        L"The OpenCode connection wasn't updated. Open OpenAbstractions to try again." :
+        L"The OpenCode connection wasn't updated. Select Finish to try again.",
         L"OpenAbstractions Setup", MB_OK | MB_ICONWARNING);
     return FALSE;
 }

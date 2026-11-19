@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
 """Build "OpenAbstractions Setup", the WiX Burn bundle (installer/apps/bundle.wxs).
 
-The bundle chains the core OpenAbstractions MSI with optional showcase
-applications. An application can carry its official NSIS host EXE before
-the integration MSI that installer/apps/build_app.py builds (VISION 2026-10-06).
-The chain file names every package with its SHA-256 and size pin:
+The distribution file names the core and independent Catalog packages with
+their SHA-256 and size pins. Preview and release use the same command, which
+projects the core-only Burn chain and owns the Setup theme:
 
   {"version": "X.Y.Z",
    "core": {"file": "abstraction-x64.msi", "sha256": "...", "bytes": N},
@@ -17,12 +16,8 @@ against its pin before anything is built, and the core must carry its
 LemonadeImage feature with lemonaded.exe, which Setup's picture plan
 installs; a core built without the lemonadeimage source is refused, and so
 is a core declaring a picture engine feature without every file payload.tsv
-gives it. The chain is the core first, then
-the applications in the chain file's order. Each application's checkbox selects
-its vital packages and rollback boundary. A failure preserves the completed
-core and remains visible. Packages stay outside the bundle's container and
-use download_url when absent beside the bundle. An official host keeps its
-separate uninstall ownership.
+gives it. Applications are added through the Panel Catalog and retain their
+independent installation and removal ownership.
 
 BAFunctions plans no predecessor-bundle restore. Burn appends the related
 bundle's uninstall after the chain; each MSI owns rollback before its commit.
@@ -30,13 +25,9 @@ The core's afterInstallFinalize upgrade removal keeps the predecessor on a
 precommit failure. A later application failure keeps the committed new core,
 with the vital application failure reported by Setup.
 
-The theme is the standard bootstrapper's HyperlinkTheme, read from the
-WixToolset.Bal.wixext 5.0.2 extension DLL given by --bal-ext, with the Options
-page's folder controls replaced by one checkbox per application. That DLL must
-be the pinned one (BAL_DLL_SHA256).
-The maintenance page reuses these choices through its existing Repair action.
-The source-bound BAFunctions DLL preserves unchecked installed applications
-and plans selected absent application packages during install/modify/repair.
+The theme is the standard bootstrapper's HyperlinkTheme, read from the pinned
+WixToolset.Bal.wixext 5.0.2 extension DLL given by --bal-ext. Setup suppresses
+Options and preserves the standard Repair/Uninstall and OA Finish controls.
 
 After the build, `wix burn extract` reads the bundle's own manifest, and every
 package in it must be the pinned file: the same chain order, the same size and
@@ -93,6 +84,38 @@ BAL_NUPKG_BYTES = _BAL["bytes"]
 BAL_DLL_SHA256 = _BAL["dll_sha256"]
 BAL_DLL_BYTES = _BAL["dll_bytes"]
 STANDARD_THEME = "wix-ir/HyperlinkTheme.xml"
+STANDARD_LOCALIZATION = "wix-ir/HyperlinkTheme.wxl"
+WXL = "http://wixtoolset.org/schemas/v4/wxl"
+# Setup's own words over the standard HyperlinkTheme strings. Every other
+# string stays as the pinned extension writes it.
+STRINGS = {
+    "InstallLicenseLinkText": 'Read the <a href="#">license terms</a>.',
+    "ProgressHeader": "Installing OpenAbstractions",
+    "ProgressLabel": "",
+    "OverallProgressPackageText": "Preparing…",
+    "ConfirmCancelMessage": "Cancel installing OpenAbstractions?",
+    "ModifyHeader": "OpenAbstractions is installed",
+    "SuccessHeader": "OpenAbstractions is ready",
+    "SuccessInstallHeader": "OpenAbstractions is ready",
+    "SuccessModifyHeader": "OpenAbstractions is ready",
+    "SuccessRepairHeader": "OpenAbstractions is repaired",
+    "SuccessRestartText": "Restart your computer to finish.",
+    "FailureHeader": "OpenAbstractions wasn't installed",
+    "FailureInstallHeader": "OpenAbstractions wasn't installed",
+    "FailureRepairHeader": "OpenAbstractions wasn't repaired",
+    "FailureHyperlinkLogText": 'Try again. The <a href="#">log file</a> shows what went wrong.',
+    "FailureRestartText": "Restart your computer to finish.",
+    "FilesInUseLabel": "Close these apps to continue:",
+    "FilesInUseCloseRadioButton": "&Close them and reopen them afterwards",
+    "FilesInUseDontCloseRadioButton": "&Keep them open and restart later",
+}
+# The maintenance page keeps Repair. The core package is permanent, so an
+# Uninstall button would remove nothing the person sees; Windows Settings
+# removes the core.
+REMOVE_CAPTION = "To remove it, open Settings > Apps > Installed apps."
+INSTALL_HEADING = "Install OpenAbstractions"
+INSTALL_TEXT = "The services your apps share, such as models, downloads and permissions."
+SUCCESS_CAPTION = "Add apps from the Catalog in OpenAbstractions."
 # The success page's own controls (bundle-actions/actions.h): Finish, and
 # the ticked box that opens OpenAbstractions when Setup closes.
 # The Setup window's title-bar and taskbar icon: OA's icon, a BA payload
@@ -525,9 +548,32 @@ def chain_context(chain: dict) -> dict:
 
 
 def burn_chain(distribution: dict) -> dict:
-    """Project the current Setup packages from the validated distribution roster."""
-    return dict(distribution, apps=[app for app in distribution['apps']
-                                    if app['id'] != CATALOG_ONLY_APP])
+    """Setup installs the core; application packages belong to the Panel Catalog.
+
+    Preview and release use this same projection. The complete authenticated
+    distribution remains available to the existing Catalog/copy-chain owners.
+    """
+    return dict(distribution, apps=[])
+
+
+def setup_actions_inputs(*, catalog_maintenance: bool = False) -> dict:
+    """Native Setup roles follow the same package projection as assembly."""
+    physical = burn_chain({'apps': []})
+    return bundle_actions_inputs([app['id'] for app in physical['apps']],
+                                 catalog_maintenance=catalog_maintenance)
+
+
+def setup_command(*, python, chain, bal_ext, util_ext, upgrade_binary, out, actions_dll,
+                  actions_receipt, actions_receipt_sha256, wix='wix', catalog_maintenance=False):
+    """The preview and release callers invoke this single Setup assembler."""
+    command = [str(python), '-B', str(HERE / 'build_bundle.py'), '--chain', str(chain),
+               '--bal-ext', str(bal_ext), '--util-ext', str(util_ext),
+               '--upgrade-binary', str(upgrade_binary), '--out', str(out), '--wix', str(wix),
+               '--actions-dll', str(actions_dll), '--actions-receipt', str(actions_receipt),
+               '--actions-receipt-sha256', str(actions_receipt_sha256)]
+    if catalog_maintenance:
+        command.append('--catalog-maintenance')
+    return command
 
 
 def read_chain_context(context: dict, root: Path) -> dict:
@@ -709,20 +755,30 @@ def apps_fragment(apps: list[dict]) -> str:
     return ET.tostring(wix, encoding="unicode") + "\n"
 
 
-def standard_theme(dll_path: Path) -> str:
-    """The standard bootstrapper's HyperlinkTheme from the pinned extension."""
+def standard_theme(dll_path: Path, member: str = STANDARD_THEME) -> str:
+    """The standard bootstrapper's HyperlinkTheme (or its strings) from the pinned extension."""
     data = dll_path.read_bytes()
     if (hashlib.sha256(data).hexdigest(), len(data)) != (BAL_DLL_SHA256, BAL_DLL_BYTES):
         raise ValueError(f"{dll_path.name} is not the pinned WixToolset.Bal.wixext 5.0.2 extension")
-    return embedded_wixlib(data).read(STANDARD_THEME).decode("utf-8-sig")
+    return embedded_wixlib(data).read(member).decode("utf-8-sig")
+
+
+def localization(standard: str) -> str:
+    """bundle.wxl: the standard HyperlinkTheme strings with STRINGS in place."""
+    ET.register_namespace("", WXL)
+    root = ET.fromstring(standard)
+    rows = {row.get("Id"): row for row in root.iter(f"{{{WXL}}}String")}
+    missing = sorted(set(STRINGS) - set(rows))
+    if root.tag != f"{{{WXL}}}WixLocalization" or missing:
+        raise ValueError("the standard localization lacks " + ", ".join(missing or ["its WixLocalization root"]))
+    for name, value in STRINGS.items():
+        rows[name].set("Value", value)
+    notices = "".join(m.group(0) + "\n" for m in re.finditer(r"<!--.*?-->", standard[:standard.find("<WixLocalization")], re.S))
+    return '<?xml version="1.0" encoding="utf-8"?>\n' + notices + ET.tostring(root, encoding="unicode") + "\n"
 
 
 def theme(standard: str, apps: list[dict], *, catalog_maintenance: bool = False) -> str:
-    """Use the existing Options and Repair planning controls for add/repair.
-
-    The BAFunctions payload preserves unselected packages and admits selected
-    missing packages during Repair. It owns planning; the theme only selects.
-    """
+    """Brand the standard Setup pages; applications are added in the Panel."""
     ET.register_namespace("", THM)
     root = ET.fromstring(standard, parser=ET.XMLParser(target=ET.TreeBuilder(insert_comments=True)))
     window = root.find(f"{{{THM}}}Window")
@@ -737,53 +793,46 @@ def theme(standard: str, apps: list[dict], *, catalog_maintenance: bool = False)
     folder = [c for c in page if c.get("Name") in FOLDER_CONTROLS or (c.text or "").strip() == FOLDER_LABEL]
     if len(folder) != 3:
         raise ValueError("the standard theme's Options page is not the one this builder edits")
-    at = list(page).index(folder[0])
-    tail = folder[0].tail
     for control in folder:
         page.remove(control)
-    controls = []
-    apps = [app for app in apps if app["id"] != CATALOG_ONLY_APP]
-    if apps:
-        label = ET.Element(f"{{{THM}}}Label", {"X": "11", "Y": "121", "Width": "-11", "Height": "17",
-                                               "FontId": "3", "DisablePrefix": "yes"})
-        label.text = "Choose apps to install or repair. Setup keeps installed apps."
-        controls.append(label)
-    for index, app in enumerate(apps):
-        box = ET.Element(f"{{{THM}}}Checkbox", {"Name": variable(app["id"]), "X": "11", "Y": str(143 + 22 * index),
-                                                "Width": "-11", "Height": "17", "TabStop": "yes", "FontId": "3"})
-        box.text = app["title"]
-        controls.append(box)
-    for control in controls:
-        control.tail = tail
-    page[at:at] = controls
-    if apps:
-        maintenance = [p for p in root.iter(f"{{{THM}}}Page") if p.get('Name') == 'Modify']
-        if len(maintenance) != 1:
-            raise ValueError('the standard theme has no single maintenance page')
-        repairs = [c for c in maintenance[0] if c.get('Name') == 'RepairButton']
-        if len(repairs) != 1:
-            raise ValueError('the standard maintenance page has no single Repair planning control')
-        repairs[0].text = 'Apply app choices'
-        choose = ET.SubElement(maintenance[0], f"{{{THM}}}Button", {
-            'Name':'ChooseAppOptionsButton','X':'11','Y':'121','Width':'170','Height':'23',
-            'TabStop':'yes','FontId':'0'})
-        ET.SubElement(choose, f"{{{THM}}}Text").text = 'Choose applications'
-        ET.SubElement(choose, f"{{{THM}}}ChangePageAction", {'Page':'Options'})
-        # The Options page is shared by a first install and maintenance. Its
-        # OK and Cancel returned to the Install page in both, so maintenance
-        # showed the licence, Options and Install controls; the finish page
-        # then appeared over them (preview-1031f, 2026-10-31). thmutil runs
-        # the first action whose condition holds, so an installed bundle
-        # returns to Modify and a first install to Install.
-        for button in page.iter(f"{{{THM}}}Button"):
-            actions = list(button.findall(f"{{{THM}}}ChangePageAction"))
-            if len(actions) != 1 or actions[0].get('Page') != 'Install' or actions[0].get('Condition'):
-                continue
-            back = ET.Element(f"{{{THM}}}ChangePageAction", {'Page': 'Modify', 'Condition': 'WixBundleInstalled'})
-            if actions[0].get('Cancel'):
-                back.set('Cancel', actions[0].get('Cancel'))
-            back.tail = actions[0].tail
-            button.insert(list(button).index(actions[0]), back)
+    # The Install page names what Setup installs above the license line.
+    install = [p for p in root.iter(f"{{{THM}}}Page") if p.get('Name') == 'Install']
+    eula = [c for p in install for c in p if c.get('Name') == 'EulaHyperlink']
+    if len(install) != 1 or len(eula) != 1:
+        raise ValueError('the standard theme has no single Install page with its license link')
+    heading = ET.Element(f"{{{THM}}}Label", {"X": "11", "Y": "80", "Width": "-11", "Height": "30",
+                                             "FontId": "2", "DisablePrefix": "yes"})
+    heading.text = INSTALL_HEADING
+    body = ET.Element(f"{{{THM}}}Label", {"X": "11", "Y": "121", "Width": "-11", "Height": "17",
+                                          "FontId": "3", "DisablePrefix": "yes"})
+    body.text = INSTALL_TEXT
+    heading.tail = body.tail = eula[0].tail
+    eula[0].set('Y', '151')
+    eula[0].set('Height', '34')
+    install[0][0:0] = [heading, body]
+    # The progress label is empty (STRINGS); the package text takes its place at the margin.
+    pages = [p for p in root.iter(f"{{{THM}}}Page") if p.get('Name') == 'Progress']
+    progress = [c for p in pages for c in p if c.get('Name') == 'OverallProgressPackageText']
+    labels = [c for p in pages for c in p if (c.text or '').strip() == '#(loc.ProgressLabel)']
+    if len(pages) != 1 or len(progress) != 1 or len(labels) != 1:
+        raise ValueError('the standard progress page has no single label and package text')
+    pages[0].remove(labels[0])
+    progress[0].set('X', '11')
+    maintenance = [p for p in root.iter(f"{{{THM}}}Page") if p.get('Name') == 'Modify']
+    if len(maintenance) != 1:
+        raise ValueError('the standard theme has no single maintenance page')
+    repairs = [c for c in maintenance[0] if c.get('Name') == 'RepairButton']
+    removes = [c for c in maintenance[0] if c.get('Name') == 'UninstallButton']
+    if len(repairs) != 1 or len(removes) != 1:
+        raise ValueError('the standard maintenance page has no single Repair and Uninstall control')
+    repairs[0].set('X', removes[0].get('X'))
+    at = list(maintenance[0]).index(removes[0])
+    maintenance[0].remove(removes[0])
+    caption = ET.Element(f"{{{THM}}}Label", {"X": "11", "Y": "121", "Width": "-11", "Height": "17",
+                                             "FontId": "3", "DisablePrefix": "yes"})
+    caption.text = REMOVE_CAPTION
+    caption.tail = repairs[0].tail
+    maintenance[0].insert(at, caption)
     # The success page (owner, 2026-10-31): Finish, plus a ticked "Open
     # OpenAbstractions" box after an install, change or repair. Finish closes
     # Setup; with the box ticked the bundle actions extension, which owns both
@@ -802,13 +851,18 @@ def theme(standard: str, apps: list[dict], *, catalog_maintenance: bool = False)
         raise ValueError("the standard Success page has no single launch and close button")
     tail = launch[0].tail
     page.remove(launch[0])
+    caption = ET.Element(f"{{{THM}}}Label", {"X": "11", "Y": "121", "Width": "-11", "Height": "17",
+                                             "FontId": "3", "DisablePrefix": "yes"})
+    caption.text = SUCCESS_CAPTION
+    caption.tail = tail
+    page.insert(list(page).index(close[0]), caption)
     if not apps and not catalog_maintenance:
         text = close[0].find(f"{{{THM}}}Text")
         (text if text is not None else close[0]).text = FINISH
     else:
         at = list(page).index(close[0])
         page.remove(close[0])
-        box = ET.Element(f"{{{THM}}}Checkbox", {"Name": OPEN_CHECKBOX, "X": "11", "Y": "121", "Width": "-11", "Height": "17",
+        box = ET.Element(f"{{{THM}}}Checkbox", {"Name": OPEN_CHECKBOX, "X": "11", "Y": "147", "Width": "-11", "Height": "17",
                                                 "TabStop": "yes", "FontId": "3",
                                                 "VisibleCondition": OPEN_CONDITION})
         box.text = OPEN_TEXT
@@ -1150,8 +1204,9 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("--chain, --bal-ext and --out are required")
     out = args.out.resolve()
     try:
-        chain = read_chain(args.chain.resolve())
-        check_pins(chain)
+        distribution = read_chain(args.chain.resolve())
+        check_pins(distribution)
+        chain = burn_chain(distribution)
         context = chain_context(chain)
         check_core_picture_feature(args.wix, Path(chain["core"]["file"]))
         action_args = (args.actions_dll, args.actions_receipt, args.actions_receipt_sha256)
@@ -1183,6 +1238,8 @@ def main(argv: list[str] | None = None) -> int:
         (out / "bundle.thm").write_text(theme(standard_theme(args.bal_ext), chain["apps"],
                                              catalog_maintenance=args.catalog_maintenance),
                                         encoding="utf-8", newline="\n")
+        (out / "bundle.wxl").write_text(localization(standard_theme(args.bal_ext, STANDARD_LOCALIZATION)),
+                                        encoding="utf-8", newline="\n")
     except (OSError, ValueError, KeyError, zipfile.BadZipFile, json.JSONDecodeError, ET.ParseError) as error:
         print("FAIL ", error)
         return 1
@@ -1190,9 +1247,9 @@ def main(argv: list[str] | None = None) -> int:
     command = [args.wix, "build", "-arch", "x64", "-ext", str(args.bal_ext.resolve()), "-ext", str(args.util_ext.resolve()),
                "-d", f"Version={chain['version']}", "-d", f"CoreMsi={chain['core']['file']}",
                "-d", f"UpgradeBinary={chain['upgrade']['file']}",
-               "-d", f"ThemeFile={out / 'bundle.thm'}",
+               "-d", f"ThemeFile={out / 'bundle.thm'}", "-d", f"LocalizationFile={out / 'bundle.wxl'}",
                "-d", f"BundleIcon={icon}", "-d", f"BundleLogo={logo}",
-               "-d", f"SuppressOptionsUI={'no' if chain['apps'] else 'yes'}",
+               "-d", "SuppressOptionsUI=yes",
                "-d", f"CoreFeatureSelection={'yes' if any(app['id'] == 'opencode' for app in chain['apps']) else 'no'}",
                *(["-d", f"BundleActions={args.actions_dll.resolve()}"] if actions else []),
                "-o", str(bundle), str(HERE / "bundle.wxs"), str(out / "apps.wxs")]
