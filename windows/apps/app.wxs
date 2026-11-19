@@ -36,18 +36,31 @@
          starts: OaPanel is private, so Windows Installer ignores it on the
          command line, and the two search properties, which Windows
          Installer requires to be public, are cleared before AppSearch fills
-         them, so a command-line value never reaches OaPanel. OaNoValue is
-         never set; it formats as the empty value that clears a property. -->
-    <SetProperty Id="OAPANEL_USER" Action="ClearOaPanelUser" Value="[OaNoValue]" Before="AppSearch" Sequence="both" />
-    <SetProperty Id="OAPANEL_MACHINE" Action="ClearOaPanelMachine" Value="[OaNoValue]" Before="AppSearch" Sequence="both" />
+         them. OaNoValue is never set; it formats as the empty value that
+         clears a property.
+
+         The clears, AppSearch, the OaPanel setters and the launch conditions
+         run in the execute sequence only. Windows Installer skips AppSearch
+         in the execute sequence once the UI sequence has run it, and the
+         full-UI server would then hold only the clears. With AppSearch absent
+         from the UI sequence, the server always clears and then searches
+         itself. Every value that reaches OaPanel comes from that search. A
+         server that skips AppSearch for any other reason leaves OaPanel empty
+         and refuses. The full UI shows the server's refusal message. -->
+    <InstallUISequence>
+      <AppSearch Suppress="yes" />
+      <LaunchConditions Suppress="yes" />
+    </InstallUISequence>
+    <SetProperty Id="OAPANEL_USER" Action="ClearOaPanelUser" Value="[OaNoValue]" Before="AppSearch" Sequence="execute" />
+    <SetProperty Id="OAPANEL_MACHINE" Action="ClearOaPanelMachine" Value="[OaNoValue]" Before="AppSearch" Sequence="execute" />
     <Property Id="OAPANEL_USER">
       <RegistrySearch Root="HKCU" Key="Software\OpenAbstractions\Abstraction\Panel" Name="program" Type="raw" />
     </Property>
     <Property Id="OAPANEL_MACHINE">
       <RegistrySearch Root="HKLM" Key="Software\OpenAbstractions\Abstraction\Panel" Name="program" Type="raw" Bitness="always64" />
     </Property>
-    <SetProperty Id="OaPanel" Action="SetOaPanelMachine" Value="[OAPANEL_MACHINE]" After="AppSearch" Condition="OAPANEL_MACHINE" Sequence="both" />
-    <SetProperty Id="OaPanel" Action="SetOaPanelUser" Value="[OAPANEL_USER]" After="SetOaPanelMachine" Condition="NOT OaPanel AND OAPANEL_USER" Sequence="both" />
+    <SetProperty Id="OaPanel" Action="SetOaPanelMachine" Value="[OAPANEL_MACHINE]" After="AppSearch" Condition="OAPANEL_MACHINE" Sequence="execute" />
+    <SetProperty Id="OaPanel" Action="SetOaPanelUser" Value="[OAPANEL_USER]" After="SetOaPanelMachine" Condition="NOT OaPanel AND OAPANEL_USER" Sequence="execute" />
     <Launch Condition="OaPanel OR Installed" Message="$(var.AppTitle) needs OpenAbstractions, which is not installed. Download it from https://github.com/openabstractions/redist/releases/latest, install it, then run this installer again." />
 
     <StandardDirectory Id="LocalAppDataFolder">
