@@ -762,8 +762,15 @@ def public_asset_names(directory, assets, version):
     return sorted(names.get(name, name) for name in assets)
 
 
-def setup_catalog_files(archive, receipt, version, run):
+def setup_catalog_files(archive, receipt, version, run, *,
+                        producer_source=None, producer_run_id=None, producer_run_attempt=None):
     """Bind the Catalog MSI, external chain MSIs and private inventory."""
+    producer = (producer_source, producer_run_id, producer_run_attempt)
+    retained = any(value is not None for value in producer)
+    if retained and (not isinstance(producer_source, str)
+            or not re.fullmatch('[0-9a-f]{40}', producer_source)
+            or any(type(value) is not int or value < 1 for value in producer[1:])):
+        raise ValueError('Setup Catalog requires the complete exact original producer identity')
     def metadata(name, limit):
         if name not in archive.namelist() or archive.getinfo(name).file_size > limit:
             raise ValueError('Setup Catalog metadata is missing or too large: ' + name)
@@ -786,18 +793,28 @@ def setup_catalog_files(archive, receipt, version, run):
         rows = rows[1:]
     if [(row.get('id'), row.get('name'), row.get('sha256'), row.get('bytes')) for row in rows] != expected_chain:
         raise ValueError('Setup Catalog receipt differs from its physical chain')
-    if (not run or type(context.get('run_attempt')) is not int
-            or not 1 <= context['run_attempt'] <= run['run_attempt']
-            or context.get('source') != run['head_sha'] or context.get('run_id') != run['id']
-            or context.get('version') != version[1:]
-            or any(proof.get(key) != context[key] for key in ('source', 'run_id', 'run_attempt'))):
+    if (not isinstance(run, dict) or not re.fullmatch('[0-9a-f]{40}', str(run.get('head_sha')))
+            or any(type(run.get(key)) is not int or run[key] < 1 for key in ('id', 'run_attempt'))):
         raise ValueError('Setup Catalog source or run differs from the promoted candidate')
+    # API artifact admission outside this reader authenticates the new assembly.
+    # check_bundle emits the admitted original producer in its Catalog proof;
+    # both that proof and the immutable context must retain the same identity.
+    identity = (dict(source=producer_source, run_id=producer_run_id, run_attempt=producer_run_attempt)
+                if retained else dict(source=run['head_sha'], run_id=run['id'], run_attempt=proof.get('run_attempt')))
+    if (any(type(proof.get(key)) is not int or proof[key] < 1 for key in ('run_id', 'run_attempt'))
+            or (not retained and proof['run_attempt'] > run['run_attempt'])
+            or any(proof.get(key) != value for key, value in identity.items())):
+        raise ValueError('Setup Catalog proof source or run differs from its selected producer')
+    if (context.get('version') != version[1:]
+            or any(type(context.get(key)) is not int for key in ('run_id', 'run_attempt'))
+            or any(context.get(key) != value for key, value in identity.items())):
+        raise ValueError('Setup Catalog source or run differs from the original producer')
     apps = [app for app in distribution['apps'] if app['id'] == owner.CATALOG_ONLY_APP]
     if len(apps) != 1:
         raise ValueError('Setup Catalog requires one exact application package')
     app = apps[0]
     signer.producer_hosts(dict(distribution, apps=apps), {'opencode': context['expected_producers']['opencode']},
-                          source=proof['source'], run_id=proof['run_id'], run_attempt=proof['run_attempt'])
+                          **identity)
     name = 'opencode-' + version[1:] + '.msi'
     package = proof['package']
     preflight = app['host']['preflight']
@@ -830,7 +847,8 @@ def setup_catalog_files(archive, receipt, version, run):
     return name, files, external_msis
 
 
-def unpack_setup(blob, digest, destination, version, packages, *, receipt_sink=None, run=None):
+def unpack_setup(blob, digest, destination, version, packages, *, receipt_sink=None, run=None,
+                 producer_source=None, producer_run_id=None, producer_run_attempt=None):
     """Check the Setup artifact and write the files it publishes.
 
     packages maps each verified-release package to its SHA-256; the bundle's
@@ -872,8 +890,13 @@ def unpack_setup(blob, digest, destination, version, packages, *, receipt_sink=N
         if not isinstance(chain, list) or not chain or not all(isinstance(entry, dict) for entry in chain):
             raise ValueError('Setup receipt has no package chain')
         split = 'catalog_opencode' in receipt
+        retained = any(value is not None for value in (producer_source, producer_run_id, producer_run_attempt))
+        if retained and not split:
+            raise ValueError('original producer identity requires the Setup Catalog context')
         if split:
-            catalog, internal, external_msis = setup_catalog_files(archive, receipt, version, run)
+            catalog, internal, external_msis = setup_catalog_files(archive, receipt, version, run,
+                producer_source=producer_source, producer_run_id=producer_run_id,
+                producer_run_attempt=producer_run_attempt)
             cores = [row for row in chain if (row.get('id'), row.get('name')) == SETUP_CORE]
             if len(cores) != 1:
                 raise ValueError('the Setup receipt lacks exactly one core MSI')

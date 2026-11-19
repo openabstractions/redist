@@ -5268,7 +5268,7 @@ jobs:
         msi=s.member(Path('original-core'),'abstraction-x64.msi')
         assert s.setup_file_pin(msi)==dict(name='abstraction-x64.msi',bytes=147587072,sha256='582692f99f46e735470f1a58aa1e03831b4a90743cadeac4f397a8dfe838e2b7')
         s.verify(msi,json.loads(Path('windows/certum_simplysign.json').read_bytes()),os.environ['SIGNTOOL'])
-        read=Path('original-core-readback');read.mkdir()
+        read=Path('original-core-readback').resolve();read.mkdir()
         subprocess.run(['wix','msi','decompile',str(msi),'-x',str(read/'files'),'-o',str(read/'package.wxs')],check=True)
         actual,_,_,_=s.msi_member_readback(read)
         engine=Path('engine-input');engine.mkdir()
