@@ -26,6 +26,7 @@ $script:CertumSubmitFailureStep = $null
 $script:CertumSubmitField = 'none'
 $script:CertumSubmitFailed = $false
 $script:CertumDiscoveryFailure = 'operation-failed'
+$script:CertumWindowObservation = $null
 
 function ConvertTo-CertumCountBucket($Count) {
     if ($Count -cin @('zero','one','two','many')) { return $Count }
@@ -53,6 +54,20 @@ function Write-CertumFailure {
         $script:CertumDiscoveryFailure
     } else { 'operation-failed' }
     [Console]::Error.WriteLine("SimplySign session operation failed; stage=$stage; category=$category; cleanup=$cleanup; schema_reason=$reason; edit_count=$count; credential diagnostics are disabled.")
+    if ($stage -ceq 'certificate-discovery' -and $null -ne $script:CertumWindowObservation) {
+        $row = $script:CertumWindowObservation
+        $result = if ($row.result -is [string] -and $row.result -cin @('observed','query-failed')) {$row.result} else {'unknown'}
+        $total = if ($row.count -is [string]) {ConvertTo-CertumCountBucket $row.count} else {'unknown'}
+        [Console]::Error.WriteLine("SimplySign window observation; result=$result; visible_count=$total.")
+        $index = 0
+        foreach ($window in $row.windows) {
+            if ($index -ge 4) { break }; $index++
+            $family = if ($window.family -is [string] -and $window.family -cin @('dialog','winforms','other')) {$window.family} else {'unknown'}
+            $owner = if ($window.owner -is [string] -and $window.owner -cin @('same-process','none','foreign')) {$window.owner} else {'unknown'}
+            $enabled = if ($window.enabled -is [string] -and $window.enabled -cin @('yes','no')) {$window.enabled} else {'unknown'}
+            [Console]::Error.WriteLine("SimplySign window observation; slot=$index; class_family=$family; owner=$owner; enabled=$enabled.")
+        }
+    }
     if ($script:CertumSubmitFailed) {
         $steps = @('target-discovery','pattern-preflight','target-revalidation','field-write','button-invoke')
         $rawStep = if ($script:CertumSubmitFailureStep) {$script:CertumSubmitFailureStep} else {$script:CertumSubmitStep}
@@ -337,6 +352,40 @@ public static class CertumWindow {
         var found = new List<IntPtr>();
         EnumWindows((h, unused) => { uint owner; GetWindowThreadProcessId(h, out owner);
             if (owner == pid && IsWindowVisible(h)) found.Add(h); return true; }, IntPtr.Zero);
+        return found.ToArray();
+    }
+    [DllImport("user32.dll")] static extern IntPtr GetWindow(IntPtr h, uint command);
+    [DllImport("user32.dll")] static extern bool IsWindowEnabled(IntPtr h);
+    public sealed class WindowObservation {
+        public string family;
+        public string owner;
+        public string enabled;
+    }
+    public static string ClassFamily(string name) {
+        if (name == "#32770") return "dialog";
+        if (name != null && name.StartsWith("WindowsForms10.", StringComparison.Ordinal)) return "winforms";
+        return "other";
+    }
+    public static WindowObservation[] Observe(IntPtr[] windows, uint pid) {
+        var found = new List<WindowObservation>();
+        for (int i = 0; i < windows.Length && i < 4; i++) {
+            IntPtr h = windows[i]; uint process;
+            if (GetWindowThreadProcessId(h, out process) == 0 || process != pid || !IsWindowVisible(h))
+                throw new InvalidOperationException("window observation identity changed");
+            var value = new System.Text.StringBuilder(256);
+            if (GetClassName(h, value, value.Capacity) == 0)
+                throw new InvalidOperationException("window observation query failed");
+            IntPtr owner = GetWindow(h, 4); // GW_OWNER; no title or control values are read.
+            string relation = "none";
+            if (owner != IntPtr.Zero) {
+                uint ownerPid;
+                if (GetWindowThreadProcessId(owner, out ownerPid) == 0)
+                    throw new InvalidOperationException("window owner query failed");
+                relation = ownerPid == pid ? "same-process" : "foreign";
+            }
+            found.Add(new WindowObservation {family=ClassFamily(value.ToString()), owner=relation,
+                enabled=IsWindowEnabled(h) ? "yes" : "no"});
+        }
         return found.ToArray();
     }
     public static int EditChildren(IntPtr handle, uint pid) {
@@ -655,12 +704,19 @@ function Stop-CertumSession($Session) {
 }
 
 function Get-CertumDiscoveredCertificate($Process, $Policy, $Clock) {
+    $script:CertumWindowObservation = $null
     while ($Clock.Elapsed.TotalSeconds -lt 120) {
         $script:CertumDiscoveryFailure = 'process-query-failed'
         $Process.Refresh()
         if ($Process.HasExited) { $script:CertumDiscoveryFailure = 'desktop-exited'; throw 'Desktop exited during authentication' }
         $script:CertumDiscoveryFailure = 'window-query-failed'
-        if (@([CertumWindow]::Owned($Process.Id)).Count -gt 1) {
+        $windows = @([CertumWindow]::Owned($Process.Id))
+        if ($windows.Count -gt 1) {
+            $script:CertumWindowObservation = @{result='query-failed';count=$(if ($windows.Count -eq 2) {'two'} else {'many'});windows=@()}
+            try {
+                $observed = @([CertumWindow]::Observe($windows, $Process.Id))
+                $script:CertumWindowObservation = @{result='observed';count=$script:CertumWindowObservation.count;windows=$observed}
+            } catch { } # Observation never changes the original refusal or emits an ErrorRecord.
             $script:CertumDiscoveryFailure = 'unexpected-modal'; throw 'unexpected Desktop modal window'
         }
         $script:CertumDiscoveryFailure = 'certificate-query-failed'
