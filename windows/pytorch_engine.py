@@ -6,6 +6,7 @@ inputs into the reduced bundle and reports its measured artifact identity.
 """
 
 import argparse
+from datetime import datetime
 import hashlib
 import json
 from pathlib import Path
@@ -475,6 +476,28 @@ def intake_inputs(output: Path, sources: Path, source: str, version: str,
         raise
 
 
+def _input_artifact_attempt(job, artifact):
+    name = artifact.get('name')
+    match = re.fullmatch(r'abstraction-pytorch-inputs-([1-9][0-9]*)', name) if isinstance(name, str) else None
+    if not match or not 1 <= int(match[1]) <= job['run_attempt']:
+        raise ValueError('PyTorch input artifact attempt differs from its producer')
+    physical_attempt = int(match[1])
+    if physical_attempt != job['run_attempt']:
+        # GitHub copies retained successes into later attempts, with a new job
+        # creation time and the original execution window. The exact artifact
+        # must have been uploaded during that retained execution.
+        values = (job.get('started_at'), artifact.get('created_at'),
+                  job.get('completed_at'), job.get('created_at'))
+        if any(not isinstance(value, str) or not re.fullmatch(
+                r'[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\.[0-9]{1,6})?Z', value)
+                for value in values):
+            raise ValueError('PyTorch retained producer lacks an exact execution window')
+        started, uploaded, completed, created = (datetime.fromisoformat(value) for value in values)
+        if not started <= uploaded <= completed < created:
+            raise ValueError('PyTorch input artifact differs from the retained execution')
+    return physical_attempt
+
+
 def consume_inputs(output: Path, sources: Path, source: str, version: str,
                    release_id: int, bundle_id: int, manifest_id: int, artifact_id: int,
                    run_id: int, attempt: int, *, publication, environment: dict, source_id=None) -> dict:
@@ -489,18 +512,16 @@ def consume_inputs(output: Path, sources: Path, source: str, version: str,
     owner = input_source(sources)
     run, jobs, artifacts = publication.inspect(INPUT_REPOSITORY, run_id)
     input_run(run, run_id, source, attempt)
-    selected_jobs = [job for job in jobs if job.get("name") == "pytorch-input"]
-    if (len(selected_jobs) != 1 or selected_jobs[0].get("head_sha") != source
-            or selected_jobs[0].get("status") != "completed"
-            or selected_jobs[0].get("conclusion") != "success"
-            or type(selected_jobs[0].get("run_attempt")) is not int
-            or not 1 <= selected_jobs[0]["run_attempt"] <= attempt):
-        raise ValueError("newest PyTorch intake job did not pass")
-    intake_attempt = selected_jobs[0]["run_attempt"]
-    selected = [item for item in artifacts if item.get("name") == f"abstraction-pytorch-inputs-{intake_attempt}"]
+    try:
+        publication.producer_attempt(run, jobs, 'pytorch-input')
+    except ValueError as error:
+        raise ValueError("newest PyTorch intake job did not pass") from error
+    job = next(job for job in jobs if job.get('name') == 'pytorch-input')
+    selected = [item for item in artifacts if item.get('id') == artifact_id]
     if len(selected) != 1:
         raise ValueError("PyTorch input artifact is missing or ambiguous")
-    artifact = selected[0]
+    intake_attempt = _input_artifact_attempt(job, selected[0])
+    artifact = publication.run_artifact(selected[0]['name'], source, artifacts, run_id=run_id)
     maximum = sum(pin["size_bytes"] for pin in INPUT_PINS.values()) + 2 * 1024 * 1024
     if (type(artifact.get("id")) is not int or artifact["id"] != artifact_id or artifact.get("expired") is not False
             or not re.fullmatch(r"sha256:[0-9a-f]{64}", artifact.get("digest", ""))

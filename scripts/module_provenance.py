@@ -161,8 +161,15 @@ def select_panel_source(prepared_graph, proxy_root, catalogue_directory, *, expe
         relay = importlib.util.module_from_spec(spec); spec.loader.exec_module(relay)
         relay.installer_prior_descriptor(expected_installer_priors)
         received = json.loads(intake.read_bytes(), object_pairs_hook=assets.strict_object)
-        if (set(received) != {'schema', 'descriptor', 'producer'} or received['schema'] != 1
-                or received['descriptor'] != expected_installer_priors or received['producer'] != expected_producer
+        producer = received.get('producer') if isinstance(received, dict) else None
+        prior_attempt = producer.get('run_attempt') if isinstance(producer, dict) else None
+        consumer_attempt = expected_producer['run_attempt']
+        if (not isinstance(received, dict) or set(received) != {'schema', 'descriptor', 'producer'}
+                or type(received['schema']) is not int or received['schema'] != 1
+                or type(prior_attempt) is not int or type(consumer_attempt) is not int
+                or not 0 < prior_attempt <= consumer_attempt
+                or received['descriptor'] != expected_installer_priors
+                or producer != dict(expected_producer, run_attempt=prior_attempt)
                 or expected_installer_priors['source'] != prepared_graph['source']):
             raise ValueError('Panel installer predecessor intake differs from authenticated prepared inputs')
         archives = [intake.parent / str(i) / row['asset']['name'] for i, row in enumerate(expected_installer_priors['priors'])]
