@@ -762,13 +762,32 @@ def public_asset_names(directory, assets, version):
     return sorted(names.get(name, name) for name in assets)
 
 
-def setup_public_msis(owner, distribution, physical, version):
-    """0.8 publishes the Comfy integration beside the separate OpenCode MSI."""
-    selected = distribution if version == 'v0.8.0' else physical
-    return {Path(package['file']).name
-            for _, kind, package, app in owner.chain_packages(selected)
-            if app is not None and kind == 'MsiPackage'
-            and (version != 'v0.8.0' or app['id'] == 'comfyui')}
+def release_msis(version, path=None):
+    """The app ids whose MSIs release-msis.tsv publishes for version, or None without a row."""
+    if path is None:
+        path = Path(__file__).resolve().parent.parent / 'release-msis.tsv'
+        if not path.exists():  # private monorepo tests use the authored file before splitting
+            path = Path(__file__).resolve().parents[3] / 'research/org-edits/redist/release-msis.tsv'
+    rows = [line.split('\t') for line in Path(path).read_text(encoding='utf-8').splitlines()
+            if line.strip() and not line.startswith('>')]
+    if not rows or rows[0] != ['version', 'apps'] or any(len(row) != 2 for row in rows):
+        raise ValueError('release-msis.tsv needs version and apps columns')
+    selected = [set(apps.split()) for tag, apps in rows[1:] if tag == version]
+    return selected[0] if selected else None
+
+
+def setup_public_msis(owner, distribution, physical, version, apps=None):
+    """The app MSIs a release publishes: those release-msis.tsv names for the version, from the
+    Setup's app distribution chain; every app MSI of the physical chain for a version it does not name."""
+    apps = release_msis(version) if apps is None else apps
+    selected = physical if apps is None else distribution
+    found = {app['id']: Path(package['file']).name
+             for _, kind, package, app in owner.chain_packages(selected)
+             if app is not None and kind == 'MsiPackage' and (apps is None or app['id'] in apps)}
+    if apps is not None and set(found) != apps:
+        print('release-msis.tsv names apps this Setup does not carry, which stay unpublished: '
+              + ', '.join(sorted(apps - set(found))), file=sys.stderr)
+    return set(found.values())
 
 
 def setup_catalog_files(archive, receipt, version, run, *,
@@ -856,7 +875,7 @@ def setup_catalog_files(archive, receipt, version, run, *,
                     raise ValueError('duplicate Setup Catalog distribution member')
                 files[member_name] = pin(member)
     files.update({signer.APP_DISTRIBUTION_CHAIN: None, 'app-chain-context.json': None})
-    external_msis = setup_public_msis(owner, distribution, physical, version)
+    external_msis = setup_public_msis(owner, distribution, physical, version) - {name}  # name is published as the Catalog MSI
     return name, files, external_msis
 
 

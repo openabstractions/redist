@@ -54,48 +54,32 @@
     </InstallExecuteSequence>
     <MediaTemplate EmbedCab="yes" />
 
-    <!-- Every search, FindHostFolder and the launch conditions run in the
-         execute sequence only, as in app.wxs. Windows Installer skips
-         AppSearch in the execute sequence once the UI sequence has run it,
-         and the full-UI server would then hold only the clears. With
-         AppSearch absent from the UI sequence, the server always clears and
-         then searches itself, for the Panel and for the recorded folder
-         alike. The full UI shows the server's refusal message. -->
+    <!-- FindRecords (oa_records.h, in the package's action library) reads
+         the Panel's program into OaPanel, as in app.wxs, and the folder an
+         earlier install recorded into OaRecordedFolder. Both properties are
+         private and set on every run, so only the registry fills them.
+         FindRecords, FindHostFolder and the launch conditions run in the
+         execute sequence only. Windows Installer skips AppSearch there
+         whenever the UI sequence has run, and a custom action runs under
+         every UI level. The full UI shows the server's refusal message. -->
     <InstallUISequence>
-      <AppSearch Suppress="yes" />
       <LaunchConditions Suppress="yes" />
     </InstallUISequence>
+    <Property Id="OaExtensionId" Value="$(var.ExtensionId)" />
+    <CustomAction Id="FindRecords" BinaryRef="HostFolderAction" DllEntry="FindRecords"
+                  Execute="immediate" Return="check" />
 
 <?if $(var.RequireOpenAbstractions) = "yes" ?>
-    <!-- The same search as app.wxs: only the registry names the Panel, and
-         the search runs in the execute sequence only. -->
-    <SetProperty Id="OAPANEL_USER" Action="ClearOaPanelUser" Value="[OaNoValue]" Before="AppSearch" Sequence="execute" />
-    <SetProperty Id="OAPANEL_MACHINE" Action="ClearOaPanelMachine" Value="[OaNoValue]" Before="AppSearch" Sequence="execute" />
-    <Property Id="OAPANEL_USER">
-      <RegistrySearch Root="HKCU" Key="Software\OpenAbstractions\Abstraction\Panel" Name="program" Type="raw" />
-    </Property>
-    <Property Id="OAPANEL_MACHINE">
-      <RegistrySearch Root="HKLM" Key="Software\OpenAbstractions\Abstraction\Panel" Name="program" Type="raw" Bitness="always64" />
-    </Property>
-    <SetProperty Id="OaPanel" Action="SetOaPanelMachine" Value="[OAPANEL_MACHINE]" After="AppSearch" Condition="OAPANEL_MACHINE" Sequence="execute" />
-    <SetProperty Id="OaPanel" Action="SetOaPanelUser" Value="[OAPANEL_USER]" After="SetOaPanelMachine" Condition="NOT OaPanel AND OAPANEL_USER" Sequence="execute" />
     <Launch Condition="OaPanel OR Installed" Message="$(var.Title) needs OpenAbstractions, which is not installed. Download it from https://github.com/openabstractions/redist/releases/latest, install it, then run this installer again." />
 <?endif?>
 
-    <!-- The folder an earlier install recorded. The search property is
-         public, as Windows Installer requires, and cleared before AppSearch
-         like the Panel's, so only the registry fills it. -->
-    <SetProperty Id="OAEXTENSION_FOLDER" Action="ClearExtensionFolder" Value="[OaNoValue]" Before="AppSearch" Sequence="execute" />
-    <Property Id="OAEXTENSION_FOLDER">
-      <RegistrySearch Root="HKCU" Key="Software\OpenAbstractions\Extensions\$(var.ExtensionId)" Name="folder" Type="raw" />
-    </Property>
-    <SetProperty Id="HostFolder" Action="SetRecordedHostFolder" Value="[OAEXTENSION_FOLDER]" After="AppSearch"
-                 Condition="Installed AND OAEXTENSION_FOLDER" Sequence="execute" />
+    <SetProperty Id="HostFolder" Action="SetRecordedHostFolder" Value="[OaRecordedFolder]" After="FindRecords"
+                 Condition="Installed AND OaRecordedFolder" Sequence="execute" />
 
     <Property Id="OaHostKey" Value="$(var.HostKey)" />
     <Property Id="OaHostSubfolder" Value="$(var.HostSubfolder)" />
     <Property Id="OaExtensionName" Value="$(var.Folder)" />
-    <SetProperty Id="OaHostConfig" Action="SetHostConfig" Value="$(var.HostConfig)" Before="AppSearch" Sequence="execute" />
+    <SetProperty Id="OaHostConfig" Action="SetHostConfig" Value="$(var.HostConfig)" Before="FindRecords" Sequence="execute" />
     <!-- An application folder found elsewhere, such as a portable copy: the
          caller writes a configuration file of the same shape naming that
          folder and passes its full path as OAHOSTCONFIG. -->
@@ -105,6 +89,7 @@
     <CustomAction Id="FindHostFolder" BinaryRef="HostFolderAction" DllEntry="FindHostFolder"
                   Execute="immediate" Return="check" />
     <InstallExecuteSequence>
+      <Custom Action="FindRecords" After="RefuseFreshExtensionReplacement" />
       <Custom Action="FindHostFolder" After="SetRecordedHostFolder" Condition="NOT Installed" />
     </InstallExecuteSequence>
     <Launch Condition="Installed OR OaHostFound" Message="$(var.MissingHost)" />

@@ -1,10 +1,10 @@
 {
   "schema": 1,
-  "release_tag": "v0.8.0",
+  "release_tag": "v0.8.1",
   "apps": [],
   "release_admission": {
     "schema": 1,
-    "version": "0.8.0",
+    "version": "0.8.1",
     "scope_sha256": "9ef284e8fdc8594c84d47c1a29b10defc39abf3053011b85e58a2b8b468c943f",
     "delivery_accepted": false,
     "outcomes": {
@@ -104,6 +104,6 @@
       ]
     },
     "selections": [],
-    "capsule_sha256": "bd619f11d31eeef9c6c85728bc4c32577d9def6319c51a83d2f2653f6351ba18"
+    "capsule_sha256": "d674f23b47c2dd6e4af88a2b62bd7c1b27e7fa5151fdb1601bb0f0ad8cde1b5d"
   }
 }

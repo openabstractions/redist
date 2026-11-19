@@ -10,6 +10,7 @@ import json
 from pathlib import Path
 import re
 import subprocess
+from decimal import Decimal
 
 SCHEMA = 1
 SURFACES = ('README.md', 'RELEASE-CHECKLIST.md', 'PROGRESS.md',
@@ -50,7 +51,90 @@ POINTERS = {
                  '/data/release_body', '/data/unsigned_platforms', '/data/download_url', '/data/final_signed_msis'),
     'installed': ('/data/source_sha', '/data/version', '/data/operation', '/data/native'),
     'setup': ('/bundle', '/signatures', '/chain', '/policy_sha256'),
+    'prospective_modules': ('/schema', '/source', '/version', '/kind', '/status', '/modules', '/scope',
+                            '/checksum_database', '/checksum_exclusions', '/split_outputs_sha256'),
+    'public_modules': ('/schema', '/source', '/version', '/kind', '/status', '/modules', '/scope',
+                       '/checksum_database', '/checksum_exclusions', '/split_outputs_sha256'),
+    'soak': ('/schema', '/source', '/version', '/kind', '/status', '/candidate', '/measurement', '/prior_journal_note'),
+    'mac_install': ('/schema', '/source', '/version', '/kind', '/status', '/candidate', '/measurement', '/disposition',
+                    '/prior_journal_note'),
 }
+
+PRIOR_JOURNAL_NOTE = 'retained 0.8.0 journal has no C-77 soak or Mac receipt'
+
+
+def candidate_inventory(source, version, assets):
+    """The portable identity shared by native qualification and published facts."""
+    if not SOURCE.fullmatch(str(source)) or not VERSION.fullmatch(str(version)):
+        raise ValueError('candidate source/version identity differs')
+    if not isinstance(assets, list) or not 2 <= len(assets) <= 10000:
+        raise ValueError('candidate asset inventory is empty or unbounded')
+    names = set()
+    for row in assets:
+        if (not isinstance(row, dict) or set(row) != {'name', 'sha256', 'bytes'}
+                or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._+-]*', str(row.get('name', '')))
+                or not SHA.fullmatch(str(row.get('sha256', '')))
+                or type(row.get('bytes')) is not int or row['bytes'] <= 0
+                or row['name'].casefold() in names):
+            raise ValueError('invalid or ambiguous candidate asset identity')
+        names.add(row['name'].casefold())
+    if assets != sorted(assets, key=lambda row: row['name']):
+        raise ValueError('candidate asset inventory is not canonical')
+    by_name = {row['name']: row for row in assets}
+    setup, core = 'OpenAbstractions-Setup-' + version + '.exe', 'abstraction-' + version + '-x64.msi'
+    if setup not in by_name or core not in by_name:
+        raise ValueError('candidate lacks its signed Setup or x64 core MSI')
+    mac = [row for row in assets if row['name'].lower().endswith(('.pkg', '.dmg')) or
+           (re.search(r'(?:darwin|macos)', row['name'], re.I) and row['name'].endswith(('.tar.gz', '.zip')))]
+    return {'source': source, 'version': version, 'setup': by_name[setup], 'core': by_name[core],
+            'macos': mac, 'assets': assets, 'inventory_sha256': digest(assets)}
+
+
+def candidate_qualification(groups, source, version, assets, *, required):
+    """Receive projections only after their native owner has validated raw evidence."""
+    result, selected = {'soak': 'pending', 'mac_install': 'pending'}, None
+    for role, kind in (('soak', 'installed-runtime-soak'), ('mac_install', 'mac-installed-qualification')):
+        if len(groups[role]) > 1:
+            raise ValueError('ambiguous installed candidate qualification')
+        if not groups[role]:
+            continue
+        row = groups[role][0]
+        identity = row.get('/candidate', {})
+        expected = candidate_inventory(source, version, identity.get('assets'))
+        if (identity != expected or (selected is not None and identity != selected)
+                or row.get('/schema') != 1 or row.get('/source') != source or row.get('/version') != version
+                or row.get('/status') != 'pass' or row.get('/kind') != kind
+                or row.get('/prior_journal_note') != PRIOR_JOURNAL_NOTE):
+            raise ValueError('installed qualification source or candidate differs')
+        selected = identity
+        for pin in [identity['setup'], identity['core'], *identity['macos']]:
+            actual = assets.get(pin['name'], {})
+            if any(actual.get(key) != pin[key] for key in ('sha256', 'bytes')):
+                raise ValueError('installed qualification artifact differs from the producer')
+        measured = row.get('/measurement', {})
+        if role == 'soak':
+            seconds = measured.get('seconds')
+            if (not isinstance(seconds, str) or len(seconds) > 64 or not re.fullmatch(r'\d+(?:\.\d+)?', seconds)
+                    or Decimal(seconds) < 3600 or measured.get('process_roles') != ['runtime', 'supervisor']
+                    or type(measured.get('crashes')) is not int or measured['crashes'] != 0
+                    or type(measured.get('restarts')) is not int or measured['restarts'] != 0
+                    or measured.get('errors_growing') is not False):
+                raise ValueError('installed soak lacks its full-hour lifetime/log observations')
+        else:
+            actual_mac = sorted(name for name, pin in assets.items() if pin['platform'] == 'macos')
+            if actual_mac != sorted(pin['name'] for pin in identity['macos']):
+                raise ValueError('Mac qualification installer inventory differs')
+            if identity['macos']:
+                if (row.get('/disposition') != 'observed'
+                        or measured.get('architecture') not in ('arm64', 'x64', 'x86_64')
+                        or measured.get('cleanup_verified') is not True):
+                    raise ValueError('Mac installer requires actual installed receiving evidence')
+            elif row.get('/disposition') != 'no macOS installable artifacts in ' + version or measured != {}:
+                raise ValueError('missing explicit Mac installer absence record')
+        result[role] = 'observed'
+    if required and set(result.values()) != {'observed'}:
+        raise ValueError('published release requires soak and Mac qualification receipts')
+    return result
 
 
 def public_msi_members(rows):
@@ -94,7 +178,9 @@ def safe_value(value):
             'timestamp_digest', 'verification', 'new_signature', 'certificate',
             'chain', 'subject', 'issuer', 'sha1', 'policy_sha256', 'native64',
             'architecture', 'platform', 'executed', 'manual', 'status', 'core', 'signatures',
-            'engine', 'bundle', 'signature', 'final_signed_msis', 'staged_sha256', 'producer_source'}
+            'engine', 'bundle', 'signature', 'final_signed_msis', 'staged_sha256', 'producer_source',
+            'module', 'sum', 'gomodsum', 'candidate', 'assets', 'setup', 'inventory_sha256',
+            'seconds', 'process_roles', 'crashes', 'restarts', 'errors_growing', 'cleanup_verified'}
         result = {key: safe_value(item) for key, item in value.items() if key in allowed}
         if 'msi_members' in value:
             if not isinstance(value.get('name'), str) or not value['name'].endswith('.msi'):
@@ -129,7 +215,7 @@ def derive(record):
     observations = record.get('observations')
     if not isinstance(observations, list):
         raise ValueError('release evidence observations are required')
-    groups = {'public': [], 'producer': [], 'installed': [], 'setup': []}
+    groups = {role: [] for role in POINTERS}
     evidence = []
     for row in observations:
         if row.get('role') not in groups or not SHA.fullmatch(str(row.get('raw_sha256', ''))):
@@ -151,6 +237,30 @@ def derive(record):
         raise ValueError('invalid producer release version')
     if source is not None and not SOURCE.fullmatch(str(source)):
         raise ValueError('invalid producer source')
+    module_qualification = {'prospective': 'pending', 'public': 'pending'}
+    module_hashes = []
+    for role, kind, field in (('prospective_modules', 'prospective-module-qualification', 'prospective'),
+                              ('public_modules', 'public-tag-readback', 'public')):
+        if len(groups[role]) > 1:
+            raise ValueError('ambiguous module qualification')
+        if not groups[role]:
+            continue
+        row = groups[role][0]
+        modules = row.get('/modules', [])
+        if (row.get('/schema') != 1 or row.get('/source') != source or row.get('/version') != version or
+                row.get('/kind') != kind or row.get('/status') != 'pass' or
+                row.get('/checksum_database') != 'sum.golang.org' or not modules or
+                not SHA.fullmatch(str(row.get('/split_outputs_sha256', ''))) or
+                (field == 'public' and row.get('/checksum_exclusions') != [])):
+            raise ValueError('module qualification source, identity or checksum policy differs')
+        if field == 'prospective':
+            module_hashes = modules
+        elif not module_hashes or modules != module_hashes:
+            raise ValueError('public module content differs from prospective qualification')
+        module_qualification[field] = 'observed'
+    if (record['context'] == 'published' and version and tuple(map(int, version.split('.'))) >= (0, 8, 1)
+            and set(module_qualification.values()) != {'observed'}):
+        raise ValueError('published release requires both module qualification receipts')
     if metadata and str(metadata.get('version', '')).removeprefix('v') != version:
         raise ValueError('candidate metadata version differs')
     url = None
@@ -237,9 +347,15 @@ def derive(record):
         platforms[platform] = {'signing': next(iter(states)) if len(states) == 1 else 'pending',
             'installed_tested_architectures': sorted(set(installed[platform])),
             'installation_state': 'observed' if installed[platform] else 'pending'}
-    return {'schema': SCHEMA, 'context': record['context'], 'source_sha': source,
+    result = {'schema': SCHEMA, 'context': record['context'], 'source_sha': source,
+            'module_qualification': module_qualification,
             'version': version, 'download_url': url, 'assets': assets,
             'platforms': platforms, 'evidence_links': sorted(set(evidence))}
+    current = version and tuple(map(int, version.split('.'))) >= (0, 8, 1)
+    if current or groups['soak'] or groups['mac_install']:
+        result['candidate_qualification'] = candidate_qualification(groups, source, version, assets,
+            required=bool(current and record['context'] == 'published'))
+    return result
 
 
 def producer_record(metadata, assets, *, unsigned_platforms, setup_signatures=None, installed=(), source_sha=None):
@@ -575,7 +691,7 @@ def read_admission_scope(plan_text, version, read_text, previous=None):
         if not isinstance(key, str) or not key or key in decisions:
             fail('scope_citation', str(key), 'decision id is absent or duplicated'); continue
         decisions[key] = row
-        if row['path'] not in ('VISION.md', 'research/release-0.8.0/PLAN.md'):
+        if row['path'] not in ('VISION.md', 'research/release-' + version + '/PLAN.md'):
             fail('scope_citation', key, 'citation must name its existing VISION or PLAN owner'); continue
         try:
             digest = citation_digest(cited_text(read_text(row['path']), row['heading']),
@@ -646,9 +762,17 @@ def read_admission_scope(plan_text, version, read_text, previous=None):
     return scope, issues
 
 
+def minor_scope_version(version):
+    """A patch uses its minor release's accepted scope, with its own artifact identity."""
+    if not VERSION.fullmatch(str(version)):
+        raise ValueError('invalid release version for accepted scope')
+    major, minor, _ = version.split('.')
+    return major + '.' + minor + '.0'
+
+
 def admission_outcomes(scope, selections, adopter_receipts, journey_receipts, *,
                        source_sha, inputs_sha256, probe_source_sha256,
-                       candidate_artifacts, read_bytes, receiving_context=None):
+                       candidate_artifacts, read_bytes, receiving_context=None, version=None):
     """Collect missing/mismatched exact producer/receiver evidence, with no effects.
 
     receiving_context is an in-process projection from the existing receiving
@@ -663,12 +787,15 @@ def admission_outcomes(scope, selections, adopter_receipts, journey_receipts, *,
         findings.append({'code': code, 'id': key, 'target': target, 'message': message})
     def matching(rows, key, target):
         return [r for r in rows if isinstance(r, dict) and r.get('id') == key and r.get('target') == target]
+    version = scope['release'] if version is None else version
+    if minor_scope_version(version) != scope['release']:
+        fail('admission_identity', '', '', 'target release differs from accepted minor scope')
     if not SOURCE.fullmatch(str(source_sha)) or not all(SHA.fullmatch(str(x)) for x in (inputs_sha256, probe_source_sha256)):
         fail('admission_identity', '', '', 'exact source, inputs and probe identities are required')
     if (candidate_artifacts.get('source_sha') != source_sha or
-            candidate_artifacts.get('version') != scope['release'] or not candidate_artifacts.get('files')):
+            candidate_artifacts.get('version') != version or not candidate_artifacts.get('files')):
         fail('admission_artifacts', '', '', 'exact existing candidate_artifacts producer identity/files required')
-    context_identity = {'source_sha': source_sha, 'version': scope['release'],
+    context_identity = {'source_sha': source_sha, 'version': version,
                         'inputs_sha256': inputs_sha256, 'probe_source_sha256': probe_source_sha256,
                         'candidate_artifacts_sha256': digest(candidate_artifacts)}
     functional_scope = bool(scope['adopters'] or scope['journeys'])
@@ -689,7 +816,7 @@ def admission_outcomes(scope, selections, adopter_receipts, journey_receipts, *,
                     # projection and cannot satisfy this target.
                     website = context.get('website_artifact')
                     if (not isinstance(website, dict) or website.get('source_sha') != source_sha or
-                            website.get('version') != scope['release'] or
+                            website.get('version') != version or
                             not website.get('files') or any(f not in candidate_artifacts.get('files', [])
                                 for f in website.get('files', []))):
                         fail('website_artifact', key, target, 'exact validated website artifact is pending')
@@ -824,7 +951,7 @@ def render_admission_outcomes(report):
 
 def collect_admission(plan_text, version, read_text, *, previous=None, **evidence):
     """One owning entry point for selection, preparation, completion and notes."""
-    scope, findings = read_admission_scope(plan_text, version, read_text, previous)
+    scope, findings = read_admission_scope(plan_text, minor_scope_version(version), read_text, previous)
     if findings:
         outcomes = {'adopters': [], 'journeys': []}
         if isinstance(scope, dict):
@@ -835,7 +962,7 @@ def collect_admission(plan_text, version, read_text, *, previous=None, **evidenc
                             'target': '', 'state': 'pending', 'observations': []})
         return {'scope_sha256': digest(scope), 'outcomes': outcomes,
                 'scope_valid': False, 'findings': findings, 'accepted': False}
-    return dict(admission_outcomes(scope, **evidence), scope_valid=True)
+    return dict(admission_outcomes(scope, version=version, **evidence), scope_valid=True)
 
 
 def requires_admission(version):
@@ -869,8 +996,8 @@ def source_admission(root, source_sha, version, *, candidate_artifacts=None,
         raw = target.read_bytes()
         inputs.append({'path': str(target.resolve()), 'sha256': hashlib.sha256(raw).hexdigest(), 'bytes': len(raw)})
         return raw if binary else raw.decode('utf-8-sig')
-    path = 'research/release-0.8.0/PLAN.md'
     try:
+        path = 'research/release-' + minor_scope_version(version) + '/PLAN.md'
         text = read(path)
         value = collect_admission(text, version, read, previous=previous,
             source_sha=source_sha, inputs_sha256=inputs_sha256,
@@ -977,9 +1104,10 @@ def scope_declaration(root, version, *, emit=False, read_text=None, refresh=None
     """
     root = Path(root)
     read = read_text or (lambda path: (root / path).read_text(encoding='utf-8-sig'))
-    plan_path = 'research/release-0.8.0/PLAN.md'
+    scope_version = minor_scope_version(version)
+    plan_path = 'research/release-' + scope_version + '/PLAN.md'
     plan = read(plan_path)
-    scope, findings = read_admission_scope(plan, version, read)
+    scope, findings = read_admission_scope(plan, scope_version, read)
     refreshed_plan = None
     if refresh is not None:
         rows = scope.get('decisions', []) if isinstance(scope, dict) else []
@@ -1003,7 +1131,7 @@ def scope_declaration(root, version, *, emit=False, read_text=None, refresh=None
         digest_value = citation_digest(cited_text(read(row['path']), row['heading']),
                                        lambda: read('VISION.md'))
         refreshed_plan = plan[:start] + digest_value + plan[end:]
-        scope, findings = read_admission_scope(refreshed_plan, version, read)
+        scope, findings = read_admission_scope(refreshed_plan, scope_version, read)
     if findings:
         raise ValueError('scope declaration: ' + json.dumps(findings, sort_keys=True))
     path = 'monitor/internal/setup/adopter_assets.json'

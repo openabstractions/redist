@@ -1,47 +1,63 @@
-OpenAbstractions 0.8.0 includes the shared runtime, the Panel and tools built
+OpenAbstractions 0.8.1 includes the shared runtime, the Panel and tools built
 from pinned module versions. Release assets and installation steps are listed below.
 
-## Release 0.8.0
+[Windows Setup](https://github.com/openabstractions/redist/releases/download/v0.8.1/OpenAbstractions-Setup-0.8.1.exe)
+· [All release assets](https://github.com/openabstractions/redist/releases/tag/v0.8.1)
+· [SHA256SUMS](https://github.com/openabstractions/redist/releases/download/v0.8.1/SHA256SUMS)
 
-Changes since 0.4.0.
+## Release 0.8.1
 
-- **Add apps from the Panel.** On Windows, the Panel's Apps Catalog installs or
-  repairs OpenCode and installs the OpenAbstractions integration for ComfyUI.
-  ComfyUI itself comes from its official source.
-- **Message between agents.** Claude and OpenCode chats can exchange messages and
-  reconnect to their existing inboxes after OpenAbstractions restarts.
-- **Let agents use applications.** Through application MCP, agents can discover
-  which actions an app supports, see their inputs and open supported actions.
-- **See what each model supports.** The model list shows model capabilities. Chat
-  can request a reasoning level or budget and accept an image when the selected
-  model supports it.
-- **Work on a ComfyUI canvas with an agent.** Open a workflow through
-  OpenAbstractions. When an agent asks to edit, choose **Allow once**, **Always
-  allow** or **Not now**. A saved approval covers canvas edits by the enrolled
-  agent in the approved ComfyUI app.
-- **Manage storage.** The Panel's Device page shows storage by type, available
-  free space, the largest reported items and verified duplicates, and lets you
-  browse committed items. **Remove** offers removal for eligible items. In
-  Activity, **Restore** retrieves eligible removed items from the download archive.
-- **Upgrade in one pass.** During an interactive Windows upgrade, Setup's
-  **Finish** step can update approved OpenCode and ComfyUI integrations when a
-  verified newer package is available. If OpenCode is running, close it and choose
-  **Retry**, or choose **Later** to finish from OpenAbstractions. Setup can complete
-  an upgrade without restarting Windows when supported apps are using
-  OpenAbstractions.
+Changes since 0.8.0.
 
-**Known limits.** Agent messaging took about 1-2 seconds under load in observed
-runs. **Remove** cannot delete files that require Administrator access. An OpenCode
-update took about 65 seconds in an observed run. On Windows, OpenAbstractions
-starts when an app needs it; if it stops unexpectedly, it starts again on the next
-request, and Windows does not restart it automatically. On Windows PCs where Smart
-App Control is on, Windows can block the bundled llama.cpp engine, and local chat
-through that engine does not start. Smart App Control can also block the official
-OpenCode installer, and the Apps Catalog then cannot install OpenCode.
+- **Use local models in OpenCode with fewer interruptions.** Prompt caches survive
+  interrupted turns, plan reminders retain their cached prefix, and title requests
+  can run beside a conversation using a small available model. A request for an
+  exact model alias reaches that model or reports why it cannot be used.
+- **Choose the chat that receives a message.** When several chats are open, the
+  sender can choose the destination. Peer-started turns use reply-only OA tools.
+  Codex wake pointers keep replies bound to the intended top-level chat and retain
+  recent tickets long enough for the receiver to read them.
+- **See clearer permission prompts.** Prompts retain the program's drive and
+  folder, show the server address, and provide accessible names and reading order.
+  Changes to application rights use the person-facing approval flow.
+- **Repair installation and scope changes.** Setup repairs OA records when moving
+  between **Just me** and **Everyone**. Integration installers locate the Panel,
+  name a failed step and configure installed OpenCode Desktop without bundling its
+  CLI. Catalog upgrades select the core features their integrations need.
+- **Download with the same checks across applications.** Credentials are scoped
+  to HTTPS and their origin. Downloads honor refused hosts, including application
+  downloads. The service can run up to three jobs at once, reuse proven bytes and
+  collect failed or cancelled partials.
+- **Find the next action in the Panel.** Connections, Catalog, Models, Permissions,
+  Activity and Apps explain failures and available remedies. Models that do not fit
+  the selected drive remain unselected, and connection pages identify missing setup.
+- **Keep runtime work alive.** The runtime outlives a starter whose Windows job
+  prevents breakaway. Opening sandboxed OpenCode avoids repeating its npm startup
+  wait.
+- **Get useful client errors.** Logging clients report why an unbound destination
+  could not receive their messages when closing.
+
+### Application and SDK changes
+
+- Provider listings expose product standing computed from the shipped declaration.
+- App Model open handles expose pending and terminal states. The applications
+  interface carries `wait_ms`, `question` and `handle`; describe can read an open
+  handle's state. Edits carry the expected revision.
+- Go, Python and JavaScript storage clients add verified read and write helpers.
+  Python and Rust transfers accept a per-call budget.
+- The facade's client dependency closure uses client and shared input-profile
+  packages. Its existing public Go entry points remain available.
+
+**Known limits.** **Remove** cannot delete files that require Administrator
+access. On Windows, an ordinary runtime host starts when an application needs it;
+after a host exits, the next request starts it again. Smart App Control can block
+supplier programs, including the bundled llama.cpp engine and parts of the
+official OpenCode installer. OA reports the refusal, and the affected model or
+installation remains unavailable.
 
 The redistributable carries native programs and the Windows app packages listed
-below. Python wheels, Rust crates and npm packages have separate
-source versions and publication status.
+below. Package publication, signing and installed checks are reported by the
+release's attached facts and checksums.
 
 ## Updating application code
 
@@ -55,7 +71,7 @@ pins.
 
 ## Candidate build targets
 
-[`tools.tsv`](https://github.com/openabstractions/redist/blob/v0.8.0/tools.tsv) names the module versions and packages consumed by the
+[`tools.tsv`](https://github.com/openabstractions/redist/blob/v0.8.1/tools.tsv) names the module versions and packages consumed by the
 build workflow. These are workflow build targets, not a promise that every optional
 program appears in a final asset; installer feature selection can omit optional
 components.
@@ -75,19 +91,19 @@ configuration.
 
 ## Installing
 
-**Windows.** Compare `OpenAbstractions-Setup-0.8.0.exe` with `SHA256SUMS`, then
+**Windows.** Compare `OpenAbstractions-Setup-0.8.1.exe` with `SHA256SUMS`, then
 run it. Setup installs the runtime and the Panel. The Panel's Apps Catalog
 installs OpenCode through its official installer and adds the OpenAbstractions
 integration to an existing ComfyUI. Install ComfyUI from its official source
-first. `opencode-0.8.0.msi` and `comfyui-0.8.0.msi` are the integration packages
+first. `opencode-0.8.1.msi` and `comfyui-0.8.1.msi` are the integration packages
 the Catalog uses; they are also attached to the release.
 
 OpenAbstractions downloads the `pytorch-*-inputs.zip` and `pytorch-*-source.zip`
 files, their manifest and the `vc-runtime-*.zip` when needed. These support files
 need no manual installation.
 
-The direct core installers are `abstraction-0.8.0-x64.msi` and
-`abstraction-0.8.0-arm64.msi`. For an MSI, the default *Just me* scope installs under
+The direct core installers are `abstraction-0.8.1-x64.msi` and
+`abstraction-0.8.1-arm64.msi`. For an MSI, the default *Just me* scope installs under
 `%LOCALAPPDATA%\Programs\OpenAbstractions` without administrator rights.
 *Everyone* installs under `%ProgramFiles%\OpenAbstractions` and requires
 elevation. Programs live in `tools\`; runnable examples live in `examples\`.
@@ -116,14 +132,15 @@ not mean a package was signed, notarised or attached.
 
 ## Checking what you downloaded
 
-In the folder containing the assets and checksum file:
+Download [SHA256SUMS](https://github.com/openabstractions/redist/releases/download/v0.8.1/SHA256SUMS)
+beside the 0.8.1 assets. In that folder:
 
     sha256sum -c --ignore-missing SHA256SUMS
 
 In PowerShell, a single-file comparison can use:
 
-    (Get-FileHash OpenAbstractions-Setup-0.8.0.exe -Algorithm SHA256).Hash.ToLower()
-    Select-String OpenAbstractions-Setup-0.8.0.exe SHA256SUMS
+    (Get-FileHash OpenAbstractions-Setup-0.8.1.exe -Algorithm SHA256).Hash.ToLower()
+    Select-String -SimpleMatch OpenAbstractions-Setup-0.8.1.exe -Path SHA256SUMS
 
 Checksums establish agreement with the published checksum file, not independent
 proof of origin. Signing, notarisation, attached assets and platform verification

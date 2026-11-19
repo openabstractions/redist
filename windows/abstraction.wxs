@@ -207,11 +207,39 @@
                        Name="ipc_library" Type="string" Value="[#abstraction_ipc.dll]" />
       </Component>
       <?endif?>
-      <Component Id="RegistryRoot" Directory="APPLICATIONFOLDER"
-                 Guid="8821E881-5E73-465E-904E-EF7FC1223A5C">
+      <!-- Scope-keyed components. Windows Installer counts a component's
+           installations by its GUID across both scopes. One GUID with an
+           HKMU key path, installed for an account and for everyone, left the
+           machine values and the all-users Start link behind when the machine
+           install was removed, and the account install wrote no HKCU values
+           (owner's PC, 2026-11-22). Each component with a registry key path
+           comes twice: ForMe writes HKCU under NOT ALLUSERS and
+           ForEveryone writes HKLM under ALLUSERS, each with its own GUID.
+
+           A Predecessor component keeps the GUID and key path that 0.8.0 and
+           earlier used in both scopes, and only an upgrade of a same-scope
+           predecessor installs it. The predecessor is removed after this
+           install commits, and its removal deletes the resources of every
+           component GUID this product does not also hold: the whole
+           Software\OpenAbstractions key, the Start link and the toast
+           activator would go with it. Holding the old GUID keeps them. A
+           Predecessor holds its key path value and nothing else. -->
+      <Component Id="RegistryRootForMe" Directory="APPLICATIONFOLDER"
+                 Guid="DF0E0032-60EA-40BE-883F-375F99998356" Condition="NOT ALLUSERS">
+        <RegistryValue Root="HKCU" Key="Software\OpenAbstractions\Abstraction"
+                       Name="version" Type="string" Value="$(var.Version)" KeyPath="yes" />
+        <RemoveRegistryKey Root="HKCU" Key="Software\OpenAbstractions" Action="removeOnUninstall" />
+      </Component>
+      <Component Id="RegistryRootForEveryone" Directory="APPLICATIONFOLDER"
+                 Guid="655FB4AA-965B-4835-93D4-DF1B4E22F00D" Condition="ALLUSERS">
+        <RegistryValue Root="HKLM" Key="Software\OpenAbstractions\Abstraction"
+                       Name="version" Type="string" Value="$(var.Version)" KeyPath="yes" />
+        <RemoveRegistryKey Root="HKLM" Key="Software\OpenAbstractions" Action="removeOnUninstall" />
+      </Component>
+      <Component Id="RegistryRootPredecessor" Directory="APPLICATIONFOLDER"
+                 Guid="8821E881-5E73-465E-904E-EF7FC1223A5C" Condition="WIX_UPGRADE_DETECTED">
         <RegistryValue Root="HKMU" Key="Software\OpenAbstractions\Abstraction"
                        Name="version" Type="string" Value="$(var.Version)" KeyPath="yes" />
-        <RemoveRegistryKey Root="HKMU" Key="Software\OpenAbstractions" Action="removeOnUninstall" />
       </Component>
     </ComponentGroup>
 
@@ -419,6 +447,22 @@
          here instead would be a scope change nobody asked for. -->
     <CustomAction Id="RefuseElevatedPerUserInstall"
                   Error="OpenAbstractions cannot install for your account from an elevated administrator session, because its runtime does not start with administrator rights. Run the installer without administrator rights to install for your account, or pass ALLUSERS=1 to install for everyone." />
+    <!-- Install scope ruling C (decisions/RULINGS-2026-11-22-owner-designs.md):
+         a per-user install is the fallback where no administrator is
+         available, and it never runs beside a per-machine one. The
+         Supervisor value is the per-machine install's own: only
+         SupervisorServiceMarker writes it, under ALLUSERS, and its removal
+         deletes the key. A per-user install, upgrade or repair finding it
+         refuses before costing. Removal goes ahead. Windows Installer
+         never upgrades across install contexts, and the per-machine product
+         stays as it is. The property is Secure: the full UI's server skips
+         AppSearch and takes the client's search result. -->
+    <Property Id="OAMACHINEINSTALL" Secure="yes">
+      <RegistrySearch Id="MachineInstallSupervisor" Root="HKLM" Key="Software\OpenAbstractions\Abstraction\Supervisor"
+                      Name="service" Type="raw" Bitness="always64" />
+    </Property>
+    <CustomAction Id="RefusePerUserBesideMachine"
+                  Error="OpenAbstractions is already installed for everyone on this PC. Use that installation, or remove it first." />
     <!-- The providers make the engine folders they install read-only for the
          account (inference CONTRACT.md INF-F3). Removal leaves those folders
          as user data, and once a provider is gone nothing gives them back:
@@ -438,10 +482,40 @@
     <CustomAction Id="UnlockLemonadeEngine" FileRef="lemonaded.exe" ExeCommand="engine unlock"
                   Execute="immediate" Return="ignore" />
     <?endif?>
+    <!-- Antivirus, an indexer or a provisioning daemon can hold a product file
+         for a moment (provjobd.exe, hosted run 44999333520). Restart Manager
+         cannot close such a holder, and Windows Installer then schedules the
+         file for the next restart at InstallValidate. Before that check a real
+         removal waits up to 20 seconds, with backoff, while a service or
+         critical process outside OA holds a file of the installation. When
+         one still holds a file, the person reads that a restart finishes the
+         removal: in a window under a full installer UI (the client's
+         AwaitRemovalReleaseShown), and in installer-actions.txt always. The
+         wait never stops the removal. -->
+    <CustomAction Id="AwaitRemovalReleaseShown" BinaryRef="UpgradeSupervisorCode"
+                  ExeCommand="service await-release --user &quot;[APPLICATIONFOLDER].&quot; [UILevel]"
+                  Execute="immediate" Return="ignore" />
+    <CustomAction Id="AwaitMachineRemovalRelease" BinaryRef="UpgradeSupervisorCode"
+                  ExeCommand="service await-release --machine &quot;[APPLICATIONFOLDER].&quot; 0"
+                  Execute="immediate" Return="ignore" />
+    <CustomAction Id="AwaitUserRemovalRelease" BinaryRef="UpgradeSupervisorCode"
+                  ExeCommand="service await-release --user &quot;[APPLICATIONFOLDER].&quot; 0"
+                  Execute="immediate" Return="ignore" />
+
+    <InstallUISequence>
+      <Custom Action="AwaitRemovalReleaseShown" Before="ExecuteAction"
+              Condition="REMOVE=&quot;ALL&quot; AND NOT UPGRADINGPRODUCTCODE" />
+    </InstallUISequence>
 
     <InstallExecuteSequence>
+      <Custom Action="AwaitMachineRemovalRelease" Before="InstallValidate"
+              Condition="ALLUSERS AND REMOVE=&quot;ALL&quot; AND NOT UPGRADINGPRODUCTCODE" />
+      <Custom Action="AwaitUserRemovalRelease" Before="InstallValidate"
+              Condition="NOT ALLUSERS AND REMOVE=&quot;ALL&quot; AND NOT UPGRADINGPRODUCTCODE" />
       <Custom Action="RefuseElevatedPerUserInstall" Before="CostInitialize"
               Condition="AdminUser AND NOT ALLUSERS AND NOT (REMOVE=&quot;ALL&quot;) AND NOT UPGRADINGPRODUCTCODE" />
+      <Custom Action="RefusePerUserBesideMachine" After="AppSearch"
+              Condition="NOT ALLUSERS AND OAMACHINEINSTALL AND NOT (REMOVE=&quot;ALL&quot;)" />
       <!-- Per scope: the rollback start first, then begin, then the commit
            release. A rollback action runs only when it was reached before the
            failure, so a begin that fails after taking the exclusion (a
@@ -646,39 +720,73 @@
         <File Id="abstraction_facade_appmodel.dll" Source="payload/tools/abstraction_facade_appmodel.dll" KeyPath="yes" />
       </Component>
     </ComponentGroup>
+    <!-- One Start link component per scope, as RegistryRootForMe describes;
+         the two differ only in the hive, the condition and the GUID. -->
     <ComponentGroup Id="PanelShortcut" Directory="AbstractionMenuFolder">
-      <Component Id="PanelStartMenu" Guid="E5D9EA35-65C8-4930-9FC0-06120E9F39BE">
+      <Component Id="PanelStartMenuForMe" Guid="A7D2B34D-8C98-47A8-BD39-DA47648BD1D3"
+                 Condition="NOT ALLUSERS">
         <!-- The AppUserModelID and toast activator make the Panel the sender of
              OA-held notifications (monitor/notification_windows.go, ASK-N7).
              Windows starts the activator's LocalServer32, the presenter, to
              deliver a click after every OA process exited. -->
-        <Shortcut Id="PanelShortcutFile" Name="OpenAbstractions Panel"
+        <Shortcut Id="PanelShortcutForMe" Name="OpenAbstractions Panel"
                   Description="Apps, models and permissions"
                   Target="[#panel.exe]" WorkingDirectory="ToolsFolder" Icon="PanelIcon">
           <ShortcutProperty Key="System.AppUserModel.ID" Value="OpenAbstractions.Panel" />
           <ShortcutProperty Key="System.AppUserModel.ToastActivatorCLSID" Value="{CC32C67F-0E49-4CC5-A212-C4CB329CD06C}" />
         </Shortcut>
-        <RegistryValue Root="HKMU" Key="Software\Classes\CLSID\{CC32C67F-0E49-4CC5-A212-C4CB329CD06C}\LocalServer32"
+        <RegistryValue Root="HKCU" Key="Software\Classes\CLSID\{CC32C67F-0E49-4CC5-A212-C4CB329CD06C}\LocalServer32"
                        Type="string" Value="&quot;[#presenter.exe]&quot; --background" />
-        <RemoveRegistryKey Root="HKMU" Key="Software\Classes\CLSID\{CC32C67F-0E49-4CC5-A212-C4CB329CD06C}"
+        <RemoveRegistryKey Root="HKCU" Key="Software\Classes\CLSID\{CC32C67F-0E49-4CC5-A212-C4CB329CD06C}"
                            Action="removeOnUninstall" />
-        <RemoveFile Id="RemoveSetupShortcut" Name="OpenAbstractions Setup.lnk"
+        <RemoveFile Id="RemoveSetupShortcutForMe" Name="OpenAbstractions Setup.lnk"
                     Directory="AbstractionMenuFolder" On="install" />
-        <RemoveFile Id="RemoveLegacySetupShortcut" Name="OpenAbstractions Setup.lnk"
+        <RemoveFile Id="RemoveLegacySetupShortcutForMe" Name="OpenAbstractions Setup.lnk"
                     Directory="LegacyAbstractionMenuFolder" On="install" />
         <!-- The old link has the same AUMID and can win Windows' app-name index. -->
-        <RemoveFile Id="RemoveLegacyPanelShortcut" Name="Abstraction Panel.lnk"
+        <RemoveFile Id="RemoveLegacyPanelShortcutForMe" Name="Abstraction Panel.lnk"
                     Directory="LegacyAbstractionMenuFolder" On="install" />
-        <RemoveFolder Id="RemoveStartMenuFolder" On="uninstall" />
-        <RegistryValue Root="HKMU" Key="Software\OpenAbstractions\Abstraction\Panel"
+        <RemoveFolder Id="RemoveStartMenuFolderForMe" On="uninstall" />
+        <RegistryValue Root="HKCU" Key="Software\OpenAbstractions\Abstraction\Panel"
                        Name="installed" Type="integer" Value="1" KeyPath="yes" />
         <!-- An application's own installer starts this Panel to register
              the application (installer/apps/app.wxs); it finds the program
              here. -->
-        <RegistryValue Root="HKMU" Key="Software\OpenAbstractions\Abstraction\Panel"
+        <RegistryValue Root="HKCU" Key="Software\OpenAbstractions\Abstraction\Panel"
                        Name="program" Type="string" Value="[#panel.exe]" />
-        <RemoveRegistryKey Root="HKMU" Key="Software\OpenAbstractions\Abstraction\Panel"
+        <RemoveRegistryKey Root="HKCU" Key="Software\OpenAbstractions\Abstraction\Panel"
                            Action="removeOnUninstall" />
+      </Component>
+      <Component Id="PanelStartMenuForEveryone" Guid="BD48D977-9AE5-40AC-A74F-D7E2AED99B7D"
+                 Condition="ALLUSERS">
+        <Shortcut Id="PanelShortcutForEveryone" Name="OpenAbstractions Panel"
+                  Description="Apps, models and permissions"
+                  Target="[#panel.exe]" WorkingDirectory="ToolsFolder" Icon="PanelIcon">
+          <ShortcutProperty Key="System.AppUserModel.ID" Value="OpenAbstractions.Panel" />
+          <ShortcutProperty Key="System.AppUserModel.ToastActivatorCLSID" Value="{CC32C67F-0E49-4CC5-A212-C4CB329CD06C}" />
+        </Shortcut>
+        <RegistryValue Root="HKLM" Key="Software\Classes\CLSID\{CC32C67F-0E49-4CC5-A212-C4CB329CD06C}\LocalServer32"
+                       Type="string" Value="&quot;[#presenter.exe]&quot; --background" />
+        <RemoveRegistryKey Root="HKLM" Key="Software\Classes\CLSID\{CC32C67F-0E49-4CC5-A212-C4CB329CD06C}"
+                           Action="removeOnUninstall" />
+        <RemoveFile Id="RemoveSetupShortcutForEveryone" Name="OpenAbstractions Setup.lnk"
+                    Directory="AbstractionMenuFolder" On="install" />
+        <RemoveFile Id="RemoveLegacySetupShortcutForEveryone" Name="OpenAbstractions Setup.lnk"
+                    Directory="LegacyAbstractionMenuFolder" On="install" />
+        <RemoveFile Id="RemoveLegacyPanelShortcutForEveryone" Name="Abstraction Panel.lnk"
+                    Directory="LegacyAbstractionMenuFolder" On="install" />
+        <RemoveFolder Id="RemoveStartMenuFolderForEveryone" On="uninstall" />
+        <RegistryValue Root="HKLM" Key="Software\OpenAbstractions\Abstraction\Panel"
+                       Name="installed" Type="integer" Value="1" KeyPath="yes" />
+        <RegistryValue Root="HKLM" Key="Software\OpenAbstractions\Abstraction\Panel"
+                       Name="program" Type="string" Value="[#panel.exe]" />
+        <RemoveRegistryKey Root="HKLM" Key="Software\OpenAbstractions\Abstraction\Panel"
+                           Action="removeOnUninstall" />
+      </Component>
+      <Component Id="PanelStartMenuPredecessor" Guid="E5D9EA35-65C8-4930-9FC0-06120E9F39BE"
+                 Condition="WIX_UPGRADE_DETECTED">
+        <RegistryValue Root="HKMU" Key="Software\OpenAbstractions\Abstraction\Panel"
+                       Name="installed" Type="integer" Value="1" KeyPath="yes" />
       </Component>
     </ComponentGroup>
 
@@ -752,11 +860,22 @@
         <File Id="modelhost.b10825.boringssl" Source="payload/tools/engines/BoringSSL-LICENSE.txt" KeyPath="yes" />
       </Component>
       <?endif?>
-      <Component Id="ModelHostMarker" Guid="13905645-2D4B-4ADA-89BF-0A12F6ABA2C2">
+      <!-- One marker per scope, as RegistryRootForMe describes. -->
+      <Component Id="ModelHostMarkerForMe" Guid="B14DE3C7-5EE6-4F82-98A5-9EA4A407A135" Condition="NOT ALLUSERS">
+        <RegistryValue Root="HKCU" Key="Software\OpenAbstractions\Abstraction\ModelHost"
+                       Name="installed" Type="integer" Value="1" KeyPath="yes" />
+        <RemoveRegistryKey Root="HKCU" Key="Software\OpenAbstractions\Abstraction\ModelHost"
+                           Action="removeOnUninstall" />
+      </Component>
+      <Component Id="ModelHostMarkerForEveryone" Guid="6F11AB95-6FFA-43DD-9B4D-ECDCAC9053FC" Condition="ALLUSERS">
+        <RegistryValue Root="HKLM" Key="Software\OpenAbstractions\Abstraction\ModelHost"
+                       Name="installed" Type="integer" Value="1" KeyPath="yes" />
+        <RemoveRegistryKey Root="HKLM" Key="Software\OpenAbstractions\Abstraction\ModelHost"
+                           Action="removeOnUninstall" />
+      </Component>
+      <Component Id="ModelHostMarkerPredecessor" Guid="13905645-2D4B-4ADA-89BF-0A12F6ABA2C2" Condition="WIX_UPGRADE_DETECTED">
         <RegistryValue Root="HKMU" Key="Software\OpenAbstractions\Abstraction\ModelHost"
                        Name="installed" Type="integer" Value="1" KeyPath="yes" />
-        <RemoveRegistryKey Root="HKMU" Key="Software\OpenAbstractions\Abstraction\ModelHost"
-                           Action="removeOnUninstall" />
       </Component>
     </ComponentGroup>
     <?endif?>
@@ -803,11 +922,22 @@
       <Component>
         <File Id="openabstractions_mcp.exe" Source="payload/tools/openabstractions-mcp.exe" KeyPath="yes" />
       </Component>
-      <Component Id="McpGatewayMarker" Guid="0B0C2E74-9A5E-4F1C-8B24-3D6A1E5F7C08">
+      <!-- One marker per scope, as RegistryRootForMe describes. -->
+      <Component Id="McpGatewayMarkerForMe" Guid="0987EBD7-148F-4579-A319-9B816BFF7718" Condition="NOT ALLUSERS">
+        <RegistryValue Root="HKCU" Key="Software\OpenAbstractions\Abstraction\McpGateway"
+                       Name="installed" Type="integer" Value="1" KeyPath="yes" />
+        <RemoveRegistryKey Root="HKCU" Key="Software\OpenAbstractions\Abstraction\McpGateway"
+                           Action="removeOnUninstall" />
+      </Component>
+      <Component Id="McpGatewayMarkerForEveryone" Guid="D44A1C50-B437-4EEC-93BD-9D8559131628" Condition="ALLUSERS">
+        <RegistryValue Root="HKLM" Key="Software\OpenAbstractions\Abstraction\McpGateway"
+                       Name="installed" Type="integer" Value="1" KeyPath="yes" />
+        <RemoveRegistryKey Root="HKLM" Key="Software\OpenAbstractions\Abstraction\McpGateway"
+                           Action="removeOnUninstall" />
+      </Component>
+      <Component Id="McpGatewayMarkerPredecessor" Guid="0B0C2E74-9A5E-4F1C-8B24-3D6A1E5F7C08" Condition="WIX_UPGRADE_DETECTED">
         <RegistryValue Root="HKMU" Key="Software\OpenAbstractions\Abstraction\McpGateway"
                        Name="installed" Type="integer" Value="1" KeyPath="yes" />
-        <RemoveRegistryKey Root="HKMU" Key="Software\OpenAbstractions\Abstraction\McpGateway"
-                           Action="removeOnUninstall" />
       </Component>
     </ComponentGroup>
     <?endif?>

@@ -11,6 +11,11 @@ to register the application after install and to remove its entry before
 uninstall; the person confirms both in the Panel (VISION 2026-10-06). The
 package is UNSIGNED.
 
+The package's FindRecords action (oa_records.h), which reads the Panel's
+program from the registry, comes from --records-dll, a built action library
+that exports it. Without it the shared extension action library (hostfolder.c)
+is compiled with --cl into --out.
+
 The ZIP's SHA-256 and size are checked against --zip-sha256 and --zip-bytes,
 and the members are extracted from those verified bytes. Every member name is
 a chain of plain Windows file-name segments: no drive, separator, parent,
@@ -24,7 +29,7 @@ every version of one application upgrades the one before.
 Usage:
   build_app.py --app-id ID --title TITLE --publisher NAME --version X.Y.Z
                --zip FILE --zip-sha256 HEX --zip-bytes N --manifest FILE --out DIR
-               [--define NAME=VALUE ...] [--wix wix]
+               [--define NAME=VALUE ...] [--records-dll FILE] [--wix wix] [--cl cl]
 
 Without arguments, prints this text.
 """
@@ -124,6 +129,15 @@ def filled_manifest(path: Path, app_id: str, defines: dict[str, str]) -> str:
     return text
 
 
+def records_action(out: Path, cl: str) -> Path:
+    """Compile the shared action library, which exports FindRecords, into out."""
+    sys.path.insert(0, str(HERE))
+    import build_extension  # noqa: PLC0415
+    action = out / "action"
+    action.mkdir(parents=True, exist_ok=True)
+    return build_extension.build_action(action, cl)
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="build_app.py", description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -137,7 +151,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--manifest", type=Path)
     parser.add_argument("--out", type=Path)
     parser.add_argument("--define", action="append", default=[], metavar="NAME=VALUE")
+    parser.add_argument("--records-dll", type=Path, help="a built action library exporting FindRecords")
     parser.add_argument("--wix", default="wix")
+    parser.add_argument("--cl", default="cl")
     args = parser.parse_args(argv)
     required = ("app_id", "title", "publisher", "version", "zip", "zip_sha256", "zip_bytes", "manifest", "out")
     if all(getattr(args, name) is None for name in required):
@@ -165,6 +181,9 @@ def main(argv: list[str] | None = None) -> int:
         files = extract(data, payload)
         manifest = out / MANIFEST_NAME
         manifest.write_text(manifest_text, encoding="utf-8", newline="\n")
+        records = args.records_dll.resolve() if args.records_dll else records_action(out, args.cl)
+        if not records.is_file():
+            raise ValueError(f"{records} is not a file")
     except (OSError, ValueError, zipfile.BadZipFile, json.JSONDecodeError) as error:
         print("FAIL ", error)
         return 1
@@ -172,7 +191,7 @@ def main(argv: list[str] | None = None) -> int:
     command = [args.wix, "build", "-arch", "x64",
                "-d", f"AppId={args.app_id}", "-d", f"AppTitle={args.title}", "-d", f"Publisher={args.publisher}",
                "-d", f"Version={args.version}", "-d", f"UpgradeCode={upgrade_code(args.app_id)}",
-               "-d", f"Payload={payload}", "-d", f"Manifest={manifest}",
+               "-d", f"Payload={payload}", "-d", f"Manifest={manifest}", "-d", f"RecordsDll={records}",
                "-o", str(msi), str(HERE / "app.wxs")]
     print(" ".join(command))
     if subprocess.run(command, cwd=out).returncode:

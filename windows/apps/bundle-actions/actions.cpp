@@ -32,8 +32,10 @@ struct OA_ACTIONS_CONTEXT {
     WCHAR appRelatedVersion[16][32];
     BOOL migrateApp[16], appMissing[16];
     BOOL (*dependencyRegistered)(LPCWSTR, LPCWSTR, LPCWSTR);
-    HWND openBox;
-    HANDLE maintenanceProcess;
+    HWND openBox, packageText, progressBar;
+    BOOL checkingCore;
+    WCHAR packageName[256];
+    HANDLE maintenanceProcess, personShell;
     BOOL maintenanceActive, maintenanceDeferred, maintenanceUnobserved;
 };
 static PVOID volatile context;
@@ -122,19 +124,87 @@ static HRESULT CALLBACK maintenanceTimer(HWND dialog, UINT event, WPARAM elapsed
     return S_OK;
 }
 
+// The account, session and elevation of a process's token.
+static BOOL tokenIdentity(HANDLE process, PSID sid, DWORD sidSize, DWORD* session, BOOL* elevated)
+{
+    HANDLE token = NULL;
+    if (!OpenProcessToken(process, TOKEN_QUERY, &token)) return FALSE;
+    DWORD_PTR user[(sizeof(TOKEN_USER) + SECURITY_MAX_SID_SIZE) / sizeof(DWORD_PTR) + 1] = {};
+    TOKEN_ELEVATION elevation = {};
+    DWORD size = 0;
+    BOOL read = GetTokenInformation(token, TokenUser, user, sizeof(user), &size) &&
+        GetTokenInformation(token, TokenSessionId, session, sizeof(*session), &size) &&
+        GetTokenInformation(token, TokenElevation, &elevation, sizeof(elevation), &size) &&
+        CopySid(sidSize, sid, reinterpret_cast<TOKEN_USER*>(user)->User.Sid);
+    CloseHandle(token);
+    *elevated = elevation.TokenIsElevated != 0;
+    return read;
+}
+
+// An elevated Setup (Run as administrator, or started from an elevated
+// window) updates the installing person's integrations through that person's
+// own desktop shell: the helper starts as the shell's child and inherits its
+// ordinary token. The shell runs as Setup's own account, in Setup's session,
+// unelevated; any other shell answers NULL.
+static HANDLE installingPersonShell()
+{
+    HWND shell = GetShellWindow();
+    DWORD pid = 0;
+    if (!shell || !GetWindowThreadProcessId(shell, &pid) || !pid) return NULL;
+    HANDLE process = OpenProcess(PROCESS_CREATE_PROCESS | PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+    if (!process) return NULL;
+    BYTE own[SECURITY_MAX_SID_SIZE] = {}, person[SECURITY_MAX_SID_SIZE] = {};
+    DWORD ownSession = 0, personSession = 0;
+    BOOL ownElevated = FALSE, personElevated = TRUE;
+    if (tokenIdentity(GetCurrentProcess(), own, sizeof(own), &ownSession, &ownElevated) &&
+        tokenIdentity(process, person, sizeof(person), &personSession, &personElevated) &&
+        !personElevated && ownSession == personSession && EqualSid(own, person)) return process;
+    CloseHandle(process);
+    return NULL;
+}
+
 static BOOL startMaintenance(OA_ACTIONS_CONTEXT* current, BOOL defer)
 {
-    // The calling BA has proved its ordinary interactive primary token. The
-    // explicit application name bypasses shell activation and identifies our
-    // direct child, including when the helper exits before the dialog opens.
+    // The calling BA has proved its ordinary interactive primary token, or it
+    // holds the installing person's unelevated shell as the helper's parent.
+    // The explicit application name bypasses shell activation and identifies
+    // our direct child, including when the helper exits before the dialog opens.
     LPCWSTR argument = defer ? L"--maintain-desktop-integration=defer" : L"--maintain-desktop-integration=apply";
     WCHAR target[1024], command[1280];
     if (!formattedVariable(current->engine, L"LaunchTarget", target, ARRAYSIZE(target)) || !target[0] ||
         swprintf_s(command, L"\"%ls\" %ls", target, argument) <= 0) return FALSE;
-    STARTUPINFOW startup = {};
-    startup.cb = sizeof(startup);
+    STARTUPINFOEXW startup = {};
+    startup.StartupInfo.cb = sizeof(startup.StartupInfo);
+    DWORD flags = 0;
+    SIZE_T listSize = 0;
+    LPPROC_THREAD_ATTRIBUTE_LIST list = NULL;
+    HANDLE parent = current->personShell;
+    // An elevated Setup starts the helper only as the person's shell's child.
+    if (!parent && setupElevated()) return FALSE;
+    if (parent) {
+        InitializeProcThreadAttributeList(NULL, 1, 0, &listSize);
+        list = listSize ? static_cast<LPPROC_THREAD_ATTRIBUTE_LIST>(HeapAlloc(GetProcessHeap(), 0, listSize)) : NULL;
+        if (!list) return FALSE;
+        if (!InitializeProcThreadAttributeList(list, 1, 0, &listSize)) {
+            HeapFree(GetProcessHeap(), 0, list);
+            return FALSE;
+        }
+        if (!UpdateProcThreadAttribute(list, 0, PROC_THREAD_ATTRIBUTE_PARENT_PROCESS, &parent, sizeof(parent), NULL, NULL)) {
+            DeleteProcThreadAttributeList(list);
+            HeapFree(GetProcessHeap(), 0, list);
+            return FALSE;
+        }
+        startup.StartupInfo.cb = sizeof(startup);
+        startup.lpAttributeList = list;
+        flags = EXTENDED_STARTUPINFO_PRESENT;
+    }
     PROCESS_INFORMATION child = {};
-    if (!CreateProcessW(target, command, NULL, NULL, FALSE, 0, NULL, NULL, &startup, &child)) return FALSE;
+    BOOL created = CreateProcessW(target, command, NULL, NULL, FALSE, flags, NULL, NULL, &startup.StartupInfo, &child);
+    if (list) {
+        DeleteProcThreadAttributeList(list);
+        HeapFree(GetProcessHeap(), 0, list);
+    }
+    if (!created) return FALSE;
     if (child.hThread) CloseHandle(child.hThread);
     if (!child.hProcess || child.hProcess == INVALID_HANDLE_VALUE) {
         current->maintenanceUnobserved = TRUE;
@@ -198,11 +268,19 @@ static BOOL finishMaintenance(OA_ACTIONS_CONTEXT* current, HWND window)
         ProcessIdToSessionId(GetCurrentProcessId(), &processSession) && tokenSession == processSession &&
         GetUserObjectInformationW(GetProcessWindowStation(), UOI_FLAGS, &station, sizeof(station), &size) &&
         (station.dwFlags & WSF_VISIBLE)) {
-        if (elevated) {
-            current->engine->Log(BOOTSTRAPPER_LOG_LEVEL_STANDARD, L"OpenAbstractions: desktop integration needs the installing person's Settings.");
-            MessageBoxW(window, L"Open OpenAbstractions to finish updating OpenCode.",
-                L"OpenAbstractions Setup", MB_OK | MB_ICONINFORMATION);
-            return TRUE;
+        if (elevated && !current->maintenanceProcess) {
+            if (current->personShell) CloseHandle(current->personShell);
+            current->personShell = installingPersonShell();
+            if (!current->personShell) {
+                current->engine->Log(BOOTSTRAPPER_LOG_LEVEL_STANDARD, L"OpenAbstractions: desktop integration needs the installing person's Settings.");
+                MessageBoxW(window, L"Open OpenAbstractions to finish updating OpenCode.",
+                    L"OpenAbstractions Setup", MB_OK | MB_ICONINFORMATION);
+                return TRUE;
+            }
+            current->engine->Log(BOOTSTRAPPER_LOG_LEVEL_STANDARD, L"OpenAbstractions: elevated Setup updates desktop integration as the installing person.");
+        } else if (!elevated && current->personShell) {
+            CloseHandle(current->personShell);
+            current->personShell = NULL;
         }
         DWORD exit = MAXDWORD;
         if (awaitMaintenance(current, window, FALSE, &exit)) {
@@ -384,6 +462,89 @@ static BOOL dependencyPath(LPCWSTR product, LPCWSTR version, LPCWSTR bundle, LPW
         L"Software\\Classes\\Installer\\Dependencies\\%ls_v%ls\\Dependents\\%ls", product, version, bundle) > 0;
 }
 
+// Windows Installer checks the signed core package before it reports any
+// progress. With Smart App Control on, that check of the 147 MB core took
+// 122 s in Windows Sandbox (signed 0.8.0 Setup, 2026-11-20), and the progress
+// page did not move. From the core's execute begin until its first progress,
+// the page says "Windows is checking the installer…" over a moving
+// (marquee) bar. The Setup log times both ends.
+static const WCHAR OA_CHECKING_TEXT[] = L"Windows is checking the installer\u2026";
+
+static void showCoreCheck(OA_ACTIONS_CONTEXT* current)
+{
+    if (current->checkingCore) return;
+    current->checkingCore = TRUE;
+    current->packageName[0] = L'\0';
+    if (current->packageText) {
+        GetWindowTextW(current->packageText, current->packageName, ARRAYSIZE(current->packageName));
+        SetWindowTextW(current->packageText, OA_CHECKING_TEXT);
+    }
+    if (current->progressBar) {
+        SetWindowLongPtrW(current->progressBar, GWL_STYLE, GetWindowLongPtrW(current->progressBar, GWL_STYLE) | PBS_MARQUEE);
+        SendMessageW(current->progressBar, PBM_SETMARQUEE, TRUE, 30);
+    }
+    current->engine->Log(BOOTSTRAPPER_LOG_LEVEL_STANDARD, L"OpenAbstractions: Windows is checking the core installer.");
+}
+
+static void endCoreCheck(OA_ACTIONS_CONTEXT* current)
+{
+    if (!current->checkingCore) return;
+    current->checkingCore = FALSE;
+    if (current->progressBar) {
+        SendMessageW(current->progressBar, PBM_SETMARQUEE, FALSE, 0);
+        SetWindowLongPtrW(current->progressBar, GWL_STYLE, GetWindowLongPtrW(current->progressBar, GWL_STYLE) & ~static_cast<LONG_PTR>(PBS_MARQUEE));
+    }
+    if (current->packageText) SetWindowTextW(current->packageText, current->packageName);
+    current->engine->Log(BOOTSTRAPPER_LOG_LEVEL_STANDARD, L"OpenAbstractions: Windows Installer started the core package.");
+}
+
+// Setup installs the core per machine (install-scope ruling C, 2026-11-22).
+// Windows Installer upgrades within one installation context only, so a
+// per-user core of this account would stay installed beside the new
+// per-machine core. Before the chain executes, Setup removes each per-user
+// core of this account with no window. That removal deletes the per-user
+// program folder (%LOCALAPPDATA%\Programs\OpenAbstractions) and its start
+// entries; the account's state under %LOCALAPPDATA%\openabstractions and
+// %APPDATA% stays. A failed removal stops Setup before anything changes.
+static const WCHAR OA_CORE_UPGRADE_CODE[] = L"{CEEF6550-5E44-4E83-8E18-A855C9D941CA}";
+
+static BOOL userCoreInstalled(LPCWSTR product)
+{
+    WCHAR state[8] = {};
+    DWORD size = ARRAYSIZE(state);
+    return MsiGetProductInfoExW(product, NULL, MSIINSTALLCONTEXT_USERUNMANAGED, INSTALLPROPERTY_PRODUCTSTATE,
+        state, &size) == ERROR_SUCCESS && !wcscmp(state, L"5");
+}
+
+static HRESULT removeUserCores(IBootstrapperEngine* engine)
+{
+    WCHAR found[8][39] = {};
+    SIZE_T count = 0;
+    for (DWORD index = 0; ; ++index) {
+        WCHAR product[39] = {};
+        UINT result = MsiEnumRelatedProductsW(OA_CORE_UPGRADE_CODE, 0, index, product);
+        if (result == ERROR_NO_MORE_ITEMS) break;
+        if (result != ERROR_SUCCESS) return HRESULT_FROM_WIN32(result);
+        if (!msiGuid(product) || !userCoreInstalled(product)) continue;
+        if (count == ARRAYSIZE(found)) return E_UNEXPECTED;
+        wcscpy_s(found[count++], product);
+    }
+    for (SIZE_T i = 0; i < count; ++i) {
+        WCHAR line[200];
+        if (swprintf_s(line, L"OpenAbstractions: removing this account's per-user OpenAbstractions %ls before the per-machine install.", found[i]) > 0)
+            engine->Log(BOOTSTRAPPER_LOG_LEVEL_STANDARD, line);
+        INSTALLUILEVEL previous = MsiSetInternalUI(INSTALLUILEVEL_NONE, NULL);
+        UINT result = MsiConfigureProductExW(found[i], INSTALLLEVEL_DEFAULT, INSTALLSTATE_ABSENT, L"REBOOT=ReallySuppress");
+        MsiSetInternalUI(previous, NULL);
+        if ((result != ERROR_SUCCESS && result != ERROR_SUCCESS_REBOOT_REQUIRED) || userCoreInstalled(found[i])) {
+            if (swprintf_s(line, L"OpenAbstractions: the per-user OpenAbstractions %ls stays installed (Windows Installer %u); Setup changed nothing.", found[i], result) > 0)
+                engine->Log(BOOTSTRAPPER_LOG_LEVEL_ERROR, line);
+            return HRESULT_FROM_WIN32(result == ERROR_SUCCESS || result == ERROR_SUCCESS_REBOOT_REQUIRED ? ERROR_INSTALL_FAILURE : result);
+        }
+    }
+    return S_OK;
+}
+
 static BOOL registeredDependency(LPCWSTR product, LPCWSTR version, LPCWSTR bundle)
 {
     WCHAR path[180];
@@ -399,6 +560,29 @@ static HRESULT WINAPI actionsProc(BA_FUNCTIONS_MESSAGE message, const LPVOID arg
 {
     OA_ACTIONS_CONTEXT* current = static_cast<OA_ACTIONS_CONTEXT*>(value);
     if (!current || !args || !results) return E_INVALIDARG;
+    if (message == BA_FUNCTIONS_MESSAGE_ONEXECUTEPACKAGEBEGIN) {
+        const BA_ONEXECUTEPACKAGEBEGIN_ARGS* input = static_cast<const BA_ONEXECUTEPACKAGEBEGIN_ARGS*>(args);
+        if (input->dwApiVersion == WIX_5_BOOTSTRAPPER_APPLICATION_API_VERSION && input->fExecute &&
+            input->wzPackageId && !wcscmp(input->wzPackageId, L"OpenAbstractions")) showCoreCheck(current);
+        return S_OK;
+    }
+    if (message == BA_FUNCTIONS_MESSAGE_ONEXECUTEPROGRESS || message == BA_FUNCTIONS_MESSAGE_ONEXECUTEPACKAGECOMPLETE) {
+        LPCWSTR package = message == BA_FUNCTIONS_MESSAGE_ONEXECUTEPROGRESS ?
+            static_cast<const BA_ONEXECUTEPROGRESS_ARGS*>(args)->wzPackageId :
+            static_cast<const BA_ONEXECUTEPACKAGECOMPLETE_ARGS*>(args)->wzPackageId;
+        if (package && !wcscmp(package, L"OpenAbstractions")) endCoreCheck(current);
+        return S_OK;
+    }
+    if (message == BA_FUNCTIONS_MESSAGE_ONEXECUTEBEGIN) {
+        const BA_ONEXECUTEBEGIN_ARGS* input = static_cast<const BA_ONEXECUTEBEGIN_ARGS*>(args);
+        BA_ONEXECUTEBEGIN_RESULTS* output = static_cast<BA_ONEXECUTEBEGIN_RESULTS*>(results);
+        if (input->dwApiVersion != WIX_5_BOOTSTRAPPER_APPLICATION_API_VERSION ||
+            output->dwApiVersion != WIX_5_BOOTSTRAPPER_APPLICATION_API_VERSION) return E_INVALIDARG;
+        if (output->fCancel || !current->corePlanned) return S_OK;
+        HRESULT hr = removeUserCores(current->engine);
+        if (FAILED(hr)) output->fCancel = TRUE;
+        return hr;
+    }
     if (message == BA_FUNCTIONS_MESSAGE_ONEXECUTEFILESINUSE) {
         const BA_ONEXECUTEFILESINUSE_ARGS* input = static_cast<const BA_ONEXECUTEFILESINUSE_ARGS*>(args);
         const BA_ONEXECUTEFILESINUSE_RESULTS* output = static_cast<const BA_ONEXECUTEFILESINUSE_RESULTS*>(results);
@@ -490,6 +674,10 @@ static HRESULT WINAPI actionsProc(BA_FUNCTIONS_MESSAGE message, const LPVOID arg
             current->openBox = input->hWnd;
             SendMessageW(input->hWnd, BM_SETCHECK, BST_CHECKED, 0);
             output->fProcessed = TRUE;
+        } else if (input->wzName && !wcscmp(input->wzName, L"OverallProgressPackageText")) {
+            current->packageText = input->hWnd;
+        } else if (input->wzName && !wcscmp(input->wzName, L"OverallCalculatedProgressbar")) {
+            current->progressBar = input->hWnd;
         }
         return S_OK;
     }
@@ -725,6 +913,7 @@ extern "C" __declspec(dllexport) void WINAPI BAFunctionsDestroy(
     OA_ACTIONS_CONTEXT* retained = static_cast<OA_ACTIONS_CONTEXT*>(InterlockedExchangePointer(&context, NULL));
     if (retained) {
         if (retained->maintenanceProcess) CloseHandle(retained->maintenanceProcess);
+        if (retained->personShell) CloseHandle(retained->personShell);
         retained->engine->Release(); HeapFree(GetProcessHeap(), 0, retained);
     }
 }

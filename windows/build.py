@@ -42,8 +42,21 @@ MODELHOST_ENGINE_PAYLOAD = frozenset({"tools/engines/" + MODELHOST_ENGINE_NAME,
                                       "tools/engines/llama.cpp-MIT.txt",
                                       "tools/engines/BoringSSL-LICENSE.txt"})
 VISUALCPP_NOTICE = HERE / "engines/VisualCpp-runtime-notice.txt"
+# The third-party Go modules every package compiles in, with their licences
+# (scripts/third_party_notices.py writes it).
+THIRD_PARTY_NOTICES = HERE.parent / "THIRD_PARTY_NOTICES.md"
 BORINGSSL_NOTICE_SHA256 ="827c8d8fc207c2392794eef9e00fe246f9f61fdcc132556c275be3dd8c3cd97f"
 PYTORCH_PAYLOAD = frozenset({"tools/pytorchd.exe"})
+
+
+def licence_notices(out):
+    """The notices the licence page carries after the licence: the compiled
+    Go modules' notices always, and the Microsoft Visual C++ runtime notice
+    when the package ships the engine bundle with those files."""
+    notices = [str(THIRD_PARTY_NOTICES)]
+    if (out / "payload/tools/engines" / MODELHOST_ENGINE_NAME).is_file():
+        notices.append(str(VISUALCPP_NOTICE))
+    return notices
 
 
 def shipped_program_role(module, package):
@@ -590,7 +603,7 @@ PREVIEW_STAGES = ('actions-native', 'appmodel-native', 'panel-resources', 'panel
 PREVIEW_SOURCE_CHECKS = ('installer.test_setup_runtime', 'installer.test_runtime_candidate',
                          'installer.test_upgrade_sequence', 'installer.test_upgrade_log')
 PREVIEW_FILES = frozenset(('python', 'wix', 'bal', 'util', 'ui', 'actions_receipt', 'go_sdk', 'node',
-    'npm', 'cl', 'rc', 'cvtres', 'link', 'vcvars', 'cmd', 'ipc', 'opencode_desktop', 'opencode_cli', 'parser', 'ripgrep', 'claude_validator'))
+    'npm', 'cl', 'rc', 'cvtres', 'link', 'vcvars', 'cmd', 'ipc', 'opencode_desktop', 'parser', 'claude_validator'))
 PREVIEW_STAGE_SECONDS = 600
 PREVIEW_CHECK_SECONDS = 240
 
@@ -739,7 +752,7 @@ def preview_inputs(path, root, *, generated=False):
     plain_path(output)
     if 'claude_validator' not in data['inputs']:
         raise ValueError('preview requires a pinned claude_validator for canonical Claude Mod validation before packaging')
-    if set(data['inputs']) != PREVIEW_FILES or set(data['directories']) != {'node_sdk','dependency_cache','bootstrap','modelhostengine'}:
+    if set(data['inputs']) != PREVIEW_FILES or set(data['directories']) != {'node_sdk','dependency_cache','modelhostengine'}:
         raise ValueError('preview input roles differ from the existing Windows producers')
     pins, errors = {}, []
     def admit(row, role=None):
@@ -1274,8 +1287,7 @@ def preview_stage(name, data, root, env):
         plugin = preview_pin(npm/('openabstractions-opencode-'+version+'.tgz'))
         run([python,'-B',root/'adopters/opencode/installer/build_installer.py','--phase','prepare-native',
             '--app-builder',root/'installer/apps/build_app.py','--plugin',plugin['path'],'--plugin-sha256',plugin['sha256'],
-            '--plugin-bytes',str(plugin['bytes']),'--cli',inputs['opencode_cli'],'--parser-tgz',inputs['parser'],
-            '--bootstrap',directories['bootstrap'],'--ripgrep',inputs['ripgrep'],'--package-set',npm,
+            '--plugin-bytes',str(plugin['bytes']),'--parser-tgz',inputs['parser'],'--package-set',npm,
             '--dependency-cache',directories['dependency_cache'],'--out',oc,'--version',version,'--cl',inputs['cl']],native_env)
     elif name == 'opencode-package':
         prepared = json.loads((oc/'payload-receipt.json').read_bytes())['prepared_native']
@@ -1394,9 +1406,7 @@ def main():
     if missing:
         return 1
 
-    # The licence page carries the third-party notice of the Microsoft Visual
-    # C++ runtime files when the package ships the engine bundle with them.
-    notices = [str(VISUALCPP_NOTICE)] if (a.out / "payload/tools/engines" / MODELHOST_ENGINE_NAME).is_file() else []
+    notices = licence_notices(a.out)
     subprocess.run([sys.executable, str(HERE / "mklicense.py"),
                     str(a.license), str(a.out / "license.rtf"), *notices], check=True)
 

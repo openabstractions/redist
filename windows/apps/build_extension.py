@@ -564,7 +564,7 @@ def native_identity_source():
 def native_action_sources():
     """Measure the shared action's direct source/header dependencies."""
     result={}
-    for name in ('hostfolder.c','hostfolder_io.h','native_windows.h'):
+    for name in ('hostfolder.c','hostfolder_io.h','oa_records.h','native_windows.h'):
         source=native_identity_source() if name=='native_windows.h' else HERE/name
         if source.is_symlink() or source.is_junction() or not source.is_file():
             raise ValueError('native action requires plain owned '+name)

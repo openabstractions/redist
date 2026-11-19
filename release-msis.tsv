@@ -1,0 +1,7 @@
+> The application MSIs each release publishes beside its core MSIs, by app id.
+> scripts/promote.py publishes exactly these from the Setup's app distribution
+> chain; a version without a row publishes the app MSIs of the physical chain.
+> OpenCode's MSI is also the Setup Catalog MSI.
+version	apps
+v0.8.0	comfyui
+v0.8.1	opencode comfyui

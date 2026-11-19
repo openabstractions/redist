@@ -456,16 +456,11 @@ def application_inputs(required, version):
     (inputs/'sdk-selection.json').write_text(json.dumps(received,sort_keys=True)+'\n')
     if 'opencode' in owners:
         opencode=owners['opencode']
-        for role,name in (('desktop','opencode-desktop.exe'),('cli','opencode-cli.zip')):
-            helper.github_asset_input('anomalyco/opencode',opencode.UPSTREAM[role]['asset'],opencode.UPSTREAM[role],inputs/name)
+        helper.github_asset_input('anomalyco/opencode',opencode.UPSTREAM['desktop']['asset'],opencode.UPSTREAM['desktop'],inputs/'opencode-desktop.exe')
         lock=json.loads((pathlib.Path(opencode.__file__).parent/'package-lock.json').read_bytes())['packages']['node_modules/jsonc-parser']
         algorithm,encoded=lock['integrity'].split('-',1)
         if algorithm!='sha512':raise ValueError('selected parser lock lacks exact SHA512')
         helper.checked_download(lock['resolved'],inputs/'jsonc-parser.tgz',expected_sha512=base64.b64decode(encoded,validate=True).hex(),max_bytes=1<<20)
-        bootstrap=inputs/'opencode-bootstrap';bootstrap.mkdir()
-        for row in opencode.bootstrap_inputs():
-            helper.checked_download(row['url'],bootstrap/row['file'],expected_sha512=row['sha512'],max_bytes=64<<20)
-        helper.checked_download(opencode.RIPGREP['url'],inputs/'opencode-ripgrep.zip',expected_sha256=opencode.RIPGREP['sha256'],max_bytes=16<<20)
         shutil.copyfile(sdk/'npm'/('openabstractions-opencode-'+version+'.tgz'),inputs/'opencode-plugin.tgz')
         prepare_opencode_plugin_inputs(helper,opencode,inputs)
     if 'comfyui' in owners:
@@ -567,8 +562,7 @@ def application_native_prepare(required,version):
             plugin=pin(inputs/'opencode-plugin.tgz')
             arguments=['--phase','prepare-native','--app-builder',str(pathlib.Path('windows/apps/build_app.py').resolve()),
                 '--plugin',plugin['file'],'--plugin-sha256',plugin['sha256'],'--plugin-bytes',str(plugin['bytes']),
-                '--cli',str((inputs/'opencode-cli.zip').resolve()),'--parser-tgz',str((inputs/'jsonc-parser.tgz').resolve()),
-                '--bootstrap',str((inputs/'opencode-bootstrap').resolve()),'--ripgrep',str((inputs/'opencode-ripgrep.zip').resolve()),
+                '--parser-tgz',str((inputs/'jsonc-parser.tgz').resolve()),
                 '--package-set',str((base/'sdk/npm').resolve()),
                 '--dependency-cache',str((inputs/'opencode-dependencies').resolve()),
                 '--out',str(out),'--version',version,'--cl',compiler['cl.exe']]
@@ -673,8 +667,7 @@ def source_roles(app,owner,out,inputs,payload=None):
         return owner.source_roles(pathlib.Path('sources'),inputs/'wix-ui.nupkg',inputs/'WixToolset.UI.wixext.dll')
     if app=='comfyui':
         return owner.source_roles(pathlib.Path('windows/apps'))
-    return owner.source_roles(out if payload is not None else None,
-                              inputs/'opencode-cli.zip' if payload is not None else None,payload,
+    return owner.source_roles(out if payload is not None else None,payload,
                               **({'retained_inputs':out/'plugin-inputs'} if payload is not None else {}))
 
 
@@ -1508,7 +1501,7 @@ def application_package(required,version):
     for name,path in shared.items():
         target=proof_inputs/name;target.parent.mkdir(parents=True,exist_ok=True)
         shutil.copyfile(path,target)
-    for name in ('wix-ui.nupkg','WixToolset.UI.wixext.dll','opencode-cli.zip'):
+    for name in ('wix-ui.nupkg','WixToolset.UI.wixext.dll'):
         if (inputs/name).is_file():shutil.copyfile(inputs/name,proof_inputs/name)
     for app in owners:
         received_producer_closure(app,pathlib.Path('setup'),expected_sources=producer['sources'],
@@ -1684,7 +1677,7 @@ def application_bind(required,version):
         received_producer_closure(app,raw,expected_sources=pins,producer_source=os.environ['CANDIDATE_SHA'],
                                   run_id=int(os.environ['GITHUB_RUN_ID']),version=version,intake_files=intake['files'],
                                   opencode_owner=owners[app] if app=='opencode' else None)
-    for name in ('wix-ui.nupkg','WixToolset.UI.wixext.dll','opencode-cli.zip'):
+    for name in ('wix-ui.nupkg','WixToolset.UI.wixext.dll'):
         if (inputs/name).is_file():
             if any(pin(inputs/name)[key]!=original['build_inputs'][name][key] for key in ('sha256','bytes')):
                 raise ValueError('retained role-policy input differs from producer measurement: '+name)

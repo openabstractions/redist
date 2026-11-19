@@ -488,15 +488,111 @@ function Assert-InstalledJ1Runtime([string]$Central,[string]$Tools,[string]$Pyth
     }
     if ($failure) { throw $failure }
 }
+function New-InstalledSoakLogState {
+    if (-not ('OASoakFileIdentity' -as [type])) {
+        Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+using Microsoft.Win32.SafeHandles;
+public static class OASoakFileIdentity {
+    [StructLayout(LayoutKind.Sequential)] struct Info {
+        public uint Attributes; public System.Runtime.InteropServices.ComTypes.FILETIME Creation, Access, Write;
+        public uint Volume, SizeHigh, SizeLow, Links, IndexHigh, IndexLow;
+    }
+    [DllImport("kernel32.dll", SetLastError=true)] static extern bool GetFileInformationByHandle(SafeFileHandle h, out Info i);
+    public static string Read(SafeFileHandle handle) {
+        Info info; if (!GetFileInformationByHandle(handle, out info)) throw new System.ComponentModel.Win32Exception();
+        return info.Volume.ToString("x8")+info.IndexHigh.ToString("x8")+info.IndexLow.ToString("x8");
+    }
+}
+'@
+    }
+    # storage/go/layout/account_data.go recordsLog and logging/go/retention.go.
+    $root=Join-Path ([Environment]::GetFolderPath([Environment+SpecialFolder]::LocalApplicationData,[Environment+SpecialFolderOption]::DoNotVerify)) 'openabstractions\logging'
+    return @{root=$root;started=[DateTime]::Now;held=[ordered]@{};tail=[Collections.Generic.List[string]]::new()}
+}
+function Get-InstalledSoakLogInterval($State,[int]$Index,[string]$Evidence) {
+    for($parent=Get-Item -LiteralPath $State.root -Force;$parent;$parent=$parent.Parent){
+        if($parent.Attributes -band [IO.FileAttributes]::ReparsePoint){throw 'Linked runtime log root or ancestor'}
+    }
+    $active=Join-Path $State.root 'records.jsonl'
+    $paths=@()
+    $history=Join-Path $State.root 'records.jsonl.history'
+    if(Test-Path -LiteralPath $history){
+        $item=Get-Item -LiteralPath $history -Force
+        if(-not $item.PSIsContainer -or ($item.Attributes -band [IO.FileAttributes]::ReparsePoint)){throw 'Linked soak log history'}
+        $paths+=@(Get-ChildItem -LiteralPath $history -File | Where-Object {$_.Name -cmatch '^\d{20}\.jsonl$'} | Sort-Object Name | ForEach-Object {$_.FullName})
+    }
+    $paths+= $active
+    if($paths.Count -gt 128){throw 'Unbounded runtime log inventory'}
+    foreach($path in $paths){
+        $item=Get-Item -LiteralPath $path -Force
+        if($item.PSIsContainer -or ($item.Attributes -band [IO.FileAttributes]::ReparsePoint)){throw 'Linked runtime log file'}
+        $stream=[IO.File]::Open($path,[IO.FileMode]::Open,[IO.FileAccess]::Read,([IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete))
+        try {
+            $id=[OASoakFileIdentity]::Read($stream.SafeFileHandle)
+            if(-not $State.held.Contains($id)){
+                if($State.held.Count -ge 128){throw 'Unbounded retained runtime log handles'}
+                $State.held[$id]=@{stream=$stream;source=$path;pending=[byte[]]@()};$stream=$null
+            }
+        }finally{if($stream){$stream.Dispose()}}
+    }
+    $rows=@();$errors=0;$warnings=0
+    foreach($id in @($State.held.Keys)){
+        $entry=$State.held[$id];$stream=$entry.stream
+        $start=$stream.Position;$length=$stream.Length-$start
+        if($length -lt 0 -or $length -gt 268435456){throw 'Runtime log truncated or interval exceeds256MiB'}
+        $chunk=New-Object byte[] ([int]$length)
+        $offset=0
+        while($offset -lt $chunk.Length){$n=$stream.Read($chunk,$offset,$chunk.Length-$offset);if($n -le 0){throw 'Runtime log shortened during read'};$offset+=$n}
+        $capture=$Evidence+'.logs-'+$Index+'-'+$id+'.jsonl'
+        $out=[IO.File]::Open($capture,[IO.FileMode]::CreateNew,[IO.FileAccess]::Write,[IO.FileShare]::None)
+        try{$out.Write($chunk,0,$chunk.Length)}finally{$out.Dispose()}
+        $rows+= [ordered]@{identity=$id;source=$entry.source;start=$start;end=$stream.Position;capture=$capture}
+        # Copy bytes directly; PowerShell array addition boxes every byte.
+        $combined=New-Object byte[] ($entry.pending.Length+$chunk.Length)
+        [Array]::Copy($entry.pending,0,$combined,0,$entry.pending.Length)
+        [Array]::Copy($chunk,0,$combined,$entry.pending.Length,$chunk.Length)
+        $last=[Array]::LastIndexOf($combined,[byte]10)
+        if($last -ge 0){
+            $text=[Text.UTF8Encoding]::new($false,$true).GetString($combined,0,$last+1)
+            foreach($line in @($text.Split([char]10) | Select-Object -SkipLast 1)){
+                $line=$line.TrimEnd([char]13);$record=$line|ConvertFrom-Json
+                if($record.level -isnot [int] -and $record.level -isnot [long]){throw 'Runtime log severity is not numeric'}
+                if($record.level -ge 8){$errors++}elseif($record.level -ge 4){$warnings++}
+                $State.tail.Add($line)
+                if($State.tail.Count -gt 50){$State.tail.RemoveAt(0)}
+            }
+            $entry.pending=New-Object byte[] ($combined.Length-$last-1)
+            [Array]::Copy($combined,$last+1,$entry.pending,0,$entry.pending.Length)
+        }else{$entry.pending=$combined}
+    }
+    # The logging implementation has no separate crash store. Inventory its
+    # actual root; retain Application Error and WER report XML for these images.
+    $inventory=@(Get-ChildItem -LiteralPath $State.root -Force)
+    foreach($item in $inventory){if($item.Attributes -band [IO.FileAttributes]::ReparsePoint){throw 'Linked logging-root inventory entry'}}
+    $crashFiles=@($inventory | Where-Object {$_.Name -match '(?i)crash|\.dmp$|\.wer$'} | ForEach-Object {$_.FullName})
+    $events=@()
+    try{$found=@(Get-WinEvent -FilterHashtable @{LogName='Application';Id=1000,1001;StartTime=$State.started} -ErrorAction Stop)}
+    catch{if($_.FullyQualifiedErrorId -notlike 'NoMatchingEventsFound*'){throw};$found=@()}
+    foreach($event in $found){
+        $xml=$event.ToXml();$document=[xml]$xml
+        if(@($document.Event.EventData.Data | Where-Object { [IO.Path]::GetFileName([string]$_.InnerText) -in @('openabstractions.exe','openabstractionsw.exe') }).Count){$events+=$xml}
+    }
+    $crash=$Evidence+'.logs-'+$Index+'-crash.json'
+    [IO.File]::WriteAllText($crash,(@{logging_root=$State.root;logging_crash_files=$crashFiles;wer_events=$events}|ConvertTo-Json -Depth 8),[Text.UTF8Encoding]::new($false))
+    if($crashFiles.Count -or $events.Count){throw 'Runtime crash observation during installed soak'}
+    return [ordered]@{index=$Index;files=$rows;errors=$errors;warnings=$warnings;crash_capture=$crash}
+}
 function Assert-InstalledRuntimeSoak([string]$Central,[string]$RuntimeHash,[string]$SupervisorHash,
-    [string]$Sid,[int]$Seconds,[string]$Evidence,[string[]]$InputPaths) {
+    [string]$Sid,[int]$Seconds,[string]$Evidence,[string[]]$InputPaths,[string]$Version='0.8.0') {
     if ($Seconds -eq 0) { return }
     if ($Seconds -ne 3600 -or $RuntimeHash -cnotmatch '^[0-9a-f]{64}$' -or $SupervisorHash -cnotmatch '^[0-9a-f]{64}$' -or -not $InputPaths.Count) { throw 'Soak needs exactly 3600s and exact payload/input pins' }
     if (Test-Path -LiteralPath $Evidence) { throw 'Soak attempt already exists; partial evidence cannot resume' }
     if (Test-Path -LiteralPath ($Evidence+'.health-0.json')) { throw 'Soak partial health evidence already exists; cannot resume' }
     $report=[ordered]@{ result='fail'; required_seconds=3600; cadence_seconds=60; cycle_budget_seconds=125;
         max_gap_seconds=185; samples=@(); processes=@(); inputs=$null; observed_awake_seconds=0 }
-    $held=@(); $failure=$null
+    $held=@(); $failure=$null; $logState=$null
     try {
         # One status plus <=5 Describe processes. Each existing process bound is
         # 10s plus two 5s output-drain bounds: <=120s, with 5s observation allowance.
@@ -504,6 +600,10 @@ function Assert-InstalledRuntimeSoak([string]$Central,[string]$RuntimeHash,[stri
         # Retained handles witness lifetime during the bounded wait between cycles.
         $inputs=Get-InstalledSoakInputs $InputPaths
         $report.inputs=$inputs
+        if($Version -match '^\d+\.\d+\.\d+$' -and [version]$Version -ge [version]'0.8.1'){
+            $logState=New-InstalledSoakLogState
+            $report.logs=[ordered]@{schema=1;root=$logState.root;intervals=@();last50=@()}
+        }
         $held=Get-InstalledSoakProcesses $Central $RuntimeHash $SupervisorHash $Sid
         $report.processes=@($held | Select-Object role,pid,parent,birth,handle_birth,session,sid,path,command,sha256)
         $previous=Assert-InstalledSoakClock (Get-InstalledSoakClock) $null
@@ -514,6 +614,12 @@ function Assert-InstalledRuntimeSoak([string]$Central,[string]$RuntimeHash,[stri
             Assert-InstalledSoakProcesses $held $Sid
             Assert-RuntimeReady $Central ($Evidence + '.health-' + $sample)
             Assert-InstalledSoakProcesses $held $Sid
+            if($logState){
+                $report.logs.intervals+=Get-InstalledSoakLogInterval $logState $sample $Evidence
+                $report.logs.last50=@($logState.tail)
+                $counts=@($report.logs.intervals | ForEach-Object {$_.errors})
+                if($counts.Count -ge 4 -and $counts[-4] -lt $counts[-3] -and $counts[-3] -lt $counts[-2] -and $counts[-2] -lt $counts[-1]){throw 'Runtime ERROR count grew in each of the last three intervals'}
+            }
             if ((ConvertTo-Json -InputObject (Get-InstalledSoakInputs $InputPaths) -Depth 5 -Compress) -cne
                 (ConvertTo-Json -InputObject $inputs -Depth 5 -Compress)) { throw 'Soak candidate or declared input bytes changed' }
             $after=Assert-InstalledSoakClock (Get-InstalledSoakClock) $before
@@ -528,6 +634,7 @@ function Assert-InstalledRuntimeSoak([string]$Central,[string]$RuntimeHash,[stri
         }
         if ($report.result -cne 'pass') { throw 'Soak sample bound exhausted without a full observed hour' }
     } catch { $failure=$_; $report.failure=$_.Exception.Message } finally {
+        if($logState){foreach($entry in $logState.held.Values){if($entry.pending.Length){$report.result='fail';if(-not $failure){$failure='Incomplete runtime log record at soak end'}};$entry.stream.Dispose()}}
         foreach ($entry in $held) { $entry.handle.Dispose() }
         [IO.File]::WriteAllText($Evidence,($report | ConvertTo-Json -Depth 10),[Text.UTF8Encoding]::new($false))
     }
@@ -2160,10 +2267,11 @@ function Assert-NativeCore([string]$Central, [string]$Tools, [string]$PythonPath
         if ($native.adopter_case -cin @('opencode','j1')) {
             $session.observations.profile=Get-ProfileFolder UserProfile
         }
-        $roles=$native.selected_app_readback.opencode.journey_payload_roles
-        $cli=@($chain.apps|Where-Object{$_.id -ceq 'opencode'}|ForEach-Object{$_.files}|Where-Object{$_.id -ceq $roles.official_cli.id})
-        if($cli.Count -ne 1){throw 'J1 exact installed official CLI member required'}
-        $program=@{path=$cli[0].path;sha256=$cli[0].sha256;bytes=$cli[0].bytes}
+        # The OpenCode integration MSI installs no OpenCode program; the
+        # request names the pinned official CLI fixture the journey drives.
+        $cli=$native.fixture_program
+        if(-not $cli -or -not $cli.path -or $cli.sha256 -notmatch '^[0-9a-f]{64}$' -or [int64]$cli.bytes -le 0){throw 'J1 pinned official OpenCode fixture program required'}
+        $program=@{path=$cli.path;sha256=$cli.sha256;bytes=[int64]$cli.bytes}
         $selectionDirectory=$directory
         if(@($chain.apps|Where-Object{$_.native}).Count){
             $selectionDirectory=Join-Path $directory 'comfy-bootstrap'
@@ -2716,7 +2824,7 @@ if ($Mode -eq 'User') {
             Assert-RuntimeReady $central runtime-status
             'ok: installed on-demand start resolved logging/config as a non-admin account' | Set-Content 'activation.txt'
             if ($SoakSeconds) {
-                Assert-InstalledRuntimeSoak $central $ExpectedRuntimeSha256 $ExpectedSupervisorSha256 $ExpectedSid $SoakSeconds (Join-Path (Get-Location) 'installed-soak.json') @($MsiPath,$PSCommandPath,(Join-Path $PSScriptRoot 'OAFixture.psm1'),$SoakRequestPath)
+                Assert-InstalledRuntimeSoak $central $ExpectedRuntimeSha256 $ExpectedSupervisorSha256 $ExpectedSid $SoakSeconds (Join-Path (Get-Location) 'installed-soak.json') @($MsiPath,$PSCommandPath,(Join-Path $PSScriptRoot 'OAFixture.psm1'),$SoakRequestPath) -Version ((Get-Content -LiteralPath $SoakRequestPath -Raw | ConvertFrom-Json).version)
             }
             # The state Restart Manager is about to see, for comparison with a removal failure.
             try { Save-RuntimeSnapshot 'pre-uninstall-snapshot.json' $ExpectedSid 'before-uninstall' (Split-Path -Parent $tools) }

@@ -37,7 +37,7 @@ on:
         type: string
         default: ''
       producer_mode:
-        description: 0.8.0 train producer; train-graph checks inputs; legacy is reserved for the exact-host diagnostic
+        description: Train producer; train-graph checks inputs; legacy is reserved for the exact-host diagnostic
         type: choice
         options: [legacy, train-graph, train]
         default: train
@@ -332,7 +332,6 @@ jobs:
           RELEASE_VERSION: ${{ inputs.version }}
         run: |
           [[ "$RELEASE_VERSION" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]] || exit 1
-          [ "$RELEASE_VERSION" = v0.8.0 ] || { echo 'FAIL this workflow checks 0.8.0 inputs only'; exit 1; }
           [ "$GITHUB_REPOSITORY" = openabstractions/redist ] && [ "$GITHUB_EVENT_NAME" = workflow_dispatch ] || exit 1
           [ "$GITHUB_ACTOR" = ReinisLusis ] && [ "$GITHUB_TRIGGERING_ACTOR" = ReinisLusis ] || exit 1
           [ "$GITHUB_REF" = "refs/heads/release/${RELEASE_VERSION#v}" ] && [ "$(git rev-parse HEAD)" = "$GITHUB_SHA" ] || exit 1
@@ -388,12 +387,15 @@ jobs:
           [ "$major" -le 255 ] && [ "$minor" -le 255 ] && [ "$patch" -le 65535 ] || {
             echo 'FAIL version exceeds Windows Installer limits'; exit 1;
           }
-          [ "$RELEASE_VERSION" = v0.8.0 ] || {
-            echo 'FAIL this workflow packages 0.8.0 only; rebuild historical releases from their release tag tooling'; exit 1;
+          # The release version comes from the dispatch input alone; the
+          # branch must be release/<version>. Releases before 0.8.0 rebuild
+          # from their own release tag tooling.
+          [ "$major" -gt 0 ] || [ "$minor" -ge 8 ] || {
+            echo 'FAIL this workflow packages 0.8.0 and later; rebuild historical releases from their release tag tooling'; exit 1;
           }
-          [ "$PRODUCER_MODE" = train ] || { echo 'FAIL 0.8.0 packages require train mode'; exit 1; }
+          [ "$PRODUCER_MODE" = train ] || { echo 'FAIL release packages require train mode'; exit 1; }
           [ "$GITHUB_REF" = "refs/heads/release/${RELEASE_VERSION#v}" ] || {
-            echo 'FAIL 0.8.0 packages require the exact current train branch'; exit 1;
+            echo 'FAIL release packages require the release/<version> branch of the dispatched version'; exit 1;
           }
           [ "$GITHUB_REF_TYPE" != tag ] || { echo 'FAIL dispatch from a branch, not an existing tag'; exit 1; }
           sha=$(git rev-parse HEAD)
@@ -1080,7 +1082,7 @@ jobs:
           if-no-files-found: error
 
   windows-sdk-sign:
-    if: ${{ !inputs.windows_tail_only && (needs.source-guard.result == 'success' && (!inputs.diagnostic_host_sign_only && (inputs.producer_mode != 'train-graph' && (always() && !inputs.signing_probe_only && needs.windows-native-build.result == 'success' && github.repository == 'openabstractions/redist' && github.event_name == 'workflow_dispatch' && (inputs.producer_mode == 'train' && github.ref == 'refs/heads/release/0.8.0' && github.ref == format('refs/heads/release/{0}', needs.candidate.outputs.version)) && github.actor == 'ReinisLusis' && github.triggering_actor == 'ReinisLusis')))) }}
+    if: ${{ !inputs.windows_tail_only && (needs.source-guard.result == 'success' && (!inputs.diagnostic_host_sign_only && (inputs.producer_mode != 'train-graph' && (always() && !inputs.signing_probe_only && needs.windows-native-build.result == 'success' && github.repository == 'openabstractions/redist' && github.event_name == 'workflow_dispatch' && (inputs.producer_mode == 'train' && github.ref == format('refs/heads/release/{0}', needs.candidate.outputs.version)) && github.actor == 'ReinisLusis' && github.triggering_actor == 'ReinisLusis')))) }}
     needs: [source-guard, candidate, windows-native-build]
     runs-on: windows-latest
     timeout-minutes: 20
@@ -1146,7 +1148,7 @@ jobs:
           if-no-files-found: error
 
   windows-pe-sign:
-    if: ${{ !inputs.windows_tail_only && (needs.source-guard.result == 'success' && (inputs.app_delivery_only != 'comfyui' && (!inputs.diagnostic_host_sign_only && (inputs.producer_mode != 'train-graph' && (always() && !inputs.signing_probe_only && needs.windows-sdk-sign.result == 'success' && (needs.windows-build.result == 'success' || (inputs.app_producer_only == 'comfyui' && needs.windows-build.result == 'skipped')) && github.repository == 'openabstractions/redist' && github.event_name == 'workflow_dispatch' && (inputs.producer_mode == 'train' && github.ref == 'refs/heads/release/0.8.0' && github.ref == format('refs/heads/release/{0}', needs.candidate.outputs.version)) && github.actor == 'ReinisLusis' && github.triggering_actor == 'ReinisLusis'))))) }}
+    if: ${{ !inputs.windows_tail_only && (needs.source-guard.result == 'success' && (inputs.app_delivery_only != 'comfyui' && (!inputs.diagnostic_host_sign_only && (inputs.producer_mode != 'train-graph' && (always() && !inputs.signing_probe_only && needs.windows-sdk-sign.result == 'success' && (needs.windows-build.result == 'success' || (inputs.app_producer_only == 'comfyui' && needs.windows-build.result == 'skipped')) && github.repository == 'openabstractions/redist' && github.event_name == 'workflow_dispatch' && (inputs.producer_mode == 'train' && github.ref == format('refs/heads/release/{0}', needs.candidate.outputs.version)) && github.actor == 'ReinisLusis' && github.triggering_actor == 'ReinisLusis'))))) }}
     needs: [source-guard, candidate, windows-build, windows-sdk-sign]
     runs-on: windows-latest
     timeout-minutes: 20
@@ -1311,7 +1313,7 @@ jobs:
           if-no-files-found: error
 
   windows-runtime-sign:
-    if: ${{ !inputs.windows_tail_only && (needs.source-guard.result == 'success' && (inputs.producer_mode == 'train' && inputs.app_delivery_only != 'comfyui' && (!inputs.diagnostic_host_sign_only && (inputs.producer_mode != 'train-graph' && (always() && !inputs.signing_probe_only && needs.windows-sdk-sign.result == 'success' && (needs.windows-runtime-build.result == 'success' || (inputs.app_producer_only == 'comfyui' && needs.windows-runtime-build.result == 'skipped')) && github.repository == 'openabstractions/redist' && github.event_name == 'workflow_dispatch' && (inputs.producer_mode == 'train' && github.ref == 'refs/heads/release/0.8.0' && github.ref == format('refs/heads/release/{0}', needs.candidate.outputs.version)) && github.actor == 'ReinisLusis' && github.triggering_actor == 'ReinisLusis'))))) }}
+    if: ${{ !inputs.windows_tail_only && (needs.source-guard.result == 'success' && (inputs.producer_mode == 'train' && inputs.app_delivery_only != 'comfyui' && (!inputs.diagnostic_host_sign_only && (inputs.producer_mode != 'train-graph' && (always() && !inputs.signing_probe_only && needs.windows-sdk-sign.result == 'success' && (needs.windows-runtime-build.result == 'success' || (inputs.app_producer_only == 'comfyui' && needs.windows-runtime-build.result == 'skipped')) && github.repository == 'openabstractions/redist' && github.event_name == 'workflow_dispatch' && (inputs.producer_mode == 'train' && github.ref == format('refs/heads/release/{0}', needs.candidate.outputs.version)) && github.actor == 'ReinisLusis' && github.triggering_actor == 'ReinisLusis'))))) }}
     needs: [source-guard, candidate, windows-runtime-build, windows-sdk-sign]
     runs-on: windows-latest
     timeout-minutes: 20
@@ -1579,7 +1581,7 @@ jobs:
           if-no-files-found: error
 
   core-bundle-native-sign:
-    if: ${{ !inputs.windows_tail_only && (needs.source-guard.result == 'success' && (inputs.core_only && !inputs.diagnostic_host_sign_only && (inputs.producer_mode != 'train-graph' && (always() && !inputs.signing_probe_only && needs.core-bundle-native-build.result == 'success' && github.repository == 'openabstractions/redist' && github.event_name == 'workflow_dispatch' && (inputs.producer_mode == 'train' && github.ref == 'refs/heads/release/0.8.0' && github.ref == format('refs/heads/release/{0}', needs.candidate.outputs.version)) && github.actor == 'ReinisLusis' && github.triggering_actor == 'ReinisLusis')))) }}
+    if: ${{ !inputs.windows_tail_only && (needs.source-guard.result == 'success' && (inputs.core_only && !inputs.diagnostic_host_sign_only && (inputs.producer_mode != 'train-graph' && (always() && !inputs.signing_probe_only && needs.core-bundle-native-build.result == 'success' && github.repository == 'openabstractions/redist' && github.event_name == 'workflow_dispatch' && (inputs.producer_mode == 'train' && github.ref == format('refs/heads/release/{0}', needs.candidate.outputs.version)) && github.actor == 'ReinisLusis' && github.triggering_actor == 'ReinisLusis')))) }}
     needs: [source-guard, candidate, core-bundle-native-build]
     runs-on: windows-latest
     environment: signing
@@ -1733,7 +1735,7 @@ jobs:
           if-no-files-found: error
 
   windows-app-native-sign:
-    if: ${{ !inputs.windows_tail_only && (needs.source-guard.result == 'success' && (!inputs.core_only && !inputs.diagnostic_host_sign_only && (inputs.producer_mode != 'train-graph' && (always() && !inputs.signing_probe_only && needs.windows-app-native-build.result == 'success' && github.repository == 'openabstractions/redist' && github.event_name == 'workflow_dispatch' && (inputs.producer_mode == 'train' && github.ref == 'refs/heads/release/0.8.0' && github.ref == format('refs/heads/release/{0}', needs.candidate.outputs.version)) && github.actor == 'ReinisLusis' && github.triggering_actor == 'ReinisLusis')))) }}
+    if: ${{ !inputs.windows_tail_only && (needs.source-guard.result == 'success' && (!inputs.core_only && !inputs.diagnostic_host_sign_only && (inputs.producer_mode != 'train-graph' && (always() && !inputs.signing_probe_only && needs.windows-app-native-build.result == 'success' && github.repository == 'openabstractions/redist' && github.event_name == 'workflow_dispatch' && (inputs.producer_mode == 'train' && github.ref == format('refs/heads/release/{0}', needs.candidate.outputs.version)) && github.actor == 'ReinisLusis' && github.triggering_actor == 'ReinisLusis')))) }}
     needs: [source-guard, candidate, windows-app-native-build]
     runs-on: windows-latest
     environment: signing
@@ -1875,7 +1877,7 @@ jobs:
           if-no-files-found: error
 
   windows-app-helpers-sign:
-    if: ${{ !inputs.windows_tail_only && (needs.source-guard.result == 'success' && (!inputs.core_only && !inputs.diagnostic_host_sign_only && (inputs.producer_mode != 'train-graph' && (always() && !inputs.signing_probe_only && needs.windows-app-helpers-build.result == 'success' && github.repository == 'openabstractions/redist' && github.event_name == 'workflow_dispatch' && (inputs.producer_mode == 'train' && github.ref == 'refs/heads/release/0.8.0' && github.ref == format('refs/heads/release/{0}', needs.candidate.outputs.version)) && github.actor == 'ReinisLusis' && github.triggering_actor == 'ReinisLusis')))) }}
+    if: ${{ !inputs.windows_tail_only && (needs.source-guard.result == 'success' && (!inputs.core_only && !inputs.diagnostic_host_sign_only && (inputs.producer_mode != 'train-graph' && (always() && !inputs.signing_probe_only && needs.windows-app-helpers-build.result == 'success' && github.repository == 'openabstractions/redist' && github.event_name == 'workflow_dispatch' && (inputs.producer_mode == 'train' && github.ref == format('refs/heads/release/{0}', needs.candidate.outputs.version)) && github.actor == 'ReinisLusis' && github.triggering_actor == 'ReinisLusis')))) }}
     needs: [source-guard, candidate, windows-app-helpers-build]
     runs-on: windows-latest
     environment: signing
@@ -2042,7 +2044,7 @@ jobs:
           if-no-files-found: error
 
   windows-app-sign:
-    if: ${{ !inputs.windows_tail_only && (needs.source-guard.result == 'success' && !cancelled() && needs.candidate.result == 'success' && needs.windows-sdk-sign.result == 'success' && needs.windows-app-msi.result == 'success' && (!inputs.core_only && !inputs.diagnostic_host_sign_only && (inputs.producer_mode != 'train-graph' && (!inputs.signing_probe_only && (inputs.app_producer_only == 'none' || inputs.app_producer_only == '') && github.repository == 'openabstractions/redist' && github.event_name == 'workflow_dispatch' && (inputs.producer_mode == 'train' && github.ref == 'refs/heads/release/0.8.0' && github.ref == format('refs/heads/release/{0}', needs.candidate.outputs.version)) && github.actor == 'ReinisLusis' && github.triggering_actor == 'ReinisLusis')))) }}
+    if: ${{ !inputs.windows_tail_only && (needs.source-guard.result == 'success' && !cancelled() && needs.candidate.result == 'success' && needs.windows-sdk-sign.result == 'success' && needs.windows-app-msi.result == 'success' && (!inputs.core_only && !inputs.diagnostic_host_sign_only && (inputs.producer_mode != 'train-graph' && (!inputs.signing_probe_only && (inputs.app_producer_only == 'none' || inputs.app_producer_only == '') && github.repository == 'openabstractions/redist' && github.event_name == 'workflow_dispatch' && (inputs.producer_mode == 'train' && github.ref == format('refs/heads/release/{0}', needs.candidate.outputs.version)) && github.actor == 'ReinisLusis' && github.triggering_actor == 'ReinisLusis')))) }}
     needs: [source-guard, candidate, windows-sdk-sign, windows-app-msi]
     runs-on: windows-latest
     timeout-minutes: 20
@@ -2157,7 +2159,7 @@ jobs:
           if-no-files-found: error
 
   windows-msi-sign:
-    if: ${{ !inputs.windows_tail_only && (needs.source-guard.result == 'success' && (!cancelled() && (inputs.app_delivery_only != 'comfyui' && (!inputs.diagnostic_host_sign_only && (inputs.producer_mode != 'train-graph' && (!inputs.signing_probe_only && (inputs.app_producer_only == 'none' || inputs.app_producer_only == '') && github.repository == 'openabstractions/redist' && github.event_name == 'workflow_dispatch' && (inputs.producer_mode == 'train' && github.ref == 'refs/heads/release/0.8.0' && github.ref == format('refs/heads/release/{0}', needs.candidate.outputs.version)) && github.actor == 'ReinisLusis' && github.triggering_actor == 'ReinisLusis')))) && needs.candidate.result == 'success' && needs.windows-pe-sign.result == 'success' && needs.windows.result == 'success' && (inputs.core_only || (!inputs.core_only && needs.windows-app-sign.result == 'success')))) }}
+    if: ${{ !inputs.windows_tail_only && (needs.source-guard.result == 'success' && (!cancelled() && (inputs.app_delivery_only != 'comfyui' && (!inputs.diagnostic_host_sign_only && (inputs.producer_mode != 'train-graph' && (!inputs.signing_probe_only && (inputs.app_producer_only == 'none' || inputs.app_producer_only == '') && github.repository == 'openabstractions/redist' && github.event_name == 'workflow_dispatch' && (inputs.producer_mode == 'train' && github.ref == format('refs/heads/release/{0}', needs.candidate.outputs.version)) && github.actor == 'ReinisLusis' && github.triggering_actor == 'ReinisLusis')))) && needs.candidate.result == 'success' && needs.windows-pe-sign.result == 'success' && needs.windows.result == 'success' && (inputs.core_only || (!inputs.core_only && needs.windows-app-sign.result == 'success')))) }}
     needs: [source-guard, candidate, windows-pe-sign, windows, windows-app-sign]
     runs-on: windows-latest
     timeout-minutes: 20
@@ -4955,7 +4957,7 @@ jobs:
           path: setup-dist/
           if-no-files-found: error
   windows-bundle-sign:
-    if: ${{ !inputs.windows_tail_only && (needs.source-guard.result == 'success' && !cancelled() && needs.candidate.result == 'success' && needs.bundle.result == 'success' && needs.windows-msi-sign.result == 'success' && (inputs.app_delivery_only != 'comfyui' && (!inputs.diagnostic_host_sign_only && (inputs.producer_mode != 'train-graph' && (!inputs.signing_probe_only && (inputs.app_producer_only == 'none' || inputs.app_producer_only == '') && github.repository == 'openabstractions/redist' && github.event_name == 'workflow_dispatch' && (inputs.producer_mode == 'train' && github.ref == 'refs/heads/release/0.8.0' && github.ref == format('refs/heads/release/{0}', needs.candidate.outputs.version)) && github.actor == 'ReinisLusis' && github.triggering_actor == 'ReinisLusis'))))) }}
+    if: ${{ !inputs.windows_tail_only && (needs.source-guard.result == 'success' && !cancelled() && needs.candidate.result == 'success' && needs.bundle.result == 'success' && needs.windows-msi-sign.result == 'success' && (inputs.app_delivery_only != 'comfyui' && (!inputs.diagnostic_host_sign_only && (inputs.producer_mode != 'train-graph' && (!inputs.signing_probe_only && (inputs.app_producer_only == 'none' || inputs.app_producer_only == '') && github.repository == 'openabstractions/redist' && github.event_name == 'workflow_dispatch' && (inputs.producer_mode == 'train' && github.ref == format('refs/heads/release/{0}', needs.candidate.outputs.version)) && github.actor == 'ReinisLusis' && github.triggering_actor == 'ReinisLusis'))))) }}
     needs: [source-guard, candidate, bundle, windows-msi-sign]
     runs-on: windows-latest
     timeout-minutes: 20
@@ -5070,7 +5072,7 @@ jobs:
           if-no-files-found: error
 
   windows-signing-probe:
-    if: ${{ !inputs.windows_tail_only && (needs.source-guard.result == 'success' && (inputs.app_delivery_only != 'comfyui' && (!inputs.diagnostic_host_sign_only && (inputs.producer_mode != 'train-graph' && (inputs.signing_probe_only && github.repository == 'openabstractions/redist' && github.event_name == 'workflow_dispatch' && (inputs.producer_mode == 'train' && github.ref == 'refs/heads/release/0.8.0' && github.ref == format('refs/heads/release/{0}', needs.candidate.outputs.version)) && github.actor == 'ReinisLusis' && github.triggering_actor == 'ReinisLusis'))))) }}
+    if: ${{ !inputs.windows_tail_only && (needs.source-guard.result == 'success' && (inputs.app_delivery_only != 'comfyui' && (!inputs.diagnostic_host_sign_only && (inputs.producer_mode != 'train-graph' && (inputs.signing_probe_only && github.repository == 'openabstractions/redist' && github.event_name == 'workflow_dispatch' && (inputs.producer_mode == 'train' && github.ref == format('refs/heads/release/{0}', needs.candidate.outputs.version)) && github.actor == 'ReinisLusis' && github.triggering_actor == 'ReinisLusis'))))) }}
     needs: [source-guard, candidate, windows-signing-probe-build]
     runs-on: windows-latest
     timeout-minutes: 20

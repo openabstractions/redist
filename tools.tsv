@@ -39,14 +39,14 @@
 > leave in 0.2.0 (docs/REMOVED.md).
 
 path	module	package	feature	subsystem
-Abstraction Panel.exe	github.com/openabstractions/abstractions/monitor@v0.8.0	.	tools	windows
-OpenAbstractions Presenter.exe	github.com/openabstractions/abstractions/monitor@v0.8.0	.	tools	windows
-inventoryd.exe	github.com/openabstractions/abstraction-storage-over-local-stores/go@v0.8.0	cmd/inventoryd	localstores	console
-lemonaded.exe	github.com/openabstractions/abstraction-provider-lemonade/go@v0.8.0	cmd/lemonaded	lemonadeimage	console
-modelhostd.exe	github.com/openabstractions/abstraction-provider-modelhost/go@v0.8.0	cmd/modelhostd	modelhost	console
-modelpack.exe	github.com/openabstractions/abstraction-provider-kit/go@v0.8.0	cmd/modelpack	service	console
-openabstractions-mcp.exe	github.com/openabstractions/abstractions/mcp-gateway@v0.8.0	.	mcpgateway	console
-openabstractions.exe	github.com/openabstractions/abstractions/serve@v0.8.0	.	service	console
-openabstractionsw.exe	github.com/openabstractions/abstractions/serve@v0.8.0	.	service	windows
-openabstractions-system.exe	github.com/openabstractions/abstractions/serve@v0.8.0	system	service	windows
-pytorchd.exe	github.com/openabstractions/abstraction-provider-pytorch/go@v0.8.0	cmd/pytorchd	pytorchimage	console
+Abstraction Panel.exe	github.com/openabstractions/abstractions/monitor@v0.8.1	.	tools	windows
+OpenAbstractions Presenter.exe	github.com/openabstractions/abstractions/monitor@v0.8.1	.	tools	windows
+inventoryd.exe	github.com/openabstractions/abstraction-storage-over-local-stores/go@v0.8.1	cmd/inventoryd	localstores	console
+lemonaded.exe	github.com/openabstractions/abstraction-provider-lemonade/go@v0.8.1	cmd/lemonaded	lemonadeimage	console
+modelhostd.exe	github.com/openabstractions/abstraction-provider-modelhost/go@v0.8.1	cmd/modelhostd	modelhost	console
+modelpack.exe	github.com/openabstractions/abstraction-provider-kit/go@v0.8.1	cmd/modelpack	service	console
+openabstractions-mcp.exe	github.com/openabstractions/abstractions/mcp-gateway@v0.8.1	.	mcpgateway	console
+openabstractions.exe	github.com/openabstractions/abstractions/serve@v0.8.1	.	service	console
+openabstractionsw.exe	github.com/openabstractions/abstractions/serve@v0.8.1	.	service	windows
+openabstractions-system.exe	github.com/openabstractions/abstractions/serve@v0.8.1	system	service	windows
+pytorchd.exe	github.com/openabstractions/abstraction-provider-pytorch/go@v0.8.1	cmd/pytorchd	pytorchimage	console

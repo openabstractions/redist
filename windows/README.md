@@ -114,7 +114,7 @@ whose endpoint is absent, once within the call's budget.
 
 **Just for you, the Panel also gets a Startup shortcut**, running
 `Abstraction Panel.exe --background`: the native Asks presenter that polls for
-pending questions in the unlocked session ([Panel window behavior](../monitor/README.md#windows)).
+pending questions in the unlocked session (Panel window behavior (`../monitor/README.md`)).
 Installed for everyone, the installer adds no such
 shortcut; the runtime's reconciler (`serve/runtime_logon_windows.go`)
 owns the presenter's sign-in entry and writes it for an account once that
@@ -327,6 +327,13 @@ like a redistributable, and the runtime serves every account (owner,
 dual-purpose MSI. The application MSIs stay per-user, and each
 prefers the Panel a machine-wide installation records over a per-user one.
 Run on its own, this package still defaults to Just me.
+Windows Installer upgrades within one installation context only. When Setup
+installs the core and finds a per-user core of this account, it removes that
+product with no window before its chain executes, then installs per machine
+(install-scope ruling C, 2026-11-22). The removal deletes the per-user program
+folder and its start entries; the account's state under
+`%LOCALAPPDATA%\openabstractions` and `%APPDATA%` stays. When the removal
+fails, Setup stops before it changes anything and its log names the product.
 The bundle asks for administrator rights whenever it needs them and never
 fails with access denied (owner, 2026-10-31): every per-machine package in this
 per-user bundle is cached only while it runs (`Cache="remove"`), inside the
@@ -352,7 +359,7 @@ The screens the person sees, one per state:
 
 - First install: "Read the license terms." with its link, the "I agree" box, **Install** and **Cancel**.
 - Already installed (a registered bundle run again): "OpenAbstractions is installed", the caption "To remove it, open Settings > Apps > Installed apps.", **Repair** and **Cancel**.
-- Progress: "Installing OpenAbstractions", the package being installed (first "Preparing…"), the progress bar and **Cancel**. **Cancel** asks "Cancel installing OpenAbstractions?".
+- Progress: "Installing OpenAbstractions", the package being installed (first "Preparing…"), the progress bar and **Cancel**. While Windows checks the core installer before its first progress, which took about two minutes with Smart App Control on, the line reads "Windows is checking the installer…" over a moving bar. **Cancel** asks "Cancel installing OpenAbstractions?".
 - Files in use: "Close these apps to continue:", then "Close them and reopen them afterwards" or "Keep them open and restart later".
 - Success: "OpenAbstractions is ready" (after a repair, "OpenAbstractions is repaired") and **Finish**. After an install, change or repair, a ticked **Open OpenAbstractions** box sits above it. Finish closes Setup and, while the box is ticked, opens OpenAbstractions in the installing account: the setup question when there is setup to do, otherwise the Panel. **Restart** appears only when Windows needs one, and then the box does not. The box is also hidden while Setup runs as administrator, where the setup step refuses to run. Each press of Finish writes one line to the Setup log: `Finish opened OpenAbstractions (--finish --update)`, `Finish closed Setup without opening OpenAbstractions`, or the launch error.
 - Failure: "OpenAbstractions wasn't installed", "Try again. The log file shows what went wrong." with the log link, the error message, **Close**, plus **Restart** only when Windows needs one.
@@ -401,6 +408,16 @@ Add `/qn` for a silent removal. A quiet removal can report success while a
 reboot is still pending; [QUALIFICATION.md](QUALIFICATION.md) records the
 observed case and how the removal log shows it.
 
+Antivirus, an indexer or a provisioning daemon can hold a product file for a
+moment, and Restart Manager cannot close such a program. Before Windows
+Installer checks for files in use, a removal waits up to 20 seconds, with
+backoff, while a service or critical process outside OpenAbstractions holds a
+file of the installation (`service await-release`). When one still holds a
+file, the removal goes on and the person reads "<program> is using
+OpenAbstractions files. Restart your computer to finish removing
+OpenAbstractions." in a window under the full installer UI, and in
+`installer-actions.txt` always.
+
 The model host and the Lemonade image provider make the engine folders they
 install read-only for the account (inference CONTRACT.md INF-F3), and removal
 leaves those folders as user data. Before either program goes, a removal of
@@ -448,6 +465,9 @@ other applications. It stays on (`MSIRESTARTMANAGERCONTROL=0`,
 end-upgrade`) and registers the rollback activation (`service start --related`
 per-user, `service start --machine` for everyone). While the exclusion is held,
 `start`, `serve supervisor` and SDK activation of the folders being replaced exit 3.
+The Panel and the presenter started from those folders exit 3 too, before they
+open anything, so a copy started after the early stop never reappears in
+Windows' files-in-use question.
 The rollback activation releases the record and runs the previous version's own
 activation: `jobdw.exe start --runtime` for 0.1.6 and 0.1.7,
 `openabstractionsw.exe start` from 0.2.0, and `sc start` of stopped per-session

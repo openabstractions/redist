@@ -1172,6 +1172,12 @@ def panel_pin_document(source_document, produced_rows, *, expected_apps):
 OPENCODE_UPGRADE_CODE = '{8E0B8005-0E00-5720-9556-E5B984F15A96}'
 
 
+def carries_pytorch_engine(release_tag):
+    """Releases from v0.8.0 list the retained PyTorch engine in the Panel catalogue."""
+    match = re.fullmatch(r'v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)', str(release_tag))
+    return bool(match) and tuple(map(int, match.groups())) >= (0, 8, 0)
+
+
 def pytorch_catalogue_row():
     """Keep the retained engine input separate from application producers."""
     import types
@@ -1191,7 +1197,7 @@ def panel_catalogue_rows(raw):
         raise ValueError('invalid Panel catalogue app rows')
     engines = [row for row in document['apps'] if row.get('id') == 'pytorch']
     if engines:
-        if document['release_tag'] != 'v0.8.0' or engines != [pytorch_catalogue_row()]:
+        if not carries_pytorch_engine(document['release_tag']) or engines != [pytorch_catalogue_row()]:
             raise ValueError('Panel PyTorch engine differs from the retained release input pin')
         document['apps'] = [row for row in document['apps'] if row.get('id') != 'pytorch']
     if 'extensions' in document:
@@ -1238,7 +1244,7 @@ def panel_pin_input(source_document, produced_rows, *, expected_apps, producer, 
         raise ValueError('Panel catalogue requires exact current producer identity')
     raw = panel_pin_document(source_document,produced_rows,expected_apps=expected_apps)
     document = json.loads(raw)
-    if document['release_tag'] == 'v0.8.0':
+    if carries_pytorch_engine(document['release_tag']):
         document['apps'].append(pytorch_catalogue_row())
         raw = (json.dumps(document, sort_keys=True) + '\n').encode('utf-8')
     extensions = [pin for pin in (opencode, comfyui) if pin is not None]

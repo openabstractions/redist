@@ -179,14 +179,45 @@ def remove_tree(path: os.PathLike[str] | str) -> None:
     if not stat.S_ISDIR(info.st_mode):
         raise ValueError("removal root must be a directory")
 
-    def writable(function, name, _error):
-        os.chmod(name, stat.S_IWRITE | stat.S_IREAD | stat.S_IEXEC)
-        function(name)
+    root_fd = None
+    if os.name != 'nt':
+        root_fd = os.open(target, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        if not os.path.samestat(info, os.fstat(root_fd)):
+            os.close(root_fd)
+            raise ValueError('removal root changed before opening')
 
-    if sys.version_info >= (3, 12):
-        shutil.rmtree(target, onexc=writable)
-    else:
-        shutil.rmtree(target, onerror=writable)
+    def writable(function, name, error):
+        if os.name == 'nt':
+            os.chmod(name, stat.S_IWRITE | stat.S_IREAD | stat.S_IEXEC)
+            function(name)
+            return
+        failure = error if isinstance(error, BaseException) else error[1]
+        relative = Path(name).relative_to(target)
+        if (not isinstance(failure, PermissionError) or function not in (os.unlink, os.rmdir)
+                or not relative.parts or any(part in ('.', '..') for part in relative.parts)):
+            raise failure
+        # POSIX unlink/rmdir needs write permission on its parent. Walk from
+        # the pinned owned root, refusing links, and change only that directory.
+        parent_fd = os.dup(root_fd)
+        try:
+            for component in relative.parts[:-1]:
+                child_fd = os.open(component, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=parent_fd)
+                os.close(parent_fd)
+                parent_fd = child_fd
+            mode = os.fstat(parent_fd).st_mode
+            os.fchmod(parent_fd, mode | stat.S_IWUSR | stat.S_IXUSR)
+            function(relative.parts[-1], dir_fd=parent_fd)
+        finally:
+            os.close(parent_fd)
+
+    try:
+        if sys.version_info >= (3, 12):
+            shutil.rmtree(target, onexc=writable)
+        else:
+            shutil.rmtree(target, onerror=writable)
+    finally:
+        if root_fd is not None:
+            os.close(root_fd)
 
 
 @contextmanager

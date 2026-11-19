@@ -11,8 +11,8 @@
  *                          application's folder
  *   OaHostSubfolder  (in)  the folder under it that receives the extension
  *   OaExtensionName  (in)  the extension's folder name inside the subfolder
- *   OAEXTENSION_FOLDER (in) the subfolder an earlier version of this
- *                          package recorded, or empty
+ *   OaRecordedFolder (in)  the subfolder an earlier version of this package
+ *                          recorded, or empty (FindRecords, oa_records.h)
  *   HostFolder       (out) <value>\<subfolder>\ when the value is a
  *                          drive-absolute path on a local drive and the
  *                          subfolder is a directory
@@ -25,6 +25,9 @@
  * nothing on disk and names no application: every name comes from the
  * package's properties. It always returns success unless Windows Installer
  * itself fails; the package's launch conditions say what was not found.
+ *
+ * The library also exports FindRecords (oa_records.h), which reads the
+ * Panel's program and the recorded folder from the registry.
  *
  * Build (a Visual Studio x64 developer environment):
  *   cl /nologo /W4 /WX /O2 /MT /GS /guard:cf /Brepro /LD hostfolder.c
@@ -69,6 +72,7 @@ static void say(MSIHANDLE install, const WCHAR *text)
 }
 
 #include "hostfolder_io.h"
+#include "oa_records.h"
 
 __declspec(dllexport) UINT __stdcall FindHostFolder(MSIHANDLE install)
 {
@@ -77,7 +81,7 @@ __declspec(dllexport) UINT __stdcall FindHostFolder(MSIHANDLE install)
     WCHAR *key = property(install, L"OaHostKey");
     WCHAR *sub = property(install, L"OaHostSubfolder");
     WCHAR *name = property(install, L"OaExtensionName");
-    WCHAR *recorded = property(install, L"OAEXTENSION_FOLDER");
+    WCHAR *recorded = property(install, L"OaRecordedFolder");
     char *data = NULL, *found = NULL, *key_utf8 = NULL;
     WCHAR *base = NULL, *folder = NULL, *target = NULL;
     if (config == NULL || key == NULL || sub == NULL || name == NULL || recorded == NULL ||

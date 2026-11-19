@@ -2612,9 +2612,9 @@ def signed_setup_upgrade_opencode(root, policy, signtool, *, policy_sha256, cand
     files = validate_expected_payload(binding['expected_producers']['opencode']['expected_payload'])['files']
     prefix = 'LocalAppDataFolder/Programs/OpenAbstractions/apps/opencode/'
     plugin = f'plugin/{version}/'
-    roles = {'cli': 'cli/opencode.exe', 'plugin': plugin + 'index.js',
-        'lifecycle': plugin + 'installer/config-lifecycle.js',
-        'bun_config': PurePosixPath('installer', 'empty-bunfig.toml').as_posix()}
+    # The MSI carries no OpenCode program; the guest reads the registration
+    # back through the installed OpenCode Desktop in Node mode.
+    roles = {'plugin': plugin + 'index.js', 'lifecycle': plugin + 'installer/config-lifecycle.js'}
     members = {}
     for role, relative in roles.items():
         rows = [row for row in files if row['path'] == prefix + relative]
@@ -2750,20 +2750,14 @@ def check_setup_installed(inputs, result, *, source, run_id, run_attempt, versio
 
 
 def opencode_content_policy(plugin_version=None):
-    """Finite upstream content pins; these confer no verified publisher identity."""
-    prefix='LocalAppDataFolder/Programs/OpenAbstractions/apps/opencode/bootstrap/'
-    common={'application':'opencode','version':'1.18.34','lock_sha256':'f9f409ec58f87bee16ef9011268bb4fd005d2f817a3c578b4c849424ef1e6750'}
+    """Finite upstream content pins; these confer no verified publisher identity.
+
+    The OpenCode integration carries no OpenCode program and no first-use
+    bootstrap closure (owner, 2026-11-21): OA's watcher build and the plugin's
+    own two msgpackr-extract natives are its content PE files."""
     npm={'url':'https://registry.npmjs.org/@msgpackr-extract/msgpackr-extract-win32-x64/-/msgpackr-extract-win32-x64-3.0.4.tgz',
          'integrity':'sha512-CmCXPQrkbwExx3j946/PtHWHbYJiCRBRDl4BlkRQcJB/YOwQxJRTpoo7aTsortjgoJ1x7opzTSxn7C+ASSLVjQ=='}
     rows={}
-    for member,sha in [('node.abi115.node','300b188fb8c997214cb65bf1b00729da293176c7d57035e40c2f432ea384dd89'),
-                       ('node.napi.node','6958541c624784dfcebfc4f3c360c57f71cfeedd0530c2393845061729081a08')]:
-        rows[prefix+'config/node_modules/@msgpackr-extract/msgpackr-extract-win32-x64/'+member]={
-            'sha256':sha,'bytes':112640,'source':dict(common,**npm,member='package/'+member)}
-    rows[prefix+'cache/bin/rg.exe']={'sha256':'decdd4992f3f1b9a5ef9898f1b40ab16886d579d6516b4efd3d5eaa19364e408','bytes':4266496,
-        'source':dict(common,url='https://github.com/BurntSushi/ripgrep/releases/download/15.1.0/ripgrep-15.1.0-x86_64-pc-windows-msvc.zip',
-                      integrity='sha256-124510b94b6baa3380d051fdf4650eaa80a302c876d611e9dba0b2e18d87493a',
-                      member='ripgrep-15.1.0-x86_64-pc-windows-msvc/rg.exe')}
     rows['LocalAppDataFolder/Programs/OpenAbstractions/apps/opencode/desktop-fix/watcher.node']={
         'sha256':'0251ee3ba7027af84a0cb8e0c2ffa1c5989eacf21bc091f95a7c5c00cc486e12','bytes':528896,
         'source':{'application':'opencode','repository':'https://github.com/parcel-bundler/watcher','tag':'v2.5.1',
@@ -2775,15 +2769,10 @@ def opencode_content_policy(plugin_version=None):
             raise ValueError('invalid selected OpenCode plugin version')
         plugin='LocalAppDataFolder/Programs/OpenAbstractions/apps/opencode/plugin/'+plugin_version+'/node_modules/@msgpackr-extract/msgpackr-extract-win32-x64/'
         source={'application':'opencode','version':'1.18.31','lock_sha256':'004bae800738a8779a64091471e9aa09195542af844da713b6a55247aab6e412'}
-        for member in ('node.abi115.node','node.napi.node'):
-            original=rows[prefix+'config/node_modules/@msgpackr-extract/msgpackr-extract-win32-x64/'+member]
-            rows[plugin+member]={'sha256':original['sha256'],'bytes':original['bytes'],'source':dict(source,**npm,member='package/'+member)}
+        for member,sha in [('node.abi115.node','300b188fb8c997214cb65bf1b00729da293176c7d57035e40c2f432ea384dd89'),
+                           ('node.napi.node','6958541c624784dfcebfc4f3c360c57f71cfeedd0530c2393845061729081a08')]:
+            rows[plugin+member]={'sha256':sha,'bytes':112640,'source':dict(source,**npm,member='package/'+member)}
     return rows
-
-
-def opencode_content_cli():
-    return ('LocalAppDataFolder/Programs/OpenAbstractions/apps/opencode/cli/opencode.exe',
-            {'sha256':'5283c2cd5b4285855daa97e6f7d17bf48146227cdf2a940e79e0f2b7869fd06e','bytes':180599176})
 
 
 def validate_expected_payload(expected):
@@ -2868,11 +2857,6 @@ def validate_expected_payload(expected):
             raise ValueError('content PE table bytes differ from reviewed upstream closure')
     if expected['schema']==2 and selected!=set(policy):
         raise ValueError('content PE closure is incomplete')
-    if expected['schema']==2:
-        path,pin=opencode_content_cli()
-        cli=[row for row in expected['files'] if row['path']==path and all(row[key]==pin[key] for key in pin)]
-        if len(cli)!=1 or not any(role['table']=='File' and role['id']==cli[0]['id'] and role['pin']==pin for role in expected['supplier_pe']):
-            raise ValueError('content PE helper version requires its exact selected signed CLI')
     return expected
 
 

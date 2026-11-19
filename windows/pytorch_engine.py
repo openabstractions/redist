@@ -203,9 +203,10 @@ INPUT_PINS = {
 
 
 def release_assets(version: str) -> dict:
-    """The retained runtime inputs keep their exact final release URLs."""
-    if version != 'v0.8.0':
-        raise ValueError('PyTorch runtime release differs from the frozen v0.8.0 inputs')
+    """Each release from v0.8.0 attaches the retained runtime inputs at its own URLs."""
+    match = re.fullmatch(r'v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)', version)
+    if not match or tuple(map(int, match.groups())) < (0, 8, 0):
+        raise ValueError('PyTorch runtime inputs ship with v0.8.0 and later releases only')
     return {name: dict(pin, url='https://github.com/openabstractions/redist/releases/download/' + version + '/' + name)
             for name, pin in INPUT_PINS.items()}
 

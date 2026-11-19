@@ -1007,12 +1007,11 @@ def check_manifest(manifest: str, chain: dict) -> list[dict]:
     for problem in elevation_problems(manifest) + apps_entry_problems(manifest):
         raise ValueError(problem)
     features = core['features']
-    if any(app['id'] == 'opencode' for app in chain['apps']):
-        allowed = {row['id'] for row in bundle_actions_inputs(['opencode'])['inputs']['core_features']['features']}
-        if not features or len(features) != len(set(features)) or 'McpGateway' not in features or not set(features) <= allowed:
-            raise ValueError('selected OpenCode requires canonical core feature planning including McpGateway')
-    elif features:
-        raise ValueError('unrelated/core-only bundle must preserve ordinary core feature selection')
+    # Every admitted bundle carries the same native core-feature planner,
+    # including a Catalog-only chain with no physical application packages.
+    allowed = {row['id'] for row in bundle_actions_inputs([])['inputs']['core_features']['features']}
+    if not features or len(features) != len(set(features)) or not {'McpGateway', 'LemonadeImage', 'PyTorchImage'} <= set(features) or not set(features) <= allowed:
+        raise ValueError('every bundle requires canonical core feature planning including McpGateway')
     for found, (identifier, kind, package, app) in zip(built, expected):
         active_boundary = found["boundary_forward"] or active_boundary
         if identifier == 'BeginCoreUpgrade':
@@ -1250,7 +1249,7 @@ def main(argv: list[str] | None = None) -> int:
                "-d", f"ThemeFile={out / 'bundle.thm'}", "-d", f"LocalizationFile={out / 'bundle.wxl'}",
                "-d", f"BundleIcon={icon}", "-d", f"BundleLogo={logo}",
                "-d", "SuppressOptionsUI=yes",
-               "-d", f"CoreFeatureSelection={'yes' if any(app['id'] == 'opencode' for app in chain['apps']) else 'no'}",
+               "-d", "CoreFeatureSelection=yes",
                *(["-d", f"BundleActions={args.actions_dll.resolve()}"] if actions else []),
                "-o", str(bundle), str(HERE / "bundle.wxs"), str(out / "apps.wxs")]
     print(" ".join(command))

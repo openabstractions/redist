@@ -40,6 +40,16 @@ DECLARATIONS = "tools/declarations/"
 
 MACHINE, USER = "ALLUSERS", "NOT ALLUSERS"
 SCOPES = {"for everyone": True, "just for me": False}
+# Each registry-keyed component comes once per scope with its own GUID
+# (abstraction.wxs, RegistryRootForMe). These GUIDs are the ones 0.8.0 and
+# earlier installed in both scopes. A Predecessor component keeps each one,
+# conditioned on PREDECESSOR, so the late removal of a same-scope predecessor
+# leaves the values this version wrote.
+PREDECESSOR = "WIX_UPGRADE_DETECTED"
+PREDECESSOR_GUIDS = {"8821E881-5E73-465E-904E-EF7FC1223A5C": "RegistryRootPredecessor",
+                     "E5D9EA35-65C8-4930-9FC0-06120E9F39BE": "PanelStartMenuPredecessor",
+                     "13905645-2D4B-4ADA-89BF-0A12F6ABA2C2": "ModelHostMarkerPredecessor",
+                     "0B0C2E74-9A5E-4F1C-8B24-3D6A1E5F7C08": "McpGatewayMarkerPredecessor"}
 # The machine installation owns its service registration. Per-user activation
 # is checked through StartUserRuntime; confirmed applications own account login.
 ARMS = {True: "SupervisorServiceMarker"}
@@ -449,7 +459,28 @@ def scoped(root):
 def installs(condition, machine):
     if condition is None:
         return True
+    if condition == PREDECESSOR:
+        return False
     return machine if condition == MACHINE else not machine
+
+
+def check_predecessors(root):
+    """Only the recorded Predecessor components take PREDECESSOR, each with
+    its retired GUID, and every one of them is present."""
+    bad, found = [], {}
+    for c in (x for x in root.iter() if untag(x) == "Component"):
+        if c.get("Condition") != PREDECESSOR:
+            continue
+        guid = (c.get("Guid") or "").strip("{}").upper()
+        if PREDECESSOR_GUIDS.get(guid) != c.get("Id"):
+            bad.append(f"abstraction.wxs: component {c.get('Id')} is conditioned on {PREDECESSOR!r} "
+                       f"without a retired GUID. Only a Predecessor keeps a GUID 0.8.0 installed in both scopes")
+        found[guid] = c.get("Id")
+    for guid, cid in PREDECESSOR_GUIDS.items():
+        if guid not in found:
+            bad.append(f"abstraction.wxs: {cid} ({guid}) is missing. A same-scope upgrade would then "
+                       f"delete the registry values and Start link this version wrote")
+    return bad
 
 
 def wxs_features(root):
@@ -637,10 +668,11 @@ def main():
 
     where, conditions = scoped(root)
     for cid, condition in conditions.items():
-        if condition not in (None, MACHINE, USER):
+        if condition not in (None, MACHINE, USER, PREDECESSOR):
             bad.append(f"abstraction.wxs: component {cid} is conditioned on {condition!r}. This "
-                       f"package has two scopes, so a condition here is absent, {MACHINE!r} or "
-                       f"{USER!r}, and every rule below reads them")
+                       f"package has two scopes, so a condition here is absent, {MACHINE!r}, "
+                       f"{USER!r} or {PREDECESSOR!r}, and every rule below reads them")
+    bad.extend(check_predecessors(root))
 
     member = {fid: [c for c, g in where.items() if g in refs]
               for fid, refs in features.items()}

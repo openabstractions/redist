@@ -30,37 +30,30 @@
     <MediaTemplate EmbedCab="yes" />
 
     <!-- The core OpenAbstractions package records its Panel's program
-         (installer/abstraction.wxs, PanelShortcut). A machine-wide
-         installation, which only an administrator can change, is preferred
-         to a per-user one. Only the registry names the program this package
-         starts: OaPanel is private, so Windows Installer ignores it on the
-         command line, and the two search properties, which Windows
-         Installer requires to be public, are cleared before AppSearch fills
-         them. OaNoValue is never set; it formats as the empty value that
-         clears a property.
+         (installer/abstraction.wxs, PanelShortcut). FindRecords
+         (oa_records.h, an immediate custom action) reads it in the execute
+         sequence and sets OaPanel, preferring a machine-wide installation,
+         which only an administrator can change, to a per-user one. OaPanel
+         is private, so Windows Installer ignores it on the command line,
+         and FindRecords sets it on every run. Only the registry names the
+         program this package starts.
 
-         The clears, AppSearch, the OaPanel setters and the launch conditions
-         run in the execute sequence only. Windows Installer skips AppSearch
-         in the execute sequence once the UI sequence has run it, and the
-         full-UI server would then hold only the clears. With AppSearch absent
-         from the UI sequence, the server always clears and then searches
-         itself. Every value that reaches OaPanel comes from that search. A
-         server that skips AppSearch for any other reason leaves OaPanel empty
-         and refuses. The full UI shows the server's refusal message. -->
+         Windows Installer skips AppSearch in the execute sequence whenever
+         the UI sequence has run, so a full-UI server never searches. A
+         custom action runs on the server under every UI level. The launch
+         conditions run in the execute sequence only, after FindRecords; the
+         full UI shows the server's refusal message. A builder that carries
+         FindRecords in its own action library points the action's BinaryRef
+         there and drops OaRecordsAction. -->
     <InstallUISequence>
-      <AppSearch Suppress="yes" />
       <LaunchConditions Suppress="yes" />
     </InstallUISequence>
-    <SetProperty Id="OAPANEL_USER" Action="ClearOaPanelUser" Value="[OaNoValue]" Before="AppSearch" Sequence="execute" />
-    <SetProperty Id="OAPANEL_MACHINE" Action="ClearOaPanelMachine" Value="[OaNoValue]" Before="AppSearch" Sequence="execute" />
-    <Property Id="OAPANEL_USER">
-      <RegistrySearch Root="HKCU" Key="Software\OpenAbstractions\Abstraction\Panel" Name="program" Type="raw" />
-    </Property>
-    <Property Id="OAPANEL_MACHINE">
-      <RegistrySearch Root="HKLM" Key="Software\OpenAbstractions\Abstraction\Panel" Name="program" Type="raw" Bitness="always64" />
-    </Property>
-    <SetProperty Id="OaPanel" Action="SetOaPanelMachine" Value="[OAPANEL_MACHINE]" After="AppSearch" Condition="OAPANEL_MACHINE" Sequence="execute" />
-    <SetProperty Id="OaPanel" Action="SetOaPanelUser" Value="[OAPANEL_USER]" After="SetOaPanelMachine" Condition="NOT OaPanel AND OAPANEL_USER" Sequence="execute" />
+    <Binary Id="OaRecordsAction" SourceFile="$(var.RecordsDll)" />
+    <CustomAction Id="FindRecords" BinaryRef="OaRecordsAction" DllEntry="FindRecords"
+                  Execute="immediate" Return="check" />
+    <InstallExecuteSequence>
+      <Custom Action="FindRecords" Before="LaunchConditions" />
+    </InstallExecuteSequence>
     <Launch Condition="OaPanel OR Installed" Message="$(var.AppTitle) needs OpenAbstractions, which is not installed. Download it from https://github.com/openabstractions/redist/releases/latest, install it, then run this installer again." />
 
     <StandardDirectory Id="LocalAppDataFolder">

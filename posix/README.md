@@ -65,7 +65,7 @@ selects a package and cannot select part of one:
 |---|---|---|
 | MCP gateway | `com.openabstractions.abstraction.mcpgateway` | no |
 
-Native providers are not available on macOS in 0.4.0: their caller check
+Native providers are not available on macOS: their caller check
 needs an XPC endpoint. The macOS package therefore carries neither the
 localstores nor the modelhost feature, and an upgrade's `postinstall`
 removes the `inventoryd`, `declarations/local-stores.json` and `modelhostd`
