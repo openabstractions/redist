@@ -98,7 +98,11 @@ jobs:
   service:
     needs: package
     runs-on: ${{ inputs.windows_image == 'windows-2022' && 'windows-2022' || 'windows-latest' }}
-    timeout-minutes: 20
+    timeout-minutes: ${{ inputs.diagnostic_failed_verify && 45 || 20 }}
+    env:
+      PREDECESSOR_RELEASE: v0.2.0
+      PREDECESSOR_VERSION: 0.2.0
+      PREDECESSOR_SHA256_EXPECTED: 274816ade8e8294be9801d2ca519c22e24d68808c1427609d161aa44dc528fd4
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
       - name: download verified package
@@ -109,14 +113,167 @@ jobs:
         run: |
           gh run download $env:GITHUB_RUN_ID -n $env:PACKAGE_ARTIFACT -D .
           if ($LASTEXITCODE -ne 0) { throw 'Verified package download failed' }
-      - name: install machine scope
-        id: install
+      - name: fetch reviewed predecessor package
+        env:
+          GH_TOKEN: ${{ github.token }}
+        id: predecessor-input-0
+        if: inputs.diagnostic_failed_verify
         shell: pwsh
         run: |
-          $msi = (Resolve-Path pkg/abstraction-x64.msi).Path
-          $p = Start-Process msiexec -Wait -PassThru -ArgumentList @('/i',$msi,'/qn','/norestart','ALLUSERS=1','MSIINSTALLPERUSER=','/l*v','machine-install.log')
-          if ($p.ExitCode -ne 0) { Get-Content machine-install.log -Tail 120; throw "Install exited $($p.ExitCode)" }
+          gh release download $env:PREDECESSOR_RELEASE --repo openabstractions/redist --pattern abstraction-x64.msi --pattern SHA256SUMS --dir predecessor
+          if ($LASTEXITCODE -ne 0) { throw 'Published predecessor download failed' }
+      - name: verify predecessor checksum
+        id: predecessor-input-1
+        if: inputs.diagnostic_failed_verify
+        shell: python
+        run: |
+          import hashlib, json, os, pathlib, re
+          package = pathlib.Path('predecessor/abstraction-x64.msi')
+          if not package.is_file() or package.stat().st_size == 0:
+              raise SystemExit('Published predecessor MSI is missing or empty')
+          entries = []
+          for line in pathlib.Path('predecessor/SHA256SUMS').read_text().splitlines():
+              match = re.fullmatch(r'([0-9a-f]{64}) [ *]abstraction-x64\.msi', line)
+              if match:
+                  entries.append(match[1])
+          actual = hashlib.sha256(package.read_bytes()).hexdigest()
+          if entries != [actual]:
+              raise SystemExit('Published predecessor checksum is absent, duplicated or mismatched')
+          if actual != os.environ['PREDECESSOR_SHA256_EXPECTED']:
+              raise SystemExit('Published predecessor differs from the reviewed 0.2.0 MSI')
+          release = os.environ['PREDECESSOR_RELEASE']
+          if release != 'v'+os.environ['PREDECESSOR_VERSION']:
+              raise SystemExit('The predecessor release and the version the fixture asserts name different versions')
+          pathlib.Path('predecessor-source.json').write_text(json.dumps({'release': release, 'repository': 'openabstractions/redist', 'file': package.name, 'sha256': actual}, indent=2))
+          with open(os.environ['GITHUB_ENV'], 'a') as output:
+              output.write('PREDECESSOR_SHA256='+actual+'\n')
+      - name: prepare the forced-failure machine candidate
+        id: predecessor-input-2
+        if: inputs.diagnostic_failed_verify
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force failing | Out-Null
+          & powershell.exe -NoProfile -ExecutionPolicy Bypass -File test_user_runtime.ps1 -Mode FailingCandidate -MsiPath (Resolve-Path pkg/abstraction-x64.msi).Path -Output (Join-Path (Resolve-Path failing).Path 'abstraction-x64.msi')
+          if ($LASTEXITCODE -ne 0) { throw "Forced-failure candidate preparation exited $LASTEXITCODE" }
+      - name: machine forced failed upgrade rolls back to the predecessor
+        id: machine-failed-upgrade
+        if: inputs.diagnostic_failed_verify
+        continue-on-error: true
+        shell: pwsh
+        timeout-minutes: 20
+        run: |
+          $predecessor = (Resolve-Path predecessor\abstraction-x64.msi).Path
+          $failing = (Resolve-Path failing\abstraction-x64.msi).Path
+          # This image is bound to the pinned, checksum-verified 0.2.0 MSI.
+          if ($env:PREDECESSOR_VERSION -ne '0.2.0') { throw 'Review the predecessor service image when changing the pinned MSI' }
+          $predecessorImage = 'openabstractionsw.exe'
+          $installer = New-Object -ComObject WindowsInstaller.Installer
+          $database = $installer.OpenDatabase($predecessor, 0)
+          $view = $database.OpenView("SELECT ``Value`` FROM ``Property`` WHERE ``Property``='ProductCode'")
+          [void]$view.Execute(); $code = $view.Fetch().StringData(1); [void]$view.Close()
+          "predecessor=$code" >> $env:GITHUB_OUTPUT
+          $p = Start-Process msiexec -Wait -PassThru -ArgumentList @('/i', $predecessor, '/qn', '/norestart', 'ALLUSERS=1', 'MSIINSTALLPERUSER=', '/l*v', 'machine-predecessor-install.log')
+          if ($p.ExitCode -ne 0) { throw "machine predecessor install exited $($p.ExitCode)" }
+          $statePath = "$env:RUNNER_TEMP/oa-predecessor-session.json"
+          & powershell.exe -NoProfile -ExecutionPolicy Bypass -STA -File test_service_session.ps1 -Mode Verify -StatePath $statePath -ExpectedImage $predecessorImage
+          if ($LASTEXITCODE -ne 0) { throw "Predecessor session fixture exited $LASTEXITCODE" }
+          $state = Get-Content -LiteralPath $statePath -Raw | ConvertFrom-Json
+          function Get-SessionInstances {
+            @(Get-CimInstance Win32_Service -Filter "Name LIKE 'OpenAbstractionsSupervisor_%'" | Where-Object {
+              $_.State -eq 'Running' -and $_.ProcessId -ne 0 -and
+              @(Get-CimInstance Win32_Process -Filter "ProcessId=$($_.ProcessId)" | Where-Object SessionId -eq $state.Session).Count
+            })
+          }
+          $before = @(Get-SessionInstances)
+          if ($before.Count -ne 1) { throw "expected one running instance in the second session $($state.Session) before the failing upgrade; observed $($before.Count)" }
+          "instance before the failing upgrade: $($before[0].Name) pid $($before[0].ProcessId) in session $($state.Session)"
+          $p = Start-Process msiexec -Wait -PassThru -ArgumentList @('/i', $failing, '/qn', '/norestart', 'ALLUSERS=1', 'MSIINSTALLPERUSER=', '/l*v', 'machine-failed-upgrade.log')
+          if ($p.ExitCode -ne 1603) { throw "the forced machine upgrade failure exited $($p.ExitCode); it must end with 1603" }
+          $log = Get-Content -LiteralPath machine-failed-upgrade.log -Raw -Encoding Unicode
+          $files = [regex]::Match($log, 'Action start [^\r\n]*: InstallFiles\.')
+          $failure = [regex]::Match($log, 'Action start [^\r\n]*: ForcedUpgradeFailure\.')
+          if (-not $files.Success -or -not $failure.Success -or $failure.Index -lt $files.Index) { throw 'the forced failure did not follow the new files' }
+          if ([regex]::IsMatch($log, 'StopPrevious(User)?Supervisor')) { throw 'the package ran a stop action; it stops nothing' }
+          if ([regex]::IsMatch($log, 'Action start [^\r\n]*: RemoveExistingProducts\.')) { throw 'the failed machine upgrade removed the predecessor; the removal must follow the commit it never reached' }
+          if ($log.IndexOf('RestartPreviousSupervisor', $failure.Index) -lt 0) { throw 'rollback did not run the machine activation' }
+          Select-String -LiteralPath machine-failed-upgrade.log -Encoding Unicode -Pattern 'RESTART MANAGER' | ForEach-Object Line
+          if ($installer.ProductState($code) -ne 5) { throw 'rollback did not leave the machine predecessor installed' }
+          & sc.exe qc OpenAbstractionsSupervisor | Out-Null
+          if ($LASTEXITCODE -ne 0) { throw "rollback did not restore the predecessor service template: sc qc exited $LASTEXITCODE" }
+          if (-not (Test-Path -LiteralPath (Join-Path (Join-Path $env:ProgramFiles 'OpenAbstractions\tools') $predecessorImage))) { throw 'rollback did not restore the predecessor programs' }
+          $record = Join-Path $env:ProgramData 'abstraction\upgrade-v1\exclusion.json'
+          if (Test-Path -LiteralPath $record) { throw "the machine upgrade exclusion survived rollback: $record" }
+          $deadline = (Get-Date).AddSeconds(60)
+          do {
+            $after = @(Get-SessionInstances | Where-Object Name -eq $before[0].Name)
+            if ($after.Count -eq 1) { break }
+            Start-Sleep -Milliseconds 500
+          } while ((Get-Date) -lt $deadline)
+          if ($after.Count -ne 1) { throw "the predecessor instance $($before[0].Name) in session $($state.Session) is not running after rollback" }
+          $restarted = [int]$after[0].ProcessId -ne [int]$before[0].ProcessId
+          "instance after rollback: $($after[0].Name) pid $($after[0].ProcessId) ($(if ($restarted) { 'restarted' } else { 'the same process: Restart Manager did not stop it' }))"
+          "machine-instance-restarted=$restarted" >> $env:GITHUB_STEP_SUMMARY
+          'ok    a failed machine upgrade left the predecessor installed, registered, with no exclusion and its session instance running'
+          exit 0
+      - name: remove the predecessor test session
+        id: predecessor-cleanup
+        continue-on-error: true
+        if: always() && inputs.diagnostic_failed_verify
+        shell: pwsh
+        timeout-minutes: 2
+        run: |
+          if (Test-Path test_service_session.ps1) {
+            & powershell.exe -NoProfile -ExecutionPolicy Bypass -STA -File test_service_session.ps1 -Mode Cleanup -StatePath "$env:RUNNER_TEMP/oa-predecessor-session.json" 2>&1 | Tee-Object predecessor-session-cleanup.log
+            if ($LASTEXITCODE -ne 0) { throw "Predecessor session cleanup exited $LASTEXITCODE" }
+          }
+          exit 0
+      - name: install machine scope
+        id: install
+        env:
+          DIAGNOSTIC_FAILED_VERIFY: ${{ inputs.diagnostic_failed_verify }}
+        continue-on-error: ${{ inputs.diagnostic_failed_verify }}
+        shell: pwsh
+        run: |
+          if ($env:DIAGNOSTIC_FAILED_VERIFY -ceq 'true') {
+            $msi = (Resolve-Path pkg\abstraction-x64.msi).Path
+            $p = Start-Process msiexec -Wait -PassThru -ArgumentList @('/i', $msi, '/qn', '/norestart', 'ALLUSERS=1', 'MSIINSTALLPERUSER=', '/l*v', 'machine-install.log')
+            if ($p.ExitCode -ne 0) {
+              Select-String -Path machine-install.log -Pattern 'Return value 3','Error [0-9]+','CustomAction .* returned' -Context 12,4 | Out-String -Width 300 | Write-Output
+              throw "machine upgrade exited $($p.ExitCode)"
+            }
+            $log = Get-Content -LiteralPath machine-install.log -Raw -Encoding Unicode
+            $removal = [regex]::Match($log, 'Action start [^\r\n]*: RemoveExistingProducts\.')
+            if (-not $removal.Success) { throw 'the machine upgrade never removed the predecessor' }
+            $before = $log.Substring(0, $removal.Index)
+            foreach ($action in 'BeginMachineUpgradeExclusion', 'InstallExecute') {
+              if ($before -notmatch "Action ended [^\r\n]*: $action\. Return value 1\.") { throw "$action did not succeed before RemoveExistingProducts" }
+            }
+            # The predecessor's nested uninstall records skipped legacy actions.
+            # Forbid any stop action in this transaction and any execution in either.
+            if ([regex]::IsMatch($before, 'StopPrevious(User)?Supervisor') -or
+                [regex]::IsMatch($log, '(?m)^Action start [^\r\n]*: StopPrevious(User)?Supervisor\.')) {
+              throw 'the package ran a stop action; it stops nothing'
+            }
+            if ($log -notmatch 'EndMachineUpgradeExclusion') { throw 'the machine exclusion release was not scheduled' }
+            # The removal follows the commit, and the predecessor's own uninstall
+            # deletes the shared service name, so registration must come after it.
+            $finalize = [regex]::Match($log, 'Action start [^\r\n]*: InstallFinalize\.')
+            if (-not $finalize.Success -or $removal.Index -lt $finalize.Index) { throw 'the machine upgrade removed the predecessor before its own commit' }
+            if ($log.Substring($removal.Index) -notmatch "Action ended [^\r\n]*: RegisterSupervisorAfterRemoval\. Return value 1\.") { throw 'the machine supervisor was not registered after the predecessor removal' }
+            $installer = New-Object -ComObject WindowsInstaller.Installer
+            if ($installer.ProductState('${{ steps.machine-failed-upgrade.outputs.predecessor }}') -eq 5) { throw 'the machine predecessor is still installed after upgrade' }
+            if (Test-Path -LiteralPath (Join-Path $env:ProgramData 'abstraction\upgrade-v1\exclusion.json')) { throw 'the machine upgrade exclusion survived commit' }
+            'ok    the machine upgrade held its exclusion, stopped nothing itself, released the exclusion and registered the host after the removal'
+            exit 0
+          } else {
+            $msi = (Resolve-Path pkg/abstraction-x64.msi).Path
+            $p = Start-Process msiexec -Wait -PassThru -ArgumentList @('/i',$msi,'/qn','/norestart','ALLUSERS=1','MSIINSTALLPERUSER=','/l*v','machine-install.log')
+            if ($p.ExitCode -ne 0) { Get-Content machine-install.log -Tail 120; throw "Install exited $($p.ExitCode)" }
+          }
       - name: fresh sign-in and recovery
+        id: fresh
+        if: ${{ !inputs.diagnostic_failed_verify && success() || inputs.diagnostic_failed_verify && always() && steps.install.outcome == 'success' }}
+        continue-on-error: ${{ inputs.diagnostic_failed_verify }}
         timeout-minutes: 10
         shell: pwsh
         run: |
@@ -132,8 +289,22 @@ jobs:
           & powershell.exe -NoProfile -ExecutionPolicy Bypass -STA -File test_service_session.ps1 -Mode Verify @activation -StatePath "$env:RUNNER_TEMP/oa-service-session.json"
           if ($LASTEXITCODE -ne 0) { throw "Session verification exited $LASTEXITCODE" }
           exit 0
+      - name: the session host's startup diagnostics
+        if: always() && inputs.diagnostic_failed_verify
+        shell: pwsh
+        run: |
+          $statePath = "$env:RUNNER_TEMP/oa-service-session.json"
+          if (-not (Test-Path -LiteralPath $statePath)) { 'no session was created'; exit 0 }
+          $state = Get-Content -LiteralPath $statePath -Raw | ConvertFrom-Json
+          $profile = @(Get-CimInstance Win32_UserProfile | Where-Object { $_.SID -eq $state.Sid } | ForEach-Object LocalPath)
+          $log = if ($profile.Count -eq 1) { Join-Path $profile[0] 'AppData\Local\openabstractions\host\host.log' } else { $null }
+          if (-not $log -or -not (Test-Path -LiteralPath $log)) { "host.log absent for the session account"; exit 0 }
+          Copy-Item -LiteralPath $log -Destination machine-host.log
+          Select-String -LiteralPath $log -Pattern 'serve supervisor start' | ForEach-Object Line
+          exit 0
+
       - name: remove installed package
-        if: always() && steps.install.outcome == 'success'
+        if: always() && !inputs.diagnostic_failed_verify && steps.install.outcome == 'success'
         shell: pwsh
         run: |
           $msi = (Resolve-Path pkg/abstraction-x64.msi).Path
@@ -142,13 +313,178 @@ jobs:
           if (@(Get-Service -Name 'OpenAbstractionsSupervisor*' -ErrorAction SilentlyContinue).Count) { throw 'Service survived uninstall' }
           & powershell.exe -NoProfile -ExecutionPolicy Bypass -STA -File test_service_session.ps1 -Mode VerifyRemoved -StatePath "$env:RUNNER_TEMP/oa-service-session.json"
           if ($LASTEXITCODE -ne 0) { throw "Runtime removal verification exited $LASTEXITCODE" }
+      - name: diagnostic lock observations before removal
+        id: observation-before
+        if: always() && inputs.diagnostic_failed_verify
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          @"
+          param([ValidateSet('before','after')][string]`$Phase)
+          `$ErrorActionPreference='Stop'
+          try {
+            `$root=Join-Path `$env:ProgramFiles 'OpenAbstractions\tools'
+            `$roster='diagnostic-oa-images.json'
+            if (`$Phase -eq 'before') {
+              `$names=@(Get-ChildItem -LiteralPath `$root -Filter '*.exe' -File | ForEach-Object Name)
+              if (-not `$names.Count) { throw 'Installed OA image roster unavailable' }
+              ConvertTo-Json -InputObject `$names | Set-Content `$roster
+            }
+            `$names=@(Get-Content -LiteralPath `$roster -Raw | ConvertFrom-Json)
+            @(Get-CimInstance Win32_Process | Where-Object { `$_.Name -in `$names } | Select-Object ProcessId,ParentProcessId,SessionId,Name,ExecutablePath,CreationDate,CommandLine) | ConvertTo-Json -Depth 4 | Set-Content "diagnostic-processes-`$Phase.json"
+            `$lock=Join-Path `$env:ProgramData 'abstraction\upgrade-v1\admission.lock'
+            `$rows=foreach(`$name in @('admission.lock','exclusion.json.lock','installer-actions.txt')) {
+              `$item=Get-Item -LiteralPath (Join-Path `$env:ProgramData ('abstraction\upgrade-v1\'+`$name)) -Force -ErrorAction SilentlyContinue
+              if(`$item){`$item | Select-Object FullName,Length,Attributes,CreationTimeUtc,LastWriteTimeUtc}
+            }
+            ConvertTo-Json -InputObject @(`$rows) -Depth 4 | Set-Content "diagnostic-locks-`$Phase.json"
+            Add-Type -TypeDefinition @'
+          using System;
+          using System.Text;
+          using System.Runtime.InteropServices;
+          public static class DiagnosticLockHolders {
+              [StructLayout(LayoutKind.Sequential)] struct Unique {public uint pid;public System.Runtime.InteropServices.ComTypes.FILETIME born;}
+              [StructLayout(LayoutKind.Sequential,CharSet=CharSet.Unicode)] struct Info {
+                  public Unique process;
+                  [MarshalAs(UnmanagedType.ByValTStr,SizeConst=256)] public string name;
+                  [MarshalAs(UnmanagedType.ByValTStr,SizeConst=64)] public string service;
+                  public uint type,status,session;[MarshalAs(UnmanagedType.Bool)]public bool restartable;
+              }
+              [DllImport("rstrtmgr.dll",CharSet=CharSet.Unicode)] static extern uint RmStartSession(out uint handle,uint flags,StringBuilder key);
+              [DllImport("rstrtmgr.dll",CharSet=CharSet.Unicode)] static extern uint RmRegisterResources(uint handle,uint files,string[] paths,uint apps,IntPtr processes,uint services,IntPtr names);
+              [DllImport("rstrtmgr.dll")] static extern uint RmGetList(uint handle,out uint needed,ref uint count,[In,Out] Info[] rows,ref uint reasons);
+              [DllImport("rstrtmgr.dll")] static extern uint RmEndSession(uint handle);
+              // Read-only RM observation; this owner never invokes RmShutdown/RmRestart.
+              public sealed class Holder {public uint pid;public long birth;public string name;}
+              public static Holder[] Holders(string path) {
+                  Holder[] found=null;Exception failure=null;
+                  var probe=new System.Threading.Thread(()=>{
+                      uint handle;var key=new StringBuilder(33);
+                      try {
+                          if(RmStartSession(out handle,0,key)!=0)throw new InvalidOperationException("RM observation session refused");
+                          try {
+                              if(RmRegisterResources(handle,1,new[]{path},0,IntPtr.Zero,0,IntPtr.Zero)!=0)throw new InvalidOperationException("RM file observation refused");
+                              uint needed,count=64,reasons=0;var rows=new Info[count];
+                              if(RmGetList(handle,out needed,ref count,rows,ref reasons)!=0 || count>64)throw new InvalidOperationException("RM holder observation incomplete");
+                              found=new Holder[count];
+                              for(int i=0;i<count;i++) {
+                                  long born=((long)(uint)rows[i].process.born.dwHighDateTime<<32)|(uint)rows[i].process.born.dwLowDateTime;
+                                  found[i]=new Holder{pid=rows[i].process.pid,birth=born,name=rows[i].name};
+                              }
+                          } finally {if(RmEndSession(handle)!=0)throw new InvalidOperationException("RM observation session did not close");}
+                      } catch(Exception e) {failure=e;}
+                  });
+                  probe.IsBackground=true;probe.Start();
+                  if(!probe.Join(2000))throw new InvalidOperationException("RM holder observation timed out");
+                  if(failure!=null)throw failure;
+                  if(found==null)throw new InvalidOperationException("RM holder roster unavailable");
+                  return found;
+              }
+          }
+          '@
+            `$holders=if(Test-Path -LiteralPath `$lock){@([DiagnosticLockHolders]::Holders(`$lock))}else{@()}
+            @{Path=`$lock;Exists=(Test-Path -LiteralPath `$lock);Holders=@(`$holders)} | ConvertTo-Json -Depth 6 | Set-Content "diagnostic-lock-holders-`$Phase.json"
+          } catch {
+            `$_ | Out-String | Set-Content "diagnostic-observation-`$Phase-error.txt"
+            throw
+          }
+          "@ | Set-Content -LiteralPath diagnostic-lock-observation.ps1 -Encoding utf8
+          & powershell.exe -NoProfile -ExecutionPolicy Bypass -File diagnostic-lock-observation.ps1 -Phase before
+          if ($LASTEXITCODE -ne 0) { throw "Lock observation before failed: $LASTEXITCODE" }
+      - name: diagnostic exact candidate machine removal
+        id: removal
+        if: always() && inputs.diagnostic_failed_verify && steps.install.outcome == 'success'
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          Import-Module .\OAFixture.psm1 -Force
+          $configRoot = Join-Path $env:ProgramData 'abstraction'
+          $beforeEvidence = $null
+          try { $beforeEvidence = Save-MachineRemovalEvidence -Root $configRoot -Prefix machine-removal-before -SeedOwnedLogIfAbsent }
+          catch { Write-Warning "Pre-removal evidence unavailable: $_" }
+          $msi = (Resolve-Path pkg\abstraction-x64.msi).Path
+          $checks = [ordered]@{
+            MSI = {
+              $p = Start-Process msiexec -Wait -PassThru -ArgumentList @('/x', $msi, '/qn', '/norestart', '/l*v', 'machine-uninstall.log')
+              if ($p.ExitCode -ne 0) { Get-Content machine-uninstall.log -Tail 60; throw "msiexec /x exited $($p.ExitCode)" }
+            }
+            RemovalLog = {
+              & powershell.exe -NoProfile -ExecutionPolicy Bypass -File test_user_runtime.ps1 -Mode CheckLogs -RemovalLogs machine-uninstall.log
+              if ($LASTEXITCODE -ne 0) { throw "Machine removal log check exited $LASTEXITCODE" }
+            }
+            Template = {
+              & sc.exe qc OpenAbstractionsSupervisor | Out-Null
+              if ($LASTEXITCODE -eq 0) { throw 'the service template survived uninstall' }
+              if ($LASTEXITCODE -ne 1060) { throw "sc qc could not establish service absence: exit $LASTEXITCODE" }
+            }
+            Instances = {
+              $left = @(Get-Service -Name 'OpenAbstractionsSupervisor_*' -ErrorAction SilentlyContinue)
+              if ($left.Count -ne 0) { $left | Format-List Name, Status; throw 'a per-session instance survived uninstall' }
+            }
+            InstallFolder = { if (Test-Path (Join-Path $env:ProgramFiles 'OpenAbstractions')) { throw 'the install folder survived uninstall' } }
+            Registry = { if (Test-Path 'HKLM:\Software\OpenAbstractions') { throw 'the machine registry key survived uninstall' } }
+            ConfigFolder = { if (Test-Path $configRoot) { throw 'the machine config folder survived uninstall' } }
+            PATH = {
+              $key = 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Environment'
+              if ((Get-ItemProperty $key -Name Path).Path -like '*OpenAbstractions*') { throw 'the machine PATH entry survived uninstall' }
+            }
+            VerifyRemoved = {
+              & powershell.exe -NoProfile -ExecutionPolicy Bypass -STA -File test_service_session.ps1 -Mode VerifyRemoved -StatePath "$env:RUNNER_TEMP/oa-service-session.json"
+              if ($LASTEXITCODE -ne 0) { throw "Runtime removal verification exited $LASTEXITCODE" }
+            }
+            OwnedLogFixture = { if (-not $beforeEvidence -or -not $beforeEvidence.OwnedLogPresentBefore) { throw 'the owned action-log removal fixture was not established' } }
+          }
+          try { Invoke-MachineRemovalChecks -Checks $checks }
+          catch {
+            $primary = $_
+            try { Save-MachineRemovalEvidence -Root $configRoot -Prefix machine-removal-after-failure }
+            catch { Write-Warning "Post-removal evidence unavailable: $_" }
+            throw $primary
+          }
+          'ok    uninstall reversed it: no template, no instance, no folder, no key, no config folder, no PATH entry'
+          exit 0
+      - name: diagnostic lock observations after removal
+        id: observation-after
+        if: always() && inputs.diagnostic_failed_verify
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          & powershell.exe -NoProfile -ExecutionPolicy Bypass -File diagnostic-lock-observation.ps1 -Phase after
+          if ($LASTEXITCODE -ne 0) { throw "Lock observation after failed: $LASTEXITCODE" }
+      - name: remove the machine predecessor left by a failed step
+        id: predecessor-removal
+        continue-on-error: true
+        if: inputs.diagnostic_failed_verify && always() && steps.machine-failed-upgrade.outputs.predecessor != ''
+        shell: pwsh
+        run: |
+          $installer = New-Object -ComObject WindowsInstaller.Installer
+          if ($installer.ProductState('${{ steps.machine-failed-upgrade.outputs.predecessor }}') -eq 5) {
+            $p = Start-Process msiexec -Wait -PassThru -ArgumentList @('/x', '${{ steps.machine-failed-upgrade.outputs.predecessor }}', '/qn', '/norestart', '/l*v', 'machine-predecessor-cleanup.log')
+            if ($p.ExitCode -ne 0) { throw "machine predecessor cleanup exited $($p.ExitCode)" }
+          }
+          exit 0
       - name: remove disposable session
+        id: cleanup
+        continue-on-error: ${{ inputs.diagnostic_failed_verify }}
         if: always()
         shell: pwsh
         run: |
           & powershell.exe -NoProfile -ExecutionPolicy Bypass -STA -File test_service_session.ps1 -Mode Cleanup -StatePath "$env:RUNNER_TEMP/oa-service-session.json" 2>&1 | Tee-Object service-session-cleanup.log
           if ($LASTEXITCODE -ne 0) { throw "Session cleanup exited $LASTEXITCODE" }
           exit 0
+      - name: grade diagnostic session outcomes
+        if: always() && inputs.diagnostic_failed_verify
+        shell: pwsh
+        env:
+          OUTCOMES: ${{ toJSON(steps) }}
+        run: |
+          $outcomes = $env:OUTCOMES | ConvertFrom-Json
+          $env:OUTCOMES | Set-Content -LiteralPath diagnostic-step-outcomes.json -Encoding utf8
+          foreach ($name in @('predecessor-input-0','predecessor-input-1','predecessor-input-2','machine-failed-upgrade','predecessor-cleanup','install','fresh','observation-before','removal','observation-after','cleanup')) {
+            if ($outcomes.$name.outcome -cne 'success') { throw "NONQUALIFYING diagnostic required step failed or incomplete: $name" }
+          }
+          if ($outcomes.'predecessor-removal'.outcome -notin @('success','skipped')) { throw 'NONQUALIFYING diagnostic predecessor cleanup failed or incomplete' }
+          'NONQUALIFYING diagnostic: all required session and cleanup steps passed'
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         if: always()
         with:
@@ -160,6 +496,19 @@ jobs:
             service-session.log
             service-session-cleanup.log
             service-session-activation/
+            predecessor-source.json
+            machine-predecessor-install.log
+            machine-failed-upgrade.log
+            predecessor-session-cleanup.log
+            machine-host.log
+            machine-removal-*
+            diagnostic-step-outcomes.json
+            diagnostic-oa-images.json
+            diagnostic-lock-observation.ps1
+            diagnostic-lock-holders-*.json
+            diagnostic-observation-*-error.txt
+            diagnostic-locks-*.json
+            diagnostic-processes-*.json
   per-user:
     needs: package
     runs-on: ${{ inputs.windows_image == 'windows-2022' && 'windows-2022' || 'windows-latest' }}

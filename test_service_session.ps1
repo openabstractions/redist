@@ -503,27 +503,37 @@ function Assert-DetachedActivationReason([string]$Diagnostics) {
     return $matches[0]
 }
 function Get-DetachedSessionSupervisor([string]$Sid,[int]$Session,[string]$Image,$Start,
-        [scriptblock]$ReadProcesses,[scriptblock]$ReadOwner) {
+        [scriptblock]$ReadProcesses,[scriptblock]$ReadOwner,$Selected) {
     $runtime=Join-Path (Split-Path $Image) 'openabstractions.exe'
     if ($Session -le 0 -or $Sid -notmatch '^S-1-5-21-' -or $Start.ProcessId -le 0 -or
         $Start.Closure -cne 'known' -or $null -eq $Start.ExitCode -or $Start.ExitCode -ne 0 -or
         $Start.RequestedFileName -ine $runtime -or $Start.RequestedArguments -cne 'start --timeout 30s' -or
         -not $Start.CreationUtc -or -not $Start.FinishedUtc) { throw 'A known exact installed start process is required' }
-    $rows=@(if ($ReadProcesses) { & $ReadProcesses } else { Get-CimInstance Win32_Process -Filter "Name='openabstractionsw.exe'" })
+    if ($Selected -and ($Selected.ProcessId -le 0 -or -not $Selected.CreationDate)) { throw 'An admitted detached supervisor pin is required' }
+    $filter=if ($Selected) { 'ProcessId='+[uint32]$Selected.ProcessId } else { "Name='openabstractionsw.exe'" }
+    $rows=@(if ($ReadProcesses) { & $ReadProcesses } else { Get-CimInstance Win32_Process -Filter $filter })
     $found=@()
     foreach ($proc in $rows) {
-        if ($proc.SessionId -ne $Session) { continue }
+        # Recovery observes only the already-admitted process. A new launch
+        # contender is not evidence about this supervisor's identity or exit.
+        if ($Selected -and $proc.ProcessId -ne $Selected.ProcessId) { continue }
+        if ($proc.SessionId -ne $Session) {
+            if ($Selected) { throw 'Selected detached supervisor has wrong session' }
+            continue
+        }
         $owner=if ($ReadOwner) { & $ReadOwner $proc } else { Get-ProcessOwnerSid $proc }
         if ($null -eq $owner) { continue }
         if ($owner -cne $Sid) { throw 'Detached supervisor has wrong principal' }
         if ($proc.ExecutablePath -ine $Image) { throw 'Detached supervisor has wrong executable' }
-        if ($proc.ParentProcessId -ne $Start.ProcessId) { throw 'Detached supervisor was not launched by the observed installed start' }
+        if ($proc.ParentProcessId -ne $Start.ProcessId) { throw "Detached supervisor was not launched by the observed installed start (pid=$($proc.ProcessId), parent=$($proc.ParentProcessId), expected=$($Start.ProcessId))" }
         $created=([DateTime]$proc.CreationDate).ToUniversalTime()
         if ($created -lt [DateTime]::Parse($Start.CreationUtc).ToUniversalTime() -or
             $created -gt [DateTime]::Parse($Start.FinishedUtc).ToUniversalTime()) { throw 'Detached supervisor creation is outside the installed start lifetime' }
+        if ($Selected -and $created -ne ([DateTime]$Selected.CreationDate).ToUniversalTime()) { throw 'Selected detached supervisor creation changed' }
         $found+=@($proc)
     }
     if ($found.Count -gt 1) { throw 'Multiple detached supervisors for the fresh account/session' }
+    if ($Selected -and $found.Count -eq 0) { throw 'Selected detached supervisor is absent' }
     if ($found.Count -eq 1) { return $found[0] }
 }
 # Snapshot the bounded wrapper's existing observations before account cleanup.
@@ -696,8 +706,9 @@ try {
         }
     }
     $activationStart=$null
+    $selectedSupervisor=$null
     function Find-Supervisor {
-        if ($ActivateRuntime) { Get-DetachedSessionSupervisor $state.Sid $session $expectedImagePath $activationStart }
+        if ($ActivateRuntime) { Get-DetachedSessionSupervisor $state.Sid $session $expectedImagePath $activationStart -Selected $selectedSupervisor }
         else { Find-Instance }
     }
     if ($ActivateRuntime) {
@@ -708,6 +719,7 @@ try {
     }
     $first = Wait-Condition { Find-Supervisor } 60 'owned supervisor Running in fresh session'
     if ($ActivateRuntime) {
+        $selectedSupervisor=[pscustomobject]@{ProcessId=[int]$first.ProcessId;CreationDate=([DateTime]$first.CreationDate).ToUniversalTime().ToString('o')}
         Write-Diagnostic "detached supervisor PID=$($first.ProcessId) parent=$($first.ParentProcessId) session=$session SID=$($state.Sid) image=$expectedImagePath"
     }
     $runtimeImage = Join-Path $env:ProgramFiles 'OpenAbstractions\tools\openabstractions.exe'
