@@ -496,6 +496,36 @@ function Assert-SessionActivation($Activation,[int]$Session,[string]$Sid) {
     }
     if ($null -eq $result.ExitCode -or $result.ExitCode -ne 0 -or $result.Closure -cne 'known' -or $result.Failure) { throw "Installed demand-start activation failed: $($result.Failure)" }
 }
+function Assert-DetachedActivationReason([string]$Diagnostics) {
+    $reasons=@('lookup','query','start' | ForEach-Object { "start: per-user service $_ denied (Windows error 5); activating the owned per-user host" })
+    $matches=@($Diagnostics -split '\r?\n' | Where-Object { $_ -cin $reasons })
+    if ($matches.Count -ne 1) { throw 'Expected the precise service access-denied detached activation reason' }
+    return $matches[0]
+}
+function Get-DetachedSessionSupervisor([string]$Sid,[int]$Session,[string]$Image,$Start,
+        [scriptblock]$ReadProcesses,[scriptblock]$ReadOwner) {
+    $runtime=Join-Path (Split-Path $Image) 'openabstractions.exe'
+    if ($Session -le 0 -or $Sid -notmatch '^S-1-5-21-' -or $Start.ProcessId -le 0 -or
+        $Start.Closure -cne 'known' -or $null -eq $Start.ExitCode -or $Start.ExitCode -ne 0 -or
+        $Start.RequestedFileName -ine $runtime -or $Start.RequestedArguments -cne 'start --timeout 30s' -or
+        -not $Start.CreationUtc -or -not $Start.FinishedUtc) { throw 'A known exact installed start process is required' }
+    $rows=@(if ($ReadProcesses) { & $ReadProcesses } else { Get-CimInstance Win32_Process -Filter "Name='openabstractionsw.exe'" })
+    $found=@()
+    foreach ($proc in $rows) {
+        if ($proc.SessionId -ne $Session) { continue }
+        $owner=if ($ReadOwner) { & $ReadOwner $proc } else { Get-ProcessOwnerSid $proc }
+        if ($null -eq $owner) { continue }
+        if ($owner -cne $Sid) { throw 'Detached supervisor has wrong principal' }
+        if ($proc.ExecutablePath -ine $Image) { throw 'Detached supervisor has wrong executable' }
+        if ($proc.ParentProcessId -ne $Start.ProcessId) { throw 'Detached supervisor was not launched by the observed installed start' }
+        $created=([DateTime]$proc.CreationDate).ToUniversalTime()
+        if ($created -lt [DateTime]::Parse($Start.CreationUtc).ToUniversalTime() -or
+            $created -gt [DateTime]::Parse($Start.FinishedUtc).ToUniversalTime()) { throw 'Detached supervisor creation is outside the installed start lifetime' }
+        $found+=@($proc)
+    }
+    if ($found.Count -gt 1) { throw 'Multiple detached supervisors for the fresh account/session' }
+    if ($found.Count -eq 1) { return $found[0] }
+}
 # Snapshot the bounded wrapper's existing observations before account cleanup.
 # An absent entry/result remains absent evidence; no startup success is inferred.
 function Save-SessionActivationDiagnostics($Activation,[string]$Directory) {
@@ -517,7 +547,7 @@ if ($Mode -eq 'VerifyRemoved') {
         throw 'Removal verification requires a completed fresh-user runtime test'
     }
     Wait-Condition {
-        $children = @(Get-CimInstance Win32_Process -Filter "Name='openabstractions.exe'" | Where-Object {
+        $children = @(Get-CimInstance Win32_Process -Filter "Name='openabstractions.exe' OR Name='openabstractionsw.exe'" | Where-Object {
             if ($_.SessionId -eq $state.Session) {
                 $owner = Get-ProcessOwnerSid $_
                 $null -ne $owner -and $owner -eq $state.Sid
@@ -650,7 +680,8 @@ try {
         Start-SessionActivationTask $activation $state.Sid $session $state $StatePath
     }
     if ($activation) { Assert-SessionActivation $activation $session $state.Sid }
-    # The service template runs the windowless host, `openabstractionsw.exe serve supervisor --service`.
+    # Historical templates run the host through SCM. The 0.8.0 demand-start
+    # known limit uses the observed installed CLI's owned detached host.
     $expectedImagePath = Join-Path $env:ProgramFiles ('OpenAbstractions\tools\' + $ExpectedImage)
     function Find-Instance {
         foreach ($svc in @(Get-CimInstance Win32_Service -Filter "Name LIKE 'OpenAbstractionsSupervisor_%'")) {
@@ -664,7 +695,21 @@ try {
             return $svc
         }
     }
-    $first = Wait-Condition { Find-Instance } 60 'SCM-created instance Running in fresh session'
+    $activationStart=$null
+    function Find-Supervisor {
+        if ($ActivateRuntime) { Get-DetachedSessionSupervisor $state.Sid $session $expectedImagePath $activationStart }
+        else { Find-Instance }
+    }
+    if ($ActivateRuntime) {
+        $activationStart=Get-Content -LiteralPath (Join-Path $activation.Diagnostics 'start-process.json') -Raw | ConvertFrom-Json
+        $reason=Assert-DetachedActivationReason (Get-Content -LiteralPath (Join-Path $activation.Diagnostics 'start.stderr') -Raw)
+        Write-Diagnostic '0.8.0 known limit, owner decision 2026-11-19: detached owned host; SCM custody and supervisor crash auto-restart are not qualified'
+        Write-Diagnostic $reason
+    }
+    $first = Wait-Condition { Find-Supervisor } 60 'owned supervisor Running in fresh session'
+    if ($ActivateRuntime) {
+        Write-Diagnostic "detached supervisor PID=$($first.ProcessId) parent=$($first.ParentProcessId) session=$session SID=$($state.Sid) image=$expectedImagePath"
+    }
     $runtimeImage = Join-Path $env:ProgramFiles 'OpenAbstractions\tools\openabstractions.exe'
     $credential = $account.Credential
     function Find-Runtime([int]$ParentPid) {
@@ -677,6 +722,7 @@ try {
             if ($null -eq $owner) { continue }
             if ($owner -ne $state.Sid) { throw 'Runtime child has wrong principal' }
             if ($proc.ExecutablePath -ne $runtimeImage) { throw 'Runtime child has wrong executable' }
+            if ($ActivateRuntime) { Write-Diagnostic "runtime PID=$($proc.ProcessId) parent=$ParentPid session=$session SID=$($state.Sid) image=$runtimeImage" | Out-Null }
             $live += $proc
         }
         if ($live.Count -gt 1) { throw 'Multiple runtime children for one supervisor' }
@@ -775,36 +821,43 @@ try {
     $oldRuntimePid = [int]$runtime.ProcessId
     Stop-Process -Id $oldRuntimePid -Force -ErrorAction Stop
     $recovered = Wait-Condition {
-        $parent = Find-Instance
+        $parent = Find-Supervisor
         if ($parent) {
             $child = Find-Runtime ([int]$parent.ProcessId)
             if ($child -and $child.ProcessId -ne $oldRuntimePid) { $child }
         }
     } 60 'runtime child replacement after child death'
     Wait-RuntimeReady 60 'capability readiness after runtime child death'
-    $first = Find-Instance
+    $first = Find-Supervisor
     if (-not $first) { throw 'Supervisor disappeared after runtime recovery' }
     $oldRuntimePid = [int]$recovered.ProcessId
     $oldPid = [int]$first.ProcessId
-    # Only the verified test-account service process is terminated; no service is fabricated or manually started.
-    Stop-Process -Id $oldPid -Force -ErrorAction Stop
-    $replacement = Wait-Condition {
-        $next = Find-Instance
-        if ($next -and $next.Name -eq $first.Name -and $next.ProcessId -ne $oldPid) { $next }
-    } 60 'SCM restart with replacement PID'
-    Wait-Condition {
-        if (-not (Get-Process -Id $oldRuntimePid -ErrorAction SilentlyContinue)) { $true }
-    } 30 'old runtime child exited after supervisor death' | Out-Null
-    $finalRuntime = Wait-Condition { Find-Runtime ([int]$replacement.ProcessId) } 60 'runtime child after SCM recovery'
-    Wait-RuntimeReady 60 'capability readiness after SCM recovery'
+    $finalRuntime=$recovered
+    $replacement=$first
+    if (-not $ActivateRuntime) {
+        # Only the verified test-account service process is terminated; no service is fabricated or manually started.
+        Stop-Process -Id $oldPid -Force -ErrorAction Stop
+        $replacement = Wait-Condition {
+            $next = Find-Instance
+            if ($next -and $next.Name -eq $first.Name -and $next.ProcessId -ne $oldPid) { $next }
+        } 60 'SCM restart with replacement PID'
+        Wait-Condition {
+            if (-not (Get-Process -Id $oldRuntimePid -ErrorAction SilentlyContinue)) { $true }
+        } 30 'old runtime child exited after supervisor death' | Out-Null
+        $finalRuntime = Wait-Condition { Find-Runtime ([int]$replacement.ProcessId) } 60 'runtime child after SCM recovery'
+        Wait-RuntimeReady 60 'capability readiness after SCM recovery'
+        Write-Diagnostic "ok: runtime child death and supervisor death recovered logging/config readiness"
+        Write-Diagnostic "ok: $($first.Name), session $session, PID $oldPid replaced by $($replacement.ProcessId)"
+    } else {
+        Write-Diagnostic 'ok: detached supervisor retained its identity and recovered runtime child logging/config readiness'
+    }
     $state.Session = $session
     $state.RuntimeVerified = $true
     $state.RuntimePid = [int]$finalRuntime.ProcessId
     $state | ConvertTo-Json | Set-Content -Encoding UTF8 $StatePath
-    Write-Diagnostic "ok: runtime child death and supervisor death recovered logging/config readiness"
-    Write-Diagnostic "ok: $($first.Name), session $session, PID $oldPid replaced by $($replacement.ProcessId)"
     if ($sessionCommand) {
-        $context = @{ User=$user; Sid=$state.Sid; Session=$session; Instance=$replacement.Name; SupervisorPid=[int]$replacement.ProcessId; RuntimePid=$state.RuntimePid }
+        $instanceName=if ($ActivateRuntime) { $null } else { $replacement.Name }
+        $context = @{ User=$user; Sid=$state.Sid; Session=$session; Instance=$instanceName; SupervisorPid=[int]$replacement.ProcessId; RuntimePid=$state.RuntimePid }
         Invoke-SessionCommand $sessionCommand $CommandArguments $CommandSeconds $account $context
         $state.CommandVerified = $true
         $state | ConvertTo-Json | Set-Content -Encoding UTF8 $StatePath

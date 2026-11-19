@@ -33,7 +33,9 @@ Changes since 0.4.0.
 
 **Known limits.** Agent messaging took about 1-2 seconds under load in observed
 runs. **Remove** cannot delete files that require Administrator access. An OpenCode
-update took about 65 seconds in an observed run.
+update took about 65 seconds in an observed run. On Windows, OpenAbstractions
+starts when an app needs it; if it stops unexpectedly, it starts again on the next
+request, and Windows does not restart it automatically.
 
 The redistributable carries native programs and the Windows app packages named in
 the appended record. Python wheels, Rust crates and npm packages have separate
