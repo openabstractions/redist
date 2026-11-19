@@ -1611,7 +1611,7 @@ def application_policy_helpers():
     return validate_public_admission, helper
 
 
-def application_source_policy(checkout, source, version, *, producer_source=None):
+def application_source_policy(checkout, source, version, *, producer_source=None, policy_revision=None):
     """Read release policy data from the independently selected local redist commit."""
     if not re.fullmatch('[0-9a-f]{40}', source or ''):
         raise ValueError('Catalog policy requires an exact source commit')
@@ -1624,14 +1624,18 @@ def application_source_policy(checkout, source, version, *, producer_source=None
         return subprocess.check_output([*command, *args], env=environment, timeout=30)
     if read('rev-parse', '--verify', 'HEAD').decode('ascii').strip() != source:
         raise ValueError('Catalog policy checkout does not match the selected source')
+    revision = policy_revision or source
+    if policy_revision is not None and (
+            not re.fullmatch('[0-9a-f]{40}', policy_revision) or policy_revision != producer_source):
+        raise ValueError('retained policy revision must match the independently selected producer source')
     owner = application_context_policy()
     validate, helper = application_policy_helpers()
     with tempfile.TemporaryDirectory(prefix='oa-catalog-policy-') as temporary:
         policy_root = Path(temporary)
         for name in ('apps.json', 'npm.tsv', 'pypi.tsv', 'app-sources.tsv'):
-            if int(read('cat-file', '-s', source + ':' + name)) > 1 << 20:
+            if int(read('cat-file', '-s', revision + ':' + name)) > 1 << 20:
                 raise ValueError('Catalog source policy file exceeds its bound')
-            (policy_root / name).write_bytes(read('show', source + ':' + name))
+            (policy_root / name).write_bytes(read('show', revision + ':' + name))
         required = owner.installer_scope(version, policy_root=policy_root, validate=validate)
         _, sources = owner.selected_sources(required, version, producer_source=producer_source or source, policy_root=policy_root, helper=helper, validate=validate)
     return required, sources
@@ -3440,8 +3444,13 @@ def phase_main(argv):
                 raise ValueError('retained context and raw producer bindings are distinct inputs')
             owner = application_context_policy()
             version = args.version.removeprefix('v') if args.version else None
-            required = owner.installer_scope(version)
-            _, sources = owner.selected_sources(required, version, producer_source=args.producer_source or args.source)
+            if args.producer_source is not None:
+                required, sources = application_source_policy(Path.cwd(),
+                    os.environ.get('CANDIDATE_SHA') or args.source, version,
+                    producer_source=args.producer_source, policy_revision=args.producer_source)
+            else:
+                required = owner.installer_scope(version)
+                _, sources = owner.selected_sources(required, version, producer_source=args.source)
             received, admitted_context_pin = retained_application_context(args.producer_context.parent, args.producer_context,
                 source=args.source, run_id=args.run_id, artifact_id=args.artifact_id,
                 artifact_name=args.artifact_name, artifact_digest=(args.artifact_digest or '').removeprefix('sha256:'),

@@ -13,7 +13,7 @@ on:
         type: boolean
         default: false
       windows_tail_bundle_resume:
-        description: Resume Setup assembly using the completed signed MSI and BA carrier from run 44642911527
+        description: Resume Setup assembly using the completed signed MSI and BA carrier from run 44736549944
         type: boolean
         default: false
       windows_tail_sign_resume:
@@ -5518,10 +5518,10 @@ jobs:
       CANDIDATE_SHA: ${{ github.sha }}
       CANDIDATE_VERSION: 0.8.0
       GH_TOKEN: ${{ github.token }}
-      MSI_SOURCE: ${{ inputs.windows_tail_bundle_resume && 'c19193b92579fd218e6b7449aa0a8efc9c046aea' || github.sha }}
-      MSI_RUN: ${{ inputs.windows_tail_bundle_resume && '44642911527' || github.run_id }}
-      MSI_ARTIFACT_ID: ${{ inputs.windows_tail_bundle_resume && '14586923496' || needs.windows-tail-msi-sign.outputs.artifact-id }}
-      MSI_ARTIFACT_DIGEST: ${{ inputs.windows_tail_bundle_resume && 'e4cabf4c7a08d08f8f9fc64796ebc0a8e7b57bc82ad83819f8f0fe18ae4109b6' || needs.windows-tail-msi-sign.outputs.artifact-digest }}
+      MSI_SOURCE: ${{ inputs.windows_tail_bundle_resume && '103e3fadfd635dff8a9174b0e42bea31f0339ca5' || github.sha }}
+      MSI_RUN: ${{ inputs.windows_tail_bundle_resume && '44736549944' || github.run_id }}
+      MSI_ARTIFACT_ID: ${{ inputs.windows_tail_bundle_resume && '14629675161' || needs.windows-tail-msi-sign.outputs.artifact-id }}
+      MSI_ARTIFACT_DIGEST: ${{ inputs.windows_tail_bundle_resume && '58d0ca8935c28a93fbb558e3afe748ddb08300fcd0b096bc89f5e45fe2a9de9b' || needs.windows-tail-msi-sign.outputs.artifact-digest }}
       MSI_ARTIFACT_ATTEMPT: ${{ inputs.windows_tail_bundle_resume && '1' || needs.windows-tail-msi-sign.outputs.artifact-attempt }}
     outputs:
       artifact-id: ${{ steps.artifact.outputs.artifact-id }}
@@ -5531,6 +5531,9 @@ jobs:
     - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
       with:
         ref: ${{ github.sha }}
+    - name: receive immutable original application policy
+      shell: bash
+      run: git fetch --no-tags --depth=1 origin "$RETAINED_SOURCE"
     - uses: actions/setup-python@e797f83bcb11b83ae66e0230d6156d7c80228e7c
       with:
         python-version: '3.12'
@@ -5678,6 +5681,9 @@ jobs:
     - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
       with:
         ref: ${{ github.sha }}
+    - name: receive immutable original application policy
+      shell: bash
+      run: git fetch --no-tags --depth=1 origin "$RETAINED_SOURCE"
     - uses: actions/setup-python@e797f83bcb11b83ae66e0230d6156d7c80228e7c
       with:
         python-version: '3.12'
@@ -5746,6 +5752,9 @@ jobs:
     - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
       with:
         ref: ${{ github.sha }}
+    - name: receive immutable original application policy
+      shell: bash
+      run: git fetch --no-tags --depth=1 origin "$RETAINED_SOURCE"
     - uses: actions/setup-python@e797f83bcb11b83ae66e0230d6156d7c80228e7c
       with:
         python-version: '3.12'
@@ -5783,7 +5792,7 @@ jobs:
         path: setup-installed-inputs.json
         if-no-files-found: error
     - name: exact signed Setup hosted elevated install readiness and removal
-      if: ${{ !inputs.windows_tail_ba_only }}
+      if: ${{ !inputs.windows_tail_ba_only && !inputs.windows_tail_bundle_resume }}
       shell: powershell
       timeout-minutes: 25
       run: |
