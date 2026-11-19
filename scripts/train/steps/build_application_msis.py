@@ -460,8 +460,21 @@ def application_inputs(required, version):
         with open(os.environ['GITHUB_ENV'],'a',encoding='utf-8') as output:
             output.write('OA_APP_VCVARS='+str(vcvars.resolve())+'\n')
         return
+    base=pathlib.Path('app-native')
+    if base.exists() or base.is_symlink() or base.is_junction():
+        raise ValueError('native input stage must be fresh')
     helper,pins=selected_sources(required,version,checkout=True)
     helper.verify_source_checkouts(pins,'sources')
+    sdk_stage=base.exists()
+    if sdk_stage:
+        ordinary_path(base,kind='directory')
+        if 'opencode' not in required or {path.name for path in base.iterdir()}!={'sdk-sources'}:
+            raise ValueError('unexpected native input stage content')
+        sdk=base/'sdk-sources';ordinary_path(sdk,kind='directory')
+        roles=helper.opencode_source_roles('npm.tsv','public-go-graph.json',version)
+        if {path.name for path in sdk.iterdir()}!={repo.split('/',1)[1] for repo in roles['sdk_sources']}:
+            raise ValueError('unexpected native input stage SDK source roster')
+        helper.verify_source_checkouts(roles['sdk_sources'],sdk)
     owners=producer_owners(required)
     # Source admission precedes artifact/tool acquisition. A custom Desktop
     # cannot fall through to the historical supplier-installer receiver.
@@ -478,7 +491,7 @@ def application_inputs(required, version):
         else:
             owner.custom_desktop_policy()
             owner.desktop_tool_inputs(pathlib.Path('app-build-inputs'))
-    base=pathlib.Path('app-native');base.mkdir()
+    if not sdk_stage:base.mkdir()
     if official_comfy(required):
         extension_inputs=base/'comfy-extension-inputs';extension_inputs.mkdir()
         shutil.copyfile(closure_file(pathlib.Path('sources/adopter-comfyui'),'.installer/extension.json'),extension_inputs/'extension.json')
