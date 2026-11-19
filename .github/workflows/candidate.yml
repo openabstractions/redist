@@ -3227,16 +3227,16 @@ jobs:
           sudo loginctl enable-linger "$account"
           sudo systemctl start "user@$uid.service"
           user() { sudo -u "$account" env HOME="$home" XDG_RUNTIME_DIR="/run/user/$uid" DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$uid/bus" "$@"; }
-          start_fixture_origin() {
-            origin_unit="oa-candidate-origin-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}.service"
-            user timeout --kill-after=2s 10s systemd-run --user --quiet --collect --unit="$origin_unit" \
-              python3 -m http.server 8099 --bind 127.0.0.1 --directory "$home/download-origin"
-            trap stop_fixture_origin EXIT
-          }
-          stop_fixture_origin() {
-            trap - EXIT
-            [ -z "${origin_unit:-}" ] || user timeout --kill-after=2s 10s systemctl --user stop "$origin_unit"
-            origin_unit=
+          download_installed_fixture() {
+            fixture_url="https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/${GITHUB_SHA}/posix/README.md"
+            fixture_sha256=$(sha256sum posix/README.md)
+            fixture_sha256=${fixture_sha256%% *}
+            user mkdir -p "$home/download-out"
+            user "$home/.local/bin/openabstractions" download "$fixture_url" --sha256 "$fixture_sha256" --out "$home/download-out" --json --timeout 60s > "$RUNNER_TEMP/download.json"
+            user cmp "$home/download-out/README.md" "$home/fixtures/README.md"
+            operation=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["receipt"]["operation_id"])' "$RUNNER_TEMP/download.json")
+            [ -n "$operation" ]
+            user "$home/.local/bin/openabstractions" jobs show "$operation" --json | python3 -c 'import json,sys; s=json.load(sys.stdin)["snapshot"]; sys.exit(0 if s["state"] == "complete" and s["receipt"]["operation_id"] == sys.argv[1] else 1)' "$operation"
           }
           configure_disposable_runtime_environment() {
             [ "$(id -u "$account")" = "$uid" ] || { echo 'Disposable account identity changed'; return 1; }
@@ -3262,16 +3262,7 @@ jobs:
             # A download through the runtime, with no store named: the runtime
             # fetches and verifies, the command copies the result out, and jobs
             # show observes the same operation.
-            user mkdir -p "$home/download-origin" "$home/download-out"
-            user sh -c 'printf "bytes through the runtime" > "$HOME/download-origin/thing.bin"'
-            start_fixture_origin
-            for _ in $(seq 50); do curl -fsS -o /dev/null http://127.0.0.1:8099/thing.bin && break; sleep 0.2; done
-            user "$home/.local/bin/openabstractions" download http://127.0.0.1:8099/thing.bin --out "$home/download-out" --json --timeout 60s > "$RUNNER_TEMP/download.json"
-            stop_fixture_origin
-            user cmp "$home/download-out/thing.bin" "$home/download-origin/thing.bin"
-            operation=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["receipt"]["operation_id"])' "$RUNNER_TEMP/download.json")
-            [ -n "$operation" ]
-            user "$home/.local/bin/openabstractions" jobs show "$operation" --json | python3 -c 'import json,sys; s=json.load(sys.stdin)["snapshot"]; sys.exit(0 if s["state"] == "complete" and s["receipt"]["operation_id"] == sys.argv[1] else 1)' "$operation"
+            download_installed_fixture
             user sh "$home/.local/share/abstraction/uninstall.sh"
             user test ! -e "$home/.local/bin/openabstractions"
             user test ! -e "$home/.config/systemd/user/abstraction-runtime.service"
@@ -3555,10 +3546,13 @@ jobs:
             { printf 'FAIL  published Panel module has no native app icon\n'; exit 1; }
           cp "$module_dir/icon/panel.icns" universal/AppIcon.icns
           cp "$module_dir/panel-application.json" universal/OA_APPLICATION_MANIFEST.json
+          gobin="$(go env GOPATH)/bin"
           for arch in amd64 arm64; do
+            rm -rf "$gobin"
+            GOOS=darwin GOARCH="$arch" go install -ldflags '-s -w -buildid=' "$panel_module"
+            built=$(find "$gobin" -type f)
             mkdir -p "$root/thin/$arch"
-            GOOS=darwin GOARCH="$arch" go -C "$module_dir" build -ldflags '-s -w -buildid=' \
-              -o "$root/thin/$arch/panel" .
+            mv "$built" "$root/thin/$arch/panel"
           done
           lipo -create -output universal/panel "$root/thin/amd64/panel" "$root/thin/arm64/panel"
           lipo -info universal/panel
