@@ -1465,6 +1465,14 @@ jobs:
           mkdir -p dist
           python3 scripts/train/steps/take_ipc_library.py "$latest"
 
+      - name: stage source-bound third-party notices for core MSI packaging
+        run: |
+          notice=()
+          if [ "$CANDIDATE_VERSION" = 0.8.1 ]; then
+            notice=(--expected-sha256 627e6448d1c90dcb511f5668cececcc4665e62a04d478c46c01cc72da9dce493)
+          fi
+          python3 scripts/train/steps/stage_windows_notices.py "${notice[@]}"
+
       # windows/build.py is the packager on a workstation and it is the packager
       # here, because two assemblers cannot be kept agreeing about what the
       # package contains and abstraction.wxs installs more than tools.tsv names.

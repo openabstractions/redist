@@ -12,6 +12,7 @@ from pathlib import Path
 import re
 import shutil
 import stat
+import struct
 import subprocess
 import sys
 import tempfile
@@ -282,6 +283,80 @@ def _panel_projection_inputs(module_zip, catalogue_path, *, module_row, expected
     return files, record
 
 
+def _canonical_panel_resource(raw):
+    """Remove only the generator's cleared, path-sized COFF debug storage.
+
+    cvtres leaves its obsolete debug length in a section-symbol auxiliary row.
+    Resource contents, relocations and all other symbol/string bytes stay exact.
+    Unknown compiler layouts are refused before replacing the generated object.
+    """
+    def refuse():
+        raise ValueError('Panel resource COFF layout differs')
+    if len(raw) < 140:
+        refuse()
+    machine, count, timestamp, symbols, symbol_count, optional, flags = struct.unpack_from('<HHIIIHH', raw)
+    if (machine, count, timestamp, optional, flags) != (0x8664, 3, 0, 0, 0x0100):
+        refuse()
+    sections = []
+    for index, name in enumerate((b'.debug$S', b'.rsrc$01', b'.rsrc$02')):
+        offset = 20 + index * 40
+        if raw[offset:offset+8] != name or any(raw[offset+8:offset+16]):
+            refuse()
+        size, data, reloc, lines, reloc_count, line_count = struct.unpack_from('<IIIIHH', raw, offset+16)
+        if lines or line_count:
+            refuse()
+        sections.append((offset, size, data, reloc, reloc_count))
+    debug, first, second = sections
+    if (debug[1:] != (0, 0, 0, 0) or not first[1] or not second[1] or
+            second[3:] != (0, 0) or not first[4] or
+            first[2] < 140 or first[2] % 4 or second[2] % 4 or symbols % 4 or
+            first[3] != first[2]+first[1] or
+            second[2] != first[3]+first[4]*10 or symbols != second[2]+second[1] or
+            symbols > len(raw) or not symbol_count or symbols+symbol_count*18+4 > len(raw)):
+        refuse()
+    gap = first[2]-140
+    if any(raw[140:first[2]]):
+        refuse()
+    strings = symbols+symbol_count*18
+    string_size = struct.unpack_from('<I', raw, strings)[0]
+    # cvtres's empty string table has a zero word; nonempty tables include
+    # their four-byte length. Preserve either exact suffix representation.
+    if string_size != len(raw)-strings and not (string_size == 0 and len(raw)-strings == 4):
+        refuse()
+    primary, debug_aux = {}, None
+    index = 0
+    while index < symbol_count:
+        offset = symbols+index*18
+        section, kind, storage, auxiliaries = struct.unpack_from('<hHBB', raw, offset+12)
+        if index+1+auxiliaries > symbol_count:
+            refuse()
+        if raw[offset:offset+4] == bytes(4):
+            name = struct.unpack_from('<I', raw, offset+4)[0]
+            if name < 4 or name >= string_size or b'\0' not in raw[strings+name:]:
+                refuse()
+        primary[index] = section
+        if raw[offset:offset+8] == b'.debug$S':
+            if (debug_aux is not None or (section, kind, storage, auxiliaries) != (1, 0, 3, 1)
+                    or any(raw[offset+8:offset+12]) or
+                    struct.unpack_from('<I', raw, offset+18)[0] != gap or
+                    any(raw[offset+22:offset+36])):
+                refuse()
+            debug_aux = offset+18
+        index += 1+auxiliaries
+    if debug_aux is None:
+        refuse()
+    for index in range(first[4]):
+        address, symbol, kind = struct.unpack_from('<IIH', raw, first[3]+index*10)
+        if address+4 > first[1] or primary.get(symbol) != 3 or kind != 3:
+            refuse()
+    data = bytearray(raw)
+    # Only absolute file offsets into the moved suffix are rebased.
+    for offset in (8, first[0]+20, first[0]+24, second[0]+20):
+        struct.pack_into('<I', data, offset, struct.unpack_from('<I', raw, offset)[0]-gap)
+    struct.pack_into('<I', data, debug_aux, 0)
+    return bytes(data[:140]+data[first[2]:])
+
+
 def prepare_panel_source(module_zip, catalogue_path, output, *, module_row, expected_archive,
                          expected_catalogue, producer, expected_apps, installer_history=None,
                          resource_environment=None, resource_runner=None):
@@ -314,6 +389,7 @@ def prepare_panel_source(module_zip, catalogue_path, output, *, module_row, expe
             '-installer-history-json',str(output/'installer-gateway-history.json'),
             '-agent-release-object',str(resource),'-agent-release-arch','amd64','-installer-history-panel-dir',str(output)]
         (resource_runner or subprocess.run)(argv,check=True,env=environment)
+        resource.write_bytes(_canonical_panel_resource(resource.read_bytes()))
         record['installer_resource']={k:observed_file(resource)[k] for k in ('bytes','sha256')}
         record['resource_compiler']={k:observed_file(Path(go))[k] for k in ('bytes','sha256')}
         record['files']=[dict(row,**record['installer_resource']) if row['path']==PANEL_INSTALLER_RESOURCE else row for row in record['files']]
@@ -405,6 +481,14 @@ def observed_input(path: Path) -> tuple[bytes, dict]:
         raise ValueError('observed input must be an ordinary file')
     data = path.read_bytes()
     return data, {'path': str(path.resolve()), 'sha256': hashlib.sha256(data).hexdigest(), 'bytes': len(data)}
+
+
+def _panel_build_sums(graph):
+    """Use only the authenticated graph's complete release/dependency h1 set."""
+    staged_graph_rows(graph)
+    return ''.join(sorted(row['module']+' '+row['version']+suffix+' '+row[key]+'\n'
+        for row in graph['modules']+graph.get('dependencies', [])
+        for suffix, key in (('', 'sum'), ('/go.mod', 'gomodsum')))).encode('utf-8')
 
 
 def observe_windows_builds(tools: Path, output: Path, provenance: Path,
@@ -579,7 +663,17 @@ def _observe_windows_builds(tools: Path, output: Path, provenance: Path,
                     if arguments['expected_archive'] != {key:archive_row[key] for key in ('bytes','sha256')}:
                         raise ValueError('Panel original module archive differs from prepared graph')
                     projection = prepare_panel_source(module_zip,catalogue_path,source,**arguments,resource_environment=dict(selected,GOROOT=info['GOROOT']))
-                    link = command([go,'-C',str(source),'build','-ldflags',flags,'-o',str(destination),'.'],selected)
+                    # The frozen module remains exact; only this build-owned pair
+                    # supplies release sums missing from its historical go.sum.
+                    modfile = owned / (pass_name + '-panel.mod')
+                    sumfile = modfile.with_suffix('.sum')
+                    modfile.write_bytes((source/'go.mod').read_bytes())
+                    sumfile.write_bytes(_panel_build_sums(graph))
+                    build_inputs = {'modfile': observed_file(modfile), 'sumfile': observed_file(sumfile)}
+                    link = command([go,'-C',str(source),'build','-mod=readonly','-modfile',str(modfile),
+                                    '-ldflags',flags,'-o',str(destination),'.'],selected)
+                    if any(pin != observed_file(Path(pin['path'])) for pin in build_inputs.values()):
+                        raise ValueError('Panel build modfile inputs changed')
                     verify_panel_source(source,projection,module_zip=module_zip,catalogue_path=catalogue_path,**arguments)
                 else:
                     link = command([go, 'install', *program_tags(name, module, package, subsystem), '-ldflags', flags, target], selected)
@@ -648,6 +742,7 @@ def _observe_windows_builds(tools: Path, output: Path, provenance: Path,
                 if projected:
                     verify_panel_source(source,projection,module_zip=module_zip,catalogue_path=catalogue_path,**arguments)
                     program['panel_source'] = projection
+                    program['panel_build_inputs'] = build_inputs
                 programs.append(program)
     for arch in ('amd64', 'arm64'):
         for name, *_ in platform_tools(rows, 'windows', arch):
@@ -659,6 +754,7 @@ def _observe_windows_builds(tools: Path, output: Path, provenance: Path,
     retained = [tools_pin, provenance_pin, *helpers]
     for program in programs:
         retained.append(program['artifact'])
+        retained.extend(program.get('panel_build_inputs', {}).values())
         for module in program['consumed']:
             if 'panel_source' not in module:
                 retained.extend([*module['cache_files'], module['ziphash']])
@@ -809,7 +905,7 @@ def admit_observed_windows_builds(original_bytes: bytes, observed_bytes: bytes, 
         projected = module == PANEL_MODULE and arch == 'amd64' and name == 'Abstraction Panel.exe'
         if projected and (expected_panel_source is None or program.get('panel_source') != expected_panel_source):
             fail('missing or different generated Panel source')
-        if (set(program) != {'pass', 'arch', 'name', 'module', 'package', 'feature', 'subsystem', 'link', 'metadata', 'artifact', 'consumed'} | ({'panel_source'} if projected else set()) or
+        if (set(program) != {'pass', 'arch', 'name', 'module', 'package', 'feature', 'subsystem', 'link', 'metadata', 'artifact', 'consumed'} | ({'panel_source','panel_build_inputs'} if projected else set()) or
                 [program[k] for k in ('pass', 'arch', 'name', 'module', 'package', 'feature', 'subsystem')] !=
                 [pass_name, arch, name, module_version, package, feature, subsystem] or subsystem not in ('console', 'windows') or
                 module not in modules or modules[module]['version'] != version): fail('program identity')
@@ -823,8 +919,17 @@ def admit_observed_windows_builds(original_bytes: bytes, observed_bytes: bytes, 
             link = program['link']['argv']
             # The owned projection is separate from the immutable module cache.
             suffix_source = '/.observed-windows-build/'+pass_name+'-panel-source'
-            if len(link) != 9 or not remote(link[2]).endswith(suffix_source):fail('Panel source link path')
-            command(program['link'],[go,'-C',link[2],'build','-ldflags',flags,'-o',program['artifact']['path'],'.'])
+            if len(link) != 12 or not remote(link[2]).endswith(suffix_source):fail('Panel source link path')
+            inputs = program['panel_build_inputs']
+            mod = next(row for row in expected_panel_source['files'] if row['path'] == 'go.mod')
+            if (set(inputs) != {'modfile','sumfile'} or
+                    pin(inputs['modfile']) != {key:mod[key] for key in ('bytes','sha256')} or
+                    pin(inputs['sumfile']) != raw_pin(_panel_build_sums(expected_graph)) or
+                    remote(inputs['modfile']['path']) != remote(link[2]).removesuffix('-source')+'.mod' or
+                    remote(inputs['sumfile']['path']) != remote(link[2]).removesuffix('-source')+'.sum'):
+                fail('Panel build modfile inputs')
+            command(program['link'],[go,'-C',link[2],'build','-mod=readonly','-modfile',inputs['modfile']['path'],
+                                     '-ldflags',flags,'-o',program['artifact']['path'],'.'])
         else:
             command(program['link'], [go, 'install', *program_tags(name, module, package, subsystem), '-ldflags', flags, target])
         artifact = program['artifact']; artifact_pin = pin(artifact)

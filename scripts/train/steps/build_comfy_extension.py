@@ -136,8 +136,17 @@ def prepare(shared, sources, pins, inputs, output, version, go, cl, sdk_receipt)
             raise ValueError('extension connector module hashes differ from the prepared graph')
         module = Path(downloaded['Dir']).resolve(strict=True)
         relative_beneath_existing(module, work / 'modcache')
+        # The frozen module may omit sums for the graph's public release modules.
+        # Keep its source immutable and supply only already validated graph hashes.
+        modfile = work / 'connector.mod'
+        modfile.write_bytes(ordinary_path(module / 'go.mod', kind='file').read_bytes())
+        sums = []
+        for selected in graph['modules'] + graph.get('dependencies', []):
+            sums.extend((selected['module'] + ' ' + selected['version'] + ' ' + selected['sum'],
+                         selected['module'] + ' ' + selected['version'] + '/go.mod ' + selected['gomodsum']))
+        modfile.with_suffix('.sum').write_text('\n'.join(sorted(sums)) + '\n', encoding='utf-8')
         subprocess.run([str(go), 'build', '-trimpath', '-buildvcs=false', '-ldflags=-s -w',
-                        '-o', str(output / PROGRAM), '.'], cwd=module, env=environment, check=True)
+                        '-modfile=' + str(modfile), '-o', str(output / PROGRAM), '.'], cwd=module, env=environment, check=True)
         buildinfo = subprocess.check_output([str(go), 'version', '-m', str(output / PROGRAM)], text=True)
     (output / 'go-buildinfo.txt').write_text(buildinfo, encoding='utf-8')
     builder.build_action(output, str(Path(cl).resolve(strict=True)))
