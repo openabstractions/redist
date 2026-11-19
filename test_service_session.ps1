@@ -378,7 +378,56 @@ function New-SessionActivation([string]$Directory, [string]$Runtime, [string]$Mo
     $script=@'
 $ErrorActionPreference='Stop'
 [IO.File]::WriteAllText(($PSScriptRoot+'\diagnostics\start-entry.txt'),[DateTime]::UtcNow.ToString('o'),[Text.UTF8Encoding]::new($false))
-$record=[ordered]@{ExitCode=$null;Closure='unknown';Sid=[Security.Principal.WindowsIdentity]::GetCurrent().User.Value;Session=(Get-Process -Id $PID).SessionId;Failure=''}
+$record=[ordered]@{ExitCode=$null;Closure='unknown';Sid=[Security.Principal.WindowsIdentity]::GetCurrent().User.Value;Session=(Get-Process -Id $PID).SessionId;Failure='';
+    DesktopBefore=$null;DesktopAfter=$null;RuntimeAbsentBefore=$false}
+function Read-ActivationDesktopShell([string]$Sid,[int]$Session) {
+    if (-not ('OAActivationDesktop' -as [type])) {
+        Add-Type -TypeDefinition @"
+using System;
+using System.ComponentModel;
+using System.Runtime.InteropServices;
+public static class OAActivationDesktop {
+    [DllImport("user32.dll")] static extern IntPtr GetShellWindow();
+    [DllImport("user32.dll")] static extern uint GetWindowThreadProcessId(IntPtr window, out uint pid);
+    [DllImport("advapi32.dll", SetLastError=true)] static extern bool OpenProcessToken(IntPtr process, uint access, out IntPtr token);
+    [DllImport("advapi32.dll", SetLastError=true)] static extern bool GetTokenInformation(IntPtr token, int kind, out int value, int size, out int length);
+    [DllImport("kernel32.dll")] static extern bool CloseHandle(IntPtr handle);
+    public static uint ShellPid() {
+        IntPtr window = GetShellWindow();
+        uint pid;
+        if (window == IntPtr.Zero || GetWindowThreadProcessId(window, out pid) == 0) return 0;
+        return pid;
+    }
+    public static bool Elevated(IntPtr process) {
+        const uint tokenQuery = 8;
+        const int tokenElevation = 20;
+        IntPtr token;
+        if (!OpenProcessToken(process, tokenQuery, out token)) throw new Win32Exception(Marshal.GetLastWin32Error());
+        try {
+            int value, length;
+            if (!GetTokenInformation(token, tokenElevation, out value, sizeof(int), out length)) throw new Win32Exception(Marshal.GetLastWin32Error());
+            if (length != sizeof(int)) throw new InvalidOperationException("Desktop shell elevation result has the wrong size");
+            return value != 0;
+        } finally { CloseHandle(token); }
+    }
+}
+"@
+    }
+    $desktopPid=[OAActivationDesktop]::ShellPid()
+    if ($desktopPid -eq 0) { return }
+    $held=[Diagnostics.Process]::GetProcessById([int]$desktopPid)
+    try {
+        $handle=$held.Handle
+        $shell=Get-CimInstance Win32_Process -Filter "ProcessId=$desktopPid"
+        $image=Join-Path $env:WINDIR 'explorer.exe'
+        if (-not $shell -or $shell.SessionId -ne $Session -or $shell.ExecutablePath -ine $image -or
+            (Get-ProcessOwnerSid $shell) -cne $Sid -or [OAActivationDesktop]::Elevated($handle) -or
+            $held.HasExited -or [OAActivationDesktop]::ShellPid() -ne $desktopPid) { return }
+        return [ordered]@{Pid=$desktopPid;Sid=$Sid;Session=$Session;Image=[string]$shell.ExecutablePath;Elevated=$false;
+            CreatedUtc=([DateTime]$shell.CreationDate).ToUniversalTime().ToString('o');
+            ObservedUtc=[DateTime]::UtcNow.ToString('o')}
+    } finally { $held.Dispose() }
+}
 try {
     if ([DateTime]::UtcNow -ge [DateTime]::Parse('__DEADLINE__').ToUniversalTime()) { throw 'RDP activation deadline expired' }
     if ($record.Sid -cne '__SID__') { throw 'RDP activation account differs' }
@@ -391,10 +440,22 @@ try {
     $info.FileName='__RUNTIME__'
     $info.Arguments='start --timeout 30s'
     $info.WorkingDirectory=Split-Path $info.FileName
+    try {
+        $record.DesktopBefore=Read-ActivationDesktopShell $record.Sid $record.Session
+        if ($record.DesktopBefore) {
+            $runtimeFilter="SessionId=$($record.Session) AND (Name='openabstractions.exe' OR Name='openabstractionsw.exe')"
+            $record.RuntimeAbsentBefore=@(Get-CimInstance Win32_Process -Filter $runtimeFilter).Count -eq 0 -and
+                @(Get-CapabilityPipes $record.Sid -Runtime).Count -eq 0
+        }
+    } catch { $record.DesktopBefore=$null }
     $result=Invoke-FixtureProcess $info 35 -ObservationPath (Join-Path $PSScriptRoot 'diagnostics/start-process.json')
     [IO.File]::WriteAllText((Join-Path $PSScriptRoot 'diagnostics/start.stdout'),$result.Output,[Text.UTF8Encoding]::new($false))
     [IO.File]::WriteAllText((Join-Path $PSScriptRoot 'diagnostics/start.stderr'),$result.Diagnostics,[Text.UTF8Encoding]::new($false))
     $record.ExitCode=$result.ExitCode;$record.Closure=$result.Closure
+    if ($record.DesktopBefore -and $record.RuntimeAbsentBefore) {
+        try { $record.DesktopAfter=Read-ActivationDesktopShell $record.Sid $record.Session }
+        catch { $record.DesktopAfter=$null }
+    }
 } catch { $record.Failure=$_.Exception.Message }
 $resultPath=Join-Path $PSScriptRoot 'diagnostics/start-result.json'
 [IO.File]::WriteAllText(($resultPath+'.tmp'),($record|ConvertTo-Json),[Text.UTF8Encoding]::new($false))
@@ -502,8 +563,35 @@ function Assert-DetachedActivationReason([string]$Diagnostics) {
     if ($matches.Count -ne 1) { throw 'Expected the precise service access-denied detached activation reason' }
     return $matches[0]
 }
+function Get-VerifiedDesktopParent([int]$Id,[string]$Sid,[int]$Session,$Start,$Proof,
+        [scriptblock]$ReadShell,[scriptblock]$ReadOwner) {
+    if ($Proof.RuntimeAbsentBefore -isnot [bool] -or -not $Proof.RuntimeAbsentBefore) { return }
+    $before=$Proof.DesktopBefore
+    $after=$Proof.DesktopAfter
+    $image=Join-Path $env:WINDIR 'explorer.exe'
+    foreach ($shell in @($before,$after)) {
+        if (-not $shell -or $shell.Pid -ne $Id -or $shell.Sid -cne $Sid -or $shell.Session -ne $Session -or
+            $shell.Image -ine $image -or $shell.Elevated -isnot [bool] -or $shell.Elevated -or
+            -not $shell.CreatedUtc -or -not $shell.ObservedUtc) { return }
+    }
+    if ($before.CreatedUtc -cne $after.CreatedUtc) { return }
+    $creation=([DateTime]$before.CreatedUtc).ToUniversalTime()
+    $started=([DateTime]$Start.CreationUtc).ToUniversalTime()
+    $ended=([DateTime]$Start.FinishedUtc).ToUniversalTime()
+    if ($creation -gt ([DateTime]$before.ObservedUtc).ToUniversalTime() -or
+        ([DateTime]$before.ObservedUtc).ToUniversalTime() -gt $started -or
+        ([DateTime]$after.ObservedUtc).ToUniversalTime() -lt $ended) { return }
+    $parents=@(if ($ReadShell) { & $ReadShell $Id } else { Get-CimInstance Win32_Process -Filter "ProcessId=$Id" })
+    if ($parents.Count -ne 1) { return }
+    $parent=$parents[0]
+    if ($parent.ProcessId -ne $Id -or $parent.SessionId -ne $Session -or $parent.ExecutablePath -ine $image -or
+        ([DateTime]$parent.CreationDate).ToUniversalTime() -ne $creation) { return }
+    $owner=if ($ReadOwner) { & $ReadOwner $parent } else { Get-ProcessOwnerSid $parent }
+    if ($owner -cne $Sid) { return }
+    return $before
+}
 function Get-DetachedSessionSupervisor([string]$Sid,[int]$Session,[string]$Image,$Start,
-        [scriptblock]$ReadProcesses,[scriptblock]$ReadOwner,$Selected) {
+        [scriptblock]$ReadProcesses,[scriptblock]$ReadOwner,$Selected,$DesktopProof,[scriptblock]$ReadShell) {
     $runtime=Join-Path (Split-Path $Image) 'openabstractions.exe'
     if ($Session -le 0 -or $Sid -notmatch '^S-1-5-21-' -or $Start.ProcessId -le 0 -or
         $Start.Closure -cne 'known' -or $null -eq $Start.ExitCode -or $Start.ExitCode -ne 0 -or
@@ -525,10 +613,16 @@ function Get-DetachedSessionSupervisor([string]$Sid,[int]$Session,[string]$Image
         if ($null -eq $owner) { continue }
         if ($owner -cne $Sid) { throw 'Detached supervisor has wrong principal' }
         if ($proc.ExecutablePath -ine $Image) { throw 'Detached supervisor has wrong executable' }
-        if ($proc.ParentProcessId -ne $Start.ProcessId) { throw "Detached supervisor was not launched by the observed installed start (pid=$($proc.ProcessId), parent=$($proc.ParentProcessId), expected=$($Start.ProcessId))" }
         $created=([DateTime]$proc.CreationDate).ToUniversalTime()
         if ($created -lt [DateTime]::Parse($Start.CreationUtc).ToUniversalTime() -or
             $created -gt [DateTime]::Parse($Start.FinishedUtc).ToUniversalTime()) { throw 'Detached supervisor creation is outside the installed start lifetime' }
+        if ($proc.ParentProcessId -ne $Start.ProcessId) {
+            $shell=Get-VerifiedDesktopParent $proc.ParentProcessId $Sid $Session $Start $DesktopProof $ReadShell $ReadOwner
+            if (-not $shell) { throw "Detached supervisor was not launched by the observed installed start or verified desktop shell (pid=$($proc.ProcessId), parent=$($proc.ParentProcessId), expected=$($Start.ProcessId))" }
+            if (-not $Selected) {
+                Write-Diagnostic "verified desktop shell parent PID=$($shell.Pid) image=$($shell.Image) SID=$Sid session=$Session created=$($shell.CreatedUtc)" | Out-Null
+            }
+        }
         if ($Selected -and $created -ne ([DateTime]$Selected.CreationDate).ToUniversalTime()) { throw 'Selected detached supervisor creation changed' }
         $found+=@($proc)
     }
@@ -706,13 +800,17 @@ try {
         }
     }
     $activationStart=$null
+    $activationResult=$null
     $selectedSupervisor=$null
     function Find-Supervisor {
-        if ($ActivateRuntime) { Get-DetachedSessionSupervisor $state.Sid $session $expectedImagePath $activationStart -Selected $selectedSupervisor }
+        if ($ActivateRuntime) {
+            Get-DetachedSessionSupervisor $state.Sid $session $expectedImagePath $activationStart -Selected $selectedSupervisor -DesktopProof $activationResult
+        }
         else { Find-Instance }
     }
     if ($ActivateRuntime) {
         $activationStart=Get-Content -LiteralPath (Join-Path $activation.Diagnostics 'start-process.json') -Raw | ConvertFrom-Json
+        $activationResult=Get-Content -LiteralPath (Join-Path $activation.Diagnostics 'start-result.json') -Raw | ConvertFrom-Json
         $reason=Assert-DetachedActivationReason (Get-Content -LiteralPath (Join-Path $activation.Diagnostics 'start.stderr') -Raw)
         Write-Diagnostic '0.8.0 known limit, owner decision 2026-11-19: detached owned host; SCM custody and supervisor crash auto-restart are not qualified'
         Write-Diagnostic $reason
