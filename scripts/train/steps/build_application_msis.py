@@ -134,17 +134,25 @@ def selected_sources(required, version, *, checkout=False, producer_source=None,
             errors.append(app+': '+str(error))
     if errors:
         raise ValueError('required installer source inputs: '+'; '.join(errors))
+    roles=None
+    if 'opencode' in required:
+        policy=pathlib.Path(policy_root or '.')
+        roles=helper.opencode_source_roles(policy/'npm.tsv',policy/'public-go-graph.json',version)
+        pins[roles['installer']['repository']]=roles['installer']['commit']
     if checkout:
         environment=load_owner('scripts/git_env.py','application_source_git_environment').source_git_environment()
-        for repo,commit in pins.items():
-            destination=pathlib.Path('sources')/repo.split('/',1)[1]
-            if destination.exists():
-                if destination.is_symlink() or destination.is_junction():raise ValueError('linked selected source checkout')
-                command=['git','-C',str(destination)]
-                head=subprocess.check_output([*command,'rev-parse','HEAD'],text=True,env=environment).strip()
-                dirty=subprocess.check_output([*command,'status','--porcelain=v1','--untracked-files=all'],text=True,env=environment).strip()
-                if head!=commit or dirty:raise ValueError('existing selected source checkout differs: '+repo)
-            else:helper.checkout(repo,commit,'sources',env=environment)
+        selections=[(pins,pathlib.Path('sources'))]
+        if roles:selections.append((roles['sdk_sources'],pathlib.Path('app-native/sdk-sources')))
+        for selection,root in selections:
+            for repo,commit in selection.items():
+                destination=root/repo.split('/',1)[1]
+                if destination.exists():
+                    if destination.is_symlink() or destination.is_junction():raise ValueError('linked selected source checkout')
+                    command=['git','-C',str(destination)]
+                    head=subprocess.check_output([*command,'rev-parse','HEAD'],text=True,env=environment).strip()
+                    dirty=subprocess.check_output([*command,'status','--porcelain=v1','--untracked-files=all'],text=True,env=environment).strip()
+                    if head!=commit or dirty:raise ValueError('existing selected source checkout differs: '+repo)
+                else:helper.checkout(repo,commit,root,env=environment)
     return helper,pins
 
 
@@ -342,10 +350,73 @@ def materialize_lemonade_inputs(native,helper,selected,inputs,tools):
     shutil.copyfile(evidence,inputs/'npm-acquisition.json')
 
 
-def prepare_opencode_plugin_inputs(helper, owner, inputs):
+def opencode_installer_role(helper, owner, roles):
+    selected=roles['installer']
+    helper.verify_source_checkouts({selected['repository']:selected['commit']},'sources')
+    expected=pathlib.Path('sources/abstractions/adopters/opencode/installer/build_installer.py')
+    if pathlib.Path(owner.__file__).resolve()!=expected.resolve(strict=True):
+        raise ValueError('OpenCode source differs from the selected installer owner')
+
+
+def opencode_role_inputs(helper, owner, version):
+    roles=helper.opencode_source_roles('npm.tsv','public-go-graph.json',version)
+    opencode_installer_role(helper,owner,roles)
+    sdk_root=pathlib.Path('app-native/sdk-sources')
+    helper.verify_source_checkouts(roles['sdk_sources'],sdk_root)
+    sdk=sdk_root/'abstractions/adopters/opencode'
+    measured=lambda path:{key:value for key,value in pin(path).items() if key in ('bytes','sha256')}
+    return dict(roles,installer_owner=measured(closure_file(pathlib.Path(owner.__file__).parent,'build_installer.py')),
+                sdk_cache_owner=measured(closure_file(sdk,'test/run_node_tests.py')))
+
+
+def receive_opencode_role_inputs(helper, owner, inputs, version):
+    expected=opencode_role_inputs(helper,owner,version)
+    received=json.loads(closure_file(inputs,'opencode-source-roles.json').read_bytes())
+    if received!=expected:
+        raise ValueError('OpenCode installer/SDK source role proof differs')
+    return received
+
+
+def opencode_role_inputs_from_git(helper, owner, version, *, policy_root, sources_root):
+    """Receive SDK provenance from its immutable object in a verified public repo."""
+    policy_root=ordinary_path(pathlib.Path(policy_root),kind='directory')
+    sources_root=ordinary_path(pathlib.Path(sources_root),kind='directory')
+    roles=helper.opencode_source_roles(policy_root/'npm.tsv',policy_root/'public-go-graph.json',version)
+    selected=roles['installer'];repo=ordinary_path(sources_root/'abstractions',kind='directory')
+    expected=closure_file(repo,'adopters/opencode/installer/build_installer.py')
+    if pathlib.Path(owner.__file__).resolve()!=expected.resolve():
+        raise ValueError('OpenCode source differs from the selected installer owner')
+    environment=load_owner(policy_root/'scripts/git_env.py','public_role_git_environment').source_git_environment()
+    environment.update(GIT_NO_LAZY_FETCH='1',GIT_NO_REPLACE_OBJECTS='1')
+    command=['git','--no-replace-objects','-C',str(repo)]
+    def git(*args):
+        try:return subprocess.check_output([*command,*args],env=environment,stderr=subprocess.PIPE)
+        except subprocess.CalledProcessError as error:
+            raise ValueError('selected OpenCode source object is unavailable') from error
+    if (git('rev-parse','HEAD').decode().strip()!=selected['commit'] or
+            git('status','--porcelain=v1','--untracked-files=all','--ignored=matching').strip() or
+            pathlib.Path(git('rev-parse','--show-toplevel').decode().strip()).resolve()!=repo.resolve() or
+            pathlib.Path(git('rev-parse','--path-format=absolute','--git-common-dir').decode().strip()).resolve()!=(repo/'.git').resolve()):
+        raise ValueError('selected OpenCode public source checkout differs')
+    sdk=roles['sdk_package'];relative=sdk['directory']+'/test/run_node_tests.py'
+    rows=git('ls-tree','-z',sdk['commit'],'--',relative).rstrip(b'\0').split(b'\0')
+    if len(rows)!=1 or b'\t' not in rows[0]:raise ValueError('selected SDK cache owner is missing')
+    metadata,name=rows[0].split(b'\t',1);fields=metadata.split()
+    if (len(fields)!=3 or fields[0] not in (b'100644',b'100755') or fields[1]!=b'blob' or
+            name.decode()!=relative or not re.fullmatch(b'[0-9a-f]{40}',fields[2])):
+        raise ValueError('selected SDK cache owner is not a regular Git source')
+    raw=git('cat-file','blob',fields[2].decode())
+    measured={key:value for key,value in pin(expected).items() if key in ('bytes','sha256')}
+    return dict(roles,installer_owner=measured,sdk_cache_owner=dict(bytes=len(raw),sha256=hashlib.sha256(raw).hexdigest()))
+
+
+def prepare_opencode_plugin_inputs(helper, owner, inputs, version):
     """Reuse the JavaScript producer's source-lock cache before offline bundling."""
     root=pathlib.Path.cwd()
-    packages={row['package']:root/'sources'/row['repository'].split('/')[-1]/row['directory']
+    roles=opencode_role_inputs(helper,owner,version)
+    sdk_root=root/'app-native/sdk-sources'
+    helper.verify_source_checkouts(roles['sdk_sources'],sdk_root)
+    packages={row['package']:sdk_root/row['repository'].split('/')[-1]/row['directory']
         for row in helper.exact_rows(root/'npm.tsv',('package','repository','commit','directory'))}
     pending=['@openabstractions/opencode'];linked={}
     while pending:
@@ -362,11 +433,16 @@ def prepare_opencode_plugin_inputs(helper, owner, inputs):
             if not peer_metadata.get(peer,{}).get('optional'))
         pending.extend(sorted(dep for dep in required if dep.startswith('@openabstractions/')))
     opencode=linked.pop('@openabstractions/opencode')
-    if opencode.resolve()!=pathlib.Path(owner.__file__).resolve().parent.parent:
-        raise ValueError('OpenCode cache source differs from the selected installer owner')
+    selected=roles['sdk_package']
+    expected=sdk_root/selected['repository'].split('/')[-1]/selected['directory']
+    if opencode.resolve()!=expected.resolve(strict=True):
+        raise ValueError('OpenCode cache source differs from the selected SDK source')
     cache_owner=load_owner(opencode/'test/run_node_tests.py','application_opencode_dependency_cache')
     cache_owner.prepare_dependency_cache(opencode,root,(inputs/'opencode-dependencies').resolve(),
         linked=tuple(linked[name] for name in sorted(linked)))
+    if opencode_role_inputs(helper,owner,version)!=roles:
+        raise ValueError('OpenCode source roles changed during cache preparation')
+    (inputs/'opencode-source-roles.json').write_text(json.dumps(roles,sort_keys=True)+'\n')
 
 
 def application_inputs(required, version):
@@ -385,6 +461,7 @@ def application_inputs(required, version):
             output.write('OA_APP_VCVARS='+str(vcvars.resolve())+'\n')
         return
     helper,pins=selected_sources(required,version,checkout=True)
+    helper.verify_source_checkouts(pins,'sources')
     owners=producer_owners(required)
     # Source admission precedes artifact/tool acquisition. A custom Desktop
     # cannot fall through to the historical supplier-installer receiver.
@@ -462,7 +539,7 @@ def application_inputs(required, version):
         if algorithm!='sha512':raise ValueError('selected parser lock lacks exact SHA512')
         helper.checked_download(lock['resolved'],inputs/'jsonc-parser.tgz',expected_sha512=base64.b64decode(encoded,validate=True).hex(),max_bytes=1<<20)
         shutil.copyfile(sdk/'npm'/('openabstractions-opencode-'+version+'.tgz'),inputs/'opencode-plugin.tgz')
-        prepare_opencode_plugin_inputs(helper,opencode,inputs)
+        prepare_opencode_plugin_inputs(helper,opencode,inputs,version)
     if 'comfyui' in owners:
         source=pathlib.Path(owners['comfyui'].__file__).parent/'desktop-host.json'
         shutil.copyfile(source,inputs/'desktop-host.json')
@@ -535,8 +612,10 @@ def application_native_prepare(required,version):
             'runner_image':{name:os.environ.get(name) for name in ('ImageOS','ImageVersion','RUNNER_ARCH')}},sort_keys=True)+'\n')
         return prepare_bundle_actions(set(),base,compiler)
     helper,pins=selected_sources(required,version)
+    helper.verify_source_checkouts(pins,'sources')
     owners=producer_owners(required)
     base=pathlib.Path('app-native');inputs=base/'inputs'
+    if 'opencode' in owners:receive_opencode_role_inputs(helper,owners['opencode'],inputs,version)
     roles=('cl.exe','rc.exe','cvtres.exe') if ('comfyui' in owners and native_archive_selected(owners['comfyui'])) else ('cl.exe','rc.exe')
     compiler={name:shutil.which(name) for name in roles}
     if not all(compiler.values()):raise ValueError('selected Visual Studio developer environment is required')
@@ -593,6 +672,7 @@ def application_native_prepare(required,version):
         subprocess.run([canonical_tool(sys.executable),str(pathlib.Path(owner.__file__).resolve()),*arguments],check=True)
     if helper.pinned_input_receipt(pins,'sources',inputs)!=received:
         raise ValueError('application preparation changed selected inputs')
+    if 'opencode' in owners:receive_opencode_role_inputs(helper,owners['opencode'],inputs,version)
     if official_comfy(required):
         receipt=pathlib.Path(os.environ['OA_WINDOWS_GO_SDK_RECEIPT'])
         go=json.loads(receipt.read_bytes())['go']
@@ -656,6 +736,7 @@ def native_context(required,version,*,checkout):
     if helper.pinned_input_receipt(pins,'sources',inputs)!=received:
         raise ValueError('received app native inputs differ from selected source/SDK bytes')
     owners=producer_owners(required)
+    if 'opencode' in owners:receive_opencode_role_inputs(helper,owners['opencode'],inputs,version)
     if 'comfyui' in owners and native_archive_selected(owners['comfyui']):
         native_go_tools(owners['comfyui'],helper,pins,inputs,
             expected=received['build_inputs']['desktop-inputs/go.json'])
@@ -1054,7 +1135,7 @@ def shared_closure_files(inputs,producer):
     names=['sdk-selection.json','selected-toolchain.json','app-native-tools.json']
     names += [name for name in ('host-tools.json','toolchain.cmake','opencode-plugin.tgz','desktop-host.json',
                               'backend-inputs.json','backend-manifest.json','producer-comfyui.py','file_boundary.py',
-                              'control-manifest.json','application-manifest.json') if name in producer['build_inputs']]
+                              'control-manifest.json','application-manifest.json','opencode-source-roles.json') if name in producer['build_inputs']]
     names += [name for name in producer['build_inputs'] if name.startswith(('backend/','archive-tool/','desktop-inputs/','control-stage/','control-intake/')) or name=='desktop_backend.cjs']
     return {name:closure_file(inputs,name,producer['build_inputs'][name]) for name in names}
 
@@ -1195,7 +1276,7 @@ def prepare_comfy_source_pair(owner,inputs,producer,destination):
 
 
 def received_producer_closure(app,raw,*,expected_sources,producer_source,run_id,version,intake_files=None,
-                              opencode_owner=None):
+                              opencode_owner=None,opencode_source_context=None):
     """Read original receipts only after the caller authenticates raw intake.
 
     Before archive production it measures the required originals. Credentialed
@@ -1232,6 +1313,23 @@ def received_producer_closure(app,raw,*,expected_sources,producer_source,run_id,
     for name in required_inputs:
         if name not in producer['build_inputs']:raise ValueError('required producer input was not measured: '+name)
         closure_file(inputs,name,producer['build_inputs'][name])
+    if app=='opencode':
+        if 'opencode-source-roles.json' not in shared or opencode_owner is None:
+            raise ValueError('OpenCode original source roles are missing')
+        if opencode_source_context is None:
+            helper=load_owner('scripts/app_producer_inputs.py','application_source_role_receiving')
+            roles=receive_opencode_role_inputs(helper,opencode_owner,inputs,version)
+        else:
+            if (not isinstance(opencode_source_context,dict) or
+                    set(opencode_source_context)!={'helper','policy_root','sources_root'}):
+                raise ValueError('incomplete explicit OpenCode source role context')
+            context=opencode_source_context
+            roles=opencode_role_inputs_from_git(context['helper'],opencode_owner,version,
+                policy_root=context['policy_root'],sources_root=context['sources_root'])
+            if json.loads(shared['opencode-source-roles.json'].read_bytes())!=roles:
+                raise ValueError('OpenCode installer/SDK source role proof differs')
+        if roles['installer']['commit']!=expected_sources[roles['installer']['repository']]:
+            raise ValueError('OpenCode installer source role differs from producer source')
     sdk=json.loads(shared['sdk-selection.json'].read_bytes())
     if set(sdk)!={'npm','pypi','canonical'}:raise ValueError('SDK selection closure differs')
     for kind in ('npm','pypi','canonical'):

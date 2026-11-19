@@ -58,7 +58,12 @@ POINTERS = {
     'soak': ('/schema', '/source', '/version', '/kind', '/status', '/candidate', '/measurement', '/prior_journal_note'),
     'mac_install': ('/schema', '/source', '/version', '/kind', '/status', '/candidate', '/measurement', '/disposition',
                     '/prior_journal_note'),
+    'source_binding': ('/schema', '/kind', '/version', '/cut', '/producer', '/publication', '/redist',
+                       '/wrapper_sha256', '/producer_reuse_sha256', '/observations'),
+    'producer_reuse': ('/schema', '/kind', '/publication', '/producer/source', '/producer/receipt/sha256',
+                       '/producer/wrapper/sha256', '/equality/cut'),
 }
+POINTERS['public_modules'] += ('/producer_source',)
 
 PRIOR_JOURNAL_NOTE = 'retained 0.8.0 journal has no C-77 soak or Mac receipt'
 
@@ -180,7 +185,8 @@ def safe_value(value):
             'architecture', 'platform', 'executed', 'manual', 'status', 'core', 'signatures',
             'engine', 'bundle', 'signature', 'final_signed_msis', 'staged_sha256', 'producer_source',
             'module', 'sum', 'gomodsum', 'candidate', 'assets', 'setup', 'inventory_sha256',
-            'seconds', 'process_roles', 'crashes', 'restarts', 'errors_growing', 'cleanup_verified'}
+            'seconds', 'process_roles', 'crashes', 'restarts', 'errors_growing', 'cleanup_verified',
+            'role', 'raw_sha256', 'projection_sha256'}
         result = {key: safe_value(item) for key, item in value.items() if key in allowed}
         if 'msi_members' in value:
             if not isinstance(value.get('name'), str) or not value['name'].endswith('.msi'):
@@ -207,6 +213,47 @@ def project(raw, role, evidence_url):
         raise ValueError('release evidence needs an existing public source/run URL')
     return {'role': role, 'raw_sha256': hashlib.sha256(raw).hexdigest(),
             'evidence_url': evidence_url, 'values': values, 'projection_sha256': digest(values)}
+
+
+SOURCE_ROLES = ('producer', 'prospective_modules', 'public_modules', 'soak', 'mac_install')
+
+
+def source_association(record, groups, source, version, metadata):
+    """Join already-verified receipts; serialized associations grant no authority."""
+    if not groups['source_binding']:
+        if groups['producer_reuse']:
+            raise ValueError('producer reuse observation requires its source association')
+        return None
+    if len(groups['source_binding']) != 1:
+        raise ValueError('ambiguous release source association')
+    row = groups['source_binding'][0]
+    identities = {name: row.get('/' + name) for name in ('cut', 'producer', 'publication', 'redist')}
+    expected = sorted([{key: observation[key] for key in ('role', 'raw_sha256', 'projection_sha256')}
+        for observation in record['observations'] if observation['role'] != 'source_binding'], key=lambda item: item['role'])
+    if (record['context'] != 'published' or row.get('/schema') != 1 or
+            row.get('/kind') != 'verified-release-source-association' or row.get('/version') != version or
+            any(not SOURCE.fullmatch(str(value)) for value in identities.values()) or
+            identities['redist'] != source or metadata.get('source') != source or
+            not SHA.fullmatch(str(row.get('/wrapper_sha256', ''))) or
+            len({item['role'] for item in expected}) != len(expected) or
+            not set(SOURCE_ROLES + ('public',)) <= {item['role'] for item in expected} or
+            row.get('/observations') != expected):
+        raise ValueError('release source association identity or receipt binding differs')
+    reuse = row.get('/producer_reuse_sha256')
+    if identities['producer'] != identities['publication']:
+        if len(groups['producer_reuse']) != 1:
+            raise ValueError('release producer association lacks its verified reuse binding')
+        bound = groups['producer_reuse'][0]
+        hashes = {item['role']: item['raw_sha256'] for item in expected}
+        if (reuse != hashes['producer_reuse'] or bound.get('/schema') != 1 or
+                bound.get('/kind') != 'qualified-producer-reuse' or bound.get('/publication') != identities['publication'] or
+                bound.get('/producer/source') != identities['producer'] or bound.get('/equality/cut') != identities['cut'] or
+                bound.get('/producer/receipt/sha256') != hashes['prospective_modules'] or
+                bound.get('/producer/wrapper/sha256') != row['/wrapper_sha256']):
+            raise ValueError('release producer association differs from its original qualified receipts')
+    elif reuse is not None or groups['producer_reuse']:
+        raise ValueError('unchanged producer has an unexpected reuse association')
+    return identities
 
 
 def derive(record):
@@ -237,6 +284,7 @@ def derive(record):
         raise ValueError('invalid producer release version')
     if source is not None and not SOURCE.fullmatch(str(source)):
         raise ValueError('invalid producer source')
+    identities = source_association(record, groups, source, version, metadata)
     module_qualification = {'prospective': 'pending', 'public': 'pending'}
     module_hashes = []
     for role, kind, field in (('prospective_modules', 'prospective-module-qualification', 'prospective'),
@@ -247,12 +295,18 @@ def derive(record):
             continue
         row = groups[role][0]
         modules = row.get('/modules', [])
-        if (row.get('/schema') != 1 or row.get('/source') != source or row.get('/version') != version or
+        expected_source = identities['producer' if field == 'prospective' else 'publication'] if identities else source
+        if (row.get('/schema') != 1 or row.get('/source') != expected_source or row.get('/version') != version or
                 row.get('/kind') != kind or row.get('/status') != 'pass' or
                 row.get('/checksum_database') != 'sum.golang.org' or not modules or
                 not SHA.fullmatch(str(row.get('/split_outputs_sha256', ''))) or
                 (field == 'public' and row.get('/checksum_exclusions') != [])):
             raise ValueError('module qualification source, identity or checksum policy differs')
+        if identities and field == 'public':
+            producer_source = row.get('/producer_source', row.get('/source'))
+            if (producer_source != identities['producer'] or
+                    row['/split_outputs_sha256'] != groups['prospective_modules'][0].get('/split_outputs_sha256')):
+                raise ValueError('public module producer or qualification binding differs')
         if field == 'prospective':
             module_hashes = modules
         elif not module_hashes or modules != module_hashes:
@@ -351,9 +405,11 @@ def derive(record):
             'module_qualification': module_qualification,
             'version': version, 'download_url': url, 'assets': assets,
             'platforms': platforms, 'evidence_links': sorted(set(evidence))}
+    if identities:
+        result['source_identities'] = identities
     current = version and tuple(map(int, version.split('.'))) >= (0, 8, 1)
     if current or groups['soak'] or groups['mac_install']:
-        result['candidate_qualification'] = candidate_qualification(groups, source, version, assets,
+        result['candidate_qualification'] = candidate_qualification(groups, identities['cut'] if identities else source, version, assets,
             required=bool(current and record['context'] == 'published'))
     return result
 

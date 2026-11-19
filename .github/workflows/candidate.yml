@@ -3226,7 +3226,7 @@ jobs:
           sudo chown -R "$account:$account" "$home/package" "$home/fixtures"
           sudo loginctl enable-linger "$account"
           sudo systemctl start "user@$uid.service"
-          user() { sudo -u "$account" env HOME="$home" XDG_RUNTIME_DIR="/run/user/$uid" DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$uid/bus" "$@"; }
+          user() { sudo -u "$account" env HOME="$home" XDG_CONFIG_HOME="$home/.config" XDG_RUNTIME_DIR="/run/user/$uid" DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$uid/bus" "$@"; }
           download_installed_fixture() {
             fixture_url="https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/${GITHUB_SHA}/posix/README.md"
             fixture_sha256=$(sha256sum posix/README.md)
@@ -3244,11 +3244,13 @@ jobs:
             [ "$(stat -c '%F %u %a' "$expected")" = "directory $uid 700" ] || { echo 'Private account runtime directory unavailable'; return 1; }
             # Hosted Ubuntu globally exports the runner's XDG_RUNTIME_DIR (runner-images#14649).
             # Correct only this new account's manager; direct sudo env does not reach services.
+            # Keep command and service config routing in this account's own home too.
             before=$(user timeout --kill-after=2s 10s systemctl --user show-environment | sed -n 's/^XDG_RUNTIME_DIR=//p') || return 1
             printf 'Disposable manager runtime directory: %s -> %s\n' "$before" "$expected"
-            user timeout --kill-after=2s 10s systemctl --user set-environment "XDG_RUNTIME_DIR=$expected" || return 1
-            after=$(user timeout --kill-after=2s 10s systemctl --user show-environment | sed -n 's/^XDG_RUNTIME_DIR=//p') || return 1
-            [ "$after" = "$expected" ] || { echo 'Disposable manager runtime environment was not established'; return 1; }
+            user timeout --kill-after=2s 10s systemctl --user set-environment "XDG_RUNTIME_DIR=$expected" "XDG_CONFIG_HOME=$home/.config" || return 1
+            after=$(user timeout --kill-after=2s 10s systemctl --user show-environment | sed -n '/^XDG_RUNTIME_DIR=/p; /^XDG_CONFIG_HOME=/p') || return 1
+            [ "$(printf '%s\n' "$after" | sed -n 's/^XDG_RUNTIME_DIR=//p')" = "$expected" ] || { echo 'Disposable manager runtime environment was not established'; return 1; }
+            [ "$(printf '%s\n' "$after" | sed -n 's/^XDG_CONFIG_HOME=//p')" = "$home/.config" ] || { echo 'Disposable manager config environment was not established'; return 1; }
           }
           {
             configure_disposable_runtime_environment

@@ -11,7 +11,7 @@ import io
 import importlib.util
 import json
 import os
-from pathlib import Path
+from pathlib import Path, PurePosixPath, PureWindowsPath
 import re
 import shutil
 import subprocess
@@ -268,15 +268,64 @@ MATRIX_PATH = 'docs/results/MATRIX.txt'
 CHARTER_DERIVED_PATHS = frozenset((CATALOG_PATH, J_RECORD_PATH, MATRIX_PATH))
 
 
-def pinned_input_receipt(pins, source_root, input_root):
-    """Keep actual producer inputs outside its immutable shipped source pair."""
+def opencode_source_roles(npm_pins, graph_path, version):
+    """Select the installer from the release graph and SDK code from npm pins."""
+    rows = exact_rows(npm_pins, ('package', 'repository', 'commit', 'directory'))
+    packages = [row for row in rows if row['package'] == '@openabstractions/opencode']
+    if (len(packages) != 1 or packages[0]['repository'] != CHARTER
+            or packages[0]['directory'] != 'adopters/opencode'):
+        raise ValueError('OpenCode SDK source row differs')
+    sdk = {}
+    if len({row['package'] for row in rows}) != len(rows):
+        raise ValueError('duplicate SDK source package')
+    for row in rows:
+        repo, commit = row['repository'], row['commit']
+        if (not re.fullmatch(r'openabstractions/[A-Za-z0-9_.-]+', repo)
+                or not COMMIT.fullmatch(commit) or (repo in sdk and sdk[repo] != commit)
+                or '\\' in row['directory'] or PurePosixPath(row['directory']).is_absolute()
+                or PureWindowsPath(row['directory']).drive or PureWindowsPath(row['directory']).root
+                or any(part in ('', '.', '..') for part in row['directory'].split('/'))):
+            raise ValueError('conflicting or invalid SDK source pin')
+        sdk[repo] = commit
+    raw = Path(graph_path).read_bytes()
+    graph = json.loads(raw)
+    if (graph.get('schema') != 2 or graph.get('version') != 'v' + version
+            or not COMMIT.fullmatch(str(graph.get('source', '')))
+            or not isinstance(graph.get('modules'), list)
+            or any(not isinstance(row, dict) for row in graph['modules'])):
+        raise ValueError('installer source requires the release public graph')
+    commits = {row.get('commit') for row in graph['modules']
+               if row.get('repository') == 'https://github.com/' + CHARTER}
+    if len(commits) != 1 or not COMMIT.fullmatch(str(next(iter(commits)))):
+        raise ValueError('release graph has no unique installer source')
+    return {'schema': 1, 'installer': {'repository': CHARTER, 'commit': commits.pop(),
+            'directory': 'adopters/opencode'}, 'sdk_sources': sdk, 'sdk_package': packages[0],
+            'npm_table': {'bytes': Path(npm_pins).stat().st_size, 'sha256': sha_file(npm_pins)},
+            'authority': {'source': graph['source'], 'version': graph['version'],
+                          'bytes': len(raw), 'sha256': hashlib.sha256(raw).hexdigest()}}
+
+
+def verify_source_checkouts(pins, source_root):
+    """Authenticate each source role independently before consuming its code."""
+    from git_env import source_git_environment
     for repo, commit in pins.items():
         root = Path(source_root) / repo.split('/', 1)[1]
-        head = subprocess.check_output(['git', '-C', str(root), 'rev-parse', 'HEAD'], text=True).strip()
+        for path in (root, *root.absolute().parents):
+            if path.is_symlink() or path.is_junction():
+                raise ValueError('linked producer source checkout')
+        if not COMMIT.fullmatch(str(commit)):
+            raise ValueError('invalid producer source commit')
+        env = source_git_environment()
+        head = subprocess.check_output(['git', '-C', str(root), 'rev-parse', 'HEAD'], text=True, env=env).strip()
         dirty = subprocess.check_output(['git', '-C', str(root), 'status', '--porcelain=v1',
-                                         '--untracked-files=all'], text=True).strip()
+                                         '--untracked-files=all'], text=True, env=env).strip()
         if head != commit or dirty:
             raise ValueError('producer source checkout differs: ' + repo)
+
+
+def pinned_input_receipt(pins, source_root, input_root):
+    """Keep actual producer inputs outside its immutable shipped source pair."""
+    verify_source_checkouts(pins, source_root)
     files = {}
     for path in sorted(Path(input_root).rglob('*')):
         relative = path.relative_to(input_root)
