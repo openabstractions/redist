@@ -124,6 +124,30 @@ def untag(el):
 UNREGISTER_CONDITION = 'ALLUSERS AND REMOVE="ALL" AND NOT UPGRADINGPRODUCTCODE'
 
 
+def check_panel_upgrade_registration(root):
+    """Only reassert the installed Panel after a predecessor's shared-key removal."""
+    actions = {el.get('Id'): el for el in root.iter() if untag(el) == 'CustomAction'}
+    sequence = {el.get('Action'): el for el in root.iter() if untag(el) == 'Custom'}
+    bad = []
+    anchor = 'StartUserRuntime'
+    for scope, hive in (('Machine', 'HKLM'), ('User', 'HKCU')):
+        condition = (('ALLUSERS' if scope == 'Machine' else 'NOT ALLUSERS') +
+                     ' AND WIX_UPGRADE_DETECTED AND NOT REMOVE AND NOT UPGRADINGPRODUCTCODE AND ((&Tools=3) OR (!Tools=3))')
+        for value, kind, data in (('Program', 'REG_SZ', '"[#panel.exe]"'), ('Installed', 'REG_DWORD', '1')):
+            name = 'Restore' + scope + 'Panel' + value
+            expected = {'Id': name, 'Directory': 'System64Folder', 'Execute': 'immediate', 'Return': 'check',
+                        'ExeCommand': f'"[System64Folder]reg.exe" ADD "{hive}\\Software\\OpenAbstractions\\Abstraction\\Panel" /v {value.lower()} /t {kind} /d {data} /f /reg:64'}
+            action, row = actions.get(name), sequence.get(name)
+            if (action is None or action.attrib != expected or row is None or
+                    row.attrib != {'Action': name, 'After': anchor, 'Condition': condition}):
+                bad.append(f'abstraction.wxs: {name} must restore only the current Panel in its exact scope after {anchor}')
+            anchor = name
+    presenter = sequence.get('StartMachinePresenter')
+    if presenter is None or presenter.get('After') != anchor:
+        bad.append('abstraction.wxs: machine presenter must follow checked Panel registration restoration')
+    return bad
+
+
 def check_supervisor_removal(root):
     actions = {el.get("Id"): el for el in root.iter() if untag(el) == "CustomAction"}
     action = actions.get("UnregisterSupervisor")
@@ -644,6 +668,7 @@ def main():
     bad.extend(check_sandbox_roots(root))
     bad.extend(check_engine_unlock(root, text))
     bad.extend(check_upgrade_shutdown(root))
+    bad.extend(check_panel_upgrade_registration(root))
     bad.extend(check_early_upgrade_bundle(root))
     bad.extend(check_elevated_scope(root))
     try:

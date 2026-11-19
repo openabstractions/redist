@@ -1611,7 +1611,7 @@ def application_policy_helpers():
     return validate_public_admission, helper
 
 
-def application_source_policy(checkout, source, version):
+def application_source_policy(checkout, source, version, *, producer_source=None):
     """Read release policy data from the independently selected local redist commit."""
     if not re.fullmatch('[0-9a-f]{40}', source or ''):
         raise ValueError('Catalog policy requires an exact source commit')
@@ -1633,7 +1633,7 @@ def application_source_policy(checkout, source, version):
                 raise ValueError('Catalog source policy file exceeds its bound')
             (policy_root / name).write_bytes(read('show', source + ':' + name))
         required = owner.installer_scope(version, policy_root=policy_root, validate=validate)
-        _, sources = owner.selected_sources(required, version, producer_source=source, policy_root=policy_root, helper=helper, validate=validate)
+        _, sources = owner.selected_sources(required, version, producer_source=producer_source or source, policy_root=policy_root, helper=helper, validate=validate)
     return required, sources
 
 
@@ -1669,13 +1669,25 @@ def _application_file_state(path, *, read_limit=None):
 
 
 def retained_application_context(root, context_path, *, source, run_id, artifact_id, artifact_name,
-                                 artifact_digest, artifact_attempt, version, required, sources):
+                                 artifact_digest, artifact_attempt, version, required, sources,
+                                 producer_source=None, producer_run_id=None, producer_run_attempt=None):
     """Receive prior mandatory signer observations inside exact API-admitted bytes.
 
     The reviewed DAG supplies the enclosing descriptor independently. Source
     selection is recomputed from this candidate; JSON supplies no authority.
     Current native/container verification remains mandatory at each consumer.
+    An explicit original source/run/attempt binds retained context independently
+    of the enclosing API artifact; omission preserves the same-source rule.
     """
+    explicit_producer = any(value is not None for value in
+                            (producer_source, producer_run_id, producer_run_attempt))
+    if explicit_producer:
+        if (not isinstance(producer_source,str) or not re.fullmatch('[0-9a-f]{40}',producer_source)
+                or any(type(value) is not int or value < 1 for value in
+                       (producer_run_id,producer_run_attempt))):
+            raise ValueError('original application producer identity requires exact source/run/attempt')
+    else:
+        producer_source,producer_run_id = source,run_id
     root, context_path = Path(root), Path(context_path)
     if root.is_symlink() or root.is_junction() or getattr(root.lstat(), 'st_file_attributes', 0) & 0x400:
         raise ValueError('application context extraction root is linked')
@@ -1735,14 +1747,16 @@ def retained_application_context(root, context_path, *, source, run_id, artifact
         raise ValueError('consumed application context bytes differ from admitted pin')
     context = json.loads(context_bytes)
     if (not isinstance(context, dict) or set(context) != {'version', 'source', 'run_id', 'run_attempt', 'sources', 'expected_producers'}
-            or context['version'] != version or context['source'] != source or context['run_id'] != run_id
+            or context['version'] != version or context['source'] != producer_source or context['run_id'] != producer_run_id
             or type(context['run_id']) is not int or type(context['run_attempt']) is not int or context['run_attempt'] < 1
+            or (explicit_producer and context['run_attempt'] != producer_run_attempt)
             or context['sources'] != sources or not isinstance(context['expected_producers'], dict)
             or set(context['expected_producers']) != set(required)):
         raise ValueError('retained application context differs from current selected source policy')
     for binding in context['expected_producers'].values():
-        if (not isinstance(binding, dict) or binding.get('source') != source or binding.get('run_id') != run_id
-                or binding.get('run_attempt') != context['run_attempt']):
+        if (not isinstance(binding, dict) or binding.get('source') != producer_source
+                or type(binding.get('run_id')) is not int or type(binding.get('run_attempt')) is not int
+                or binding.get('run_id') != producer_run_id or binding.get('run_attempt') != context['run_attempt']):
             raise ValueError('retained application binding differs from original producer identity')
     for name, state in observed.items():
         path = msi_extracted_member(root, 'SourceDir\\' + name.replace('/', '\\'))
@@ -1750,8 +1764,8 @@ def retained_application_context(root, context_path, *, source, run_id, artifact
             raise ValueError('application context member changed during admission')
     if _application_file_state(intake_path, read_limit=8 << 20) != intake_bytes:
         raise ValueError('application context intake changed during admission')
-    return (dict(expected_producers=context['expected_producers'], source=source,
-                 run_id=run_id, run_attempt=context['run_attempt']),
+    return (dict(expected_producers=context['expected_producers'], source=producer_source,
+                 run_id=producer_run_id, run_attempt=context['run_attempt']),
             dict(sha256=context_digest, bytes=context_size))
 
 
@@ -2062,6 +2076,32 @@ def restore_bundle_engine(engine, expected):
     path.write_bytes(data)
 
 
+def _bundle_signature_identity(proof):
+    fields = {'name','sha256','bytes','certificate','chain','timestamp_certificate_sha256',
+              'file_digest','timestamp_digest','timestamp','verification','tool_output_sha256'}
+    if (not isinstance(proof,dict) or set(proof)!=fields
+            or not isinstance(proof['tool_output_sha256'],str)
+            or not re.fullmatch('[0-9a-f]{64}',proof['tool_output_sha256'])):
+        raise ValueError('invalid bundle signature proof schema')
+    # Fresh native verification remains mandatory. Verbose SignTool stdout
+    # includes temporary extraction paths; retain its hash as diagnostics only.
+    identity = {key:value for key,value in proof.items() if key!='tool_output_sha256'}
+    try:
+        return json.dumps(identity,sort_keys=True,separators=(',',':'),allow_nan=False)
+    except (TypeError,ValueError) as error:
+        raise ValueError('invalid bundle signature proof values') from error
+
+
+def _bundle_catalogue_identity(proof):
+    if not isinstance(proof,dict) or set(proof)!={'package','signature','preflight','source','run_id','run_attempt'}:
+        raise ValueError('invalid bundle Catalog proof schema')
+    identity = dict(proof,**{key:_bundle_signature_identity(proof[key]) for key in ('signature','preflight')})
+    try:
+        return json.dumps(identity,sort_keys=True,separators=(',',':'),allow_nan=False)
+    except (TypeError,ValueError) as error:
+        raise ValueError('invalid bundle Catalog proof values') from error
+
+
 def verify_bundle_actions(receipt,chain,ba,policy,signtool,*,catalog_maintenance=False):
     """Read the signed native BA payload, separate from application package roles."""
     owner=bundle_owner();expected=receipt.get('bootstrapper_native')
@@ -2257,7 +2297,7 @@ def check_bundle(root, policy, signtool, *, signing, policy_sha256, expected_pro
             catalog_pin = file_pin | catalogue
             catalog_proof = dict(package=catalog_pin, signature=catalog_signature,
                                  preflight=proof, source=source, run_id=run_id, run_attempt=run_attempt)
-            if not signing and receipt.get('catalog_opencode') != catalog_proof:
+            if not signing and _bundle_catalogue_identity(receipt.get('catalog_opencode')) != _bundle_catalogue_identity(catalog_proof):
                 raise ValueError('signed Setup Catalog proof differs from native verification')
     installed = None
     installed_paths = None
@@ -2287,7 +2327,7 @@ def check_bundle(root, policy, signtool, *, signing, policy_sha256, expected_pro
         ba_proof=verify_bundle_actions(receipt,chain,Path(temporary)/'ba',policy,signtool,
             catalog_maintenance=catalog_maintenance)
         if ba_proof is not None:
-            if not signing and receipt.get('bootstrapper_native_signature')!=ba_proof:
+            if not signing and _bundle_signature_identity(receipt.get('bootstrapper_native_signature'))!=_bundle_signature_identity(ba_proof):
                 raise ValueError('bundle BA native signature differs from final receipt')
             receipt['bootstrapper_native_signature']=ba_proof
         upgrade_path = None
@@ -2482,15 +2522,20 @@ def setup_catalog_transition_inputs(previous, candidate, extension, runtime, pan
 
 
 def _admit_setup_catalog_artifact(directory, *, context, policy_source, source, run_id, run_attempt,
-                                  version, artifact_id, digest, attempt):
+                                  version, artifact_id, digest, attempt,
+                                  producer_source=None, producer_run_id=None, producer_run_attempt=None):
     if context.parent.resolve() != directory.resolve():
         raise ValueError('Catalog transition context must belong to its verified Setup root')
-    required, sources = application_source_policy(policy_source, source, version)
+    required, sources = application_source_policy(policy_source, source, version,
+        **({'producer_source':producer_source} if producer_source is not None else {}))
     digest = digest.removeprefix('sha256:')
     binding, _ = retained_application_context(directory, context, source=source, run_id=run_id,
         artifact_id=artifact_id, artifact_name='setup-bundle-' + str(attempt),
-        artifact_digest=digest, artifact_attempt=attempt, version=version, required=required, sources=sources)
-    if type(run_attempt) is not int or binding['run_attempt'] != run_attempt:
+        artifact_digest=digest, artifact_attempt=attempt, version=version, required=required, sources=sources,
+        producer_source=producer_source,producer_run_id=producer_run_id,producer_run_attempt=producer_run_attempt)
+    if (type(run_attempt) is not int or run_attempt < 1
+            or (producer_source is not None and run_attempt != attempt)
+            or binding['run_attempt'] != (producer_run_attempt if producer_source is not None else run_attempt)):
         raise ValueError('Catalog transition producer attempt differs from retained context')
     return binding, dict(id=artifact_id, sha256=digest, attempt=attempt)
 
@@ -2528,7 +2573,7 @@ def opencode_catalog_extension(document, version):
 def signed_setup_upgrade_opencode(root, policy, signtool, *, policy_sha256, candidate_intake, catalog_path):
     """Receive the signed candidate Catalog without requiring an earlier Catalog."""
     binding, artifact = _admit_setup_catalog_artifact(root, **candidate_intake)
-    if binding['run_attempt'] != artifact['attempt']:
+    if candidate_intake.get('producer_source') is None and binding['run_attempt'] != artifact['attempt']:
         raise ValueError('signed Setup upgrade requires the exact producer attempt')
     catalog = _application_file_state(file_boundary.ordinary_path(catalog_path, kind='file'), read_limit=1 << 20)
     document = json.loads(catalog)
@@ -2546,7 +2591,7 @@ def signed_setup_upgrade_opencode(root, policy, signtool, *, policy_sha256, cand
     chain = owner.read_chain_context(receipt['chain_context'], root)
     distribution = bundle_distribution_chain(Path(root), owner, chain)
     host = next(row['host'] for row in distribution['apps'] if row['id'] == 'opencode')
-    host_pin = setup_file_pin(member(root, PurePosixPath(host['file']).name))
+    host_pin = setup_file_pin(member(root, PureWindowsPath(host['file']).name))
     if any(host_pin[key] != host[key] for key in ('sha256', 'bytes')):
         raise ValueError('signed Setup upgrade OpenCode Desktop host changed after verification')
     files = validate_expected_payload(binding['expected_producers']['opencode']['expected_payload'])['files']
@@ -2562,7 +2607,7 @@ def signed_setup_upgrade_opencode(root, policy, signtool, *, policy_sha256, cand
             raise ValueError(f'signed OpenCode MSI lacks exact {role} File identity')
         members[role] = rows[0]
     plugin_members = [row for row in files if row['path'].startswith(prefix + plugin)]
-    return dict(source=binding['source'], run_id=binding['run_id'], run_attempt=binding['run_attempt'],
+    return dict(source=candidate_intake['source'], run_id=candidate_intake['run_id'], run_attempt=candidate_intake['run_attempt'],
         artifact=artifact, version=version, host=host_pin, members=members,
         plugin_members=plugin_members,
         bundle={key: receipt['bundle'][key] for key in ('sha256', 'bytes', 'name')},
@@ -3300,6 +3345,9 @@ def phase_main(argv):
     parser.add_argument('--github-env', type=Path)
     parser.add_argument('--producer-bindings', type=Path)
     parser.add_argument('--producer-context', type=Path)
+    parser.add_argument('--producer-source')
+    parser.add_argument('--producer-run-id', type=int)
+    parser.add_argument('--producer-run-attempt', type=int)
     parser.add_argument('--artifact-id', type=int)
     parser.add_argument('--artifact-name')
     parser.add_argument('--artifact-digest')
@@ -3366,6 +3414,8 @@ def phase_main(argv):
     if (args.native_family or args.native_roster) and args.operation not in ('check-native-source', 'sign-pe', 'verify-pe', 'verify-language', 'verify-msis', 'sign-msi', 'provider-images'):
         parser.error('native family does not belong to this phase')
     native_member_names(args.native_family)
+    if any(value is not None for value in (args.producer_source,args.producer_run_id,args.producer_run_attempt)) and not args.producer_context:
+        parser.error('original producer identity requires an admitted producer context')
     admitted_context_pin = None
     def producer_context():
         nonlocal admitted_context_pin
@@ -3375,11 +3425,13 @@ def phase_main(argv):
             owner = application_context_policy()
             version = args.version.removeprefix('v') if args.version else None
             required = owner.installer_scope(version)
-            _, sources = owner.selected_sources(required, version, producer_source=args.source)
+            _, sources = owner.selected_sources(required, version, producer_source=args.producer_source or args.source)
             received, admitted_context_pin = retained_application_context(args.producer_context.parent, args.producer_context,
                 source=args.source, run_id=args.run_id, artifact_id=args.artifact_id,
                 artifact_name=args.artifact_name, artifact_digest=(args.artifact_digest or '').removeprefix('sha256:'),
-                artifact_attempt=args.artifact_attempt, version=version, required=required, sources=sources)
+                artifact_attempt=args.artifact_attempt, version=version, required=required, sources=sources,
+                producer_source=args.producer_source,producer_run_id=args.producer_run_id,
+                producer_run_attempt=args.producer_run_attempt)
             return received
         return dict(expected_producers=json.loads(args.producer_bindings.read_bytes()) if args.producer_bindings else None,
                     source=args.source or os.environ.get('CANDIDATE_SHA'),
@@ -3439,7 +3491,9 @@ def phase_main(argv):
             digest=args.previous_artifact_digest, attempt=args.previous_artifact_attempt)
         candidate = dict(context=args.producer_context, policy_source=args.policy_source, source=args.source,
             run_id=args.run_id, run_attempt=args.run_attempt, version=args.version, artifact_id=args.artifact_id,
-            digest=args.artifact_digest, attempt=args.artifact_attempt)
+            digest=args.artifact_digest, attempt=args.artifact_attempt,
+            producer_source=args.producer_source,producer_run_id=args.producer_run_id,
+            producer_run_attempt=args.producer_run_attempt)
         value = _admit_and_verify_setup_catalog_transition(args.previous_root, root, policy, args.signtool,
             policy_sha256=hashlib.sha256(args.policy.read_bytes()).hexdigest(),
             previous_intake=previous, candidate_intake=candidate, catalog_path=args.catalog_document,

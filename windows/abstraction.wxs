@@ -328,6 +328,25 @@
          host. -->
     <CustomAction Id="RegisterSupervisorAfterRemoval" FileRef="openabstractions.exe" ExeCommand="host register"
                   Execute="immediate" Return="check" />
+    <?if $(var.Panel) = yes ?>
+    <!-- 0.4's retired tray component deletes the shared Panel key during its
+         late uninstall, after this version wrote its registry values. Restore
+         only this installation's values after that removal, in its real scope.
+         Like RegisterSupervisorAfterRemoval these checked immediate actions
+         use the token that started msiexec; machine installation is elevated. -->
+    <CustomAction Id="RestoreMachinePanelProgram" Directory="System64Folder"
+                  ExeCommand="&quot;[System64Folder]reg.exe&quot; ADD &quot;HKLM\Software\OpenAbstractions\Abstraction\Panel&quot; /v program /t REG_SZ /d &quot;[#panel.exe]&quot; /f /reg:64"
+                  Execute="immediate" Return="check" />
+    <CustomAction Id="RestoreMachinePanelInstalled" Directory="System64Folder"
+                  ExeCommand="&quot;[System64Folder]reg.exe&quot; ADD &quot;HKLM\Software\OpenAbstractions\Abstraction\Panel&quot; /v installed /t REG_DWORD /d 1 /f /reg:64"
+                  Execute="immediate" Return="check" />
+    <CustomAction Id="RestoreUserPanelProgram" Directory="System64Folder"
+                  ExeCommand="&quot;[System64Folder]reg.exe&quot; ADD &quot;HKCU\Software\OpenAbstractions\Abstraction\Panel&quot; /v program /t REG_SZ /d &quot;[#panel.exe]&quot; /f /reg:64"
+                  Execute="immediate" Return="check" />
+    <CustomAction Id="RestoreUserPanelInstalled" Directory="System64Folder"
+                  ExeCommand="&quot;[System64Folder]reg.exe&quot; ADD &quot;HKCU\Software\OpenAbstractions\Abstraction\Panel&quot; /v installed /t REG_DWORD /d 1 /f /reg:64"
+                  Execute="immediate" Return="check" />
+    <?endif?>
     <!-- Delete the registration and its instances before the payload goes, for
          a real uninstall only: under UPGRADINGPRODUCTCODE a successor owns the
          shared service name from RegisterSupervisorAfterRemoval onwards. -->
@@ -486,7 +505,15 @@
       <Custom Action="StartUserRuntime" After="RegisterSupervisorAfterRemoval"
               Condition="NOT ALLUSERS AND NOT (REMOVE=&quot;ALL&quot;) AND NOT UPGRADINGPRODUCTCODE" />
       <?if $(var.Panel) = yes ?>
-      <Custom Action="StartMachinePresenter" After="StartUserRuntime"
+      <Custom Action="RestoreMachinePanelProgram" After="StartUserRuntime"
+              Condition="ALLUSERS AND WIX_UPGRADE_DETECTED AND NOT REMOVE AND NOT UPGRADINGPRODUCTCODE AND ((&amp;Tools=3) OR (!Tools=3))" />
+      <Custom Action="RestoreMachinePanelInstalled" After="RestoreMachinePanelProgram"
+              Condition="ALLUSERS AND WIX_UPGRADE_DETECTED AND NOT REMOVE AND NOT UPGRADINGPRODUCTCODE AND ((&amp;Tools=3) OR (!Tools=3))" />
+      <Custom Action="RestoreUserPanelProgram" After="RestoreMachinePanelInstalled"
+              Condition="NOT ALLUSERS AND WIX_UPGRADE_DETECTED AND NOT REMOVE AND NOT UPGRADINGPRODUCTCODE AND ((&amp;Tools=3) OR (!Tools=3))" />
+      <Custom Action="RestoreUserPanelInstalled" After="RestoreUserPanelProgram"
+              Condition="NOT ALLUSERS AND WIX_UPGRADE_DETECTED AND NOT REMOVE AND NOT UPGRADINGPRODUCTCODE AND ((&amp;Tools=3) OR (!Tools=3))" />
+      <Custom Action="StartMachinePresenter" After="RestoreUserPanelInstalled"
               Condition="ALLUSERS AND NOT REMOVE AND NOT UPGRADINGPRODUCTCODE AND ((&amp;Tools=3) OR (!Tools=3))" />
       <?endif?>
     </InstallExecuteSequence>

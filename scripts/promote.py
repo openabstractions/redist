@@ -955,7 +955,8 @@ def unpack_verified(blob, digest, destination, run, version, *, producer_attempt
                     or (item.external_attr >> 16) & 0o170000 == 0o120000):
                 raise ValueError('artifact entries must be ordinary root-level files')
         for name in ('candidate.json', 'NOTES.md', 'SHA256SUMS'):
-            if archive.getinfo(name).file_size > 1024 * 1024:
+            limit = 16 << 20 if name == 'candidate.json' else 1 << 20
+            if archive.getinfo(name).file_size > limit:
                 raise ValueError('verified release metadata is too large: ' + name)
         metadata = json.loads(archive.read('candidate.json'))
         expected = {'schema': 1, 'source': run['head_sha'], 'version': version,

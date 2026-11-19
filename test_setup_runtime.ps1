@@ -28,7 +28,7 @@ By default requires a real unelevated interactive user profile. Windows may ask 
 approve UAC for installation and removal. Existing OA state is refused. The exact
 bundle and owning fixture/module bytes are checked before any installer execution.
 An incomplete or failed journey remains failed; its finally block attempts exact
-bundle removal and retains the installer/removal logs. No account is created.
+ bundle and exact installed core removal and retains their logs. No account is created.
 HostedElevated requires a disposable GitHub-hosted Windows runner, an elevated
 Administrator token and Valid Authenticode before dispatch. It proves elevated
 headless runner acceptance; standard-user MSI acceptance remains separate. Hosted
@@ -52,7 +52,7 @@ $bundle = [IO.Path]::GetFullPath($BundlePath)
 $fixture = Join-Path $PSScriptRoot 'test_user_runtime.ps1'
 $module = Join-Path $PSScriptRoot 'OAFixture.psm1'
 New-Item -ItemType Directory -Force -Path $taskRoot | Out-Null
-foreach ($name in @('receipt.json','setup-install.log','setup-uninstall.log')) {
+foreach ($name in @('receipt.json','setup-install.log','setup-uninstall.log','core-uninstall.log')) {
     if (Test-Path -LiteralPath (Join-Path $taskRoot $name)) { throw 'Refusing to overwrite an existing Setup attempt; reconcile its retained evidence' }
 }
 $started = [DateTime]::UtcNow
@@ -99,8 +99,41 @@ function Assert-MachineSupervisorConfiguration([string]$Configuration, [string]$
     if ($RecoveryFlag -notmatch 'FAILURE_ACTIONS_ON_NONCRASH_FAILURES\s*:\s*TRUE') { throw 'Supervisor non-crash failure recovery is absent' }
 }
 
+function Remove-SetupPackages([string]$Bundle, [string]$Version, [string]$ProductCode, [string]$Directory, [Collections.IDictionary]$Report) {
+    $removeInfo=New-Object Diagnostics.ProcessStartInfo
+    $removeInfo.FileName=$Bundle
+    $removeInfo.Arguments='-uninstall -quiet -norestart -log "' + (Join-Path $Directory 'setup-uninstall.log') + '"'
+    $removeInfo.WorkingDirectory=$Directory
+    $removed=Invoke-FixtureProcess $removeInfo 600
+    $Report.uninstall_exit=$removed.ExitCode
+    [IO.File]::WriteAllText((Join-Path $Directory 'setup-uninstall.stdout'),$removed.Output,[Text.UTF8Encoding]::new($false))
+    [IO.File]::WriteAllText((Join-Path $Directory 'setup-uninstall.stderr'),$removed.Diagnostics,[Text.UTF8Encoding]::new($false))
+    if ($removed.ExitCode -ne 0) { throw "Setup uninstall exited $($removed.ExitCode)" }
+    # The visible, permanent core has its own platform removal owner. Recheck
+    # the exact product admitted after this clean install before invoking it.
+    if ($ProductCode -cnotmatch '^\{[0-9A-F]{8}(-[0-9A-F]{4}){3}-[0-9A-F]{12}\}$') { throw 'Exact installed core ProductCode required for removal' }
+    $products=@(Get-InstalledProducts -Context 4 | Where-Object { $_.ProductName -in @('OpenAbstractions','Abstraction') -or $_.ProductCode -eq $ProductCode })
+    if ($products.Count -ne 1 -or $products[0].ProductCode -cne $ProductCode -or $products[0].ProductName -notin @('OpenAbstractions','Abstraction') -or
+        $products[0].State -ne 5 -or $products[0].Context -ne 4 -or $products[0].UserSid -or $products[0].VersionString -cne $Version) {
+        throw 'Exact installed machine core changed before platform removal'
+    }
+    $log=Join-Path $Directory 'core-uninstall.log'
+    $coreInfo=New-Object Diagnostics.ProcessStartInfo
+    $coreInfo.FileName=Join-Path $env:SystemRoot 'System32\msiexec.exe'
+    # Basic UI permits Windows Installer's normal elevation consent prompt.
+    $coreInfo.Arguments='/x ' + $ProductCode + ' /passive /norestart /l*v "' + $log + '"'
+    $coreInfo.WorkingDirectory=$Directory
+    $coreRemoved=Invoke-FixtureProcess $coreInfo 600
+    $Report.core_uninstall_exit=$coreRemoved.ExitCode
+    [IO.File]::WriteAllText((Join-Path $Directory 'core-uninstall.stdout'),$coreRemoved.Output,[Text.UTF8Encoding]::new($false))
+    [IO.File]::WriteAllText((Join-Path $Directory 'core-uninstall.stderr'),$coreRemoved.Diagnostics,[Text.UTF8Encoding]::new($false))
+    if ($coreRemoved.ExitCode -ne 0) { throw "Core uninstall exited $($coreRemoved.ExitCode)" }
+    $Report.removal_log_verdict=Assert-RemovalLog ([IO.File]::ReadAllText($log))
+}
+
 $failure = $null
 $attempted = $false
+$coreProductCode = $null
 try {
     if (-not [Environment]::Is64BitProcess) { throw 'Exact x64 Setup needs native x64 PowerShell' }
     foreach ($entry in @(@($bundle,$BundleSha256),@($fixture,$FixtureSha256),@($module,$ModuleSha256))) {
@@ -150,6 +183,8 @@ try {
     if ($installed.ExitCode -ne 0) { throw "Setup install exited $($installed.ExitCode); original log retained" }
     $products=@(Get-InstalledProducts -Context 4 | Where-Object { $_.ProductName -in @('OpenAbstractions', 'Abstraction') })
     if ($products.Count -ne 1 -or $products[0].State -ne 5 -or $products[0].VersionString -ne $Version) { throw 'Setup did not install the exact core version per-machine' }
+    $coreProductCode=$products[0].ProductCode
+    $report.core_product_code=$coreProductCode
     $user=@(Get-InstalledProducts -UserSid $sid -Context 2 | Where-Object { $_.ProductName -in @('OpenAbstractions', 'Abstraction') })
     if ($user.Count) { throw 'Setup unexpectedly installed a user-scope core' }
     $central=Join-Path $env:ProgramFiles 'OpenAbstractions\tools\openabstractions.exe'
@@ -190,18 +225,7 @@ try {
 } catch { $failure=$_; $report.failure=($_ | Out-String) } finally {
     if ($attempted) {
         try {
-            $removeInfo=New-Object Diagnostics.ProcessStartInfo
-            $removeInfo.FileName=$bundle
-            $removeInfo.Arguments='-uninstall -quiet -norestart -log "' + (Join-Path $taskRoot 'setup-uninstall.log') + '"'
-            $removeInfo.WorkingDirectory=$taskRoot
-            $removed=Invoke-FixtureProcess $removeInfo 600
-            $report.uninstall_exit=$removed.ExitCode
-            [IO.File]::WriteAllText((Join-Path $taskRoot 'setup-uninstall.stdout'),$removed.Output,[Text.UTF8Encoding]::new($false))
-            [IO.File]::WriteAllText((Join-Path $taskRoot 'setup-uninstall.stderr'),$removed.Diagnostics,[Text.UTF8Encoding]::new($false))
-            if ($removed.ExitCode -ne 0) { throw "Setup uninstall exited $($removed.ExitCode)" }
-            $logs=@(Get-ChildItem -LiteralPath $taskRoot -File -Filter 'setup-uninstall*OpenAbstractions*.log')
-            if ($logs.Count -ne 1) { throw 'Exact core uninstall log missing or ambiguous' }
-            $report.removal_log_verdict=Assert-RemovalLog ([IO.File]::ReadAllText($logs[0].FullName))
+            Remove-SetupPackages $bundle $Version $coreProductCode $taskRoot $report
             Assert-NoRuntime -Sid $sid -Seconds 20
             Assert-NoRuntime -Sid 'S-1-5-18' -Seconds 20
             $left=Get-OpenAbstractionsFootprint $sid $local $env:ProgramFiles $startup
