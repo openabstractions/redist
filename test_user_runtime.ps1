@@ -82,6 +82,9 @@ if ($Mode -eq 'ValidateOnly') {
 # invoking account itself and starts User with the account's SID as its marker.
 $localAccountChild = $Mode -eq 'User' -and $env:OA_FIXTURE_LOCAL_ACCOUNT -and
     $env:OA_FIXTURE_LOCAL_ACCOUNT -eq [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+# A cold Sandbox spends over 120 seconds checking a signed MSI in Windows Installer.
+$localInstallSeconds = 300
+$localInstallExtraSeconds = $localInstallSeconds - 90
 if ($Mode -notin @('CheckLogs','LocalAccount','ComfyCancelReadback') -and -not $localAccountChild -and ($env:GITHUB_ACTIONS -ne 'true' -or $env:RUNNER_ENVIRONMENT -ne 'github-hosted')) {
     throw 'This mutating fixture requires a disposable GitHub-hosted runner.'
 }
@@ -683,13 +686,13 @@ function Invoke-InstallWithDiagnostics([scriptblock]$Install, [scriptblock]$Diag
         throw $original
     }
 }
-function Assert-PackageHash([string]$Path, [string]$Expected) {
+function Assert-PackageHash([string]$Path, [string]$Expected, [string]$Mismatch = 'Predecessor package differs from the verified release checksum') {
     $stream = [IO.File]::OpenRead($Path)
     $sha = [Security.Cryptography.SHA256]::Create()
     try { $actual = ([BitConverter]::ToString($sha.ComputeHash($stream))).Replace('-','').ToLowerInvariant() }
     finally { $sha.Dispose(); $stream.Dispose() }
     if ($Expected -notmatch '^[0-9a-f]{64}$' -or $actual -ne $Expected) {
-        throw 'Predecessor package differs from the verified release checksum'
+        throw $Mismatch
     }
 }
 function Get-PackageProperty([string]$Path, [ValidateSet('ProductVersion','ProductCode','UpgradeCode')][string]$Property) {
@@ -1169,23 +1172,14 @@ function Assert-InstalledPanelShortcuts([string]$Tools, [string]$Package) {
 # jobs list observe the operation this program submitted, an equal submission
 # returns the original receipt (JOB-A2), and jobs result writes the file it is
 # given.
-function Assert-ServiceDownload([string]$Central, [string]$PythonPath) {
-$work = Join-Path (Get-Location) 'service-download'
-New-Item -ItemType Directory -Force -Path "$work\serve","$work\out","$work\out2" | Out-Null
-Set-Content "$work\serve\thing.bin" 'bytes the runtime fetched and the command delivered'
-$srv = Start-Process -FilePath $PythonPath -WindowStyle Hidden -PassThru -RedirectStandardOutput service-download-server.log -RedirectStandardError service-download-server.err -WorkingDirectory "$work\serve" -ArgumentList '-m','http.server','8099','--bind','127.0.0.1'
-try {
-    # Bound HTTP readiness independently of each command's process deadline.
-    $ready=$false
-    $readyUntil=[DateTime]::UtcNow.AddSeconds(10)
-    while ([DateTime]::UtcNow -lt $readyUntil) {
-      try { Invoke-WebRequest 'http://127.0.0.1:8099/thing.bin' -UseBasicParsing -TimeoutSec 1 | Out-Null; $ready=$true; break }
-      catch { Start-Sleep -Milliseconds 200 }
-    }
-    if (-not $ready) { throw 'Isolated HTTP source did not become ready' }
-    $first = (Invoke-CheckedTool $Central @('download','http://127.0.0.1:8099/thing.bin','--out',"`"$work\out`"",'--json','--timeout','60s')) -join "`n" | ConvertFrom-Json
+function Assert-ServiceDownload([string]$Central, [string]$Source, [string]$ExpectedSHA256) {
+    $work = Join-Path (Get-Location) 'service-download'
+    New-Item -ItemType Directory -Force -Path "$work\out","$work\out2" | Out-Null
+    $download = @('download',$Source,'--sha256',$ExpectedSHA256,'--out',"`"$work\out\thing.bin`"",'--json','--timeout','60s')
+
+    $first = (Invoke-CheckedTool $Central $download) -join "`n" | ConvertFrom-Json
     if ($first.snapshot.state -ne 'complete') { throw "download did not complete: $($first.snapshot.state)" }
-    if ((Get-Content "$work\out\thing.bin" -Raw) -ne (Get-Content "$work\serve\thing.bin" -Raw)) { throw 'download delivered different bytes' }
+    Assert-PackageHash "$work\out\thing.bin" $ExpectedSHA256 'download delivered different bytes'
     $id = $first.receipt.operation_id
     if (-not $id) { throw 'download did not name the operation it created' }
 
@@ -1195,17 +1189,13 @@ try {
     $listed = (Invoke-CheckedTool $Central @('jobs','list','--json')) -join "`n" | ConvertFrom-Json
     if (-not ($listed.snapshots | Where-Object { $_.receipt.operation_id -eq $id })) { throw 'jobs list did not include the operation this program submitted' }
 
-    $again = (Invoke-CheckedTool $Central @('download','http://127.0.0.1:8099/thing.bin','--out',"`"$work\out`"",'--json','--timeout','60s')) -join "`n" | ConvertFrom-Json
+    $again = (Invoke-CheckedTool $Central $download) -join "`n" | ConvertFrom-Json
     if ($again.receipt.operation_id -ne $id) { throw 'an equal submission did not return the original receipt (JOB-A2)' }
 
     $copied = (Invoke-CheckedTool $Central @('jobs','result',$id,'--out',"`"$work\out2\thing.bin`"",'--json')) -join "`n" | ConvertFrom-Json
     if ($copied.out -notlike '*\out2\thing.bin') { throw "jobs result wrote somewhere other than the file it was given: $($copied.out)" }
-    if ((Get-Content "$work\out2\thing.bin" -Raw) -ne (Get-Content "$work\serve\thing.bin" -Raw)) { throw 'jobs result delivered different bytes' }
-} finally {
-    if (-not $srv.HasExited) { $srv.Kill() }
-    if (-not $srv.WaitForExit(5000)) { throw 'HTTP fixture process termination was not observed' }
-    $srv.Dispose()
-}
+    Assert-PackageHash "$work\out2\thing.bin" $ExpectedSHA256 'jobs result delivered different bytes'
+
     'Service download passed' | Set-Content service-download.txt
 }
 # Observe the installer-started presenter before the short action window opens.
@@ -2648,7 +2638,8 @@ if ($Mode -eq 'LocalAccount') {
         $info.Arguments = $arguments -join ' '
         $info.WorkingDirectory = $directory
         $info.EnvironmentVariables['OA_FIXTURE_LOCAL_ACCOUNT'] = $sid
-        $child = Invoke-FixtureProcess $info (Get-UserFixtureSeconds ([bool]$PredecessorMsiPath) $hasOrdinary $SoakSeconds) -ObservationPath (Join-Path $directory 'local-account-process.json')
+        $seconds = (Get-UserFixtureSeconds ([bool]$PredecessorMsiPath) $hasOrdinary $SoakSeconds) + $localInstallExtraSeconds
+        $child = Invoke-FixtureProcess $info $seconds -ObservationPath (Join-Path $directory 'local-account-process.json')
         $child.Output | Set-Content -Encoding UTF8 (Join-Path $directory 'fixture.log')
         $child.Diagnostics | Set-Content -Encoding UTF8 (Join-Path $directory 'fixture.err')
         if ($child.ExitCode -ne 0) { throw "Local-account fixture exited $($child.ExitCode); inspect $directory" }
@@ -2764,7 +2755,9 @@ if ($Mode -eq 'User') {
         } else {
             $installAttempted = $true
             Invoke-InstallWithDiagnostics {
-                Invoke-Bounded msiexec.exe (Get-CandidateInstallArguments $MsiPath $Unscoped.IsPresent)
+                $install = @{}
+                if ($localAccountChild) { $install.Seconds = $localInstallSeconds }
+                Invoke-Bounded msiexec.exe (Get-CandidateInstallArguments $MsiPath $Unscoped.IsPresent) @install
             } { Save-ActivationFailure $tools }
             $installed = $true
             Assert-NoUpgradeExclusion
@@ -2785,7 +2778,12 @@ if ($Mode -eq 'User') {
             if ($Unscoped) { Assert-SingleUserScope }
             $central = Join-Path $tools 'openabstractions.exe'
             Assert-RuntimeReady $central post-install-status
-            if ($CheckTools) { Assert-ServiceDownload $central $PythonPath }
+            if ($CheckTools) {
+                # Use the immutable public README already checked by the Linux qualification.
+                Assert-ServiceDownload $central `
+                    'https://raw.githubusercontent.com/openabstractions/redist/38f7e5b0283c0ba7a98019d0ac6626d714c51df7/posix/README.md' `
+                    '714512b598dc1d4f798457099771551e3877624599477d5612ef5bd9e721a5e6'
+            }
             if ($NativeCoreRequest) {
                 $native=Get-Content -LiteralPath $NativeCoreRequest -Raw|ConvertFrom-Json
                 $selectedPlans=@(Get-SelectedAppPlan $native)
