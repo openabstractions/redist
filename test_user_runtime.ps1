@@ -624,7 +624,8 @@ function Assert-RemovedRegistration {
 # process that supervises its runtime. Through 0.1.5 jobd ran `start`; 0.1.6 and
 # 0.1.7 run the windowless jobdw `start --runtime`; from 0.1.8 the shortcut runs
 # the windowless host `openabstractionsw serve host`, which does not exit, so
-# the fixture activates it with the idempotent `start`. The rule reads the
+# the fixture activates it with the idempotent `start`. Published 0.4.0 and
+# later use `serve supervisor` for that same installed image. The rule reads the
 # version it was given, so moving the qualification's predecessor forward
 # changes nothing here.
 function Get-PredecessorActivation([string]$Version) {
@@ -634,6 +635,9 @@ function Get-PredecessorActivation([string]$Version) {
     }
     if ([version]$Version -le [version]'0.1.7') {
         return [pscustomobject]@{ Images = @('jobdw.exe'); Arguments = 'start --runtime'; Start = 'start --runtime'; Supervisor = @('jobdw'); Initializer = 'jobd.exe' }
+    }
+    if ([version]$Version -ge [version]'0.4.0') {
+        return [pscustomobject]@{ Images = @('openabstractionsw.exe'); Arguments = 'serve supervisor'; Start = 'start'; Supervisor = @('openabstractionsw'); Initializer = '' }
     }
     return [pscustomobject]@{ Images = @('openabstractionsw.exe'); Arguments = 'serve host'; Start = 'start'; Supervisor = @('openabstractionsw'); Initializer = '' }
 }
