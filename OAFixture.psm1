@@ -293,6 +293,7 @@ public static class OAFixtureCustody {
     public class Service { public string Name; public int Error; public uint State, Pid, Win32Exit; }
     [DllImport("advapi32.dll", SetLastError=true)] static extern bool OpenProcessToken(IntPtr p, uint access, out IntPtr token);
     [DllImport("advapi32.dll", SetLastError=true)] static extern bool GetTokenInformation(IntPtr token, int kind, byte[] data, uint size, out uint used);
+    [DllImport("advapi32.dll", EntryPoint="GetTokenInformation", SetLastError=true)] static extern bool GetTokenInformationBuffer(IntPtr token, int kind, IntPtr data, uint size, out uint used);
     [DllImport("kernel32.dll")] static extern bool CloseHandle(IntPtr h);
     [DllImport("secur32.dll")] static extern uint LsaEnumerateLogonSessions(out uint count, out IntPtr list);
     [DllImport("secur32.dll")] static extern uint LsaGetLogonSessionData(ref Luid id, out IntPtr data);
@@ -311,6 +312,34 @@ public static class OAFixtureCustody {
             if (used < 16) throw new InvalidOperationException("Token statistics prefix unavailable");
             return (((ulong)BitConverter.ToUInt32(data,12)<<32)|BitConverter.ToUInt32(data,8)).ToString("x");
         } finally { CloseHandle(token); }
+    }
+    public static string LogonSid() {
+        IntPtr token;
+        if (!OpenProcessToken(new IntPtr(-1),8,out token)) throw new Win32Exception(Marshal.GetLastWin32Error());
+        IntPtr data=IntPtr.Zero;
+        try {
+            uint needed;
+            // TokenLogonSid (28) returns TOKEN_GROUPS with exactly one logon SID.
+            if(GetTokenInformationBuffer(token,28,IntPtr.Zero,0,out needed) || Marshal.GetLastWin32Error()!=122)
+                throw new InvalidOperationException("TokenLogonSid buffer size unavailable");
+            if(needed<IntPtr.Size*2+4 || needed>65536) throw new InvalidOperationException("TokenLogonSid buffer bound invalid");
+            data=Marshal.AllocHGlobal((int)needed);
+            uint used;
+            if(!GetTokenInformationBuffer(token,28,data,needed,out used)) throw new Win32Exception(Marshal.GetLastWin32Error());
+            if(used>needed || used<IntPtr.Size*2+4 || Marshal.ReadInt32(data)!=1) throw new InvalidOperationException("One native logon SID required");
+            if(((uint)Marshal.ReadInt32(data,IntPtr.Size*2)&0xc0000000u)!=0xc0000000u) throw new InvalidOperationException("Native logon SID attributes unavailable");
+            string sid=new SecurityIdentifier(Marshal.ReadIntPtr(data,IntPtr.Size)).Value;
+            LogonSidSuffix(sid); // Retain only the documented S-1-5-5-X-Y form.
+            return sid;
+        } finally { if(data!=IntPtr.Zero) Marshal.FreeHGlobal(data); CloseHandle(token); }
+    }
+    public static string LogonSidSuffix(string sid) {
+        string[] parts=sid.Split('-'); uint high,low;
+        if(parts.Length!=6 || parts[0]!="S" || parts[1]!="1" || parts[2]!="5" || parts[3]!="5" ||
+            !uint.TryParse(parts[4],System.Globalization.NumberStyles.None,System.Globalization.CultureInfo.InvariantCulture,out high) ||
+            !uint.TryParse(parts[5],System.Globalization.NumberStyles.None,System.Globalization.CultureInfo.InvariantCulture,out low))
+            throw new InvalidOperationException("Native logon SID form required");
+        return (((ulong)high<<32)|low).ToString("x");
     }
     public static Logon[] SessionLogons(string sid, uint session) {
         uint count; IntPtr list;
@@ -382,11 +411,17 @@ function Get-FixtureCustodySnapshot {
     if($current.User.Value -cne $Sid -or [Diagnostics.Process]::GetCurrentProcess().SessionId -ne $Session) { throw 'Custody snapshot requires the actual caller account/session' }
     $luid=[OAFixtureCustody]::AuthenticationId()
     $result=[ordered]@{Schema=1;Utc=[DateTime]::UtcNow.ToString('o');Sid=$Sid;Session=$Session;CallerPid=$PID;
-        AuthenticationId=$luid;LogonSids=@($current.Groups|ForEach-Object Value|Where-Object {$_ -match '^S-1-5-5-\d+-\d+$'});
+        AuthenticationId=$luid;LogonSids=@();LogonSidSupervisorName=$null;
         SupervisorName=('OpenAbstractionsSupervisor_'+$luid);Logons=@();Services=@();Processes=@();RuntimePipe=$null;Unavailable=@()}
+    $logonSuffix=@()
+    try{
+        $nativeSid=[OAFixtureCustody]::LogonSid()
+        $result.LogonSids=@($nativeSid);$logonSuffix=@([OAFixtureCustody]::LogonSidSuffix($nativeSid))
+        $result.LogonSidSupervisorName='OpenAbstractionsSupervisor_'+$logonSuffix[0]
+    }catch{$result.Unavailable+=@('token-logon-sid')}
     try{$result.Logons=@(Get-FixtureSessionLogons $Sid $Session $ReadLogons)}catch{$result.Unavailable+=@('logons')}
     if(-not $ReadService){$ReadService={param($name) [OAFixtureCustody]::Query($name)}}
-    foreach($id in @(@($luid)+@($result.Logons|ForEach-Object AuthenticationId)|Select-Object -Unique)) {
+    foreach($id in @(@($luid)+$logonSuffix+@($result.Logons|ForEach-Object AuthenticationId)|Select-Object -Unique)) {
         $name='OpenAbstractionsSupervisor_'+$id
         try{$row=& $ReadService $name;$result.Services+=@(@{Name=$name;Error=[int]$row.Error;State=[int]$row.State;Pid=[uint32]$row.Pid;Win32Exit=[int]$row.Win32Exit})}
         catch{$result.Unavailable+=@('service-query')}
