@@ -1273,6 +1273,8 @@ def received_producer_closure(app,raw,*,expected_sources,producer_source,run_id,
     else:
         if final.get('bootstrap')!=native.get('bootstrap'):
             raise ValueError('OpenCode final receipt contradicts prepared source: bootstrap')
+        if final.get('bundled_plugin')!=native.get('bundled_plugin'):
+            raise ValueError('OpenCode final receipt contradicts prepared source: bundled_plugin')
         for key in ('plugin','payload','upstream','native_source_hashes','zip_sha256','host_inputs_sha256'):
             if final[key]!=native[key]:raise ValueError('OpenCode final receipt contradicts prepared source: '+key)
     if app=='lemonade':
@@ -1284,7 +1286,15 @@ def received_producer_closure(app,raw,*,expected_sources,producer_source,run_id,
         closure_file(inputs,'desktop-host.json',native['desktop_binding'])
         if native['inputs']['desktop_binding']!=native['desktop_binding']:
             raise ValueError('preparation desktop binding contradicts measured input')
-    if app=='opencode':closure_file(inputs,'opencode-plugin.tgz',native['plugin'])
+    if app=='opencode':
+        original_plugin=native['plugin']
+        if 'bundled_plugin' in native:
+            composition=native['bundled_plugin']
+            if (not isinstance(composition,dict) or
+                    any(composition.get(key)!=native['plugin'][key] for key in ('sha256','bytes'))):
+                raise ValueError('bundled OpenCode plugin contradicts prepared source')
+            original_plugin=composition['original_plugin']
+        closure_file(inputs,'opencode-plugin.tgz',original_plugin)
     paths={**{'provenance/inputs/'+name:path for name,path in shared.items()},
            **{'provenance/'+app+'/'+name:path for name,path in files.items()},
            'provenance/inputs/producer-inputs.json':original,'apps/'+app+'/installer-receipt.json':final_path}
