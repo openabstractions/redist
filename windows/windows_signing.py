@@ -309,13 +309,14 @@ function Usage($certificate) {
     }
     return $values
 }
-function Chain($certificate) {
+function Chain($certificate, $verificationTime = $null) {
     if ($null -eq $certificate) { return @{valid=$false;certificates=@();status=@('MissingCertificate')} }
     $chain = [Security.Cryptography.X509Certificates.X509Chain]::new()
     try {
         $chain.ChainPolicy.RevocationMode = [Security.Cryptography.X509Certificates.X509RevocationMode]::Online
         $chain.ChainPolicy.RevocationFlag = [Security.Cryptography.X509Certificates.X509RevocationFlag]::EntireChain
         $chain.ChainPolicy.VerificationFlags = [Security.Cryptography.X509Certificates.X509VerificationFlags]::NoFlag
+        if ($null -ne $verificationTime) { $chain.ChainPolicy.VerificationTime = $verificationTime }
         $valid = $chain.Build($certificate)
         $status = @($chain.ChainStatus | Where-Object { $_.Status -ne [Security.Cryptography.X509Certificates.X509ChainStatusFlags]::NoError } | ForEach-Object { $_.Status.ToString() })
         return @{valid=($valid -and $status.Count -eq 0);status=$status;certificates=@($chain.ChainElements | ForEach-Object { Digest $_.Certificate })}
@@ -329,12 +330,24 @@ $oaStage = 'timestamp-chain'
 $tsa = Chain $timestamp
 $oaStage = 'cms-read'
 $cms = if ($leaf) { [OASignatureCms]::Read($env:OA_SIGNATURE_FILE) } else { @($null,$null,$null,$null,$null,$null,$null) }
+# An authenticated signing time can qualify only an expiry-only supplier TSA.
+# Keep the current-time online chain result, including all revocation failures.
+$historicalTsa = @{valid=$false;status=@('NotChecked')}
+if ($signature.Status.ToString() -eq 'Valid' -and $timestamp -and
+    $cms[3] -eq (Digest $timestamp) -and $tsa.valid -eq $false -and
+    $tsa.status.Count -eq 1 -and $tsa.status[0] -eq 'NotTimeValid') {
+    $oaStage = 'timestamp-signing-time-chain'
+    $signingTime = [DateTime]::Parse($cms[6], [Globalization.CultureInfo]::InvariantCulture,
+        [Globalization.DateTimeStyles]::RoundtripKind)
+    $historicalTsa = Chain $timestamp $signingTime
+}
 $oaStage = 'serialization'
 @{status=$signature.Status.ToString();sha1=$(if ($leaf) {$leaf.Thumbprint.ToLowerInvariant()} else {$null})
   sha256=(Digest $leaf);subject=$(if ($leaf) {$leaf.Subject} else {$null})
   issuer=$(if ($leaf) {$leaf.Issuer} else {$null});eku=@(Usage $leaf)
   chain_valid=$chain.valid;chain_status=$chain.status;chain=$chain.certificates;timestamp_sha256=(Digest $timestamp)
   timestamp_eku=@(Usage $timestamp);timestamp_chain_valid=$tsa.valid;timestamp_chain_status=$tsa.status
+  timestamp_signing_time_chain_valid=$historicalTsa.valid;timestamp_signing_time_chain_status=$historicalTsa.status
   file_digest_oid=$cms[0];timestamp_digest_oid=$cms[1];cms_leaf_sha256=$cms[2];cms_timestamp_sha256=$cms[3];cms_digest_oid=$cms[4]
   supplier_leaf_valid_at_timestamp=($leaf -and [bool]::Parse($cms[5]));timestamp_utc=$cms[6]} | ConvertTo-Json -Depth 5 -Compress
 } catch {
@@ -621,8 +634,20 @@ def supplier_timestamp_rule(signature):
             and signature.get('chain_status') == ['NotTimeValid'])
 
 
+def supplier_timestamp_chain_rule(signature):
+    """Require an expiry-only current TSA and its fully trusted bound-time chain."""
+    return (signature.get('status') == 'Valid'
+            and signature.get('cms_timestamp_sha256') == signature.get('timestamp_sha256')
+            and re.fullmatch('[0-9a-f]{64}', str(signature.get('timestamp_sha256'))) is not None
+            and signature.get('timestamp_chain_valid') is False
+            and signature.get('timestamp_chain_status') == ['NotTimeValid']
+            and signature.get('timestamp_signing_time_chain_valid') is True
+            and signature.get('timestamp_signing_time_chain_status') == [])
+
+
 def _verify_signature(path, expected, signtool, signature, *, supplier_timestamp=False):
     supplier_time = supplier_timestamp and supplier_timestamp_rule(signature)
+    supplier_tsa_time = supplier_timestamp and supplier_timestamp_chain_rule(signature)
     criteria = (
         ('status', lambda: signature.get('status') == 'Valid'),
         *(("leaf-" + key, lambda key=key: signature.get(key) == expected[key])
@@ -632,12 +657,12 @@ def _verify_signature(path, expected, signtool, signature, *, supplier_timestamp
         ('leaf-chain-status', lambda: signature.get('chain_status') == [] or supplier_time),
         *((('supplier-timestamp-leaf-time', lambda: signature.get('supplier_leaf_valid_at_timestamp') is True),)
           if supplier_timestamp else ()),
-        ('timestamp-chain-status', lambda: signature.get('timestamp_chain_status') == []),
+        ('timestamp-chain-status', lambda: signature.get('timestamp_chain_status') == [] or supplier_tsa_time),
         ('leaf-chain-roster', lambda: isinstance(signature.get('chain'), list) and len(signature['chain']) >= 2),
         ('leaf-chain-leaf', lambda: signature['chain'][0] == expected['sha256']),
         ('timestamp-certificate', lambda: re.fullmatch('[0-9a-f]{64}', str(signature.get('timestamp_sha256')))),
         ('timestamp-eku', lambda: TIME_STAMPING in signature.get('timestamp_eku', [])),
-        ('timestamp-chain-valid', lambda: signature.get('timestamp_chain_valid') is True),
+        ('timestamp-chain-valid', lambda: signature.get('timestamp_chain_valid') is True or supplier_tsa_time),
         ('file-digest', lambda: signature.get('file_digest_oid') == '2.16.840.1.101.3.4.2.1'),
         ('cms-digest', lambda: signature.get('cms_digest_oid') == '2.16.840.1.101.3.4.2.1'),
         ('timestamp-digest', lambda: signature.get('timestamp_digest_oid') == '2.16.840.1.101.3.4.2.1'),
@@ -663,7 +688,7 @@ def _verify_signature(path, expected, signtool, signature, *, supplier_timestamp
             'chain': signature['chain'], 'timestamp_certificate_sha256': signature['timestamp_sha256'],
             'file_digest': 'SHA256', 'timestamp_digest': 'SHA256', 'timestamp': 'RFC3161',
             'verification': ('embedded Authenticode /pa /all /tw; expected leaf/EKU; supplier signing-time validity; online timestamp chain'
-                             if supplier_time else 'embedded Authenticode /pa /all /tw; expected leaf/EKU; online trusted chains'),
+                             if supplier_time or supplier_tsa_time else 'embedded Authenticode /pa /all /tw; expected leaf/EKU; online trusted chains'),
             'tool_output_sha256': hashlib.sha256(output.encode()).hexdigest()}
 
 
